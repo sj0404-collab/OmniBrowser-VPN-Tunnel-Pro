@@ -175,8 +175,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
-    // Start local anti-DPI proxy server immediately
+    // Start local anti-DPI proxy server immediately and release any legacy TUN lock
     LaunchedEffect(Unit) {
+        BrowsecVpnService.stopSystemTunIfAny(context)
         BrowsecLocalProxyServer.ensureRunning()
     }
 
@@ -270,41 +271,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             .apply()
     }
 
-    // VPN Service Permission Launcher so native apps can run through Android VpnService
-    var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
-    val vpnPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) {
-        val pkg = pendingVpnLaunchPkg
-        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-        if (!pkg.isNullOrBlank()) {
-            nativeAppsManager.launchApp(pkg)
-            Toast.makeText(context, "🛡️ Запущено через Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
-        }
-    }
-
     fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
         if (!vpnRoutedApps.contains(pkg)) {
             vpnRoutedApps.add(pkg)
             persistBrowserSettings()
         }
         browsecEnabled = true
-        val prepareIntent = try {
-            VpnService.prepare(context)
-        } catch (_: Exception) {
-            null
-        }
-        if (prepareIntent != null) {
-            pendingVpnLaunchPkg = pkg
-            vpnPermissionLauncher.launch(prepareIntent)
+        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+        val ok = nativeAppsManager.launchApp(pkg)
+        if (ok) {
+            Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec Anti-DPI ($browsecCountry, 127.0.0.1:${BrowsecLocalProxyServer.activePort})!", Toast.LENGTH_LONG).show()
         } else {
-            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-            val ok = nativeAppsManager.launchApp(pkg)
-            if (ok) {
-                Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
-            } else {
-                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
-            }
+            Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -454,16 +432,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        val headers = mutableMapOf<String, String>()
-        if (browsecEnabled) {
-            val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
-            headers["Accept-Language"] = node.acceptLang
-            headers["X-Forwarded-For"] = node.edgeIp
-            headers["CF-IPCountry"] = node.code
-            headers["X-Real-IP"] = node.edgeIp
-            headers["DNT"] = "1"
-        }
-        wv.loadUrl(finalUrl, headers)
+        // Direct loadUrl as in v1.0.0 so YouTube and Google never block or drop connections
+        wv.loadUrl(finalUrl)
     }
 
     fun ensureTabWebView(tab: BrowserTabModel): WebView {
@@ -1100,18 +1070,24 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Button(
                                             onClick = {
-                                                val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
-                                                if (prep != null) {
-                                                    pendingVpnLaunchPkg = null
-                                                    vpnPermissionLauncher.launch(prep)
-                                                } else {
-                                                    BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                                    Toast.makeText(context, "🛡️ Системный туннель Browsec ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
-                                                }
+                                                browsecEnabled = true
+                                                BrowsecVpnService.startForApp(context, browsecCountry, null)
+                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = false)
+                                                Toast.makeText(context, "✅ Прямой трафик Browsec ($browsecCountry) как в v1.0.0 активен!", Toast.LENGTH_SHORT).show()
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                                         ) {
-                                            Text("🛡️ Включить системный VPN-туннель", fontSize = 11.sp, color = Color.White)
+                                            Text("⚡ Прямой режим v1.0 (YouTube + Трафик)", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                browsecEnabled = true
+                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                        ) {
+                                            Text("🔓 Открыть сайт через Веб-Туннель", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1120,7 +1096,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                         ) {
-                                            Text("📱 Выбрать приложения для Browsec (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                            Text("📱 Приложения Browsec (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
