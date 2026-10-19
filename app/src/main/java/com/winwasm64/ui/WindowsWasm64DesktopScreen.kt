@@ -1,11 +1,17 @@
 package com.winwasm64.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.app.DownloadManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.net.VpnService
+import android.os.Build
 import android.os.Environment
+import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -34,6 +40,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -44,7 +51,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -55,12 +64,16 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.winwasm64.engine.Wasm64WindowsRuntime
 import com.winwasm64.nativeapps.NativeAppEntry
 import com.winwasm64.nativeapps.NativeAppsManager
-import com.winwasm64.nativeapps.NativeFormatBinding
 import com.winwasm64.torrent.BitTorrentEngine
 import com.winwasm64.torrent.TorrentSessionStatus
 import com.winwasm64.torrent.TorrentState
+import com.winwasm64.vpn.BrowsecLocalProxyServer
+import com.winwasm64.vpn.BrowsecVpnService
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.delay
 
 class BrowserTabModel(
@@ -87,7 +100,7 @@ private val AD_DOMAINS = setOf(
     "mc.yandex.ru", "an.yandex.ru", "ads.youtube.com", "popads.net", "propellerads.com"
 )
 
-private data class VpnNode(
+data class VpnNode(
     val code: String,
     val flag: String,
     val countryName: String,
@@ -95,7 +108,7 @@ private data class VpnNode(
     val edgeIp: String
 )
 
-private val VPN_NODES = listOf(
+val VPN_NODES = listOf(
     VpnNode("DE", "🇩🇪", "Германия (Frankfurt High-Speed)", "de-DE,de;q=0.9,en-US;q=0.8,ru;q=0.7", "185.220.101.42"),
     VpnNode("NL", "🇳🇱", "Нидерланды (Amsterdam AMS-IX)", "nl-NL,nl;q=0.9,en-US;q=0.8,ru;q=0.7", "185.107.56.114"),
     VpnNode("US", "🇺🇸", "США (New York Backbone)", "en-US,en;q=0.9,ru;q=0.7", "198.51.100.84"),
@@ -104,14 +117,70 @@ private val VPN_NODES = listOf(
     VpnNode("SG", "🇸🇬", "Сингапур (Asia-Pacific Core)", "en-SG,en;q=0.9,ru;q=0.7", "139.99.88.19")
 )
 
+/**
+ * Custom crisp dark text field using BasicTextField so text is NEVER cut off vertically
+ * and is always bright white on a dark background.
+ */
+@Composable
+fun CompactDarkTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    modifier: Modifier = Modifier,
+    onGo: (() -> Unit)? = null
+) {
+    Box(
+        modifier = modifier
+            .height(40.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color(0xFF0B1120))
+            .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.CenterStart
+    ) {
+        if (value.isEmpty()) {
+            Text(
+                text = placeholder,
+                color = Color(0xFF94A3B8),
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            textStyle = TextStyle(
+                color = Color.White,
+                fontSize = 13.sp,
+                fontFamily = FontFamily.Monospace
+            ),
+            cursorBrush = SolidColor(Color(0xFF38BDF8)),
+            keyboardOptions = KeyboardOptions(imeAction = if (onGo != null) ImeAction.Go else ImeAction.Done),
+            keyboardActions = KeyboardActions(
+                onGo = { onGo?.invoke() },
+                onDone = { onGo?.invoke() }
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("omni_browser_v2_prefs", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE) }
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
+    // Start local anti-DPI proxy server immediately
+    LaunchedEffect(Unit) {
+        BrowsecLocalProxyServer.ensureRunning()
+    }
+
+    // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Browsec VPN
     var currentSection by remember { mutableIntStateOf(0) }
 
     var adBlockEnabled by remember { mutableStateOf(prefs.getBoolean("adblock_on", true)) }
@@ -129,12 +198,21 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var devToolsEnabled by remember { mutableStateOf(false) }
     var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
 
+    // Sync Browsec state into BitTorrentEngine
+    LaunchedEffect(browsecEnabled, browsecCountry) {
+        val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
+        torrentEngine.useBrowsecVpn = browsecEnabled
+        torrentEngine.browsecCountryCode = node.code
+        torrentEngine.browsecEdgeIp = node.edgeIp
+    }
+
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
 
     val tabs = remember {
         val savedUrls = prefs.getString("saved_tab_urls", null)
             ?.split("\n")
-            ?.filter { it.isNotBlank() }
+            ?.filter { it.isNotBlank() && !it.contains("piped.video") }
+            ?.takeIf { it.isNotEmpty() }
             ?: listOf("https://www.google.com", "https://m.youtube.com")
         mutableStateListOf<BrowserTabModel>().apply {
             savedUrls.forEachIndexed { idx, u ->
@@ -151,14 +229,29 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val bookmarks = remember {
         mutableStateListOf(
             "https://www.google.com" to "🔍 Google Поиск",
-            "https://m.youtube.com" to "🎬 YouTube (Со звуком)",
-            "https://piped.video" to "🎬 Piped (Зеркало YouTube без блокировок)",
-            "https://archive.org/details/movies" to "🧲 Archive.org Фильмы и Торренты",
-            "https://rutracker.org" to "🧲 RuTracker (Через Browsec VPN)",
+            "https://m.youtube.com" to "🎬 YouTube Моб. (Прямой)",
+            "https://www.youtube.com/?app=desktop" to "🖥 YouTube ПК (Через Browsec)",
+            "https://archive.org/details/software" to "🧲 Archive.org Программы и Игры",
+            "https://rutracker.org" to "🧲 RuTracker (С Browsec VPN)",
             "https://github.com" to "💻 GitHub"
         )
     }
-    val historyList = remember { mutableStateListOf<String>() }
+
+    val historyList = remember {
+        val savedHist = prefs.getString("saved_history", null)
+            ?.split("\n")
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
+        mutableStateListOf<String>().apply { addAll(savedHist) }
+    }
+
+    val vpnRoutedApps = remember {
+        val savedSet = prefs.getStringSet("vpn_routed_apps", emptySet()).orEmpty()
+        mutableStateListOf<String>().apply {
+            addAll(savedSet)
+            BrowsecVpnService.routedPackages.addAll(savedSet)
+        }
+    }
 
     fun persistBrowserSettings() {
         prefs.edit()
@@ -171,8 +264,77 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             .putBoolean("desktop_mode", desktopMode)
             .putString("saved_tab_urls", tabs.joinToString("\n") { it.url })
             .putInt("active_tab_idx", activeTabIndex)
+            .putString("saved_history", historyList.take(100).joinToString("\n"))
             .putStringSet("custom_ad_domains", customBlockedDomains.toSet())
+            .putStringSet("vpn_routed_apps", vpnRoutedApps.toSet())
             .apply()
+    }
+
+    // VPN Service Permission Launcher so native apps can run through Android VpnService
+    var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        val pkg = pendingVpnLaunchPkg
+        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+        if (!pkg.isNullOrBlank()) {
+            nativeAppsManager.launchApp(pkg)
+            Toast.makeText(context, "🛡️ Запущено через Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
+        if (!vpnRoutedApps.contains(pkg)) {
+            vpnRoutedApps.add(pkg)
+            persistBrowserSettings()
+        }
+        browsecEnabled = true
+        val prepareIntent = try {
+            VpnService.prepare(context)
+        } catch (_: Exception) {
+            null
+        }
+        if (prepareIntent != null) {
+            pendingVpnLaunchPkg = pkg
+            vpnPermissionLauncher.launch(prepareIntent)
+        } else {
+            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+            val ok = nativeAppsManager.launchApp(pkg)
+            if (ok) {
+                Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // Storage permission launcher for Android
+    val storagePermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        Toast.makeText(context, "📂 Доступ к памяти обновлён", Toast.LENGTH_SHORT).show()
+    }
+
+    fun requestFullStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:${context.packageName}")
+                    )
+                    context.startActivity(intent)
+                    return
+                } catch (_: Exception) {
+                }
+            }
+        }
+        storagePermLauncher.launch(
+            arrayOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+        )
     }
 
     val webViewContainer = remember { FrameLayout(context) }
@@ -275,17 +437,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        val finalUrl = if (useProxyTunnel && !target.contains("translate.goog") && !target.contains("piped.video")) {
-            if (target.contains("youtube.com") || target.contains("youtu.be")) {
-                val vid = Uri.parse(target).getQueryParameter("v")
-                if (!vid.isNullOrBlank()) {
-                    "https://www.youtube-nocookie.com/embed/$vid?autoplay=1"
-                } else {
-                    "https://piped.video/trending"
-                }
-            } else {
-                "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
-            }
+        // NEVER redirect to piped.video! Always use direct YouTube with Browsec VPN headers or Google Translate proxy for non-YouTube
+        val finalUrl = if (useProxyTunnel && !target.contains("translate.goog") && !target.contains("youtube.com") && !target.contains("youtu.be")) {
+            "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
         } else {
             target
         }
@@ -306,6 +460,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             headers["Accept-Language"] = node.acceptLang
             headers["X-Forwarded-For"] = node.edgeIp
             headers["CF-IPCountry"] = node.code
+            headers["X-Real-IP"] = node.edgeIp
             headers["DNT"] = "1"
         }
         wv.loadUrl(finalUrl, headers)
@@ -356,7 +511,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         }
                         val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
                         dm.enqueue(req)
-                        Toast.makeText(context, "📥 Загрузка начата: $fileName", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "📥 Загрузка начата: $fileName (см. раздел История и Загрузки)", Toast.LENGTH_LONG).show()
                     } catch (e: Exception) {
                         torrentEngine.startFromMagnetOrUrl(url)
                         currentSection = 1
@@ -453,8 +608,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         tab.lastErrorText = null
                         val host = Uri.parse(url).host ?: url
                         tab.loadingStatusText = "⏳ Загрузка страницы $host..."
-                        if (!tab.isIncognito && !historyList.contains(url)) {
-                            historyList.add(0, url)
+                        if (!tab.isIncognito) {
+                            val stamp = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                            val entry = "$stamp | $url"
+                            historyList.removeAll { it.endsWith("| $url") || it == url }
+                            historyList.add(0, entry)
                         }
                         persistBrowserSettings()
                     }
@@ -490,7 +648,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         tab.isLoading = false
                         tab.loadingProgress = 0
                         tab.lastErrorText = "$desc ($failingUrl)"
-                        tab.loadingStatusText = "⚠️ $desc — нажмите «Пробить блокировку» или «YouTube Зеркало»"
+                        tab.loadingStatusText = "⚠️ $desc — нажмите «Сменить страну Browsec» и «↻ Обновить»"
                         if (!browsecEnabled) {
                             browsecEnabled = true
                         }
@@ -550,7 +708,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     var installedApps by remember { mutableStateOf<List<NativeAppEntry>>(emptyList()) }
-    var formatBindings by remember { mutableStateOf(nativeAppsManager.getBindings()) }
     LaunchedEffect(Unit) {
         installedApps = nativeAppsManager.loadInstalledNativeApps()
     }
@@ -579,6 +736,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
 
             if (currentSection == 0) {
+                // 1. Multi-Tab Strip
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -691,13 +849,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
+                // 2. Navigation Bar with ALWAYS-VISIBLE Reload ↻, Stop ✕, History 🕘, Downloads 📥, and Crisp URL Bar
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFF111827))
                         .padding(horizontal = 6.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     SmallNavIconButton("←", enabled = activeTab.canGoBack) {
                         activeTab.webView?.goBack()
@@ -705,51 +864,38 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     SmallNavIconButton("→", enabled = activeTab.canGoForward) {
                         activeTab.webView?.goForward()
                     }
-                    SmallNavIconButton(if (activeTab.isLoading) "✕" else "↻", enabled = true) {
-                        if (activeTab.isLoading) {
+                    // ALWAYS VISIBLE Reload button!
+                    SmallNavIconButton("↻", enabled = true) {
+                        navigateTab(activeTab, activeTab.url)
+                    }
+                    // Separate Stop button when loading
+                    if (activeTab.isLoading) {
+                        SmallNavIconButton("✕", enabled = true) {
                             activeTab.webView?.stopLoading()
                             activeTab.isLoading = false
                             activeTab.loadingProgress = 0
-                        } else {
-                            activeTab.webView?.reload()
                         }
                     }
 
-                    OutlinedTextField(
+                    CompactDarkTextField(
                         value = addressInput,
                         onValueChange = { addressInput = it },
-                        singleLine = true,
-                        placeholder = { Text("URL, поиск или magnet:?...", fontSize = 12.sp, color = Color(0xFF64748B)) },
-                        textStyle = LocalTextStyle.current.copy(
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace
-                        ),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-                        keyboardActions = KeyboardActions(
-                            onGo = { navigateTab(activeTab, addressInput) }
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(44.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF38BDF8),
-                            unfocusedBorderColor = Color(0xFF334155),
-                            focusedContainerColor = Color(0xFF0B1120),
-                            unfocusedContainerColor = Color(0xFF0B1120)
-                        )
+                        placeholder = "Введите URL, поисковый запрос или magnet:?...",
+                        modifier = Modifier.weight(1f),
+                        onGo = { navigateTab(activeTab, addressInput) }
                     )
 
                     Button(
                         onClick = { navigateTab(activeTab, addressInput) },
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                        modifier = Modifier.height(40.dp),
+                        modifier = Modifier.height(38.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                     ) {
-                        Text("Перейти", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("Перейти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
                     }
                 }
 
+                // 3. Loading Progress Indicator & Quick Controls
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -777,9 +923,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     ) {
                         Text(
                             text = if (activeTab.isLoading) {
-                                "⏳ Загрузка сайта: ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
+                                "⏳ Загрузка: ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url} (Browsec $browsecCountry)"
                             } else {
-                                "🔒 Готово (100%) • ${Uri.parse(activeTab.url).host ?: activeTab.url} • Вкладок: ${tabs.size}"
+                                "🔒 Готово (100%) • ${Uri.parse(activeTab.url).host ?: activeTab.url} • Browsec $browsecCountry"
                             },
                             color = if (activeTab.isLoading) Color(0xFF38BDF8) else Color(0xFF94A3B8),
                             fontSize = 11.sp,
@@ -789,17 +935,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         )
 
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (activeTab.isLoading) {
-                                Text(
-                                    text = "⚡ Через Туннель",
-                                    color = Color(0xFFFBBF24),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.clickable {
-                                        navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
-                                    }
-                                )
-                            }
+                            Text(
+                                text = "🕘 История (${historyList.size})",
+                                color = Color(0xFF38BDF8),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable { currentSection = 2 }
+                            )
+                            Text(
+                                text = "📥 Загрузки",
+                                color = Color(0xFF34D399),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable { currentSection = 2 }
+                            )
                             Text(
                                 text = if (desktopMode) "🖥 ПК" else "📱 Моб",
                                 color = Color(0xFFE2E8F0),
@@ -810,7 +959,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     activeTab.webView?.settings?.userAgentString = if (desktopMode) {
                                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                                     } else null
-                                    activeTab.webView?.reload()
+                                    navigateTab(activeTab, activeTab.url)
                                     persistBrowserSettings()
                                 }
                             )
@@ -818,6 +967,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
+                // 4. Extensions Bar
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -828,14 +978,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     ExtensionChip(
-                        label = "🛡️ AdBlock ($adBlockedCount)",
-                        active = adBlockEnabled,
-                        activeColor = Color(0xFF059669)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
-                    }
-
-                    ExtensionChip(
                         label = "🌐 Browsec VPN ($browsecCountry)",
                         active = browsecEnabled,
                         activeColor = Color(0xFF0284C7)
@@ -844,7 +986,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
 
                     ExtensionChip(
-                        label = "🎬 YouTube Звук+Зеркало",
+                        label = "🛡️ AdBlock ($adBlockedCount)",
+                        active = adBlockEnabled,
+                        activeColor = Color(0xFF059669)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
+                    }
+
+                    ExtensionChip(
+                        label = "🎬 YouTube со звуком",
                         active = youtubeBoostEnabled,
                         activeColor = Color(0xFFDC2626)
                     ) {
@@ -862,6 +1012,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
 
                     ExtensionChip(
+                        label = "⭐ Закладки",
+                        active = activeExtensionPopup == "bookmarks",
+                        activeColor = Color(0xFF2563EB)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
+                    }
+
+                    ExtensionChip(
                         label = "🔧 DevTools (F12)",
                         active = devToolsEnabled,
                         activeColor = Color(0xFFD97706)
@@ -871,15 +1029,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
 
                     ExtensionChip(
-                        label = "⭐ Закладки",
-                        active = activeExtensionPopup == "bookmarks",
-                        activeColor = Color(0xFF2563EB)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
-                    }
-
-                    ExtensionChip(
-                        label = "🔍 Найти на стр.",
+                        label = "🔍 Найти",
                         active = activeExtensionPopup == "find",
                         activeColor = Color(0xFF4F46E5)
                     ) {
@@ -887,6 +1037,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
+                // 5. Interactive Extension Popups (With Crisp Non-Clipped Inputs)
                 AnimatedVisibility(visible = activeExtensionPopup != null) {
                     Surface(
                         color = Color(0xFF1E293B),
@@ -897,6 +1048,83 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     ) {
                         Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             when (activeExtensionPopup) {
+                                "browsec" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "🌐 Browsec VPN ($browsecCountry) — Браузер + Торренты + Приложения",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                        Switch(checked = browsecEnabled, onCheckedChange = {
+                                            browsecEnabled = it
+                                            persistBrowserSettings()
+                                            navigateTab(activeTab, activeTab.url)
+                                        })
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        VPN_NODES.forEach { node ->
+                                            val selected = browsecCountry == node.code
+                                            Surface(
+                                                color = if (selected) Color(0xFF0284C7) else Color(0xFF0F172A),
+                                                shape = RoundedCornerShape(8.dp),
+                                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                                                modifier = Modifier.clickable {
+                                                    browsecCountry = node.code
+                                                    browsecEnabled = true
+                                                    BrowsecVpnService.activeCountry = node.code
+                                                    persistBrowserSettings()
+                                                    navigateTab(activeTab, activeTab.url)
+                                                }
+                                            ) {
+                                                Text(
+                                                    text = "${node.flag} ${node.code}",
+                                                    color = Color.White,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
+                                                if (prep != null) {
+                                                    pendingVpnLaunchPkg = null
+                                                    vpnPermissionLauncher.launch(prep)
+                                                } else {
+                                                    BrowsecVpnService.startForApp(context, browsecCountry, null)
+                                                    Toast.makeText(context, "🛡️ Системный туннель Browsec ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                        ) {
+                                            Text("🛡️ Включить системный VPN-туннель", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                activeExtensionPopup = null
+                                                currentSection = 3
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                        ) {
+                                            Text("📱 Выбрать приложения для Browsec (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                        }
+                                    }
+                                }
+
                                 "adblock" -> {
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -913,12 +1141,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     Text("Заблокировано рекламных запросов и трекеров: $adBlockedCount", color = Color(0xFF34D399), fontSize = 12.sp)
                                     var customDomain by remember { mutableStateOf("") }
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedTextField(
+                                        CompactDarkTextField(
                                             value = customDomain,
                                             onValueChange = { customDomain = it },
-                                            placeholder = { Text("Добавить домен в блок (напр. ads.site.ru)", fontSize = 11.sp) },
-                                            singleLine = true,
-                                            modifier = Modifier.weight(1f).height(44.dp)
+                                            placeholder = "Добавить домен в блок (напр. ads.site.ru)",
+                                            modifier = Modifier.weight(1f)
                                         )
                                         Button(onClick = {
                                             if (customDomain.isNotBlank()) {
@@ -927,78 +1154,37 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 persistBrowserSettings()
                                             }
                                         }) {
-                                            Text("+ Блок", fontSize = 11.sp)
-                                        }
-                                    }
-                                }
-
-                                "browsec" -> {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text("🌐 Browsec VPN + Анти-DPI Прокси", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                        Switch(checked = browsecEnabled, onCheckedChange = {
-                                            browsecEnabled = it
-                                            persistBrowserSettings()
-                                            navigateTab(activeTab, activeTab.url)
-                                        })
-                                    }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        VPN_NODES.forEach { node ->
-                                            val selected = browsecCountry == node.code
-                                            FilterChip(
-                                                selected = selected,
-                                                onClick = {
-                                                    browsecCountry = node.code
-                                                    browsecEnabled = true
-                                                    persistBrowserSettings()
-                                                    navigateTab(activeTab, activeTab.url)
-                                                },
-                                                label = { Text("${node.flag} ${node.code}", fontSize = 12.sp) }
-                                            )
-                                        }
-                                    }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(
-                                            onClick = {
-                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                                        ) {
-                                            Text("🔓 Открыть текущий сайт через Веб-Туннель", fontSize = 11.sp)
-                                        }
-                                        OutlinedButton(onClick = { activeExtensionPopup = null }) {
-                                            Text("Закрыть", fontSize = 11.sp)
+                                            Text("+ Блок", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
 
                                 "youtube" -> {
-                                    Text("🎬 YouTube HD со звуком + Прямой поиск без блокировок", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text("🎬 Прямой YouTube со звуком (Через Browsec VPN $browsecCountry)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                     var ytSearch by remember { mutableStateOf("") }
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedTextField(
+                                        CompactDarkTextField(
                                             value = ytSearch,
                                             onValueChange = { ytSearch = it },
-                                            placeholder = { Text("Поиск видео/музыки на YouTube...", fontSize = 12.sp) },
-                                            singleLine = true,
-                                            modifier = Modifier.weight(1f).height(44.dp)
+                                            placeholder = "Введите название видео или песни для YouTube...",
+                                            modifier = Modifier.weight(1f),
+                                            onGo = {
+                                                browsecEnabled = true
+                                                val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
+                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q")
+                                                activeExtensionPopup = null
+                                            }
                                         )
                                         Button(
                                             onClick = {
+                                                browsecEnabled = true
                                                 val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
                                                 navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q")
                                                 activeExtensionPopup = null
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
                                         ) {
-                                            Text("▶ YouTube", fontSize = 11.sp)
+                                            Text("▶ Найти на YouTube", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                     Row(
@@ -1007,21 +1193,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Button(
                                             onClick = {
+                                                browsecEnabled = true
                                                 navigateTab(activeTab, "https://m.youtube.com")
                                                 activeExtensionPopup = null
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C))
                                         ) {
-                                            Text("🏠 Главная YouTube", fontSize = 11.sp)
+                                            Text("📱 YouTube Мобильный", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
-                                                navigateTab(activeTab, "https://piped.video/trending")
+                                                browsecEnabled = true
+                                                navigateTab(activeTab, "https://www.youtube.com/?app=desktop")
                                                 activeExtensionPopup = null
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                                         ) {
-                                            Text("🛡️ Зеркало Piped (Без таймаутов)", fontSize = 11.sp)
+                                            Text("🖥 YouTube Полный (ПК)", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1040,9 +1228,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 )
                                                 Toast.makeText(context, "🔊 Звук разблокирован и усилен!", Toast.LENGTH_SHORT).show()
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                                         ) {
-                                            Text("🔊 Форсировать Звук 200%", fontSize = 11.sp)
+                                            Text("🔊 Усилить Звук 200%", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
@@ -1053,12 +1241,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("⭐ Закладки и Быстрый доступ", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Text("⭐ Закладки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                         Button(onClick = {
                                             bookmarks.add(0, activeTab.url to activeTab.title.ifBlank { activeTab.url })
                                             Toast.makeText(context, "⭐ Добавлено в закладки", Toast.LENGTH_SHORT).show()
                                         }) {
-                                            Text("+ Сохранить текущую", fontSize = 11.sp)
+                                            Text("+ Сохранить вкладку", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                     Row(
@@ -1078,24 +1266,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                                 "find" -> {
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedTextField(
+                                        CompactDarkTextField(
                                             value = findInPageQuery,
                                             onValueChange = {
                                                 findInPageQuery = it
                                                 activeTab.webView?.findAllAsync(it)
                                             },
-                                            placeholder = { Text("Найти текст на странице...", fontSize = 12.sp) },
-                                            singleLine = true,
-                                            modifier = Modifier.weight(1f).height(44.dp)
+                                            placeholder = "Найти слово на странице...",
+                                            modifier = Modifier.weight(1f)
                                         )
                                         Button(onClick = { activeTab.webView?.findNext(true) }) {
-                                            Text("Далее ↓", fontSize = 11.sp)
+                                            Text("Далее ↓", fontSize = 11.sp, color = Color.White)
                                         }
                                         OutlinedButton(onClick = {
                                             activeTab.webView?.clearMatches()
                                             activeExtensionPopup = null
                                         }) {
-                                            Text("✕", fontSize = 11.sp)
+                                            Text("✕", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
@@ -1111,7 +1298,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     ) {
                         Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(
-                                text = "⚠️ Сайт не ответил напрямую: ${activeTab.lastErrorText}",
+                                text = "⚠️ Таймаут или блокировка: ${activeTab.lastErrorText}",
                                 color = Color(0xFFFDE047),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold
@@ -1123,26 +1310,19 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 Button(
                                     onClick = {
                                         browsecEnabled = true
-                                        browsecCountry = if (browsecCountry == "DE") "NL" else "DE"
+                                        val nextIdx = (VPN_NODES.indexOfFirst { it.code == browsecCountry } + 1) % VPN_NODES.size
+                                        browsecCountry = VPN_NODES[nextIdx].code
                                         navigateTab(activeTab, activeTab.url)
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                                 ) {
-                                    Text("🌐 Сменить узел Browsec ($browsecCountry) и повторить", fontSize = 11.sp)
+                                    Text("🌐 Сменить страну Browsec ($browsecCountry) и Обновить", fontSize = 11.sp, color = Color.White)
                                 }
                                 Button(
-                                    onClick = { navigateTab(activeTab, activeTab.url, useProxyTunnel = true) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                    onClick = { navigateTab(activeTab, "https://m.youtube.com") },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
                                 ) {
-                                    Text("🔓 Открыть через Прокси-Туннель", fontSize = 11.sp)
-                                }
-                                if (activeTab.url.contains("youtube", ignoreCase = true)) {
-                                    Button(
-                                        onClick = { navigateTab(activeTab, "https://piped.video/trending") },
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                                    ) {
-                                        Text("🎬 Прямое зеркало YouTube", fontSize = 11.sp)
-                                    }
+                                    Text("🎬 Открыть m.youtube.com", fontSize = 11.sp, color = Color.White)
                                 }
                             }
                         }
@@ -1150,6 +1330,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 }
             }
 
+            // ===================== PERSISTENT WEBVIEW CONTAINER =====================
             Box(
                 modifier = if (currentSection == 0) {
                     Modifier.weight(1f).fillMaxWidth()
@@ -1176,66 +1357,122 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
+            // ===================== SECTION 1: TORRENT CLIENT + BROWSEC VPN + MEMORY ACCESS =====================
             if (currentSection == 1) {
                 TorrentClientSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     torrentEngine = torrentEngine,
                     statuses = torrentStatuses,
                     nativeAppsManager = nativeAppsManager,
+                    browsecEnabled = browsecEnabled,
+                    browsecCountry = browsecCountry,
+                    onToggleBrowsec = {
+                        browsecEnabled = !browsecEnabled
+                        persistBrowserSettings()
+                    },
+                    onCycleCountry = {
+                        val nextIdx = (VPN_NODES.indexOfFirst { it.code == browsecCountry } + 1) % VPN_NODES.size
+                        browsecCountry = VPN_NODES[nextIdx].code
+                        browsecEnabled = true
+                        persistBrowserSettings()
+                    },
+                    onRequestStorageAccess = { requestFullStorageAccess() },
                     onPickTorrentFile = { torrentFilePicker.launch("*/*") }
                 )
             }
 
+            // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
             if (currentSection == 2) {
-                NativeAppsSection(
+                HistoryAndDownloadsSection(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    historyList = historyList,
+                    torrentEngine = torrentEngine,
+                    nativeAppsManager = nativeAppsManager,
+                    onOpenUrlInBrowser = { u ->
+                        val cleanUrl = u.substringAfter("| ").trim()
+                        navigateTab(activeTab, cleanUrl)
+                        currentSection = 0
+                    },
+                    onClearHistory = {
+                        historyList.clear()
+                        persistBrowserSettings()
+                    },
+                    onRequestStorageAccess = { requestFullStorageAccess() }
+                )
+            }
+
+            // ===================== SECTION 3: NATIVE APPS + BROWSEC VPN LAUNCHER =====================
+            if (currentSection == 3) {
+                NativeAppsWithBrowsecSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     nativeAppsManager = nativeAppsManager,
                     installedApps = installedApps,
-                    bindings = formatBindings,
+                    browsecCountry = browsecCountry,
+                    vpnRoutedApps = vpnRoutedApps,
                     downloadedFiles = torrentEngine.getDownloadDirectory().listFiles()?.toList().orEmpty(),
-                    currentBrowserUrl = activeTab.url,
-                    onUpdateBindings = { formatBindings = nativeAppsManager.getBindings() },
+                    onSelectCountry = { code ->
+                        browsecCountry = code
+                        browsecEnabled = true
+                        BrowsecVpnService.activeCountry = code
+                        persistBrowserSettings()
+                    },
+                    onLaunchAppWithBrowsec = { pkg, name ->
+                        startBrowsecAndLaunchNativeApp(pkg, name)
+                    },
+                    onToggleAppInVpn = { pkg ->
+                        if (vpnRoutedApps.contains(pkg)) {
+                            vpnRoutedApps.remove(pkg)
+                            BrowsecVpnService.routedPackages.remove(pkg)
+                        } else {
+                            vpnRoutedApps.add(pkg)
+                            BrowsecVpnService.routedPackages.add(pkg)
+                        }
+                        persistBrowserSettings()
+                    },
                     onRefreshApps = { installedApps = nativeAppsManager.loadInstalledNativeApps() }
                 )
             }
 
+            // ===================== BOTTOM NAVIGATION BAR (4 SECTIONS) =====================
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF0F172A))
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    .padding(horizontal = 6.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 BottomSectionButton(
                     modifier = Modifier.weight(1f),
                     title = "🌐 Браузер (${tabs.size})",
-                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Не сбрасывается",
+                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Browsec $browsecCountry",
                     selected = currentSection == 0,
                     activeColor = Color(0xFF0284C7)
-                ) {
-                    currentSection = 0
-                }
+                ) { currentSection = 0 }
 
                 BottomSectionButton(
                     modifier = Modifier.weight(1f),
-                    title = "🧲 Торренты (${torrentStatuses.size})",
-                    subtitle = "BitTorrent P2P",
+                    title = "🧲 Торрент (${torrentStatuses.size})",
+                    subtitle = "+ Browsec VPN",
                     selected = currentSection == 1,
                     activeColor = Color(0xFF059669)
-                ) {
-                    currentSection = 1
-                }
+                ) { currentSection = 1 }
 
                 BottomSectionButton(
                     modifier = Modifier.weight(1f),
-                    title = "📱 Приложения (${installedApps.size})",
-                    subtitle = "Нативный запуск",
+                    title = "📥 Загрузки",
+                    subtitle = "🕘 История (${historyList.size})",
                     selected = currentSection == 2,
+                    activeColor = Color(0xFFD97706)
+                ) { currentSection = 2 }
+
+                BottomSectionButton(
+                    modifier = Modifier.weight(1f),
+                    title = "📱 Приложения",
+                    subtitle = "Запуск с VPN",
+                    selected = currentSection == 3,
                     activeColor = Color(0xFF7C3AED)
-                ) {
-                    currentSection = 2
-                }
+                ) { currentSection = 3 }
             }
         }
     }
@@ -1247,6 +1484,11 @@ private fun TorrentClientSection(
     torrentEngine: BitTorrentEngine,
     statuses: List<TorrentSessionStatus>,
     nativeAppsManager: NativeAppsManager,
+    browsecEnabled: Boolean,
+    browsecCountry: String,
+    onToggleBrowsec: () -> Unit,
+    onCycleCountry: () -> Unit,
+    onRequestStorageAccess: () -> Unit,
     onPickTorrentFile: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1259,14 +1501,14 @@ private fun TorrentClientSection(
         modifier = modifier
             .background(Color(0xFF090D16))
             .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Surface(
             color = Color(0xFF111827),
             shape = RoundedCornerShape(12.dp),
             border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF059669))
         ) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1274,13 +1516,13 @@ private fun TorrentClientSection(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "🧲 Встроенный BitTorrent Клиент (P2P + BEP-19 WebSeed)",
+                            text = "🧲 BitTorrent Клиент + Browsec VPN ($browsecCountry)",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            fontSize = 13.sp
                         )
                         Text(
-                            text = "Папка сохранения: ${torrentEngine.getDownloadDirectory().absolutePath}",
+                            text = "Папка: ${torrentEngine.getPublicDisplayPath()}",
                             color = Color(0xFF34D399),
                             fontSize = 11.sp,
                             maxLines = 1,
@@ -1290,51 +1532,114 @@ private fun TorrentClientSection(
                     Button(
                         onClick = onPickTorrentFile,
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.height(34.dp)
                     ) {
-                        Text("📂 Открыть .torrent", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text("📂 Файл .torrent", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
 
+                // Storage Permission + Browsec VPN row for Torrents
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        color = if (browsecEnabled) Color(0xFF0284C7) else Color(0xFF1E293B),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.clickable { onToggleBrowsec() }
+                    ) {
+                        Text(
+                            text = if (browsecEnabled) "🛡️ Browsec VPN в Торренте: ВКЛ ($browsecCountry)" else "🛡️ Browsec VPN: ВЫКЛ",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+
+                    Surface(
+                        color = Color(0xFF1E293B),
+                        shape = RoundedCornerShape(8.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                        modifier = Modifier.clickable { onCycleCountry() }
+                    ) {
+                        Text(
+                            text = "🌍 Сменить страну ($browsecCountry)",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+
+                    Surface(
+                        color = Color(0xFF065F46),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.clickable { onRequestStorageAccess() }
+                    ) {
+                        Text(
+                            text = "🔓 Доступ к памяти (/Download)",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+
+                // Crisp non-clipped Magnet/URL input
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    OutlinedTextField(
+                    CompactDarkTextField(
                         value = magnetOrUrlInput,
                         onValueChange = { magnetOrUrlInput = it },
-                        placeholder = { Text("Вставьте magnet:?xt=urn:btih:... или ссылку на .torrent", fontSize = 11.sp) },
-                        singleLine = true,
-                        textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
-                        modifier = Modifier.weight(1f).height(44.dp)
+                        placeholder = "Вставьте magnet:?xt=urn:btih:... или URL .torrent",
+                        modifier = Modifier.weight(1f),
+                        onGo = {
+                            if (magnetOrUrlInput.isNotBlank()) {
+                                torrentEngine.startFromMagnetOrUrl(magnetOrUrlInput)
+                                magnetOrUrlInput = ""
+                            }
+                        }
                     )
                     Button(
                         onClick = {
                             if (magnetOrUrlInput.isNotBlank()) {
                                 torrentEngine.startFromMagnetOrUrl(magnetOrUrlInput)
                                 magnetOrUrlInput = ""
-                                Toast.makeText(context, "🧲 Торрент запущен!", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "🧲 Торрент запущен через Browsec $browsecCountry!", Toast.LENGTH_SHORT).show()
                             }
                         },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                     ) {
-                        Text("⬇ Скачать", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("⬇ Скачать", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
 
+                // Crisp non-clipped Search input
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    OutlinedTextField(
+                    CompactDarkTextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        placeholder = { Text("Поиск торрентов (игры .exe, фильмы, музыка, программы)...", fontSize = 11.sp) },
-                        singleLine = true,
-                        textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
-                        modifier = Modifier.weight(1f).height(44.dp)
+                        placeholder = "Поиск торрентов (игры .exe, фильмы, музыка, программы)...",
+                        modifier = Modifier.weight(1f),
+                        onGo = {
+                            isSearching = true
+                            torrentEngine.searchPublicTorrents(searchQuery) { res ->
+                                catalogItems = res
+                                isSearching = false
+                            }
+                        }
                     )
                     Button(
                         onClick = {
@@ -1344,9 +1649,11 @@ private fun TorrentClientSection(
                                 isSearching = false
                             }
                         },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
                     ) {
-                        Text(if (isSearching) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text(if (isSearching) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
             }
@@ -1354,7 +1661,7 @@ private fun TorrentClientSection(
 
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             if (statuses.isNotEmpty()) {
                 item {
@@ -1375,7 +1682,7 @@ private fun TorrentClientSection(
                             if (st.state == TorrentState.COMPLETED) Color(0xFF10B981) else Color(0xFF38BDF8)
                         )
                     ) {
-                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1408,7 +1715,7 @@ private fun TorrentClientSection(
                             Canvas(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(10.dp)
+                                    .height(8.dp)
                                     .clip(RoundedCornerShape(3.dp))
                                     .background(Color(0xFF090D16))
                             ) {
@@ -1437,28 +1744,38 @@ private fun TorrentClientSection(
                             )
 
                             Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Button(
                                     onClick = {
                                         val f = File(st.outputFilePath)
                                         val res = nativeAppsManager.openFileInNativeApp(f)
                                         res.onFailure {
-                                            Toast.makeText(context, "Файл ещё качается или не найден: ${it.message}", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(context, "Файл: ${it.message}", Toast.LENGTH_SHORT).show()
                                         }
                                     },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.weight(1.2f).height(36.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                 ) {
-                                    Text("📱 Открыть нативно", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    Text("📱 Открыть файл", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
                                 }
 
-                                OutlinedButton(onClick = { torrentEngine.togglePause(st.id) }) {
-                                    Text(if (st.state == TorrentState.PAUSED) "▶ Продолжить" else "⏸ Пауза", fontSize = 11.sp)
+                                OutlinedButton(
+                                    onClick = { torrentEngine.togglePause(st.id) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.weight(1f).height(36.dp)
+                                ) {
+                                    Text(if (st.state == TorrentState.PAUSED) "▶ Пуск" else "⏸ Пауза", fontSize = 11.sp, color = Color.White, maxLines = 1)
                                 }
 
-                                OutlinedButton(onClick = { torrentEngine.removeTorrent(st.id, deleteFile = true) }) {
-                                    Text("🗑 Удалить", fontSize = 11.sp, color = Color(0xFFEF4444))
+                                OutlinedButton(
+                                    onClick = { torrentEngine.removeTorrent(st.id, deleteFile = true) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.weight(0.9f).height(36.dp)
+                                ) {
+                                    Text("🗑 Удалить", fontSize = 11.sp, color = Color(0xFFEF4444), maxLines = 1)
                                 }
                             }
                         }
@@ -1468,7 +1785,7 @@ private fun TorrentClientSection(
 
             item {
                 Text(
-                    text = "🔥 Проверенные торренты с мгновенной раздачей (Игры .EXE, Фильмы MP4, Программы, APK):",
+                    text = "🔥 Проверенные торренты (Игры .EXE, Программы 32/64-bit, Видео MP4, APK):",
                     color = Color(0xFFFBBF24),
                     fontWeight = FontWeight.Bold,
                     fontSize = 13.sp
@@ -1498,9 +1815,10 @@ private fun TorrentClientSection(
                                 torrentEngine.startFromCatalogItem(item)
                                 Toast.makeText(context, "🧲 Скачивание начато: ${item.title}", Toast.LENGTH_SHORT).show()
                             },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                         ) {
-                            Text("⬇ Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("⬇ Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     }
                 }
@@ -1510,33 +1828,225 @@ private fun TorrentClientSection(
 }
 
 @Composable
-private fun NativeAppsSection(
+private fun HistoryAndDownloadsSection(
+    modifier: Modifier,
+    historyList: List<String>,
+    torrentEngine: BitTorrentEngine,
+    nativeAppsManager: NativeAppsManager,
+    onOpenUrlInBrowser: (String) -> Unit,
+    onClearHistory: () -> Unit,
+    onRequestStorageAccess: () -> Unit
+) {
+    val context = LocalContext.current
+    var subTab by remember { mutableIntStateOf(0) } // 0 = Загрузки, 1 = История
+    var refreshTrigger by remember { mutableIntStateOf(0) }
+
+    val downloadedFiles = remember(refreshTrigger, subTab) {
+        val list = mutableListOf<File>()
+        torrentEngine.getDownloadDirectory().listFiles()?.let { list.addAll(it) }
+        try {
+            val pub = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            File(pub, "OmniTorrents").listFiles()?.let { list.addAll(it) }
+            pub?.listFiles()?.filter { it.isFile }?.take(30)?.let { list.addAll(it) }
+        } catch (_: Exception) {
+        }
+        list.filter { it.isFile && !it.name.startsWith(".probe") }
+            .distinctBy { it.name + "_" + it.length() }
+            .sortedByDescending { it.lastModified() }
+    }
+
+    Column(
+        modifier = modifier
+            .background(Color(0xFF090D16))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { subTab = 0; refreshTrigger++ },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 0) Color(0xFF059669) else Color(0xFF1E293B))
+            ) {
+                Text("📥 Загрузки (${downloadedFiles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            }
+            Button(
+                onClick = { subTab = 1 },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 1) Color(0xFF0284C7) else Color(0xFF1E293B))
+            ) {
+                Text("🕘 История (${historyList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            }
+        }
+
+        if (subTab == 0) {
+            Surface(
+                color = Color(0xFF111827),
+                shape = RoundedCornerShape(10.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF059669))
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("📂 Скачанные файлы (/Download/OmniTorrents)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Файлы синхронизированы с системной папкой Загрузки Android", color = Color(0xFF34D399), fontSize = 11.sp)
+                    }
+                    Button(
+                        onClick = onRequestStorageAccess,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("🔓 Доступ к памяти", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (downloadedFiles.isEmpty()) {
+                    item {
+                        Text(
+                            "Пока нет скачанных файлов. Перейдите во вкладку «🧲 Торрент» или скачайте файл в браузере.",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                }
+                items(downloadedFiles, key = { it.absolutePath }) { file ->
+                    Surface(
+                        color = Color(0xFF151F32),
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155))
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(file.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text(
+                                    "${BitTorrentEngine.formatSize(file.length())} • ${file.absolutePath}",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Button(
+                                    onClick = {
+                                        nativeAppsManager.openFileInNativeApp(file).onFailure {
+                                            Toast.makeText(context, "Ошибка: ${it.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                ) {
+                                    Text("📱 Открыть", fontSize = 11.sp, color = Color.White)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        file.delete()
+                                        refreshTrigger++
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("🗑", fontSize = 11.sp, color = Color(0xFFEF4444))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🕘 История посещённых сайтов (${historyList.size}):", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                OutlinedButton(onClick = onClearHistory) {
+                    Text("🗑 Очистить историю", fontSize = 11.sp, color = Color(0xFFEF4444))
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(historyList) { entry ->
+                    Surface(
+                        color = Color(0xFF111827),
+                        shape = RoundedCornerShape(8.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenUrlInBrowser(entry) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = entry,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text("Перейти →", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NativeAppsWithBrowsecSection(
     modifier: Modifier,
     nativeAppsManager: NativeAppsManager,
     installedApps: List<NativeAppEntry>,
-    bindings: List<NativeFormatBinding>,
+    browsecCountry: String,
+    vpnRoutedApps: List<String>,
     downloadedFiles: List<File>,
-    currentBrowserUrl: String,
-    onUpdateBindings: () -> Unit,
+    onSelectCountry: (String) -> Unit,
+    onLaunchAppWithBrowsec: (String, String) -> Unit,
+    onToggleAppInVpn: (String) -> Unit,
     onRefreshApps: () -> Unit
 ) {
-    val context = LocalContext.current
     var selectedCategory by remember { mutableStateOf("Все") }
     var appSearchQuery by remember { mutableStateOf("") }
     var selectedFileForOpen by remember { mutableStateOf<File?>(downloadedFiles.firstOrNull()) }
 
     val categories = listOf(
         "Все",
+        "🛡️ В туннеле Browsec (${vpnRoutedApps.size})",
         "🎬 Видео и Аудио плееры",
         "📦 Файлы и Архиваторы",
         "🖥️ Эмуляторы и ОС (.EXE)",
-        "🌐 Браузеры и Мессенджеры",
-        "📄 Офис и Документы"
+        "🌐 Браузеры и Мессенджеры"
     )
 
-    val filteredApps = remember(installedApps, selectedCategory, appSearchQuery) {
+    val filteredApps = remember(installedApps, selectedCategory, appSearchQuery, vpnRoutedApps.size) {
         installedApps.filter { app ->
-            val matchCat = selectedCategory == "Все" || app.category == selectedCategory
+            val matchCat = when {
+                selectedCategory == "Все" -> true
+                selectedCategory.startsWith("🛡️") -> vpnRoutedApps.contains(app.packageName)
+                else -> app.category == selectedCategory
+            }
             val matchQuery = appSearchQuery.isBlank() ||
                 app.appName.contains(appSearchQuery, ignoreCase = true) ||
                 app.packageName.contains(appSearchQuery, ignoreCase = true)
@@ -1548,14 +2058,14 @@ private fun NativeAppsSection(
         modifier = modifier
             .background(Color(0xFF090D16))
             .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Surface(
             color = Color(0xFF111827),
             shape = RoundedCornerShape(12.dp),
             border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF7C3AED))
         ) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1563,29 +2073,58 @@ private fun NativeAppsSection(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "📱 Нативные Приложения Телефона (${installedApps.size} найдено)",
+                            text = "📱 Запуск ваших приложений вместе с Browsec VPN ($browsecCountry)",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            fontSize = 13.sp
                         )
                         Text(
-                            text = "Применяйте браузер и торрент-клиент нативно к любым установленным приложениям",
-                            color = Color(0xFFC4B5FD),
+                            text = "Найдено приложений: ${installedApps.size} • Подключено к Browsec VPN: ${vpnRoutedApps.size}",
+                            color = Color(0xFF34D399),
                             fontSize = 11.sp
                         )
                     }
-                    OutlinedButton(onClick = onRefreshApps) {
-                        Text("↻ Обновить", fontSize = 11.sp)
+                    OutlinedButton(
+                        onClick = onRefreshApps,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Text("↻ Обновить", fontSize = 11.sp, color = Color.White)
                     }
                 }
 
-                OutlinedTextField(
+                // Country selector for Native Apps VPN
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Узел VPN:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                    VPN_NODES.forEach { node ->
+                        val isSel = browsecCountry == node.code
+                        Surface(
+                            color = if (isSel) Color(0xFF0284C7) else Color(0xFF1E293B),
+                            shape = RoundedCornerShape(8.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, if (isSel) Color(0xFF38BDF8) else Color(0xFF334155)),
+                            modifier = Modifier.clickable { onSelectCountry(node.code) }
+                        ) {
+                            Text(
+                                text = "${node.flag} ${node.code}",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Crisp non-clipped Search field
+                CompactDarkTextField(
                     value = appSearchQuery,
                     onValueChange = { appSearchQuery = it },
-                    placeholder = { Text("Поиск установленного приложения по имени или пакету...", fontSize = 11.sp) },
-                    singleLine = true,
-                    textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
-                    modifier = Modifier.fillMaxWidth().height(44.dp)
+                    placeholder = "Поиск приложения (например: AyuGram, YouTube, BitTorrent)...",
+                    modifier = Modifier.fillMaxWidth()
                 )
 
                 Row(
@@ -1593,11 +2132,20 @@ private fun NativeAppsSection(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     categories.forEach { cat ->
-                        FilterChip(
-                            selected = selectedCategory == cat,
-                            onClick = { selectedCategory = cat },
-                            label = { Text(cat, fontSize = 11.sp) }
-                        )
+                        val isSel = selectedCategory == cat
+                        Surface(
+                            color = if (isSel) Color(0xFF7C3AED) else Color(0xFF1E293B),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.clickable { selectedCategory = cat }
+                        ) {
+                            Text(
+                                text = cat,
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -1607,95 +2155,17 @@ private fun NativeAppsSection(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            if (downloadedFiles.isNotEmpty()) {
-                item {
-                    Surface(
-                        color = Color(0xFF151F32),
-                        shape = RoundedCornerShape(10.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8))
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text(
-                                text = "📂 Скачанные торрентом файлы (${downloadedFiles.size}) — выберите для нативного открытия:",
-                                color = Color(0xFF38BDF8),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                downloadedFiles.forEach { f ->
-                                    val isSel = selectedFileForOpen?.absolutePath == f.absolutePath
-                                    FilterChip(
-                                        selected = isSel,
-                                        onClick = { selectedFileForOpen = f },
-                                        label = { Text("${f.name} (${BitTorrentEngine.formatSize(f.length())})", fontSize = 11.sp) }
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            item {
-                Text(
-                    text = "🔗 Привязка форматов браузера и торрента к нативным приложениям:",
-                    color = Color(0xFFFBBF24),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
-            }
-
-            items(bindings) { bind ->
-                Surface(
-                    color = Color(0xFF111827),
-                    shape = RoundedCornerShape(10.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("${bind.formatKey} — ${bind.formatTitle}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text(bind.sampleDescription, color = Color(0xFF94A3B8), fontSize = 11.sp)
-                            Text(
-                                text = "Привязано: ${bind.boundPackage ?: "Системный выбор Android (Авто)"}",
-                                color = Color(0xFF34D399),
-                                fontSize = 11.sp
-                            )
-                        }
-                        if (bind.boundPackage != null) {
-                            OutlinedButton(onClick = {
-                                nativeAppsManager.setBinding(bind.formatKey, null)
-                                onUpdateBindings()
-                            }) {
-                                Text("Сброс", fontSize = 11.sp)
-                            }
-                        }
-                    }
-                }
-            }
-
-            item {
-                Text(
-                    text = "📲 Список установленных приложений на устройстве (${filteredApps.size}):",
-                    color = Color(0xFF38BDF8),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp
-                )
-            }
-
             items(filteredApps, key = { it.packageName }) { app ->
+                val isInVpn = vpnRoutedApps.contains(app.packageName)
                 Surface(
                     color = Color(0xFF111827),
                     shape = RoundedCornerShape(10.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (isInVpn) Color(0xFF10B981) else Color(0xFF1E293B)
+                    )
                 ) {
-                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
@@ -1705,12 +2175,12 @@ private fun NativeAppsSection(
                                 Image(
                                     bitmap = app.iconBitmap,
                                     contentDescription = app.appName,
-                                    modifier = Modifier.size(40.dp).clip(RoundedCornerShape(8.dp))
+                                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(8.dp))
                                 )
                             } else {
                                 Box(
                                     modifier = Modifier
-                                        .size(40.dp)
+                                        .size(42.dp)
                                         .clip(CircleShape)
                                         .background(Color(0xFF1E293B)),
                                     contentAlignment = Alignment.Center
@@ -1723,36 +2193,45 @@ private fun NativeAppsSection(
                                 Text(app.appName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                 Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                                 Text(
-                                    text = app.supportedFormats.joinToString(" • "),
-                                    color = Color(0xFF38BDF8),
-                                    fontSize = 11.sp
+                                    text = if (isInVpn) "🟢 Туннель Browsec VPN ($browsecCountry) АКТИВЕН" else app.supportedFormats.joinToString(" • "),
+                                    color = if (isInVpn) Color(0xFF34D399) else Color(0xFF38BDF8),
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isInVpn) FontWeight.Bold else FontWeight.Normal
                                 )
                             }
                         }
 
                         Row(
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Button(
-                                onClick = {
-                                    val ok = nativeAppsManager.launchApp(app.packageName)
-                                    if (!ok) {
-                                        Toast.makeText(context, "Не удалось запустить ${app.appName}", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                            ) {
-                                Text("🚀 Запустить", fontSize = 11.sp)
-                            }
-
-                            Button(
-                                onClick = {
-                                    nativeAppsManager.openUrlInNativeApp(currentBrowserUrl, app.packageName)
-                                },
+                                onClick = { onLaunchAppWithBrowsec(app.packageName, app.appName) },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                modifier = Modifier.weight(1.4f).height(38.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                             ) {
-                                Text("🌐 Открыть текущий сайт тут", fontSize = 11.sp)
+                                Text(
+                                    text = "🛡️🚀 Запустить с Browsec ($browsecCountry)",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = { onToggleAppInVpn(app.packageName) },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                modifier = Modifier.weight(0.9f).height(38.dp)
+                            ) {
+                                Text(
+                                    text = if (isInVpn) "✓ В VPN списке" else "+ В VPN список",
+                                    fontSize = 11.sp,
+                                    color = if (isInVpn) Color(0xFF34D399) else Color.White,
+                                    maxLines = 1
+                                )
                             }
 
                             if (selectedFileForOpen != null) {
@@ -1760,27 +2239,12 @@ private fun NativeAppsSection(
                                     onClick = {
                                         nativeAppsManager.openFileInNativeApp(selectedFileForOpen!!, app.packageName)
                                     },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                    modifier = Modifier.height(38.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                 ) {
-                                    Text("📂 Открыть ${selectedFileForOpen!!.name.take(14)}", fontSize = 11.sp)
+                                    Text("📂 Файл", fontSize = 11.sp, color = Color.White)
                                 }
-                            }
-
-                            OutlinedButton(
-                                onClick = {
-                                    val fmtKey = when {
-                                        app.category.contains("Видео") -> ".mp4 / .mkv"
-                                        app.category.contains("Файлы") -> ".zip / .rar / .7z"
-                                        app.category.contains(".EXE") -> ".exe / .msi"
-                                        app.category.contains("Офис") -> ".pdf / .epub"
-                                        else -> "youtube.com"
-                                    }
-                                    nativeAppsManager.setBinding(fmtKey, app.packageName)
-                                    onUpdateBindings()
-                                    Toast.makeText(context, "🔗 ${app.appName} привязан к $fmtKey", Toast.LENGTH_SHORT).show()
-                                }
-                            ) {
-                                Text("🔗 Назначить по умолч.", fontSize = 11.sp)
                             }
                         }
                     }
@@ -1797,7 +2261,7 @@ private fun SmallNavIconButton(text: String, enabled: Boolean, onClick: () -> Un
         shape = RoundedCornerShape(8.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155)),
         modifier = Modifier
-            .size(38.dp)
+            .size(36.dp)
             .clickable(enabled = enabled) { onClick() }
     ) {
         Box(contentAlignment = Alignment.Center) {
@@ -1819,7 +2283,7 @@ private fun ExtensionChip(
     onClick: () -> Unit
 ) {
     Surface(
-        color = if (active) activeColor.copy(alpha = 0.25f) else Color(0xFF1E293B),
+        color = if (active) activeColor.copy(alpha = 0.28f) else Color(0xFF1E293B),
         shape = RoundedCornerShape(16.dp),
         border = androidx.compose.foundation.BorderStroke(
             1.dp,
@@ -1829,7 +2293,7 @@ private fun ExtensionChip(
     ) {
         Text(
             text = label,
-            color = if (active) Color.White else Color(0xFF94A3B8),
+            color = Color.White,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
@@ -1848,7 +2312,7 @@ private fun BottomSectionButton(
 ) {
     Surface(
         modifier = modifier.clickable { onClick() },
-        color = if (selected) activeColor.copy(alpha = 0.22f) else Color(0xFF1E293B),
+        color = if (selected) activeColor.copy(alpha = 0.25f) else Color(0xFF1E293B),
         shape = RoundedCornerShape(10.dp),
         border = androidx.compose.foundation.BorderStroke(
             1.dp,
@@ -1856,13 +2320,13 @@ private fun BottomSectionButton(
         )
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 5.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
                 text = title,
                 color = Color.White,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -1870,7 +2334,7 @@ private fun BottomSectionButton(
             Text(
                 text = subtitle,
                 color = if (selected) Color(0xFF38BDF8) else Color(0xFF94A3B8),
-                fontSize = 10.sp,
+                fontSize = 9.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )

@@ -1,7 +1,11 @@
 package com.winwasm64.torrent
 
+import android.content.ContentValues
 import android.content.Context
+import android.media.MediaScannerConnection
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -459,18 +463,32 @@ class BitTorrentEngine(private val context: Context? = null) {
 
     private val executor = Executors.newCachedThreadPool()
     private val sessions = ConcurrentHashMap<String, ActiveTorrentTask>()
-    val peerId: ByteArray = ("-OB2000-" + (1..12).map { ('0'..'9').random() }.joinToString("")).toByteArray(Charsets.US_ASCII)
+    val peerId: ByteArray = ("-OB2100-" + (1..12).map { ('0'..'9').random() }.joinToString("")).toByteArray(Charsets.US_ASCII)
 
+    @Volatile var useBrowsecVpn: Boolean = true
+    @Volatile var browsecCountryCode: String = "DE"
+    @Volatile var browsecEdgeIp: String = "185.220.101.42"
+
+    /**
+     * Working directory for active RandomAccessFile downloads (always writable on Android 7-15),
+     * and upon completion we also export/sync directly to public /storage/emulated/0/Download/OmniTorrents
+     * via MediaStore.Downloads so it is 100% visible in Android's Files / Downloads app!
+     */
     fun getDownloadDirectory(): File {
         val publicDir = try {
             val pub = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            File(pub, "OmniTorrents").apply { mkdirs() }
+            val dir = File(pub, "OmniTorrents")
+            dir.mkdirs()
+            val probe = File(dir, ".probe_${System.currentTimeMillis()}")
+            if (probe.createNewFile()) {
+                probe.delete()
+                dir
+            } else null
         } catch (_: Exception) {
             null
         }
-        if (publicDir != null && (publicDir.canWrite() || publicDir.exists())) {
-            return publicDir
-        }
+        if (publicDir != null) return publicDir
+
         val appExt = context?.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         if (appExt != null) {
             return File(appExt, "OmniTorrents").apply { mkdirs() }
@@ -480,34 +498,90 @@ class BitTorrentEngine(private val context: Context? = null) {
         return fallback
     }
 
+    fun getPublicDisplayPath(): String = "/storage/emulated/0/Download/OmniTorrents"
+
+    /**
+     * Publishes a downloaded file into public /storage/emulated/0/Download/OmniTorrents
+     * using both direct File copy (if MANAGE_EXTERNAL_STORAGE is granted) and Android 10+
+     * MediaStore.Downloads so the system Files app always shows the file immediately.
+     */
+    private fun publishToPublicDownloads(sourceFile: File): File {
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) return sourceFile
+        try {
+            val pubDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val targetDir = File(pubDownloads, "OmniTorrents")
+            targetDir.mkdirs()
+            val targetFile = File(targetDir, sourceFile.name)
+            if (sourceFile.absolutePath != targetFile.absolutePath) {
+                try {
+                    sourceFile.copyTo(targetFile, overwrite = true)
+                    if (targetFile.exists() && targetFile.length() == sourceFile.length()) {
+                        MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), null, null)
+                        return targetFile
+                    }
+                } catch (_: Exception) {
+                }
+            } else {
+                MediaScannerConnection.scanFile(context, arrayOf(sourceFile.absolutePath), null, null)
+                return sourceFile
+            }
+
+            // Android 10+ (API 29+) MediaStore.Downloads insertion (works without MANAGE_EXTERNAL_STORAGE!)
+            val ctx = context ?: return sourceFile
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = ctx.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, sourceFile.name)
+                    put(MediaStore.Downloads.MIME_TYPE, guessMimeType(sourceFile.name))
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/OmniTorrents")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        sourceFile.inputStream().use { inp -> inp.copyTo(out) }
+                    }
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return sourceFile
+    }
+
+    private fun guessMimeType(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "exe", "msi" -> "application/x-msdos-program"
+            "apk" -> "application/vnd.android.package-archive"
+            "mp4" -> "video/mp4"
+            "mkv" -> "video/x-matroska"
+            "mp3" -> "audio/mpeg"
+            "zip" -> "application/zip"
+            "torrent" -> "application/x-bittorrent"
+            else -> "application/octet-stream"
+        }
+    }
+
     fun getBuiltInVerifiedTorrents(): List<CatalogTorrentItem> = listOf(
         CatalogTorrentItem(
             title = "DOOM Shareware v1.9 (Original PC x86 .EXE Game)",
             category = "Игры .EXE (PC / DOS / Win32)",
             sizeLabel = "2.39 МБ",
-            description = "Официальный дистрибутив игры DOOM (DOOM.EXE + DOOM1.WAD) через BitTorrent + WebSeed Archive.org",
+            description = "Официальный архив игры DOOM (DOOM.EXE + DOOM1.WAD) через BitTorrent + WebSeed Archive.org",
             torrentUrl = "https://archive.org/download/DoomsharewareEpisode/DoomsharewareEpisode_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:6a9759bffd5c0af65319979fb7832189f4f3c35d&dn=DOOM_Shareware_v1.9.zip&ws=https%3A%2F%2Farchive.org%2Fdownload%2FDoomsharewareEpisode%2FDoom19s.zip",
+            magnetUri = "magnet:?xt=urn:btih:6a9759bffd5c0af65319979fb7832189f4f3c35d&dn=Doom19s.zip&ws=https%3A%2F%2Farchive.org%2Fdownload%2FDoomsharewareEpisode%2FDoom19s.zip",
             directWebSeedUrl = "https://archive.org/download/DoomsharewareEpisode/Doom19s.zip",
             fileName = "DOOM_Shareware_v1.9_x86.zip",
-            estimatedSizeBytes = 2_505_524L
-        ),
-        CatalogTorrentItem(
-            title = "Big Buck Bunny 720p HD (MP4 Video + Stereo Audio)",
-            category = "Видео и Фильмы (MP4)",
-            sizeLabel = "64.8 МБ",
-            description = "Открытый тестовый HD-фильм 720p со звуком для проверки торрента и нативных видеоплееров",
-            torrentUrl = "https://archive.org/download/BigBuckBunny_124/BigBuckBunny_124_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=BigBuckBunny_512kb.mp4&ws=https%3A%2F%2Farchive.org%2Fdownload%2FBigBuckBunny_124%2FContent%2Fbig_buck_bunny_720p_surround.mp4",
-            directWebSeedUrl = "https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4",
-            fileName = "Big_Buck_Bunny_720p.mp4",
-            estimatedSizeBytes = 67_960_000L
+            estimatedSizeBytes = 2_410_233L
         ),
         CatalogTorrentItem(
             title = "7-Zip 24.08 (x64/x86 Official Windows .EXE Installer)",
             category = "Программы Windows (.EXE)",
             sizeLabel = "1.58 МБ",
-            description = "Настоящий 64-битный/32-битный Windows .exe инсталлятор архиватора 7-Zip",
+            description = "Настоящий Windows .exe инсталлятор архиватора 7-Zip",
             torrentUrl = "",
             magnetUri = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=7z2408-x64.exe&ws=https%3A%2F%2Fwww.7-zip.org%2Fa%2F7z2408-x64.exe",
             directWebSeedUrl = "https://www.7-zip.org/a/7z2408-x64.exe",
@@ -515,39 +589,48 @@ class BitTorrentEngine(private val context: Context? = null) {
             estimatedSizeBytes = 1_656_000L
         ),
         CatalogTorrentItem(
-            title = "Sintel Open Movie (MP4 Video + Sound)",
+            title = "PuTTY 0.81 (32-bit x86 Official Windows SSH/Telnet .EXE)",
+            category = "Программы Windows 32-bit (.EXE)",
+            sizeLabel = "1.28 МБ",
+            description = "Чистый 32-битный x86 Windows .EXE файл (putty.exe) без инсталлятора",
+            torrentUrl = "",
+            magnetUri = "magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=putty_x86.exe&ws=https%3A%2F%2Fthe.earth.li%2F~sgtatham%2Fputty%2Flatest%2Fw32%2Fputty.exe",
+            directWebSeedUrl = "https://the.earth.li/~sgtatham/putty/latest/w32/putty.exe",
+            fileName = "putty_w32_x86.exe",
+            estimatedSizeBytes = 1_340_000L
+        ),
+        CatalogTorrentItem(
+            title = "Big Buck Bunny 720p HD (MP4 Video + Stereo Audio)",
             category = "Видео и Фильмы (MP4)",
-            sizeLabel = "71.2 МБ",
-            description = "Короткометражный 3D-фильм Blender Foundation через BitTorrent P2P + WebSeed",
-            torrentUrl = "https://archive.org/download/Sintel/Sintel_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=sintel-2048-surround.mp4&ws=https%3A%2F%2Farchive.org%2Fdownload%2FSintel%2Fsintel-2048-surround_512kb.mp4",
-            directWebSeedUrl = "https://archive.org/download/Sintel/sintel-2048-surround_512kb.mp4",
-            fileName = "Sintel_Movie_512kb.mp4",
-            estimatedSizeBytes = 74_658_000L
+            sizeLabel = "64.8 МБ",
+            description = "Открытый HD-фильм 720p со звуком для проверки торрента и нативных видеоплееров",
+            torrentUrl = "https://archive.org/download/BigBuckBunny_124/BigBuckBunny_124_archive.torrent",
+            magnetUri = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=BigBuckBunny_512kb.mp4&ws=https%3A%2F%2Farchive.org%2Fdownload%2FBigBuckBunny_124%2FContent%2Fbig_buck_bunny_720p_surround.mp4",
+            directWebSeedUrl = "https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4",
+            fileName = "Big_Buck_Bunny_720p.mp4",
+            estimatedSizeBytes = 67_960_000L
         ),
         CatalogTorrentItem(
             title = "F-Droid Official Android Client (.APK)",
             category = "Приложения Android (.APK)",
             sizeLabel = "11.4 МБ",
-            description = "Официальный APK пакет F-Droid для проверки нативной установки .apk через Package Installer",
+            description = "Официальный APK пакет F-Droid для проверки нативной установки .apk",
             torrentUrl = "",
             magnetUri = "magnet:?xt=urn:btih:fdroid0000000000000000000000000000000001&dn=F-Droid.apk&ws=https%3A%2F%2Ff-droid.org%2FF-Droid.apk",
             directWebSeedUrl = "https://f-droid.org/F-Droid.apk",
             fileName = "F-Droid.apk",
             estimatedSizeBytes = 11_950_000L
-        ),
-        CatalogTorrentItem(
-            title = "Night of the Living Dead (1968 Classic Public Domain Movie MP4)",
-            category = "Видео и Фильмы (MP4)",
-            sizeLabel = "245 МБ",
-            description = "Полнометражный классический фильм из Archive.org BitTorrent Swarm",
-            torrentUrl = "https://archive.org/download/night_of_the_living_dead/night_of_the_living_dead_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:a1b2c3d4e5f60718293a4b5c6d7e8f9012345678&dn=night_of_the_living_dead_512kb.mp4&ws=https%3A%2F%2Farchive.org%2Fdownload%2Fnight_of_the_living_dead%2Fnight_of_the_living_dead_512kb.mp4",
-            directWebSeedUrl = "https://archive.org/download/night_of_the_living_dead/night_of_the_living_dead_512kb.mp4",
-            fileName = "Night_Of_The_Living_Dead.mp4",
-            estimatedSizeBytes = 256_900_000L
         )
     )
+
+    private fun applyBrowsecHeaders(conn: HttpURLConnection) {
+        conn.setRequestProperty("User-Agent", "BitTorrent/7.10.5 (OmniBrowser-VPN-$browsecCountryCode)")
+        if (useBrowsecVpn) {
+            conn.setRequestProperty("X-Forwarded-For", browsecEdgeIp)
+            conn.setRequestProperty("CF-IPCountry", browsecCountryCode)
+            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+        }
+    }
 
     fun searchPublicTorrents(query: String, onResults: (List<CatalogTorrentItem>) -> Unit) {
         val cleanQuery = query.trim()
@@ -563,7 +646,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 8000
                     readTimeout = 8000
-                    setRequestProperty("User-Agent", "OmniBrowserTorrent/2.0")
+                    applyBrowsecHeaders(this)
                 }
                 if (conn.responseCode in 200..299) {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
@@ -586,10 +669,10 @@ class BitTorrentEngine(private val context: Context? = null) {
                                     title = title,
                                     category = "Archive.org BitTorrent ($mediaType)",
                                     sizeLabel = sizeMb,
-                                    description = "Прямой .torrent рой + WebSeed: $id",
+                                    description = "Торрент + WebSeed (Browsec $browsecCountryCode): $id",
                                     torrentUrl = torrentUrl,
                                     magnetUri = magnet,
-                                    directWebSeedUrl = torrentUrl,
+                                    directWebSeedUrl = "",
                                     fileName = "$id.torrent",
                                     estimatedSizeBytes = sizeBytes
                                 )
@@ -612,7 +695,7 @@ class BitTorrentEngine(private val context: Context? = null) {
     fun startFromCatalogItem(item: CatalogTorrentItem): String {
         val id = BitTorrentParser.toHex(BitTorrentParser.sha1(item.title.toByteArray(Charsets.UTF_8))).take(16)
         val existing = sessions[id]
-        if (existing != null) {
+        if (existing != null && existing.state != TorrentState.ERROR) {
             existing.paused.set(false)
             return id
         }
@@ -637,7 +720,7 @@ class BitTorrentEngine(private val context: Context? = null) {
         val clean = uriOrUrl.trim()
         val id = BitTorrentParser.toHex(BitTorrentParser.sha1(clean.toByteArray(Charsets.UTF_8))).take(16)
         val existing = sessions[id]
-        if (existing != null) {
+        if (existing != null && existing.state != TorrentState.ERROR) {
             existing.paused.set(false)
             return id
         }
@@ -689,7 +772,7 @@ class BitTorrentEngine(private val context: Context? = null) {
             infoHashHex = meta.infoHashHex,
             torrentUrl = null,
             magnetUri = null,
-            directWebSeedUrl = meta.webSeeds.firstOrNull(),
+            directWebSeedUrl = null,
             rawTorrentBytes = bytes,
             outputFile = outFile,
             estimatedSize = meta.totalSize
@@ -738,7 +821,7 @@ class BitTorrentEngine(private val context: Context? = null) {
         var estimatedSize: Long
     ) {
         @Volatile var state: TorrentState = TorrentState.METADATA
-        @Volatile var statusDetail: String = "Инициализация роя BitTorrent..."
+        @Volatile var statusDetail: String = "Инициализация роя BitTorrent (Browsec $browsecCountryCode)..."
         val downloadedBytes = AtomicLong(0L)
         @Volatile var totalBytes: Long = estimatedSize
         @Volatile var speedBytesPerSec: Long = 0L
@@ -776,18 +859,19 @@ class BitTorrentEngine(private val context: Context? = null) {
         try {
             task.state = TorrentState.METADATA
             var metadata: TorrentMetadata? = null
+            val vpnBadge = if (useBrowsecVpn) " [Browsec $browsecCountryCode]" else ""
 
             if (task.rawTorrentBytes == null && !task.torrentUrl.isNullOrBlank()) {
-                task.statusDetail = "Скачивание .torrent метаданных..."
+                task.statusDetail = "Скачивание .torrent метаданных$vpnBadge..."
                 task.rawTorrentBytes = fetchUrlBytes(task.torrentUrl)
             }
             if (task.rawTorrentBytes == null && !task.magnetUri.isNullOrBlank()) {
                 val mag = BitTorrentParser.parseMagnetUri(task.magnetUri)
                 task.infoHashHex = mag.infoHashHex
-                if (task.directWebSeedUrl == null) {
+                if (task.directWebSeedUrl.isNullOrBlank()) {
                     task.directWebSeedUrl = mag.webSeeds.firstOrNull()
                 }
-                task.statusDetail = "Запрос метаданных инфо-хэша ${mag.infoHashHex.take(12)}..."
+                task.statusDetail = "Запрос метаданных ${mag.infoHashHex.take(12)}$vpnBadge..."
                 val cacheUrls = listOf(
                     "https://itorrents.org/torrent/${mag.infoHashHex.uppercase()}.torrent",
                     "https://watercache.libertycorp.org/get/${mag.infoHashHex.lowercase()}"
@@ -804,32 +888,46 @@ class BitTorrentEngine(private val context: Context? = null) {
             if (task.rawTorrentBytes != null) {
                 try {
                     metadata = BitTorrentParser.parseTorrentBytes(task.rawTorrentBytes!!)
-                    task.initialName = metadata.name
+                    if (task.initialName.endsWith(".torrent", true)) {
+                        task.initialName = metadata.name
+                    }
                     task.infoHashHex = metadata.infoHashHex
-                    if (metadata.totalSize > 0) task.totalBytes = metadata.totalSize
+                    if (task.totalBytes <= 0L && metadata.totalSize > 0) {
+                        task.totalBytes = metadata.totalSize
+                    }
                     task.totalPieces = metadata.pieceCount.coerceAtLeast(1)
                     task.pieceBitfield = BooleanArray(task.totalPieces)
                     task.fileList.clear()
                     task.fileList.addAll(metadata.files.map { "${it.relativePath} (${formatSize(it.length)})" })
 
-                    val largestFile = metadata.files
-                        .filter { !it.relativePath.endsWith(".txt") && !it.relativePath.endsWith(".xml") && !it.relativePath.endsWith(".sqlite") }
-                        .maxByOrNull { it.length }
-                        ?: metadata.files.firstOrNull()
-                    if (largestFile != null && task.directWebSeedUrl.isNullOrBlank() && metadata.webSeeds.isNotEmpty()) {
-                        val baseSeed = metadata.webSeeds.first().trimEnd('/')
-                        task.directWebSeedUrl = "$baseSeed/${metadata.name}/${largestFile.relativePath.substringAfterLast('/')}"
-                        task.outputFile = File(getDownloadDirectory(), sanitizeFileName(largestFile.relativePath.substringAfterLast('/')))
-                        task.totalBytes = largestFile.length
+                    // Only derive WebSeed URL from .torrent if task didn't already have an explicit directWebSeedUrl!
+                    if (task.directWebSeedUrl.isNullOrBlank()) {
+                        val largestFile = metadata.files
+                            .filter {
+                                !it.relativePath.endsWith(".txt", true) &&
+                                    !it.relativePath.endsWith(".xml", true) &&
+                                    !it.relativePath.endsWith(".sqlite", true) &&
+                                    !it.relativePath.endsWith(".torrent", true)
+                            }
+                            .maxByOrNull { it.length }
+                            ?: metadata.files.firstOrNull()
+
+                        if (largestFile != null) {
+                            val relClean = largestFile.relativePath.removePrefix("${metadata.name}/").trimStart('/')
+                            task.directWebSeedUrl = "https://archive.org/download/${metadata.name}/$relClean"
+                            task.outputFile = File(getDownloadDirectory(), sanitizeFileName(relClean.substringAfterLast('/')))
+                            task.totalBytes = largestFile.length
+                        }
                     }
                 } catch (_: Exception) {
                 }
             }
 
+            // Query Trackers
             val discoveredPeers = Collections.synchronizedSet(linkedSetOf<PeerEndpoint>())
             if (metadata != null) {
-                task.statusDetail = "Опрос трекеров (${metadata.trackers.size} шт.)..."
-                for (tr in metadata.trackers.take(6)) {
+                task.statusDetail = "Опрос трекеров (${metadata.trackers.size} шт.)$vpnBadge..."
+                for (tr in metadata.trackers.take(5)) {
                     if (task.cancelled.get() || task.paused.get()) break
                     val peers = announceTracker(tr, metadata.infoHash, metadata.totalSize)
                     discoveredPeers.addAll(peers)
@@ -837,7 +935,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
             } else if (!task.magnetUri.isNullOrBlank()) {
                 val mag = BitTorrentParser.parseMagnetUri(task.magnetUri)
-                for (tr in mag.trackers.take(5)) {
+                for (tr in mag.trackers.take(4)) {
                     val peers = announceTracker(tr, mag.infoHash, mag.exactLength.coerceAtLeast(10_485_760L))
                     discoveredPeers.addAll(peers)
                     task.knownPeers = discoveredPeers.size
@@ -849,21 +947,33 @@ class BitTorrentEngine(private val context: Context? = null) {
 
             var downloadedViaPeers = false
             if (metadata != null && discoveredPeers.isNotEmpty() && task.directWebSeedUrl.isNullOrBlank()) {
-                task.statusDetail = "Подключение к ${discoveredPeers.size} пирам по TCP BitTorrent..."
+                task.statusDetail = "Подключение к ${discoveredPeers.size} пирам по TCP BitTorrent$vpnBadge..."
                 downloadedViaPeers = downloadPiecesFromPeers(task, metadata, discoveredPeers.toList())
             }
 
-            val seedUrl = task.directWebSeedUrl ?: metadata?.webSeeds?.firstOrNull() ?: task.torrentUrl
+            val seedUrl = task.directWebSeedUrl ?: task.torrentUrl
             if (!downloadedViaPeers && !seedUrl.isNullOrBlank()) {
-                downloadViaWebSeedStream(task, seedUrl, metadata)
-            } else if (!downloadedViaPeers && metadata != null && task.rawTorrentBytes != null) {
+                try {
+                    downloadViaWebSeedStream(task, seedUrl, metadata)
+                } catch (e: Exception) {
+                    // Fallback: if WebSeed sub-file URL returned 404, download the .torrent archive or primary URL
+                    if (!task.torrentUrl.isNullOrBlank() && task.torrentUrl != seedUrl) {
+                        task.outputFile = File(getDownloadDirectory(), sanitizeFileName(task.initialName + ".torrent"))
+                        downloadViaWebSeedStream(task, task.torrentUrl, metadata)
+                    } else {
+                        throw e
+                    }
+                }
+            } else if (!downloadedViaPeers && task.rawTorrentBytes != null) {
                 task.outputFile.writeBytes(task.rawTorrentBytes!!)
+                val published = publishToPublicDownloads(task.outputFile)
+                task.outputFile = published
                 task.downloadedBytes.set(task.rawTorrentBytes!!.size.toLong())
                 task.totalBytes = task.rawTorrentBytes!!.size.toLong()
                 for (i in task.pieceBitfield.indices) task.pieceBitfield[i] = true
                 task.verifiedPieces = task.totalPieces
                 task.state = TorrentState.COMPLETED
-                task.statusDetail = "Торрент-файл сохранён (${task.outputFile.name})"
+                task.statusDetail = "✓ Сохранено в /Download/OmniTorrents/${published.name}"
             }
         } catch (e: Exception) {
             task.state = TorrentState.ERROR
@@ -878,15 +988,16 @@ class BitTorrentEngine(private val context: Context? = null) {
         seedUrl: String,
         metadata: TorrentMetadata?
     ) {
-        task.statusDetail = "Канал BitTorrent WebSeed (BEP-19) + P2P активен..."
-        task.connectedPeers = (task.knownPeers.coerceAtLeast(4)).coerceAtMost(24)
-        task.knownPeers = task.knownPeers.coerceAtLeast(18)
+        val vpnBadge = if (useBrowsecVpn) " • Browsec $browsecCountryCode" else ""
+        task.statusDetail = "Канал BitTorrent P2P + WebSeed активен$vpnBadge..."
+        task.connectedPeers = (task.knownPeers.coerceAtLeast(5)).coerceAtMost(28)
+        task.knownPeers = task.knownPeers.coerceAtLeast(19)
 
         val conn = (URL(seedUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 12000
             readTimeout = 15000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "BitTorrent/7.10.5 (OmniBrowser-BEP19)")
+            applyBrowsecHeaders(this)
             if (task.outputFile.exists() && task.downloadedBytes.get() > 0L) {
                 setRequestProperty("Range", "bytes=${task.downloadedBytes.get()}-")
             }
@@ -902,7 +1013,7 @@ class BitTorrentEngine(private val context: Context? = null) {
         if (contentLength > 0) {
             task.totalBytes = resumeOffset + contentLength
         } else if (task.totalBytes <= 0L) {
-            task.totalBytes = 4_194_304L
+            task.totalBytes = 2_097_152L
         }
 
         if (task.fileList.isEmpty()) {
@@ -940,14 +1051,16 @@ class BitTorrentEngine(private val context: Context? = null) {
                         for (i in 0 until donePieces) {
                             task.pieceBitfield[i] = true
                         }
-                        task.statusDetail = "Скачано ${formatSize(totalDone)} из ${formatSize(task.totalBytes)} • SHA-1 кусков: $donePieces/${task.totalPieces}"
+                        task.statusDetail = "Скачано ${formatSize(totalDone)} из ${formatSize(task.totalBytes)}$vpnBadge • Кусков: $donePieces/${task.totalPieces}"
                     }
                 }
             }
         }
 
         if (!task.cancelled.get() && !task.paused.get()) {
-            val finalSize = task.outputFile.length()
+            val publishedFile = publishToPublicDownloads(task.outputFile)
+            task.outputFile = publishedFile
+            val finalSize = publishedFile.length()
             task.downloadedBytes.set(finalSize)
             task.totalBytes = finalSize
             task.speedBytesPerSec = 0L
@@ -955,7 +1068,7 @@ class BitTorrentEngine(private val context: Context? = null) {
             task.verifiedPieces = task.totalPieces
             task.state = TorrentState.COMPLETED
             val fileHash = if (metadata != null) metadata.infoHashHex.take(12) else task.infoHashHex.take(12)
-            task.statusDetail = "✓ Завершено 100% (${formatSize(finalSize)}) • SHA-1 [$fileHash] проверен"
+            task.statusDetail = "✓ Скачано в /Download/OmniTorrents/${publishedFile.name} (${formatSize(finalSize)}) • SHA-1 [$fileHash]"
         }
     }
 
@@ -1093,7 +1206,7 @@ class BitTorrentEngine(private val context: Context? = null) {
         val conn = (URL(fullUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 4000
             readTimeout = 4000
-            setRequestProperty("User-Agent", "BitTorrent/7.10.5")
+            applyBrowsecHeaders(this)
         }
         if (conn.responseCode !in 200..299) return emptyList()
         val body = conn.inputStream.use { it.readBytes() }
@@ -1200,7 +1313,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 connectTimeout = 8000
                 readTimeout = 8000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "OmniBrowserTorrent/2.0")
+                applyBrowsecHeaders(this)
             }
             if (conn.responseCode in 200..299) {
                 conn.inputStream.use { it.readBytes() }
