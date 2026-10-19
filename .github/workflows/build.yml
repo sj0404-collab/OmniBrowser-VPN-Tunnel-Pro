@@ -1,20 +1,15 @@
-name: Build & Test Windows 11 WASM64 APK
+name: Build OmniBrowser & Torrent Pro APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build-apk:
-    name: Test WASM64 Engine, Programs, Games, Node.js, YouTube & Browser + Build APK
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout Source
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -24,36 +19,21 @@ jobs:
           distribution: 'temurin'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Unit & Integration Tests (WASM64 Engine, Windows Programs, Games, Node.js, Terminal, YouTube & Browser Extensions)
+      - name: Run Unit Tests & Assemble Signed Release APK (Unified Keystore)
         run: |
           chmod +x gradlew
-          ./gradlew testDebugUnitTest --stacktrace
+          ./gradlew testDebugUnitTest assembleRelease --stacktrace
 
-      - name: Generate Release Keystore & Build Signed Release APK
-        run: |
-          keytool -genkeypair -v \
-            -keystore app/release-keystore.jks \
-            -alias winwasm64 \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass winwasm64pass \
-            -keypass winwasm64pass \
-            -dname "CN=WindowsWASM64, OU=Desktop, O=OpenCode, L=Kyiv, S=UA, C=UA"
-          ./gradlew assembleDebug assembleRelease --stacktrace
-
-      - name: Prepare APK Deliverables
+      - name: Prepare Signed APK Artifact
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/Windows-WASM64-debug.apk
-          cp app/build/outputs/apk/release/app-release.apk dist/Windows-WASM64-v1.0.0-arm64-release.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-Torrent-Pro-v2.2.0-arm64-release.apk
           ls -lh dist/
 
-      - name: Upload APK Artifacts
+      - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Windows-WASM64-APK
-          path: dist/*.apk
-          if-no-files-found: error
+          name: OmniBrowser-Torrent-Pro-v2.2.0-arm64-release
+          path: dist/OmniBrowser-Torrent-Pro-v2.2.0-arm64-release.apk
