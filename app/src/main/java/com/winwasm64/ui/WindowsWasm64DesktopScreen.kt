@@ -1025,7 +1025,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }
                                         Button(
                                             onClick = {
-                                                Wasm64WindowsRuntime.playHardwareTestTone()
+                                                Wasm64WindowsRuntime(context.filesDir).playWindowsPcmSound(523.25, 110)
                                                 activeTab.webView?.evaluateJavascript(
                                                     """
                                                     (function(){
