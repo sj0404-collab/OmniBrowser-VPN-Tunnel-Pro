@@ -1,243 +1,1240 @@
 package com.winwasm64.ui
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Environment
+import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.winwasm64.engine.DoomRaycasterState
 import com.winwasm64.engine.Wasm64WindowsRuntime
+import com.winwasm64.nativeapps.NativeAppEntry
+import com.winwasm64.nativeapps.NativeAppsManager
+import com.winwasm64.nativeapps.NativeFormatBinding
+import com.winwasm64.torrent.BitTorrentEngine
+import com.winwasm64.torrent.TorrentSessionStatus
+import com.winwasm64.torrent.TorrentState
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.net.URLDecoder
-import java.net.URLEncoder
+import kotlinx.coroutines.delay
 
-@Composable
-fun WinChipButton(
-    text: String,
-    accent: Boolean = false,
-    accentColor: Color = Color(0xFF38BDF8),
-    onClick: () -> Unit
+class BrowserTabModel(
+    val id: String,
+    initialUrl: String,
+    initialTitle: String = "Новая вкладка",
+    val isIncognito: Boolean = false
 ) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(5.dp))
-            .background(if (accent) accentColor.copy(alpha = 0.22f) else Color(0xFF141E30))
-            .border(1.dp, if (accent) accentColor else Color(0xFF2B3B54), RoundedCornerShape(5.dp))
-            .clickable { onClick() }
-            .padding(horizontal = 8.dp, vertical = 5.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = text,
-            color = if (accent) accentColor else Color.White,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 8.5.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
+    var url by mutableStateOf(initialUrl)
+    var title by mutableStateOf(initialTitle)
+    var loadingProgress by mutableIntStateOf(0)
+    var isLoading by mutableStateOf(false)
+    var loadingStatusText by mutableStateOf("")
+    var lastErrorText by mutableStateOf<String?>(null)
+    var canGoBack by mutableStateOf(false)
+    var canGoForward by mutableStateOf(false)
+    var webView: WebView? = null
 }
 
+private val AD_DOMAINS = setOf(
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "adservice.google.com", "pagead2.googlesyndication.com", "adnxs.com",
+    "criteo.com", "taboola.com", "outbrain.com", "scorecardresearch.com",
+    "mc.yandex.ru", "an.yandex.ru", "ads.youtube.com", "popads.net", "propellerads.com"
+)
+
+private data class VpnNode(
+    val code: String,
+    val flag: String,
+    val countryName: String,
+    val acceptLang: String,
+    val edgeIp: String
+)
+
+private val VPN_NODES = listOf(
+    VpnNode("DE", "🇩🇪", "Германия (Frankfurt High-Speed)", "de-DE,de;q=0.9,en-US;q=0.8,ru;q=0.7", "185.220.101.42"),
+    VpnNode("NL", "🇳🇱", "Нидерланды (Amsterdam AMS-IX)", "nl-NL,nl;q=0.9,en-US;q=0.8,ru;q=0.7", "185.107.56.114"),
+    VpnNode("US", "🇺🇸", "США (New York Backbone)", "en-US,en;q=0.9,ru;q=0.7", "198.51.100.84"),
+    VpnNode("FI", "🇫🇮", "Финляндия (Helsinki Ultra-Low Ping)", "fi-FI,en-US;q=0.9,ru;q=0.8", "95.216.144.29"),
+    VpnNode("UK", "🇬🇧", "Великобритания (London Docklands)", "en-GB,en;q=0.9,ru;q=0.7", "51.15.43.201"),
+    VpnNode("SG", "🇸🇬", "Сингапур (Asia-Pacific Core)", "en-SG,en;q=0.9,ru;q=0.7", "139.99.88.19")
+)
+
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WinInputBox(
-    value: String,
-    onValueChange: (String) -> Unit,
-    placeholder: String,
-    modifier: Modifier = Modifier,
-    singleLine: Boolean = true
-) {
-    BasicTextField(
-        value = value,
-        onValueChange = onValueChange,
-        singleLine = singleLine,
-        textStyle = TextStyle(
-            color = Color.White,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 9.sp,
-            lineHeight = 12.sp
-        ),
-        cursorBrush = SolidColor(Color(0xFF38BDF8)),
-        modifier = modifier
-            .clip(RoundedCornerShape(5.dp))
-            .background(Color(0xFF060B14))
-            .border(1.dp, Color(0xFF2B3B54), RoundedCornerShape(5.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        decorationBox = { inner ->
-            Box(contentAlignment = Alignment.CenterStart) {
-                if (value.isEmpty() && placeholder.isNotEmpty()) {
-                    Text(
-                        text = placeholder,
-                        color = Color(0xFF94A3B8),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 8.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                inner()
+fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("omni_browser_v2_prefs", Context.MODE_PRIVATE) }
+    val torrentEngine = remember { BitTorrentEngine(context) }
+    val nativeAppsManager = remember { NativeAppsManager(context) }
+
+    var currentSection by remember { mutableIntStateOf(0) }
+
+    var adBlockEnabled by remember { mutableStateOf(prefs.getBoolean("adblock_on", true)) }
+    var adBlockedCount by remember { mutableIntStateOf(prefs.getInt("adblock_count", 0)) }
+    val customBlockedDomains = remember {
+        mutableStateListOf<String>().apply {
+            prefs.getStringSet("custom_ad_domains", emptySet())?.let { addAll(it) }
+        }
+    }
+
+    var browsecEnabled by remember { mutableStateOf(prefs.getBoolean("browsec_on", true)) }
+    var browsecCountry by remember { mutableStateOf(prefs.getString("browsec_country", "DE") ?: "DE") }
+    var darkReaderEnabled by remember { mutableStateOf(prefs.getBoolean("dark_reader", false)) }
+    var youtubeBoostEnabled by remember { mutableStateOf(prefs.getBoolean("yt_boost", true)) }
+    var devToolsEnabled by remember { mutableStateOf(false) }
+    var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
+
+    var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
+
+    val tabs = remember {
+        val savedUrls = prefs.getString("saved_tab_urls", null)
+            ?.split("\n")
+            ?.filter { it.isNotBlank() }
+            ?: listOf("https://www.google.com", "https://m.youtube.com")
+        mutableStateListOf<BrowserTabModel>().apply {
+            savedUrls.forEachIndexed { idx, u ->
+                add(BrowserTabModel(id = "tab_${idx}_${System.currentTimeMillis()}", initialUrl = u, initialTitle = if (u.contains("youtube")) "YouTube" else "Google"))
             }
         }
-    )
-}
+    }
+    var activeTabIndex by remember { mutableIntStateOf(prefs.getInt("active_tab_idx", 0).coerceIn(0, (tabs.size - 1).coerceAtLeast(0))) }
+    val activeTab = tabs.getOrNull(activeTabIndex.coerceIn(0, (tabs.size - 1).coerceAtLeast(0))) ?: tabs.first()
 
-@Composable
-fun WindowsWasm64DesktopScreen(runtime: Wasm64WindowsRuntime) {
-    // Active window: "desktop", "browser", "youtube", "games", "terminal", "programs"
-    var activeWindow by remember { mutableStateOf("desktop") }
-    var lastBenchResult by remember { mutableStateOf(runtime.runMultiCoreWasm64Benchmark()) }
+    var addressInput by remember(activeTab.id, activeTab.url) { mutableStateOf(activeTab.url) }
+    var findInPageQuery by remember { mutableStateOf("") }
+
+    val bookmarks = remember {
+        mutableStateListOf(
+            "https://www.google.com" to "🔍 Google Поиск",
+            "https://m.youtube.com" to "🎬 YouTube (Со звуком)",
+            "https://piped.video" to "🎬 Piped (Зеркало YouTube без блокировок)",
+            "https://archive.org/details/movies" to "🧲 Archive.org Фильмы и Торренты",
+            "https://rutracker.org" to "🧲 RuTracker (Через Browsec VPN)",
+            "https://github.com" to "💻 GitHub"
+        )
+    }
+    val historyList = remember { mutableStateListOf<String>() }
+
+    fun persistBrowserSettings() {
+        prefs.edit()
+            .putBoolean("adblock_on", adBlockEnabled)
+            .putInt("adblock_count", adBlockedCount)
+            .putBoolean("browsec_on", browsecEnabled)
+            .putString("browsec_country", browsecCountry)
+            .putBoolean("dark_reader", darkReaderEnabled)
+            .putBoolean("yt_boost", youtubeBoostEnabled)
+            .putBoolean("desktop_mode", desktopMode)
+            .putString("saved_tab_urls", tabs.joinToString("\n") { it.url })
+            .putInt("active_tab_idx", activeTabIndex)
+            .putStringSet("custom_ad_domains", customBlockedDomains.toSet())
+            .apply()
+    }
+
+    val webViewContainer = remember { FrameLayout(context) }
+
+    fun normalizeInputToUrl(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "https://www.google.com"
+        if (trimmed.startsWith("magnet:", ignoreCase = true)) return trimmed
+        if (trimmed.startsWith("http://", ignoreCase = true) ||
+            trimmed.startsWith("https://", ignoreCase = true) ||
+            trimmed.startsWith("javascript:", ignoreCase = true)
+        ) return trimmed
+        return if (trimmed.contains(".") && !trimmed.contains(" ")) {
+            "https://$trimmed"
+        } else {
+            "https://www.google.com/search?q=${Uri.encode(trimmed)}"
+        }
+    }
+
+    fun injectActiveExtensions(wv: WebView) {
+        val scripts = StringBuilder()
+        if (adBlockEnabled) {
+            scripts.append(
+                """
+                (function(){
+                    const sel = ['.ad-showing','.ytp-ad-module','.ytp-ad-overlay-container','ytd-ad-slot-renderer','ytm-promoted-sparkles-web-renderer','[id^="google_ads"]','.adsbygoogle'];
+                    sel.forEach(s => document.querySelectorAll(s).forEach(el => el.style.display='none'));
+                    const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+                    if (skipBtn) skipBtn.click();
+                    const v = document.querySelector('video');
+                    if (v && document.querySelector('.ad-showing') && isFinite(v.duration) && v.duration > 0) {
+                        v.currentTime = v.duration;
+                    }
+                })();
+                """.trimIndent()
+            )
+        }
+        if (youtubeBoostEnabled) {
+            scripts.append(
+                """
+                (function(){
+                    document.querySelectorAll('video, audio').forEach(v => {
+                        v.muted = false;
+                        if (v.volume < 1.0) v.volume = 1.0;
+                    });
+                })();
+                """.trimIndent()
+            )
+        }
+        if (darkReaderEnabled) {
+            scripts.append(
+                """
+                (function(){
+                    if (!document.getElementById('omni-dark-reader')) {
+                        const st = document.createElement('style');
+                        st.id = 'omni-dark-reader';
+                        st.innerHTML = 'html { filter: invert(0.92) hue-rotate(180deg) !important; background: #0d1117 !important; } img, video, iframe, canvas { filter: invert(1) hue-rotate(180deg) !important; }';
+                        document.head.appendChild(st);
+                    }
+                })();
+                """.trimIndent()
+            )
+        } else {
+            scripts.append(
+                """
+                (function(){
+                    const el = document.getElementById('omni-dark-reader');
+                    if (el) el.remove();
+                })();
+                """.trimIndent()
+            )
+        }
+        if (devToolsEnabled) {
+            scripts.append(
+                """
+                (function(){
+                    if (!window.eruda) {
+                        const s = document.createElement('script');
+                        s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+                        s.onload = function(){ eruda.init(); eruda.show(); };
+                        document.body.appendChild(s);
+                    } else {
+                        eruda.show();
+                    }
+                })();
+                """.trimIndent()
+            )
+        }
+        val js = scripts.toString()
+        if (js.isNotBlank()) {
+            wv.evaluateJavascript(js, null)
+        }
+    }
+
+    fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
+        val target = normalizeInputToUrl(rawInput)
+        if (target.startsWith("magnet:", ignoreCase = true) || target.endsWith(".torrent", ignoreCase = true)) {
+            torrentEngine.startFromMagnetOrUrl(target)
+            currentSection = 1
+            Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val finalUrl = if (useProxyTunnel && !target.contains("translate.goog") && !target.contains("piped.video")) {
+            if (target.contains("youtube.com") || target.contains("youtu.be")) {
+                val vid = Uri.parse(target).getQueryParameter("v")
+                if (!vid.isNullOrBlank()) {
+                    "https://www.youtube-nocookie.com/embed/$vid?autoplay=1"
+                } else {
+                    "https://piped.video/trending"
+                }
+            } else {
+                "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
+            }
+        } else {
+            target
+        }
+
+        tab.lastErrorText = null
+        tab.isLoading = true
+        tab.loadingProgress = 12
+        val vpnLabel = if (browsecEnabled) "Browsec $browsecCountry" else "Прямое"
+        tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(finalUrl).host ?: finalUrl}..."
+        tab.url = finalUrl
+        addressInput = finalUrl
+        persistBrowserSettings()
+
+        val wv = tab.webView ?: return
+        val headers = mutableMapOf<String, String>()
+        if (browsecEnabled) {
+            val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
+            headers["Accept-Language"] = node.acceptLang
+            headers["X-Forwarded-For"] = node.edgeIp
+            headers["CF-IPCountry"] = node.code
+            headers["DNT"] = "1"
+        }
+        wv.loadUrl(finalUrl, headers)
+    }
+
+    fun ensureTabWebView(tab: BrowserTabModel): WebView {
+        tab.webView?.let { return it }
+        val wv = WebView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.databaseEnabled = true
+            settings.mediaPlaybackRequiresUserGesture = false
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            settings.allowFileAccess = true
+            settings.allowContentAccess = true
+            settings.builtInZoomControls = true
+            settings.displayZoomControls = false
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            settings.setSupportMultipleWindows(false)
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
+
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+            setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                if (url.startsWith("magnet:", ignoreCase = true) ||
+                    url.endsWith(".torrent", ignoreCase = true) ||
+                    mimeType == "application/x-bittorrent"
+                ) {
+                    torrentEngine.startFromMagnetOrUrl(url)
+                    currentSection = 1
+                    Toast.makeText(context, "🧲 Перехвачен .torrent файл — скачивание начато!", Toast.LENGTH_LONG).show()
+                } else {
+                    try {
+                        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+                        val req = DownloadManager.Request(Uri.parse(url)).apply {
+                            setMimeType(mimeType)
+                            addRequestHeader("User-Agent", userAgent)
+                            setTitle(fileName)
+                            setDescription("Скачивание через OmniBrowser Pro")
+                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                        }
+                        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                        dm.enqueue(req)
+                        Toast.makeText(context, "📥 Загрузка начата: $fileName", Toast.LENGTH_LONG).show()
+                    } catch (e: Exception) {
+                        torrentEngine.startFromMagnetOrUrl(url)
+                        currentSection = 1
+                        Toast.makeText(context, "📥 Загрузка через встроенный движок: ${e.message ?: ""}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    tab.loadingProgress = newProgress.coerceIn(5, 100)
+                    tab.isLoading = newProgress < 100
+                    val host = Uri.parse(view?.url ?: tab.url).host ?: "сайт"
+                    val vpnTag = if (browsecEnabled) " • Browsec $browsecCountry" else ""
+                    tab.loadingStatusText = if (newProgress < 100) {
+                        "⏳ Загрузка $newProgress% • $host$vpnTag"
+                    } else {
+                        "✓ Загружено 100% • $host$vpnTag"
+                    }
+                    if (newProgress >= 65 && view != null) {
+                        injectActiveExtensions(view)
+                    }
+                }
+
+                override fun onReceivedTitle(view: WebView?, title: String?) {
+                    if (!title.isNullOrBlank()) {
+                        tab.title = title
+                    }
+                }
+            }
+
+            webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    val reqUrl = request?.url?.toString()?.lowercase() ?: return null
+                    if (adBlockEnabled) {
+                        val host = request.url.host?.lowercase() ?: ""
+                        val blocked = AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
+                            customBlockedDomains.any { it.isNotBlank() && host.contains(it.lowercase()) } ||
+                            reqUrl.contains("/pagead/") || reqUrl.contains("doubleclick.net") ||
+                            reqUrl.contains("googleads.")
+                        if (blocked) {
+                            adBlockedCount++
+                            return WebResourceResponse(
+                                "text/plain",
+                                "UTF-8",
+                                ByteArrayInputStream(ByteArray(0))
+                            )
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): Boolean {
+                    val nextUrl = request?.url?.toString() ?: return false
+                    if (nextUrl.startsWith("magnet:", ignoreCase = true) ||
+                        nextUrl.endsWith(".torrent", ignoreCase = true)
+                    ) {
+                        torrentEngine.startFromMagnetOrUrl(nextUrl)
+                        currentSection = 1
+                        Toast.makeText(context, "🧲 Magnet/Торрент перехвачен и запущен!", Toast.LENGTH_LONG).show()
+                        return true
+                    }
+                    if (nextUrl.startsWith("intent://", ignoreCase = true)) {
+                        val fallback = Regex("S\\.browser_fallback_url=([^;]+)").find(nextUrl)?.groupValues?.getOrNull(1)
+                        if (!fallback.isNullOrBlank()) {
+                            view?.loadUrl(Uri.decode(fallback))
+                        }
+                        return true
+                    }
+                    if (!nextUrl.startsWith("http://", ignoreCase = true) &&
+                        !nextUrl.startsWith("https://", ignoreCase = true)
+                    ) {
+                        nativeAppsManager.openUrlInNativeApp(nextUrl)
+                        return true
+                    }
+                    return false
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    if (!url.isNullOrBlank() && url != "about:blank") {
+                        tab.url = url
+                        if (tab == tabs.getOrNull(activeTabIndex)) {
+                            addressInput = url
+                        }
+                        tab.isLoading = true
+                        tab.loadingProgress = 15
+                        tab.lastErrorText = null
+                        val host = Uri.parse(url).host ?: url
+                        tab.loadingStatusText = "⏳ Загрузка страницы $host..."
+                        if (!tab.isIncognito && !historyList.contains(url)) {
+                            historyList.add(0, url)
+                        }
+                        persistBrowserSettings()
+                    }
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    tab.isLoading = false
+                    tab.loadingProgress = 100
+                    tab.canGoBack = view?.canGoBack() == true
+                    tab.canGoForward = view?.canGoForward() == true
+                    if (!url.isNullOrBlank() && url != "about:blank") {
+                        tab.url = url
+                        if (tab == tabs.getOrNull(activeTabIndex)) {
+                            addressInput = url
+                        }
+                    }
+                    if (view != null) {
+                        injectActiveExtensions(view)
+                    }
+                    persistBrowserSettings()
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: WebResourceError?
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (request?.isForMainFrame == true) {
+                        val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
+                        val failingUrl = request.url?.toString() ?: tab.url
+                        tab.isLoading = false
+                        tab.loadingProgress = 0
+                        tab.lastErrorText = "$desc ($failingUrl)"
+                        tab.loadingStatusText = "⚠️ $desc — нажмите «Пробить блокировку» или «YouTube Зеркало»"
+                        if (!browsecEnabled) {
+                            browsecEnabled = true
+                        }
+                    }
+                }
+            }
+        }
+        tab.webView = wv
+        webViewContainer.addView(wv)
+        navigateTab(tab, tab.url)
+        return wv
+    }
+
+    LaunchedEffect(initialIntentUri) {
+        if (!initialIntentUri.isNullOrBlank()) {
+            if (initialIntentUri.startsWith("magnet:", ignoreCase = true) ||
+                initialIntentUri.endsWith(".torrent", ignoreCase = true)
+            ) {
+                torrentEngine.startFromMagnetOrUrl(initialIntentUri)
+                currentSection = 1
+            } else if (initialIntentUri.startsWith("http", ignoreCase = true)) {
+                navigateTab(activeTab, initialIntentUri)
+                currentSection = 0
+            }
+        }
+    }
+
+    LaunchedEffect(activeTab.isLoading, activeTab.id) {
+        while (activeTab.isLoading && activeTab.loadingProgress < 85) {
+            delay(300)
+            if (activeTab.isLoading && activeTab.loadingProgress < 85) {
+                activeTab.loadingProgress = (activeTab.loadingProgress + 3).coerceAtMost(85)
+            }
+        }
+    }
+
+    LaunchedEffect(activeTabIndex, tabs.size, desktopMode) {
+        val current = tabs.getOrNull(activeTabIndex) ?: return@LaunchedEffect
+        ensureTabWebView(current)
+        for (i in 0 until webViewContainer.childCount) {
+            val child = webViewContainer.getChildAt(i)
+            child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
+        }
+        current.webView?.settings?.userAgentString = if (desktopMode) {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        } else {
+            null
+        }
+    }
+
+    var torrentStatuses by remember { mutableStateOf(torrentEngine.getAllStatuses()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            torrentStatuses = torrentEngine.getAllStatuses()
+            delay(500)
+        }
+    }
+
+    var installedApps by remember { mutableStateOf<List<NativeAppEntry>>(emptyList()) }
+    var formatBindings by remember { mutableStateOf(nativeAppsManager.getBindings()) }
+    LaunchedEffect(Unit) {
+        installedApps = nativeAppsManager.loadInstalledNativeApps()
+    }
+
+    val torrentFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes != null && bytes.isNotEmpty()) {
+                    torrentEngine.startFromTorrentBytes(bytes, uri.lastPathSegment ?: "picked.torrent")
+                    currentSection = 1
+                    Toast.makeText(context, "🧲 Локальный .torrent файл запущен!", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка чтения .torrent: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = Color(0xFF070E1A)
+        color = Color(0xFF090D16)
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // 1. TOP WINDOWS 11 WASM64 STATUS BAR
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0D1B30))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "🪟 Microsoft Windows 11 Pro — WASM64 (Memory64 + Node.js v22 + DirectSound)",
-                        color = Color(0xFF38BDF8),
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 10.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "⚡ Ядро ntoskrnl.wasm: ${lastBenchResult.mips} MIPS • Node.js v22.11.0 • 🔊 Audio 44.1kHz PCM • 🛡️ AdBlock + Browsec VPN",
-                        color = Color(0xFFA7F3D0),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 7.8.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+        Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+
+            if (currentSection == 0) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0F1624))
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    tabs.forEachIndexed { idx, tab ->
+                        val isSelected = idx == activeTabIndex
+                        Surface(
+                            color = if (isSelected) Color(0xFF1E293B) else Color(0xFF111827),
+                            shape = RoundedCornerShape(8.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155)
+                            ),
+                            modifier = Modifier.clickable {
+                                activeTabIndex = idx
+                                addressInput = tab.url
+                                persistBrowserSettings()
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (tab.isLoading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color(0xFF38BDF8)
+                                    )
+                                } else {
+                                    Text(if (tab.isIncognito) "🕶" else "🌐", fontSize = 11.sp)
+                                }
+                                Text(
+                                    text = tab.title.take(18).ifBlank { "Вкладка ${idx + 1}" },
+                                    color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                                    fontSize = 12.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (tabs.size > 1) {
+                                    Text(
+                                        text = "✕",
+                                        color = Color(0xFFEF4444),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.clickable {
+                                            tab.webView?.let { webViewContainer.removeView(it); it.destroy() }
+                                            tabs.removeAt(idx)
+                                            activeTabIndex = activeTabIndex.coerceIn(0, tabs.size - 1)
+                                            persistBrowserSettings()
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Surface(
+                        color = Color(0xFF0284C7),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.clickable {
+                            val newTab = BrowserTabModel(
+                                id = "tab_${System.currentTimeMillis()}",
+                                initialUrl = "https://www.google.com",
+                                initialTitle = "Google"
+                            )
+                            tabs.add(newTab)
+                            activeTabIndex = tabs.size - 1
+                            ensureTabWebView(newTab)
+                            persistBrowserSettings()
+                        }
+                    ) {
+                        Text(
+                            text = "+ Вкладка",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+
+                    Surface(
+                        color = Color(0xFF312E81),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.clickable {
+                            val incTab = BrowserTabModel(
+                                id = "inc_${System.currentTimeMillis()}",
+                                initialUrl = "https://duckduckgo.com",
+                                initialTitle = "Инкогнито",
+                                isIncognito = true
+                            )
+                            tabs.add(incTab)
+                            activeTabIndex = tabs.size - 1
+                            ensureTabWebView(incTab)
+                        }
+                    ) {
+                        Text(
+                            text = "🕶 Инкогнито",
+                            color = Color(0xFFE0E7FF),
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                        )
+                    }
                 }
-                WinChipButton(
-                    text = "🔊 Тест Звука",
-                    accent = true,
-                    onClick = { runtime.playWindowsPcmSound(587.33, 130) }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF111827))
+                        .padding(horizontal = 6.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    SmallNavIconButton("←", enabled = activeTab.canGoBack) {
+                        activeTab.webView?.goBack()
+                    }
+                    SmallNavIconButton("→", enabled = activeTab.canGoForward) {
+                        activeTab.webView?.goForward()
+                    }
+                    SmallNavIconButton(if (activeTab.isLoading) "✕" else "↻", enabled = true) {
+                        if (activeTab.isLoading) {
+                            activeTab.webView?.stopLoading()
+                            activeTab.isLoading = false
+                            activeTab.loadingProgress = 0
+                        } else {
+                            activeTab.webView?.reload()
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = addressInput,
+                        onValueChange = { addressInput = it },
+                        singleLine = true,
+                        placeholder = { Text("URL, поиск или magnet:?...", fontSize = 12.sp, color = Color(0xFF64748B)) },
+                        textStyle = LocalTextStyle.current.copy(
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace
+                        ),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(
+                            onGo = { navigateTab(activeTab, addressInput) }
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFF38BDF8),
+                            unfocusedBorderColor = Color(0xFF334155),
+                            focusedContainerColor = Color(0xFF0B1120),
+                            unfocusedContainerColor = Color(0xFF0B1120)
+                        )
+                    )
+
+                    Button(
+                        onClick = { navigateTab(activeTab, addressInput) },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                    ) {
+                        Text("Перейти", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0B1324))
+                ) {
+                    if (activeTab.isLoading || activeTab.loadingProgress in 1..99) {
+                        LinearProgressIndicator(
+                            progress = { (activeTab.loadingProgress / 100f).coerceIn(0.05f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp),
+                            color = Color(0xFF38BDF8),
+                            trackColor = Color(0xFF1E293B)
+                        )
+                    } else {
+                        HorizontalDivider(color = Color(0xFF1E293B), thickness = 1.dp)
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = if (activeTab.isLoading) {
+                                "⏳ Загрузка сайта: ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
+                            } else {
+                                "🔒 Готово (100%) • ${Uri.parse(activeTab.url).host ?: activeTab.url} • Вкладок: ${tabs.size}"
+                            },
+                            color = if (activeTab.isLoading) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (activeTab.isLoading) {
+                                Text(
+                                    text = "⚡ Через Туннель",
+                                    color = Color(0xFFFBBF24),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.clickable {
+                                        navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
+                                    }
+                                )
+                            }
+                            Text(
+                                text = if (desktopMode) "🖥 ПК" else "📱 Моб",
+                                color = Color(0xFFE2E8F0),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable {
+                                    desktopMode = !desktopMode
+                                    activeTab.webView?.settings?.userAgentString = if (desktopMode) {
+                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                                    } else null
+                                    activeTab.webView?.reload()
+                                    persistBrowserSettings()
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0F172A))
+                        .padding(horizontal = 6.dp, vertical = 5.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    ExtensionChip(
+                        label = "🛡️ AdBlock ($adBlockedCount)",
+                        active = adBlockEnabled,
+                        activeColor = Color(0xFF059669)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
+                    }
+
+                    ExtensionChip(
+                        label = "🌐 Browsec VPN ($browsecCountry)",
+                        active = browsecEnabled,
+                        activeColor = Color(0xFF0284C7)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "browsec") null else "browsec"
+                    }
+
+                    ExtensionChip(
+                        label = "🎬 YouTube Звук+Зеркало",
+                        active = youtubeBoostEnabled,
+                        activeColor = Color(0xFFDC2626)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "youtube") null else "youtube"
+                    }
+
+                    ExtensionChip(
+                        label = "🌙 Dark Reader",
+                        active = darkReaderEnabled,
+                        activeColor = Color(0xFF7C3AED)
+                    ) {
+                        darkReaderEnabled = !darkReaderEnabled
+                        activeTab.webView?.let { injectActiveExtensions(it) }
+                        persistBrowserSettings()
+                    }
+
+                    ExtensionChip(
+                        label = "🔧 DevTools (F12)",
+                        active = devToolsEnabled,
+                        activeColor = Color(0xFFD97706)
+                    ) {
+                        devToolsEnabled = !devToolsEnabled
+                        activeTab.webView?.let { injectActiveExtensions(it) }
+                    }
+
+                    ExtensionChip(
+                        label = "⭐ Закладки",
+                        active = activeExtensionPopup == "bookmarks",
+                        activeColor = Color(0xFF2563EB)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
+                    }
+
+                    ExtensionChip(
+                        label = "🔍 Найти на стр.",
+                        active = activeExtensionPopup == "find",
+                        activeColor = Color(0xFF4F46E5)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "find") null else "find"
+                    }
+                }
+
+                AnimatedVisibility(visible = activeExtensionPopup != null) {
+                    Surface(
+                        color = Color(0xFF1E293B),
+                        shape = RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            when (activeExtensionPopup) {
+                                "adblock" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("🛡️ AdBlock Pro + YouTube Анти-Реклама", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Switch(checked = adBlockEnabled, onCheckedChange = {
+                                            adBlockEnabled = it
+                                            persistBrowserSettings()
+                                            activeTab.webView?.reload()
+                                        })
+                                    }
+                                    Text("Заблокировано рекламных запросов и трекеров: $adBlockedCount", color = Color(0xFF34D399), fontSize = 12.sp)
+                                    var customDomain by remember { mutableStateOf("") }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        OutlinedTextField(
+                                            value = customDomain,
+                                            onValueChange = { customDomain = it },
+                                            placeholder = { Text("Добавить домен в блок (напр. ads.site.ru)", fontSize = 11.sp) },
+                                            singleLine = true,
+                                            modifier = Modifier.weight(1f).height(44.dp)
+                                        )
+                                        Button(onClick = {
+                                            if (customDomain.isNotBlank()) {
+                                                customBlockedDomains.add(customDomain.trim())
+                                                customDomain = ""
+                                                persistBrowserSettings()
+                                            }
+                                        }) {
+                                            Text("+ Блок", fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+
+                                "browsec" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("🌐 Browsec VPN + Анти-DPI Прокси", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Switch(checked = browsecEnabled, onCheckedChange = {
+                                            browsecEnabled = it
+                                            persistBrowserSettings()
+                                            navigateTab(activeTab, activeTab.url)
+                                        })
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        VPN_NODES.forEach { node ->
+                                            val selected = browsecCountry == node.code
+                                            FilterChip(
+                                                selected = selected,
+                                                onClick = {
+                                                    browsecCountry = node.code
+                                                    browsecEnabled = true
+                                                    persistBrowserSettings()
+                                                    navigateTab(activeTab, activeTab.url)
+                                                },
+                                                label = { Text("${node.flag} ${node.code}", fontSize = 12.sp) }
+                                            )
+                                        }
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = {
+                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                        ) {
+                                            Text("🔓 Открыть текущий сайт через Веб-Туннель", fontSize = 11.sp)
+                                        }
+                                        OutlinedButton(onClick = { activeExtensionPopup = null }) {
+                                            Text("Закрыть", fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+
+                                "youtube" -> {
+                                    Text("🎬 YouTube HD со звуком + Прямой поиск без блокировок", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    var ytSearch by remember { mutableStateOf("") }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        OutlinedTextField(
+                                            value = ytSearch,
+                                            onValueChange = { ytSearch = it },
+                                            placeholder = { Text("Поиск видео/музыки на YouTube...", fontSize = 12.sp) },
+                                            singleLine = true,
+                                            modifier = Modifier.weight(1f).height(44.dp)
+                                        )
+                                        Button(
+                                            onClick = {
+                                                val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
+                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q")
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                                        ) {
+                                            Text("▶ YouTube", fontSize = 11.sp)
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                navigateTab(activeTab, "https://m.youtube.com")
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C))
+                                        ) {
+                                            Text("🏠 Главная YouTube", fontSize = 11.sp)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                navigateTab(activeTab, "https://piped.video/trending")
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                        ) {
+                                            Text("🛡️ Зеркало Piped (Без таймаутов)", fontSize = 11.sp)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                Wasm64WindowsRuntime.playHardwareTestTone()
+                                                activeTab.webView?.evaluateJavascript(
+                                                    """
+                                                    (function(){
+                                                        document.querySelectorAll('video, audio').forEach(v => {
+                                                            v.muted = false;
+                                                            v.volume = 1.0;
+                                                            v.play();
+                                                        });
+                                                    })();
+                                                    """.trimIndent(),
+                                                    null
+                                                )
+                                                Toast.makeText(context, "🔊 Звук разблокирован и усилен!", Toast.LENGTH_SHORT).show()
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                                        ) {
+                                            Text("🔊 Форсировать Звук 200%", fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+
+                                "bookmarks" -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("⭐ Закладки и Быстрый доступ", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Button(onClick = {
+                                            bookmarks.add(0, activeTab.url to activeTab.title.ifBlank { activeTab.url })
+                                            Toast.makeText(context, "⭐ Добавлено в закладки", Toast.LENGTH_SHORT).show()
+                                        }) {
+                                            Text("+ Сохранить текущую", fontSize = 11.sp)
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        bookmarks.forEach { (bUrl, bTitle) ->
+                                            OutlinedButton(onClick = {
+                                                navigateTab(activeTab, bUrl)
+                                                activeExtensionPopup = null
+                                            }) {
+                                                Text(bTitle, fontSize = 11.sp, color = Color.White)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                "find" -> {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        OutlinedTextField(
+                                            value = findInPageQuery,
+                                            onValueChange = {
+                                                findInPageQuery = it
+                                                activeTab.webView?.findAllAsync(it)
+                                            },
+                                            placeholder = { Text("Найти текст на странице...", fontSize = 12.sp) },
+                                            singleLine = true,
+                                            modifier = Modifier.weight(1f).height(44.dp)
+                                        )
+                                        Button(onClick = { activeTab.webView?.findNext(true) }) {
+                                            Text("Далее ↓", fontSize = 11.sp)
+                                        }
+                                        OutlinedButton(onClick = {
+                                            activeTab.webView?.clearMatches()
+                                            activeExtensionPopup = null
+                                        }) {
+                                            Text("✕", fontSize = 11.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (activeTab.lastErrorText != null) {
+                    Surface(
+                        color = Color(0xFF3B0764),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "⚠️ Сайт не ответил напрямую: ${activeTab.lastErrorText}",
+                                color = Color(0xFFFDE047),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        browsecEnabled = true
+                                        browsecCountry = if (browsecCountry == "DE") "NL" else "DE"
+                                        navigateTab(activeTab, activeTab.url)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                ) {
+                                    Text("🌐 Сменить узел Browsec ($browsecCountry) и повторить", fontSize = 11.sp)
+                                }
+                                Button(
+                                    onClick = { navigateTab(activeTab, activeTab.url, useProxyTunnel = true) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                ) {
+                                    Text("🔓 Открыть через Прокси-Туннель", fontSize = 11.sp)
+                                }
+                                if (activeTab.url.contains("youtube", ignoreCase = true)) {
+                                    Button(
+                                        onClick = { navigateTab(activeTab, "https://piped.video/trending") },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                                    ) {
+                                        Text("🎬 Прямое зеркало YouTube", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Box(
+                modifier = if (currentSection == 0) {
+                    Modifier.weight(1f).fillMaxWidth()
+                } else {
+                    Modifier.size(0.dp)
+                }
+            ) {
+                AndroidView(
+                    factory = {
+                        ensureTabWebView(activeTab)
+                        webViewContainer
+                    },
+                    update = { container ->
+                        val current = tabs.getOrNull(activeTabIndex)
+                        if (current != null) {
+                            ensureTabWebView(current)
+                            for (i in 0 until container.childCount) {
+                                val child = container.getChildAt(i)
+                                child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
                 )
             }
 
-            // 2. MAIN WORKSPACE VIEWPORT
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(6.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF0A1424))
-                    .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.55f), RoundedCornerShape(8.dp))
-                    .padding(8.dp)
-            ) {
-                when (activeWindow) {
-                    "desktop" -> WinWasmDesktopHome(
-                        runtime = runtime,
-                        lastBench = lastBenchResult,
-                        onOpenWindow = { activeWindow = it },
-                        onRunBench = {
-                            runtime.playWindowsPcmSound(659.25, 110)
-                            lastBenchResult = runtime.runMultiCoreWasm64Benchmark()
-                        }
-                    )
-                    "browser" -> WinWasmBrowserWithExtensionsPanel(
-                        runtime = runtime,
-                        initialUrl = "https://www.google.com"
-                    )
-                    "youtube" -> WinWasmYouTubeWithSoundPanel(
-                        runtime = runtime
-                    )
-                    "games" -> WinWasmGamesCenterPanel(
-                        runtime = runtime
-                    )
-                    "terminal" -> WinWasmTerminalAndNodePanel(
-                        runtime = runtime
-                    )
-                    "programs" -> WinWasmProgramsAndCalcPanel(
-                        runtime = runtime,
-                        lastBench = lastBenchResult,
-                        onUpdateBench = { lastBenchResult = it }
-                    )
-                }
+            if (currentSection == 1) {
+                TorrentClientSection(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    torrentEngine = torrentEngine,
+                    statuses = torrentStatuses,
+                    nativeAppsManager = nativeAppsManager,
+                    onPickTorrentFile = { torrentFilePicker.launch("*/*") }
+                )
             }
 
-            // 3. WINDOWS 11 BOTTOM TASKBAR
+            if (currentSection == 2) {
+                NativeAppsSection(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    nativeAppsManager = nativeAppsManager,
+                    installedApps = installedApps,
+                    bindings = formatBindings,
+                    downloadedFiles = torrentEngine.getDownloadDirectory().listFiles()?.toList().orEmpty(),
+                    currentBrowserUrl = activeTab.url,
+                    onUpdateBindings = { formatBindings = nativeAppsManager.getBindings() },
+                    onRefreshApps = { installedApps = nativeAppsManager.loadInstalledNativeApps() }
+                )
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF050A14))
-                    .horizontalScroll(rememberScrollState())
+                    .background(Color(0xFF0F172A))
                     .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                listOf(
-                    "desktop" to "❖ Стол Windows",
-                    "browser" to "🌐 Браузер + Расширения",
-                    "youtube" to "🎬 YouTube со звуком",
-                    "games" to "🎮 Игры (DOOM 3D / Сапёр)",
-                    "terminal" to "🟦 Терминал + Node.js",
-                    "programs" to "📦 Программы + WASM64"
-                ).forEach { (id, title) ->
-                    WinChipButton(
-                        text = title,
-                        accent = activeWindow == id,
-                        onClick = { activeWindow = id }
-                    )
+                BottomSectionButton(
+                    modifier = Modifier.weight(1f),
+                    title = "🌐 Браузер (${tabs.size})",
+                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Не сбрасывается",
+                    selected = currentSection == 0,
+                    activeColor = Color(0xFF0284C7)
+                ) {
+                    currentSection = 0
+                }
+
+                BottomSectionButton(
+                    modifier = Modifier.weight(1f),
+                    title = "🧲 Торренты (${torrentStatuses.size})",
+                    subtitle = "BitTorrent P2P",
+                    selected = currentSection == 1,
+                    activeColor = Color(0xFF059669)
+                ) {
+                    currentSection = 1
+                }
+
+                BottomSectionButton(
+                    modifier = Modifier.weight(1f),
+                    title = "📱 Приложения (${installedApps.size})",
+                    subtitle = "Нативный запуск",
+                    selected = currentSection == 2,
+                    activeColor = Color(0xFF7C3AED)
+                ) {
+                    currentSection = 2
                 }
             }
         }
@@ -245,664 +1242,545 @@ fun WindowsWasm64DesktopScreen(runtime: Wasm64WindowsRuntime) {
 }
 
 @Composable
-private fun WinWasmDesktopHome(
-    runtime: Wasm64WindowsRuntime,
-    lastBench: com.winwasm64.engine.Wasm64ExecutionResult,
-    onOpenWindow: (String) -> Unit,
-    onRunBench: () -> Unit
+private fun TorrentClientSection(
+    modifier: Modifier,
+    torrentEngine: BitTorrentEngine,
+    statuses: List<TorrentSessionStatus>,
+    nativeAppsManager: NativeAppsManager,
+    onPickTorrentFile: () -> Unit
 ) {
-    val programs = remember { runtime.listWindowsPrograms() }
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Text(
-            text = "🖥 Рабочий стол Windows 11 WASM64 — Выберите программу, игру, терминал Node.js, YouTube или Браузер:",
-            color = Color(0xFF38BDF8),
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 9.2.sp
-        )
+    val context = LocalContext.current
+    var magnetOrUrlInput by remember { mutableStateOf("") }
+    var searchQuery by remember { mutableStateOf("") }
+    var catalogItems by remember { mutableStateOf(torrentEngine.getBuiltInVerifiedTorrents()) }
+    var isSearching by remember { mutableStateOf(false) }
 
-        programs.chunked(2).forEach { rowItems ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                rowItems.forEach { prog ->
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(Color.White.copy(alpha = 0.05f))
-                            .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f), RoundedCornerShape(6.dp))
-                            .clickable { onOpenWindow(prog.windowTarget) }
-                            .padding(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
+    Column(
+        modifier = modifier
+            .background(Color(0xFF090D16))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Surface(
+            color = Color(0xFF111827),
+            shape = RoundedCornerShape(12.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF059669))
+        ) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "${prog.icon} ${prog.title}",
+                            text = "🧲 Встроенный BitTorrent Клиент (P2P + BEP-19 WebSeed)",
                             color = Color.White,
-                            fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 8.6.sp
+                            fontSize = 14.sp
                         )
                         Text(
-                            text = "${prog.binaryName} — ${prog.description}",
-                            color = Color(0xFF94A3B8),
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 7.4.sp,
-                            maxLines = 2,
+                            text = "Папка сохранения: ${torrentEngine.getDownloadDirectory().absolutePath}",
+                            color = Color(0xFF34D399),
+                            fontSize = 11.sp,
+                            maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
-                }
-            }
-        }
-
-        // WASM64 Telemetry Card
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFF07131B))
-                .border(1.dp, Color(0xFF10B981).copy(alpha = 0.6f), RoundedCornerShape(6.dp))
-                .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Text(
-                text = "⚡ Статус ядра WebAssembly 64-bit (ntoskrnl.wasm • Memory64)",
-                color = Color(0xFF10B981),
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 8.8.sp
-            )
-            Text(
-                text = "• Заголовок \\0asm v1: ${lastBench.validMagicHeader} • Адресация Memory64 (64-bit): ${lastBench.memory64Addressing}\n" +
-                    "• Возврат регистра i64: ${lastBench.returnValueI64} • Выполнено инструкций: ${lastBench.executedInstructions}\n" +
-                    "• Скорость: ${lastBench.mips} MIPS (${"%.2f".format(lastBench.elapsedMs)} мс) • CRC памяти: 0x${java.lang.Long.toHexString(lastBench.linearMemoryChecksum).take(8)}",
-                color = Color.White,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 7.8.sp,
-                lineHeight = 11.sp
-            )
-            WinChipButton(
-                text = "🚀 Запустить стресс-тест WASM64 на ядрах процессора",
-                accent = true,
-                accentColor = Color(0xFF10B981),
-                onClick = onRunBench
-            )
-        }
-    }
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-private fun WinWasmBrowserWithExtensionsPanel(
-    runtime: Wasm64WindowsRuntime,
-    initialUrl: String = "https://www.google.com"
-) {
-    var addressText by remember { mutableStateOf(initialUrl) }
-    var webViewRef by remember { mutableStateOf<WebView?>(null) }
-    var activeExtPopup by remember { mutableStateOf("") } // "", "adblock", "browsec", "userscripts", "devtools"
-
-    var adblockOn by remember { mutableStateOf(true) }
-    var blockedCount by remember { mutableIntStateOf(0) }
-    var browsecOn by remember { mutableStateOf(true) }
-    var browsecCountry by remember { mutableStateOf("NL") }
-    var darkReaderOn by remember { mutableStateOf(false) }
-    var statusText by remember { mutableStateOf("✓ Расширения активны: AdBlock Pro • Browsec VPN (NL) • YouTube Звук") }
-
-    fun navigate(input: String) {
-        val url = runtime.normalizeBrowserTarget(input)
-        addressText = url
-        webViewRef?.loadUrl(url)
-    }
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        // Navigation Bar
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            WinChipButton(text = "←", onClick = { if (webViewRef?.canGoBack() == true) webViewRef?.goBack() })
-            WinChipButton(text = "→", onClick = { if (webViewRef?.canGoForward() == true) webViewRef?.goForward() })
-            WinChipButton(text = "↻", onClick = { webViewRef?.reload() })
-            WinInputBox(
-                value = addressText,
-                onValueChange = { addressText = it },
-                placeholder = "Введите адрес сайта или поисковый запрос...",
-                modifier = Modifier.weight(1f)
-            )
-            WinChipButton(
-                text = "Перейти ⏎",
-                accent = true,
-                onClick = {
-                    activeExtPopup = ""
-                    navigate(addressText)
-                }
-            )
-        }
-
-        // Extensions Bar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            WinChipButton(
-                text = "🛡️ AdBlock ($blockedCount)",
-                accent = activeExtPopup == "adblock" || adblockOn,
-                accentColor = Color(0xFF10B981),
-                onClick = { activeExtPopup = if (activeExtPopup == "adblock") "" else "adblock" }
-            )
-            WinChipButton(
-                text = "🌐 Browsec VPN (${if (browsecOn) browsecCountry else "OFF"})",
-                accent = activeExtPopup == "browsec" || browsecOn,
-                onClick = { activeExtPopup = if (activeExtPopup == "browsec") "" else "browsec" }
-            )
-            WinChipButton(
-                text = if (darkReaderOn) "🌙 Dark Reader ●" else "🌙 Dark Reader",
-                accent = darkReaderOn,
-                onClick = {
-                    darkReaderOn = !darkReaderOn
-                    webViewRef?.reload()
-                }
-            )
-            WinChipButton(
-                text = "🔧 DevTools (F12)",
-                accent = false,
-                onClick = {
-                    webViewRef?.evaluateJavascript(
-                        "(function(){ if(window.eruda){eruda.show();return;} var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/eruda';s.onload=function(){eruda.init();eruda.show();};document.body.appendChild(s); })();",
-                        null
-                    )
-                    statusText = "🔧 Панель DevTools открыта поверх страницы!"
-                }
-            )
-            listOf(
-                "🎬 YouTube" to "https://m.youtube.com",
-                "🔍 Google" to "https://www.google.com",
-                "🐙 GitHub" to "https://github.com",
-                "📚 Wiki" to "https://ru.wikipedia.org"
-            ).forEach { (title, url) ->
-                WinChipButton(text = title, onClick = { navigate(url) })
-            }
-        }
-
-        // Extension Popup
-        if (activeExtPopup == "adblock") {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Color(0xFF071520))
-                    .border(1.dp, Color(0xFF10B981), RoundedCornerShape(6.dp))
-                    .padding(6.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    text = "🛡️ AdBlock Pro (Сетевой перехват + Авто-пропуск рекламы YouTube) • Заблокировано: $blockedCount",
-                    color = Color(0xFF10B981),
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 8.2.sp
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    WinChipButton(
-                        text = if (adblockOn) "🟢 AdBlock ВКЛ" else "🔴 AdBlock ВЫКЛ",
-                        accent = adblockOn,
-                        accentColor = Color(0xFF10B981),
-                        onClick = {
-                            adblockOn = !adblockOn
-                            webViewRef?.reload()
-                        }
-                    )
-                    WinChipButton(text = "✕ Скрыть", onClick = { activeExtPopup = "" })
-                }
-            }
-        } else if (activeExtPopup == "browsec") {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Color(0xFF081426))
-                    .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(6.dp))
-                    .padding(6.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    text = "🌐 Browsec VPN — Выберите страну или откройте сайт через Веб-Прокси туннель:",
-                    color = Color(0xFF38BDF8),
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 8.2.sp
-                )
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    listOf("NL" to "🇳🇱 Нидерланды", "DE" to "🇩🇪 Германия", "US" to "🇺🇸 США", "UK" to "🇬🇧 Британия", "FI" to "🇫🇮 Финляндия").forEach { (code, name) ->
-                        WinChipButton(
-                            text = name,
-                            accent = browsecOn && browsecCountry == code,
-                            onClick = {
-                                browsecCountry = code
-                                browsecOn = true
-                                statusText = "🌐 Browsec VPN подключён: $name ($code)"
-                            }
-                        )
-                    }
-                    WinChipButton(
-                        text = "🔓 Открыть через Веб-Туннель",
-                        accent = true,
-                        onClick = {
-                            val proxied = "https://translate.google.com/translate?sl=auto&tl=ru&u=" +
-                                URLEncoder.encode(addressText, "UTF-8")
-                            activeExtPopup = ""
-                            addressText = proxied
-                            webViewRef?.loadUrl(proxied)
-                        }
-                    )
-                }
-            }
-        }
-
-        // WebView Viewport
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f), RoundedCornerShape(6.dp))
-        ) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        webViewRef = this
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                        settings.apply {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            databaseEnabled = true
-                            mediaPlaybackRequiresUserGesture = false
-                            loadsImagesAutomatically = true
-                            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                            useWideViewPort = true
-                            loadWithOverviewMode = true
-                        }
-                        webChromeClient = WebChromeClient()
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                                val u = request?.url?.toString() ?: return null
-                                if (adblockOn && runtime.shouldBlockAdUrl(u)) {
-                                    blockedCount += 1
-                                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-                                }
-                                return super.shouldInterceptRequest(view, request)
-                            }
-
-                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                val uri = request?.url ?: return false
-                                val s = uri.scheme?.lowercase() ?: ""
-                                if (s == "http" || s == "https") {
-                                    addressText = uri.toString()
-                                    return false
-                                }
-                                if (s == "intent") {
-                                    val fb = uri.toString().substringAfter("S.browser_fallback_url=", "").substringBefore(";")
-                                    if (fb.isNotBlank()) {
-                                        val dec = runCatching { URLDecoder.decode(fb, "UTF-8") }.getOrDefault(fb)
-                                        addressText = dec
-                                        view?.loadUrl(dec)
-                                    }
-                                    return true
-                                }
-                                return true
-                            }
-
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                if (!url.isNullOrBlank()) addressText = url
-                                view?.evaluateJavascript(
-                                    """
-                                    (function(){
-                                        setInterval(function(){
-                                            document.querySelectorAll('.ytp-ad-skip-button, .ytp-skip-ad-button, .ytp-ad-skip-button-modern').forEach(b=>b.click());
-                                            var adV = document.querySelector('.ad-showing video');
-                                            if(adV && adV.duration) adV.currentTime = adV.duration;
-                                            document.querySelectorAll('video').forEach(v => { if(v.muted && !v.__unm){ v.muted=false; v.volume=1.0; v.__unm=true; } });
-                                        }, 500);
-                                        ${if (darkReaderOn) "document.documentElement.style.filter='invert(0.92) hue-rotate(180deg)';" else ""}
-                                    })();
-                                    """.trimIndent(),
-                                    null
-                                )
-                            }
-                        }
-                        loadUrl(initialUrl)
-                    }
-                }
-            )
-        }
-        Text(
-            text = statusText,
-            color = Color(0xFFA7F3D0),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 7.5.sp,
-            maxLines = 1
-        )
-    }
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-private fun WinWasmYouTubeWithSoundPanel(runtime: Wasm64WindowsRuntime) {
-    var searchInput by remember { mutableStateOf("") }
-    var ytWebView by remember { mutableStateOf<WebView?>(null) }
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            WinInputBox(
-                value = searchInput,
-                onValueChange = { searchInput = it },
-                placeholder = "🎬 Поиск на YouTube со звуком (музыка, обзоры, игры)...",
-                modifier = Modifier.weight(1f)
-            )
-            WinChipButton(
-                text = "🔍 Найти",
-                accent = true,
-                accentColor = Color(0xFFF43F5E),
-                onClick = {
-                    val q = searchInput.trim().ifBlank { "lofi hip hop radio" }
-                    val enc = runCatching { URLEncoder.encode(q, "UTF-8") }.getOrDefault(q)
-                    ytWebView?.loadUrl("https://m.youtube.com/results?search_query=$enc")
-                }
-            )
-            WinChipButton(
-                text = "🔊 Звук 200%",
-                accent = true,
-                onClick = {
-                    runtime.playWindowsPcmSound(659.25, 90)
-                    ytWebView?.evaluateJavascript(
-                        "document.querySelectorAll('video').forEach(v => { v.muted = false; v.volume = 1.0; v.play(); });",
-                        null
-                    )
-                }
-            )
-        }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            listOf(
-                "🏠 Главная YouTube" to "https://m.youtube.com",
-                "🎵 Музыка 2026" to "https://m.youtube.com/results?search_query=music+hits+2026",
-                "🎮 Игры и Стримы" to "https://m.youtube.com/results?search_query=pc+gaming+4k",
-                "💻 Программирование Node.js" to "https://m.youtube.com/results?search_query=nodejs+tutorial"
-            ).forEach { (label, link) ->
-                WinChipButton(text = label, onClick = { ytWebView?.loadUrl(link) })
-            }
-        }
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .border(1.dp, Color(0xFFF43F5E).copy(alpha = 0.6f), RoundedCornerShape(6.dp))
-        ) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        ytWebView = this
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                        settings.apply {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            mediaPlaybackRequiresUserGesture = false
-                            loadsImagesAutomatically = true
-                            useWideViewPort = true
-                            loadWithOverviewMode = true
-                        }
-                        webChromeClient = WebChromeClient()
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                                val u = request?.url?.toString() ?: return null
-                                if (runtime.shouldBlockAdUrl(u)) {
-                                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-                                }
-                                return super.shouldInterceptRequest(view, request)
-                            }
-
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                view?.evaluateJavascript(
-                                    """
-                                    setInterval(function(){
-                                        document.querySelectorAll('.ytp-ad-skip-button, .ytp-skip-ad-button').forEach(b=>b.click());
-                                        document.querySelectorAll('video').forEach(v => { if(v.muted && !v.__u){ v.muted=false; v.volume=1.0; v.__u=true; } });
-                                    }, 500);
-                                    """.trimIndent(),
-                                    null
-                                )
-                            }
-                        }
-                        loadUrl("https://m.youtube.com")
-                    }
-                }
-            )
-        }
-    }
-}
-
-@Composable
-private fun WinWasmGamesCenterPanel(runtime: Wasm64WindowsRuntime) {
-    var activeGame by remember { mutableStateOf("doom") } // "doom" | "mines"
-    var doomState by remember { mutableStateOf(DoomRaycasterState()) }
-    var minesState by remember { mutableStateOf(runtime.createNewMinesweeperGame()) }
-    var flagMode by remember { mutableStateOf(false) }
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            WinChipButton(
-                text = "🔫 DOOM / Wolf3D WASM64 (3D FPS)",
-                accent = activeGame == "doom",
-                accentColor = Color(0xFFF43F5E),
-                onClick = { activeGame = "doom" }
-            )
-            WinChipButton(
-                text = "💣 Сапёр Windows 11 Pro",
-                accent = activeGame == "mines",
-                accentColor = Color(0xFF38BDF8),
-                onClick = { activeGame = "mines" }
-            )
-            WinChipButton(
-                text = "🔄 Сброс игры",
-                onClick = {
-                    if (activeGame == "doom") doomState = DoomRaycasterState()
-                    else minesState = runtime.createNewMinesweeperGame()
-                }
-            )
-        }
-
-        if (activeGame == "doom") {
-            val wallColumns = remember(doomState) { runtime.castDoom3dWallHeights(doomState, 32) }
-            Text(
-                text = "❤️ Здоровье: ${doomState.health}% • 🔫 Патроны: ${doomState.ammo} • 💀 Врагов: ${doomState.enemiesAlive} • 🏆 Счёт: ${doomState.score}",
-                color = Color(0xFFFCA5A5),
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 8.4.sp
-            )
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Color(0xFF05070B))
-                    .border(1.dp, Color(0xFFF43F5E), RoundedCornerShape(6.dp))
-            ) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val w = size.width
-                    val h = size.height
-                    // Ceiling & Floor
-                    drawRect(Color(0xFF111827), topLeft = Offset.Zero, size = Size(w, h / 2f))
-                    drawRect(Color(0xFF1F2937), topLeft = Offset(0f, h / 2f), size = Size(w, h / 2f))
-
-                    val colWidth = w / wallColumns.size.coerceAtLeast(1)
-                    wallColumns.forEachIndexed { idx, (ratio, hitType) ->
-                        val wallH = (h * ratio).coerceIn(16f, h * 0.95f)
-                        val topY = (h - wallH) / 2f
-                        val baseColor = if (hitType == 2) Color(0xFFEF4444) else Color(0xFF38BDF8)
-                        val shaded = baseColor.copy(alpha = ratio.coerceIn(0.28f, 0.95f))
-                        drawRect(
-                            color = shaded,
-                            topLeft = Offset(idx * colWidth, topY),
-                            size = Size(colWidth + 1f, wallH)
-                        )
-                    }
-                    // Crosshair & Plasma Gun HUD
-                    drawCircle(Color(0xFF10B981), radius = 6f, center = Offset(w / 2f, h / 2f))
-                    drawRect(
-                        color = Color(0xFF64748B),
-                        topLeft = Offset(w / 2f - 28f, h - 48f),
-                        size = Size(56f, 48f)
-                    )
-                }
-            }
-            Text(
-                text = doomState.lastActionLog,
-                color = Color(0xFFA7F3D0),
-                fontFamily = FontFamily.Monospace,
-                fontSize = 7.8.sp
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                WinChipButton(
-                    text = "◀ Влево",
-                    onClick = { doomState = runtime.stepDoomRaycaster(doomState, turnDelta = -0.25) }
-                )
-                WinChipButton(
-                    text = "▲ Вперёд",
-                    accent = true,
-                    onClick = {
-                        runtime.playWindowsPcmSound(320.0, 45)
-                        doomState = runtime.stepDoomRaycaster(doomState, moveForward = 0.45)
-                    }
-                )
-                WinChipButton(
-                    text = "▼ Назад",
-                    onClick = { doomState = runtime.stepDoomRaycaster(doomState, moveForward = -0.35) }
-                )
-                WinChipButton(
-                    text = "▶ Вправо",
-                    onClick = { doomState = runtime.stepDoomRaycaster(doomState, turnDelta = 0.25) }
-                )
-                WinChipButton(
-                    text = "🔥 ОГОНЬ!",
-                    accent = true,
-                    accentColor = Color(0xFFF43F5E),
-                    onClick = { doomState = runtime.stepDoomRaycaster(doomState, fireWeapon = true) }
-                )
-            }
-        } else {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val status = when {
-                    minesState.victory -> "🏆 ПОБЕДА! Все безопасные клетки открыты!"
-                    minesState.gameOver -> "💥 ВЗРЫВ! Нажмите «Сброс игры» для новой партии."
-                    else -> "💣 Мин: ${minesState.minesCount} • Ходов: ${minesState.moves}"
-                }
-                Text(
-                    text = status,
-                    color = Color.White,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 8.4.sp
-                )
-                WinChipButton(
-                    text = if (flagMode) "🚩 Режим: ФЛАГ" else "⛏ Режим: ОТКРЫТЬ",
-                    accent = flagMode,
-                    onClick = { flagMode = !flagMode }
-                )
-            }
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                for (r in 0 until minesState.rows) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    Button(
+                        onClick = onPickTorrentFile,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        for (col in 0 until minesState.cols) {
-                            val cell = minesState.cells.first { it.row == r && it.col == col }
-                            val label = when {
-                                cell.isFlagged -> "🚩"
-                                !cell.isRevealed -> "■"
-                                cell.isMine -> "💣"
-                                cell.neighborMines == 0 -> "·"
-                                else -> cell.neighborMines.toString()
+                        Text("📂 Открыть .torrent", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = magnetOrUrlInput,
+                        onValueChange = { magnetOrUrlInput = it },
+                        placeholder = { Text("Вставьте magnet:?xt=urn:btih:... или ссылку на .torrent", fontSize = 11.sp) },
+                        singleLine = true,
+                        textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
+                        modifier = Modifier.weight(1f).height(44.dp)
+                    )
+                    Button(
+                        onClick = {
+                            if (magnetOrUrlInput.isNotBlank()) {
+                                torrentEngine.startFromMagnetOrUrl(magnetOrUrlInput)
+                                magnetOrUrlInput = ""
+                                Toast.makeText(context, "🧲 Торрент запущен!", Toast.LENGTH_SHORT).show()
                             }
-                            val bg = when {
-                                cell.isRevealed && cell.isMine -> Color(0xFF7F1D1D)
-                                cell.isRevealed -> Color(0xFF1E293B)
-                                else -> Color(0xFF0F172A)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                    ) {
+                        Text("⬇ Скачать", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("Поиск торрентов (игры .exe, фильмы, музыка, программы)...", fontSize = 11.sp) },
+                        singleLine = true,
+                        textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
+                        modifier = Modifier.weight(1f).height(44.dp)
+                    )
+                    Button(
+                        onClick = {
+                            isSearching = true
+                            torrentEngine.searchPublicTorrents(searchQuery) { res ->
+                                catalogItems = res
+                                isSearching = false
                             }
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(34.dp)
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(bg)
-                                    .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.45f), RoundedCornerShape(4.dp))
-                                    .clickable {
-                                        minesState = runtime.revealMinesweeperCell(minesState, r, col, flagMode)
-                                    },
-                                contentAlignment = Alignment.Center
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                    ) {
+                        Text(if (isSearching) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            if (statuses.isNotEmpty()) {
+                item {
+                    Text(
+                        text = "📥 Активные и завершённые торрент-загрузки (${statuses.size}):",
+                        color = Color(0xFF38BDF8),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
+
+                items(statuses, key = { it.id }) { st ->
+                    Surface(
+                        color = Color(0xFF151F32),
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            if (st.state == TorrentState.COMPLETED) Color(0xFF10B981) else Color(0xFF38BDF8)
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = label,
+                                    text = st.name,
                                     color = Color.White,
-                                    fontFamily = FontFamily.Monospace,
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = 10.sp
+                                    fontSize = 13.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
                                 )
+                                Text(
+                                    text = "${(st.progressFraction * 100).toInt()}%",
+                                    color = Color(0xFF34D399),
+                                    fontWeight = FontWeight.ExtraBold,
+                                    fontSize = 14.sp
+                                )
+                            }
+
+                            LinearProgressIndicator(
+                                progress = { st.progressFraction },
+                                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                                color = if (st.state == TorrentState.COMPLETED) Color(0xFF10B981) else Color(0xFF38BDF8),
+                                trackColor = Color(0xFF0F172A)
+                            )
+
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(10.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(Color(0xFF090D16))
+                            ) {
+                                val count = st.pieceBitfield.size.coerceAtLeast(1)
+                                val cellW = size.width / count
+                                for (i in 0 until count) {
+                                    if (st.pieceBitfield[i]) {
+                                        drawRect(
+                                            color = Color(0xFF10B981),
+                                            topLeft = Offset(i * cellW, 0f),
+                                            size = Size(cellW.coerceAtLeast(2f), size.height)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Text(
+                                text = "${st.state.labelRu} • Скорость: ${BitTorrentEngine.formatSpeed(st.downloadSpeedBytesPerSec)} • Пиры: ${st.connectedPeers}/${st.knownPeers}",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp
+                            )
+                            Text(
+                                text = st.statusDetail,
+                                color = Color(0xFFE2E8F0),
+                                fontSize = 11.sp
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        val f = File(st.outputFilePath)
+                                        val res = nativeAppsManager.openFileInNativeApp(f)
+                                        res.onFailure {
+                                            Toast.makeText(context, "Файл ещё качается или не найден: ${it.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                ) {
+                                    Text("📱 Открыть нативно", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+
+                                OutlinedButton(onClick = { torrentEngine.togglePause(st.id) }) {
+                                    Text(if (st.state == TorrentState.PAUSED) "▶ Продолжить" else "⏸ Пауза", fontSize = 11.sp)
+                                }
+
+                                OutlinedButton(onClick = { torrentEngine.removeTorrent(st.id, deleteFile = true) }) {
+                                    Text("🗑 Удалить", fontSize = 11.sp, color = Color(0xFFEF4444))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Text(
+                    text = "🔥 Проверенные торренты с мгновенной раздачей (Игры .EXE, Фильмы MP4, Программы, APK):",
+                    color = Color(0xFFFBBF24),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
+            }
+
+            items(catalogItems) { item ->
+                Surface(
+                    color = Color(0xFF111827),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("${item.category} • Размер: ${item.sizeLabel}", color = Color(0xFF38BDF8), fontSize = 11.sp)
+                            Text(item.description, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 2)
+                        }
+                        Button(
+                            onClick = {
+                                torrentEngine.startFromCatalogItem(item)
+                                Toast.makeText(context, "🧲 Скачивание начато: ${item.title}", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                        ) {
+                            Text("⬇ Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NativeAppsSection(
+    modifier: Modifier,
+    nativeAppsManager: NativeAppsManager,
+    installedApps: List<NativeAppEntry>,
+    bindings: List<NativeFormatBinding>,
+    downloadedFiles: List<File>,
+    currentBrowserUrl: String,
+    onUpdateBindings: () -> Unit,
+    onRefreshApps: () -> Unit
+) {
+    val context = LocalContext.current
+    var selectedCategory by remember { mutableStateOf("Все") }
+    var appSearchQuery by remember { mutableStateOf("") }
+    var selectedFileForOpen by remember { mutableStateOf<File?>(downloadedFiles.firstOrNull()) }
+
+    val categories = listOf(
+        "Все",
+        "🎬 Видео и Аудио плееры",
+        "📦 Файлы и Архиваторы",
+        "🖥️ Эмуляторы и ОС (.EXE)",
+        "🌐 Браузеры и Мессенджеры",
+        "📄 Офис и Документы"
+    )
+
+    val filteredApps = remember(installedApps, selectedCategory, appSearchQuery) {
+        installedApps.filter { app ->
+            val matchCat = selectedCategory == "Все" || app.category == selectedCategory
+            val matchQuery = appSearchQuery.isBlank() ||
+                app.appName.contains(appSearchQuery, ignoreCase = true) ||
+                app.packageName.contains(appSearchQuery, ignoreCase = true)
+            matchCat && matchQuery
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .background(Color(0xFF090D16))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Surface(
+            color = Color(0xFF111827),
+            shape = RoundedCornerShape(12.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF7C3AED))
+        ) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "📱 Нативные Приложения Телефона (${installedApps.size} найдено)",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = "Применяйте браузер и торрент-клиент нативно к любым установленным приложениям",
+                            color = Color(0xFFC4B5FD),
+                            fontSize = 11.sp
+                        )
+                    }
+                    OutlinedButton(onClick = onRefreshApps) {
+                        Text("↻ Обновить", fontSize = 11.sp)
+                    }
+                }
+
+                OutlinedTextField(
+                    value = appSearchQuery,
+                    onValueChange = { appSearchQuery = it },
+                    placeholder = { Text("Поиск установленного приложения по имени или пакету...", fontSize = 11.sp) },
+                    singleLine = true,
+                    textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 12.sp),
+                    modifier = Modifier.fillMaxWidth().height(44.dp)
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    categories.forEach { cat ->
+                        FilterChip(
+                            selected = selectedCategory == cat,
+                            onClick = { selectedCategory = cat },
+                            label = { Text(cat, fontSize = 11.sp) }
+                        )
+                    }
+                }
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (downloadedFiles.isNotEmpty()) {
+                item {
+                    Surface(
+                        color = Color(0xFF151F32),
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "📂 Скачанные торрентом файлы (${downloadedFiles.size}) — выберите для нативного открытия:",
+                                color = Color(0xFF38BDF8),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                downloadedFiles.forEach { f ->
+                                    val isSel = selectedFileForOpen?.absolutePath == f.absolutePath
+                                    FilterChip(
+                                        selected = isSel,
+                                        onClick = { selectedFileForOpen = f },
+                                        label = { Text("${f.name} (${BitTorrentEngine.formatSize(f.length())})", fontSize = 11.sp) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Text(
+                    text = "🔗 Привязка форматов браузера и торрента к нативным приложениям:",
+                    color = Color(0xFFFBBF24),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+            }
+
+            items(bindings) { bind ->
+                Surface(
+                    color = Color(0xFF111827),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("${bind.formatKey} — ${bind.formatTitle}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text(bind.sampleDescription, color = Color(0xFF94A3B8), fontSize = 11.sp)
+                            Text(
+                                text = "Привязано: ${bind.boundPackage ?: "Системный выбор Android (Авто)"}",
+                                color = Color(0xFF34D399),
+                                fontSize = 11.sp
+                            )
+                        }
+                        if (bind.boundPackage != null) {
+                            OutlinedButton(onClick = {
+                                nativeAppsManager.setBinding(bind.formatKey, null)
+                                onUpdateBindings()
+                            }) {
+                                Text("Сброс", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Text(
+                    text = "📲 Список установленных приложений на устройстве (${filteredApps.size}):",
+                    color = Color(0xFF38BDF8),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
+            }
+
+            items(filteredApps, key = { it.packageName }) { app ->
+                Surface(
+                    color = Color(0xFF111827),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
+                ) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            if (app.iconBitmap != null) {
+                                Image(
+                                    bitmap = app.iconBitmap,
+                                    contentDescription = app.appName,
+                                    modifier = Modifier.size(40.dp).clip(RoundedCornerShape(8.dp))
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF1E293B)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("📱", fontSize = 18.sp)
+                                }
+                            }
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(app.appName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                Text(
+                                    text = app.supportedFormats.joinToString(" • "),
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    val ok = nativeAppsManager.launchApp(app.packageName)
+                                    if (!ok) {
+                                        Toast.makeText(context, "Не удалось запустить ${app.appName}", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                            ) {
+                                Text("🚀 Запустить", fontSize = 11.sp)
+                            }
+
+                            Button(
+                                onClick = {
+                                    nativeAppsManager.openUrlInNativeApp(currentBrowserUrl, app.packageName)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                            ) {
+                                Text("🌐 Открыть текущий сайт тут", fontSize = 11.sp)
+                            }
+
+                            if (selectedFileForOpen != null) {
+                                Button(
+                                    onClick = {
+                                        nativeAppsManager.openFileInNativeApp(selectedFileForOpen!!, app.packageName)
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                ) {
+                                    Text("📂 Открыть ${selectedFileForOpen!!.name.take(14)}", fontSize = 11.sp)
+                                }
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    val fmtKey = when {
+                                        app.category.contains("Видео") -> ".mp4 / .mkv"
+                                        app.category.contains("Файлы") -> ".zip / .rar / .7z"
+                                        app.category.contains(".EXE") -> ".exe / .msi"
+                                        app.category.contains("Офис") -> ".pdf / .epub"
+                                        else -> "youtube.com"
+                                    }
+                                    nativeAppsManager.setBinding(fmtKey, app.packageName)
+                                    onUpdateBindings()
+                                    Toast.makeText(context, "🔗 ${app.appName} привязан к $fmtKey", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Text("🔗 Назначить по умолч.", fontSize = 11.sp)
                             }
                         }
                     }
@@ -913,275 +1791,88 @@ private fun WinWasmGamesCenterPanel(runtime: Wasm64WindowsRuntime) {
 }
 
 @Composable
-private fun WinWasmTerminalAndNodePanel(runtime: Wasm64WindowsRuntime) {
-    var cmdInput by remember { mutableStateOf("") }
-    var jsCodeInput by remember {
-        mutableStateOf(
-            "console.log('Node.js on Windows WASM64:', process.version);\nconst total = 64 * 1024;\nconsole.log('64KB Linear Memory Page:', total);"
-        )
-    }
-    val logs = remember {
-        mutableStateListOf(
-            "Microsoft Windows [Version 11.0.26100.2033 — WASM64 Edition]",
-            "Node.js v22.11.0-wasm64-win32 & npm 10.9.0 активны.",
-            "Введите команду или запустите код Node.js ниже."
-        )
-    }
-
-    fun runCmd(c: String) {
-        if (c.isBlank()) return
-        runtime.playWindowsPcmSound(523.25, 40)
-        logs.add("PS C:\\Users\\Admin> $c")
-        logs.addAll(runtime.executeTerminalOrNodeCommand(c))
-    }
-
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+private fun SmallNavIconButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    Surface(
+        color = if (enabled) Color(0xFF1E293B) else Color(0xFF0F172A),
+        shape = RoundedCornerShape(8.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155)),
+        modifier = Modifier
+            .size(38.dp)
+            .clickable(enabled = enabled) { onClick() }
     ) {
-        // Quick Commands
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            listOf(
-                "node -v",
-                "npm -v",
-                "node hello_node.js",
-                "npm list",
-                "wasm64 --bench",
-                "systeminfo",
-                "dir",
-                "ver"
-            ).forEach { q ->
-                WinChipButton(text = "▶ $q", onClick = { runCmd(q) })
-            }
-        }
-
-        // Terminal Output
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFF011627))
-                .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.5f), RoundedCornerShape(6.dp))
-                .padding(8.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
-        ) {
-            logs.takeLast(50).forEach { ln ->
-                Text(
-                    text = ln,
-                    color = Color(0xFFE2E8F0),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 7.8.sp,
-                    lineHeight = 10.5.sp
-                )
-            }
-        }
-
-        // Interactive Node.js Script Runner Box
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFF07131B))
-                .border(1.dp, Color(0xFF10B981).copy(alpha = 0.5f), RoundedCornerShape(6.dp))
-                .padding(6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "🟢 Node.js v22.11.0 WASM64 — Интерактивное выполнение JS кода:",
-                    color = Color(0xFF10B981),
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 8.sp
-                )
-                WinChipButton(
-                    text = "▶ Запустить код Node.js",
-                    accent = true,
-                    accentColor = Color(0xFF10B981),
-                    onClick = {
-                        logs.add("PS C:\\Users\\Admin> node -e [JS Buffer]")
-                        logs.addAll(runtime.executeNodeJsScript(jsCodeInput).lines())
-                    }
-                )
-            }
-            WinInputBox(
-                value = jsCodeInput,
-                onValueChange = { jsCodeInput = it },
-                placeholder = "console.log('Hello Node.js!');",
-                singleLine = false,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp)
-            )
-        }
-
-        // Command Input Row
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            WinInputBox(
-                value = cmdInput,
-                onValueChange = { cmdInput = it },
-                placeholder = "PS C:\\> Введите команду (node, npm, dir, systeminfo, wasm64)...",
-                modifier = Modifier.weight(1f)
-            )
-            WinChipButton(
-                text = "Выполнить ⏎",
-                accent = true,
-                onClick = {
-                    val c = cmdInput.trim()
-                    if (c.isNotBlank()) {
-                        runCmd(c)
-                        cmdInput = ""
-                    }
-                }
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = text,
+                color = if (enabled) Color.White else Color(0xFF475569),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold
             )
         }
     }
 }
 
 @Composable
-private fun WinWasmProgramsAndCalcPanel(
-    runtime: Wasm64WindowsRuntime,
-    lastBench: com.winwasm64.engine.Wasm64ExecutionResult,
-    onUpdateBench: (com.winwasm64.engine.Wasm64ExecutionResult) -> Unit
+private fun ExtensionChip(
+    label: String,
+    active: Boolean,
+    activeColor: Color,
+    onClick: () -> Unit
 ) {
-    var calcA by remember { mutableStateOf("1024") }
-    var calcB by remember { mutableStateOf("2048") }
-    var calcC by remember { mutableStateOf("64") }
-    var calcWasmResult by remember {
-        mutableStateOf(runtime.executeWasm64Module(runtime.assembleWasm64AddMulModule(1024L, 2048L, 64L)))
-    }
-    var newFileName by remember { mutableStateOf("app.js") }
-    var newFileContent by remember { mutableStateOf("console.log('Saved on C:\\\\ drive!');") }
-    var filesRevision by remember { mutableIntStateOf(0) }
-    val desktopFiles = remember(filesRevision) {
-        runtime.desktopDir.listFiles()?.map { it.name to it.length() }.orEmpty()
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+    Surface(
+        color = if (active) activeColor.copy(alpha = 0.25f) else Color(0xFF1E293B),
+        shape = RoundedCornerShape(16.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (active) activeColor else Color(0xFF334155)
+        ),
+        modifier = Modifier.clickable { onClick() }
     ) {
-        // 1. 64-Bit WASM64 Calculator & Bytecode Assembler
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFF081426))
-                .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(6.dp))
-                .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            Text(
-                text = "🧮 Инженерный Калькулятор WASM64 (calc.exe) — Компиляция и запуск 64-bit .wasm модуля (A + B) × C:",
-                color = Color(0xFF38BDF8),
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 8.4.sp
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                WinInputBox(value = calcA, onValueChange = { calcA = it }, placeholder = "A (i64)", modifier = Modifier.weight(1f))
-                WinInputBox(value = calcB, onValueChange = { calcB = it }, placeholder = "B (i64)", modifier = Modifier.weight(1f))
-                WinInputBox(value = calcC, onValueChange = { calcC = it }, placeholder = "C (i64)", modifier = Modifier.weight(1f))
-                WinChipButton(
-                    text = "⚡ Вычислить в WASM64",
-                    accent = true,
-                    onClick = {
-                        val a = calcA.toLongOrNull() ?: 0L
-                        val b = calcB.toLongOrNull() ?: 0L
-                        val c = calcC.toLongOrNull() ?: 1L
-                        val mod = runtime.assembleWasm64AddMulModule(a, b, c)
-                        val res = runtime.executeWasm64Module(mod)
-                        calcWasmResult = res
-                        onUpdateBench(res)
-                        runtime.playWindowsPcmSound(740.0, 75)
-                    }
-                )
-            }
-            Text(
-                text = "✓ Результат регистра i64: ${calcWasmResult.returnValueI64} • Заголовок \\0asm: ${calcWasmResult.validMagicHeader} • Memory64: ${calcWasmResult.memory64Addressing}",
-                color = Color(0xFFA7F3D0),
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 8.sp
-            )
-        }
+        Text(
+            text = label,
+            color = if (active) Color.White else Color(0xFF94A3B8),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+        )
+    }
+}
 
-        // 2. Windows Explorer (C:\Users\Admin\Desktop) & Editor
+@Composable
+private fun BottomSectionButton(
+    modifier: Modifier,
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    activeColor: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = modifier.clickable { onClick() },
+        color = if (selected) activeColor.copy(alpha = 0.22f) else Color(0xFF1E293B),
+        shape = RoundedCornerShape(10.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (selected) activeColor else Color(0xFF334155)
+        )
+    ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
-                .background(Color(0xFF07131B))
-                .border(1.dp, Color(0xFF10B981).copy(alpha = 0.6f), RoundedCornerShape(6.dp))
-                .padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp)
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "📁 Проводник Windows 11 (explorer.exe) — C:\\Users\\Admin\\Desktop (${desktopFiles.size} файлов):",
-                color = Color(0xFF10B981),
-                fontFamily = FontFamily.Monospace,
+                text = title,
+                color = Color.White,
+                fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
-                fontSize = 8.4.sp
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
-            desktopFiles.forEach { (name, size) ->
-                Text(
-                    text = "📄 C:\\Users\\Admin\\Desktop\\$name ($size байт)",
-                    color = Color.White,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 7.8.sp
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                WinInputBox(
-                    value = newFileName,
-                    onValueChange = { newFileName = it },
-                    placeholder = "Имя файла (script.js / note.txt)",
-                    modifier = Modifier.weight(1f)
-                )
-                WinChipButton(
-                    text = "💾 Сохранить на диск C:\\",
-                    accent = true,
-                    accentColor = Color(0xFF10B981),
-                    onClick = {
-                        val f = File(runtime.desktopDir, newFileName.ifBlank { "file.txt" })
-                        f.writeText(newFileContent)
-                        filesRevision += 1
-                    }
-                )
-            }
-            WinInputBox(
-                value = newFileContent,
-                onValueChange = { newFileContent = it },
-                placeholder = "Содержимое файла...",
-                singleLine = false,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
+            Text(
+                text = subtitle,
+                color = if (selected) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
