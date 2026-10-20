@@ -416,12 +416,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         val pkg = pendingVpnLaunchPkg
+        BrowsecLocalProxyServer.useBrowsecTunnel = true
         BrowsecVpnService.startForApp(context, browsecCountry, pkg)
         if (!pkg.isNullOrBlank()) {
             nativeAppsManager.launchApp(pkg)
-            Toast.makeText(context, "🛡️ Запущено через Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "🛡️ Запущено через список Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
         } else {
-            Toast.makeText(context, "🛡️ Внутренний сервер Browsec VPN ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "🛡️ Внутренний VPN списка приложений ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -582,20 +583,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
         val wv = tab.webView ?: return
         wv.loadUrl(target)
-    }
-
-    var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
-    val vpnPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            val pkg = pendingVpnLaunchPkg
-            BrowsecLocalProxyServer.useBrowsecTunnel = true
-            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-            if (!pkg.isNullOrBlank()) {
-                nativeAppsManager.launchApp(pkg)
-            }
-        }
     }
 
     /**
