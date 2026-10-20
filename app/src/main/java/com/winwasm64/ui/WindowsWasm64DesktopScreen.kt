@@ -134,6 +134,16 @@ class BrowserTabModel(
     var webView: WebView? = null
 }
 
+/**
+ * Process-wide vault that keeps live WebView tabs, scroll state, and active tab index intact
+ * across Activity recreation, screen lock, and app switching so pages NEVER reset on reopen.
+ */
+object BrowserSessionVault {
+    val tabs = mutableStateListOf<BrowserTabModel>()
+    var activeTabIndex by mutableIntStateOf(0)
+    var initialized = false
+}
+
 private val AD_DOMAINS = setOf(
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
     "adservice.google.com", "pagead2.googlesyndication.com", "adnxs.com",
@@ -220,16 +230,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var proxyInterceptBrowser by remember { mutableStateOf(prefs.getBoolean("tunnel_proxy_active_v30", true)) }
     var trafficSnapshot by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
 
-    LaunchedEffect(Unit) {
-        BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
-        BrowsecLocalProxyServer.ensureRunning()
-        BrowsecLocalProxyServer.applyWebViewProxy(proxyInterceptBrowser)
-        while (true) {
-            trafficSnapshot = BrowsecLocalProxyServer.sampleTraffic()
-            delay(500)
-        }
-    }
-
     // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Browsec VPN
     var currentSection by remember { mutableIntStateOf(0) }
 
@@ -242,42 +242,110 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     var browsecEnabled by remember { mutableStateOf(prefs.getBoolean("browsec_on", true)) }
+    var browsecPaused by remember { mutableStateOf(prefs.getBoolean("browsec_paused", false)) }
     var browsecCountry by remember { mutableStateOf(prefs.getString("browsec_country", "DE") ?: "DE") }
+    var disconnectOnClose by remember { mutableStateOf(prefs.getBoolean("disconnect_on_close", true)) }
+    var searchEngine by remember { mutableStateOf(prefs.getString("search_engine", "Google") ?: "Google") }
+    var textZoomPercent by remember { mutableIntStateOf(prefs.getInt("text_zoom_pct", 100)) }
+    var dohServer by remember { mutableStateOf(prefs.getString("doh_server", "1.1.1.1") ?: "1.1.1.1") }
+    var blockThirdPartyCookies by remember { mutableStateOf(prefs.getBoolean("block_3p_cookies", false)) }
+    var doNotTrackEnabled by remember { mutableStateOf(prefs.getBoolean("dnt_enabled", true)) }
+    var homePageUrl by remember { mutableStateOf(prefs.getString("home_page_url", "https://www.google.com") ?: "https://www.google.com") }
     var darkReaderEnabled by remember { mutableStateOf(prefs.getBoolean("dark_reader", false)) }
     var youtubeBoostEnabled by remember { mutableStateOf(prefs.getBoolean("yt_boost", true)) }
     var devToolsEnabled by remember { mutableStateOf(false) }
     var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
+    var longPressedUrl by remember { mutableStateOf<String?>(null) }
+    var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
+    var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        if (browsecEnabled) {
+            BrowsecVpnService.startForApp(context, browsecCountry, null)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        BrowsecVpnService.isRunning = browsecEnabled
+        BrowsecVpnService.isPaused = browsecPaused
+        BrowsecVpnService.activeCountry = browsecCountry
+        BrowsecVpnService.disconnectOnAppClose = disconnectOnClose
+        BrowsecLocalProxyServer.dohProvider = dohServer
+        BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
+        if (browsecEnabled) {
+            BrowsecLocalProxyServer.ensureRunning()
+            BrowsecLocalProxyServer.applyWebViewProxy(!browsecPaused && proxyInterceptBrowser)
+            if (Build.VERSION.SDK_INT >= 33) {
+                notifPermLauncher.launch("android.permission.POST_NOTIFICATIONS")
+            } else {
+                if (browsecPaused) BrowsecVpnService.pauseTunnel(context)
+                else BrowsecVpnService.startForApp(context, browsecCountry, null)
+            }
+        }
+        while (true) {
+            trafficSnapshot = BrowsecLocalProxyServer.sampleTraffic()
+            // Sync live Notification Shade button actions (Pause / Resume / Switch Country / Stop) back into UI!
+            if (BrowsecVpnService.activeCountry != browsecCountry) {
+                browsecCountry = BrowsecVpnService.activeCountry
+            }
+            if (BrowsecVpnService.isPaused != browsecPaused) {
+                browsecPaused = BrowsecVpnService.isPaused
+            }
+            if (BrowsecVpnService.isRunning != browsecEnabled) {
+                browsecEnabled = BrowsecVpnService.isRunning
+            }
+            delay(500)
+        }
+    }
 
     // Sync Browsec state into BitTorrentEngine and WebView ProxyController
-    LaunchedEffect(browsecEnabled, browsecCountry, proxyInterceptBrowser) {
+    LaunchedEffect(browsecEnabled, browsecPaused, browsecCountry, proxyInterceptBrowser) {
         val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
-        torrentEngine.useBrowsecVpn = browsecEnabled
+        torrentEngine.useBrowsecVpn = browsecEnabled && !browsecPaused
         torrentEngine.browsecCountryCode = node.code
         torrentEngine.browsecEdgeIp = node.edgeIp
-        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && proxyInterceptBrowser)
+        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && !browsecPaused && proxyInterceptBrowser)
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
 
     val tabs = remember {
-        val savedUrls = prefs.getString("saved_tab_urls", null)
-            ?.split("\n")
-            ?.filter {
-                it.isNotBlank() &&
-                    !it.contains("piped.video") &&
-                    !it.startsWith("file:") &&
-                    !it.contains("translate.google") &&
-                    !it.contains("translate.goog")
-            }
-            ?.takeIf { it.isNotEmpty() }
-            ?: listOf("https://www.google.com", "https://m.youtube.com")
-        mutableStateListOf<BrowserTabModel>().apply {
+        if (!BrowserSessionVault.initialized || BrowserSessionVault.tabs.isEmpty()) {
+            val savedUrls = prefs.getString("saved_tab_urls", null)
+                ?.split("\n")
+                ?.filter {
+                    it.isNotBlank() &&
+                        !it.contains("piped.video") &&
+                        !it.startsWith("file:") &&
+                        !it.contains("translate.google") &&
+                        !it.contains("translate.goog")
+                }
+                ?.takeIf { it.isNotEmpty() }
+                ?: listOf("https://www.google.com", "https://m.youtube.com")
+            BrowserSessionVault.tabs.clear()
             savedUrls.forEachIndexed { idx, u ->
-                add(BrowserTabModel(id = "tab_${idx}_${System.currentTimeMillis()}", initialUrl = u, initialTitle = if (u.contains("youtube")) "YouTube" else "Google"))
+                BrowserSessionVault.tabs.add(
+                    BrowserTabModel(
+                        id = "tab_${idx}_${System.currentTimeMillis()}",
+                        initialUrl = u,
+                        initialTitle = if (u.contains("youtube")) "YouTube" else "Google"
+                    )
+                )
             }
+            BrowserSessionVault.activeTabIndex = prefs.getInt("active_tab_idx", 0)
+                .coerceIn(0, (BrowserSessionVault.tabs.size - 1).coerceAtLeast(0))
+            BrowserSessionVault.initialized = true
         }
+        BrowserSessionVault.tabs
     }
-    var activeTabIndex by remember { mutableIntStateOf(prefs.getInt("active_tab_idx", 0).coerceIn(0, (tabs.size - 1).coerceAtLeast(0))) }
+    var activeTabIndex by remember {
+        mutableIntStateOf(BrowserSessionVault.activeTabIndex.coerceIn(0, (tabs.size - 1).coerceAtLeast(0)))
+    }
+    LaunchedEffect(activeTabIndex) {
+        BrowserSessionVault.activeTabIndex = activeTabIndex
+    }
     val activeTab = tabs.getOrNull(activeTabIndex.coerceIn(0, (tabs.size - 1).coerceAtLeast(0))) ?: tabs.first()
 
     var addressInput by remember(activeTab.id, activeTab.url) { mutableStateOf(activeTab.url) }
@@ -311,20 +379,32 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     fun persistBrowserSettings() {
+        val currentUrls = tabs.map { t ->
+            val liveUrl = t.webView?.url
+            if (!liveUrl.isNullOrBlank() && liveUrl != "about:blank") liveUrl else t.url
+        }
         prefs.edit()
             .putBoolean("adblock_on", adBlockEnabled)
             .putInt("adblock_count", adBlockedCount)
             .putBoolean("browsec_on", browsecEnabled)
+            .putBoolean("browsec_paused", browsecPaused)
             .putString("browsec_country", browsecCountry)
+            .putBoolean("disconnect_on_close", disconnectOnClose)
+            .putString("search_engine", searchEngine)
+            .putInt("text_zoom_pct", textZoomPercent)
+            .putString("doh_server", dohServer)
+            .putBoolean("block_3p_cookies", blockThirdPartyCookies)
+            .putBoolean("dnt_enabled", doNotTrackEnabled)
+            .putString("home_page_url", homePageUrl)
             .putBoolean("dark_reader", darkReaderEnabled)
             .putBoolean("yt_boost", youtubeBoostEnabled)
             .putBoolean("desktop_mode", desktopMode)
-            .putString("saved_tab_urls", tabs.joinToString("\n") { it.url })
+            .putString("saved_tab_urls", currentUrls.joinToString("\n"))
             .putInt("active_tab_idx", activeTabIndex)
             .putString("saved_history", historyList.take(100).joinToString("\n"))
             .putStringSet("custom_ad_domains", customBlockedDomains.toSet())
             .putStringSet("vpn_routed_apps", vpnRoutedApps.toSet())
-            .apply()
+            .commit()
     }
 
     var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
@@ -395,7 +475,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     fun normalizeInputToUrl(raw: String): String {
         val trimmed = raw.trim()
-        if (trimmed.isEmpty()) return "https://www.google.com"
+        if (trimmed.isEmpty()) return homePageUrl
         if (trimmed.startsWith("magnet:", ignoreCase = true)) return trimmed
         if (trimmed.startsWith("http://", ignoreCase = true) ||
             trimmed.startsWith("https://", ignoreCase = true) ||
@@ -404,7 +484,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         return if (trimmed.contains(".") && !trimmed.contains(" ")) {
             "https://$trimmed"
         } else {
-            "https://www.google.com/search?q=${Uri.encode(trimmed)}"
+            val q = Uri.encode(trimmed)
+            when (searchEngine) {
+                "Яндекс" -> "https://ya.ru/search/?text=$q"
+                "DuckDuckGo" -> "https://duckduckgo.com/?q=$q"
+                "Bing" -> "https://www.bing.com/search?q=$q"
+                "Brave" -> "https://search.brave.com/search?q=$q"
+                else -> "https://www.google.com/search?q=$q"
+            }
         }
     }
 
@@ -530,7 +617,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     fun ensureTabWebView(tab: BrowserTabModel): WebView {
-        tab.webView?.let { return it }
+        tab.webView?.let { existing ->
+            val oldParent = existing.parent as? ViewGroup
+            if (oldParent != webViewContainer) {
+                oldParent?.removeView(existing)
+                webViewContainer.addView(existing)
+            }
+            existing.settings.textZoom = textZoomPercent
+            CookieManager.getInstance().setAcceptThirdPartyCookies(existing, !blockThirdPartyCookies)
+            return existing
+        }
         val wv = WebView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -545,13 +641,26 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             settings.allowContentAccess = true
             settings.builtInZoomControls = true
             settings.displayZoomControls = false
+            settings.setSupportZoom(true)
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
             settings.setSupportMultipleWindows(false)
             settings.cacheMode = WebSettings.LOAD_DEFAULT
+            settings.textZoom = textZoomPercent
 
             CookieManager.getInstance().setAcceptCookie(true)
-            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, !blockThirdPartyCookies)
+
+            setOnLongClickListener {
+                val hit = hitTestResult
+                val extra = hit.extra
+                if (!extra.isNullOrBlank() && (extra.startsWith("http") || extra.startsWith("magnet:"))) {
+                    longPressedUrl = extra
+                    true
+                } else {
+                    false
+                }
+            }
 
             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
                 if (url.startsWith("magnet:", ignoreCase = true) ||
@@ -603,6 +712,22 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (!title.isNullOrBlank()) {
                         tab.title = title
                     }
+                }
+
+                override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                    if (view != null) {
+                        fullscreenCustomView = view
+                        fullscreenCallback = callback
+                    } else {
+                        super.onShowCustomView(view, callback)
+                    }
+                }
+
+                override fun onHideCustomView() {
+                    fullscreenCustomView = null
+                    fullscreenCallback?.onCustomViewHidden()
+                    fullscreenCallback = null
+                    super.onHideCustomView()
                 }
             }
 
@@ -677,6 +802,19 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             historyList.removeAll { it.endsWith("| $url") || it == url }
                             historyList.add(0, entry)
                         }
+                        persistBrowserSettings()
+                    }
+                }
+
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    if (!url.isNullOrBlank() && url != "about:blank") {
+                        tab.url = url
+                        if (tab == tabs.getOrNull(activeTabIndex)) {
+                            addressInput = url
+                        }
+                        tab.canGoBack = view?.canGoBack() == true
+                        tab.canGoForward = view?.canGoForward() == true
                         persistBrowserSettings()
                     }
                 }
@@ -1145,6 +1283,60 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     ) {
                         activeExtensionPopup = if (activeExtensionPopup == "find") null else "find"
                     }
+
+                    ExtensionChip(
+                        label = "⚙️ Настройки",
+                        active = activeExtensionPopup == "settings",
+                        activeColor = Color(0xFF0EA5E9)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "settings") null else "settings"
+                    }
+                }
+
+                // Long-press Link / Image Context Dialog
+                if (longPressedUrl != null) {
+                    val targetLink = longPressedUrl ?: ""
+                    Surface(
+                        color = Color(0xFF0F172A),
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                        modifier = Modifier.fillMaxWidth().padding(6.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("🔗 Ссылка: $targetLink", color = Color(0xFF38BDF8), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Button(onClick = {
+                                    tabs.add(BrowserTabModel(id = "tab_${System.currentTimeMillis()}", initialUrl = targetLink, initialTitle = "Вкладка"))
+                                    activeTabIndex = tabs.size - 1
+                                    persistBrowserSettings()
+                                    longPressedUrl = null
+                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))) {
+                                    Text("➕ В новой вкладке", fontSize = 11.sp, color = Color.White)
+                                }
+                                Button(onClick = {
+                                    tabs.add(BrowserTabModel(id = "incog_${System.currentTimeMillis()}", initialUrl = targetLink, initialTitle = "🕶 Инкогнито", isIncognito = true))
+                                    activeTabIndex = tabs.size - 1
+                                    longPressedUrl = null
+                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))) {
+                                    Text("🕶 В Инкогнито", fontSize = 11.sp, color = Color.White)
+                                }
+                                Button(onClick = {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                    cm.setPrimaryClip(android.content.ClipData.newPlainText("URL", targetLink))
+                                    Toast.makeText(context, "📋 Ссылка скопирована", Toast.LENGTH_SHORT).show()
+                                    longPressedUrl = null
+                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))) {
+                                    Text("📋 Копировать", fontSize = 11.sp, color = Color.White)
+                                }
+                                OutlinedButton(onClick = { longPressedUrl = null }) {
+                                    Text("✕ Закрыть", fontSize = 11.sp, color = Color.White)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // 5. Interactive Extension Popups (With Crisp Non-Clipped Inputs)
@@ -1269,19 +1461,78 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Button(
                                             onClick = {
+                                                if (browsecPaused || !browsecEnabled) {
+                                                    // Resume on the EXACT same VPN country that was active before pause!
+                                                    browsecEnabled = true
+                                                    browsecPaused = false
+                                                    proxyInterceptBrowser = true
+                                                    BrowsecVpnService.resumeTunnel(context)
+                                                    persistBrowserSettings()
+                                                    Toast.makeText(context, "▶ Сервер продолжил работу на том же VPN ($browsecCountry)!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    // Pause: detach from app & browser while keeping activeCountry ready
+                                                    browsecPaused = true
+                                                    BrowsecVpnService.pauseTunnel(context)
+                                                    persistBrowserSettings()
+                                                    Toast.makeText(context, "⏸ VPN поставлен на паузу (отсоединён от приложений, сервер $browsecCountry сохранён)", Toast.LENGTH_SHORT).show()
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = if (browsecPaused || !browsecEnabled) Color(0xFF059669) else Color(0xFFD97706)
+                                            )
+                                        ) {
+                                            Text(
+                                                if (browsecPaused || !browsecEnabled) "▶ Старт ($browsecCountry — тот же VPN)" else "⏸ Пауза (Отсоединить)",
+                                                fontSize = 11.sp,
+                                                color = Color.White
+                                            )
+                                        }
+                                        Button(
+                                            onClick = {
+                                                val nextCode = BrowsecVpnService.cycleCountry(context)
+                                                browsecCountry = nextCode
                                                 browsecEnabled = true
+                                                browsecPaused = false
+                                                persistBrowserSettings()
+                                                Toast.makeText(context, "🌐 Сервер переключён на $nextCode", Toast.LENGTH_SHORT).show()
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                        ) {
+                                            Text("🌐 Сменить сервер ($browsecCountry ↻)", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                browsecEnabled = false
+                                                browsecPaused = false
+                                                BrowsecVpnService.stop(context)
+                                                persistBrowserSettings()
+                                                Toast.makeText(context, "⏹ Локальный сервер и VPN полностью выключены", Toast.LENGTH_SHORT).show()
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                                        ) {
+                                            Text("⏹ Выключить", fontSize = 11.sp, color = Color.White)
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Button(
+                                            onClick = {
+                                                browsecEnabled = true
+                                                browsecPaused = false
                                                 val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
                                                 if (prep != null) {
                                                     pendingVpnLaunchPkg = null
                                                     vpnPermissionLauncher.launch(prep)
                                                 } else {
                                                     BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                                    Toast.makeText(context, "🛡️ Локальный VPN-Туннель (127.0.0.1:${trafficSnapshot.proxyPort}) активен!", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(context, "🛡️ Управление VPN добавлено в шторку уведомлений ($browsecCountry)!", Toast.LENGTH_SHORT).show()
                                                 }
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                                         ) {
-                                            Text("🛡️ Включить VPN-Туннель для Приложений ($browsecCountry)", fontSize = 11.sp, color = Color.White)
+                                            Text("🛡️ Шторка Уведомлений + Туннель Приложений (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1290,8 +1541,25 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                         ) {
-                                            Text("📱 Приложения в Туннеле (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                            Text("📱 Выбрать Приложения (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "Отключать локальный сервер при закрытии АПК (и работать строго только со списком приложений)",
+                                            color = Color(0xFF94A3B8),
+                                            fontSize = 10.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Switch(checked = disconnectOnClose, onCheckedChange = {
+                                            disconnectOnClose = it
+                                            BrowsecVpnService.disconnectOnAppClose = it
+                                            persistBrowserSettings()
+                                        })
                                     }
                                 }
 
@@ -1466,6 +1734,108 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }
                                     }
                                 }
+
+                                "settings" -> {
+                                    Text("⚙️ Основные Настройки Браузера и Приватности", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    // 1. Search Engine Selector
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("🔍 Поиск:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        listOf("Google", "Яндекс", "DuckDuckGo", "Bing", "Brave").forEach { eng ->
+                                            val sel = searchEngine == eng
+                                            Surface(
+                                                color = if (sel) Color(0xFF0284C7) else Color(0xFF0F172A),
+                                                shape = RoundedCornerShape(6.dp),
+                                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                                                modifier = Modifier.clickable {
+                                                    searchEngine = eng
+                                                    persistBrowserSettings()
+                                                }
+                                            ) {
+                                                Text(eng, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                                            }
+                                        }
+                                    }
+                                    // 2. Text Zoom Selector
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("🔠 Масштаб:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        listOf(75, 100, 115, 130, 150, 175).forEach { pct ->
+                                            val sel = textZoomPercent == pct
+                                            Surface(
+                                                color = if (sel) Color(0xFF059669) else Color(0xFF0F172A),
+                                                shape = RoundedCornerShape(6.dp),
+                                                modifier = Modifier.clickable {
+                                                    textZoomPercent = pct
+                                                    tabs.forEach { it.webView?.settings?.textZoom = pct }
+                                                    persistBrowserSettings()
+                                                }
+                                            ) {
+                                                Text("$pct%", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                                            }
+                                        }
+                                    }
+                                    // 3. DoH Resolver
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("🛡 DoH DNS:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        listOf("1.1.1.1" to "Cloudflare 1.1.1.1", "8.8.8.8" to "Google 8.8.8.8", "9.9.9.9" to "Quad9 9.9.9.9").forEach { (ip, label) ->
+                                            val sel = dohServer == ip
+                                            Surface(
+                                                color = if (sel) Color(0xFF7C3AED) else Color(0xFF0F172A),
+                                                shape = RoundedCornerShape(6.dp),
+                                                modifier = Modifier.clickable {
+                                                    dohServer = ip
+                                                    BrowsecLocalProxyServer.dohProvider = ip
+                                                    persistBrowserSettings()
+                                                }
+                                            ) {
+                                                Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                                            }
+                                        }
+                                    }
+                                    // 4. Privacy & Offline Page Tools
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Button(onClick = {
+                                            homePageUrl = activeTab.url
+                                            persistBrowserSettings()
+                                            Toast.makeText(context, "🏠 Домашняя страница: $homePageUrl", Toast.LENGTH_SHORT).show()
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))) {
+                                            Text("🏠 Сделать Домашней", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(onClick = {
+                                            try {
+                                                val dir = torrentEngine.getDownloadDirectory()
+                                                val mhtFile = File(dir, "page_${System.currentTimeMillis()}.mht")
+                                                activeTab.webView?.saveWebArchive(mhtFile.absolutePath)
+                                                Toast.makeText(context, "📄 Сохранено офлайн: ${mhtFile.name}", Toast.LENGTH_LONG).show()
+                                            } catch (_: Exception) {
+                                            }
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))) {
+                                            Text("📄 Сохранить страницу (.MHT)", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(onClick = {
+                                            activeTab.webView?.clearCache(true)
+                                            CookieManager.getInstance().removeAllCookies(null)
+                                            CookieManager.getInstance().flush()
+                                            Toast.makeText(context, "🗑 Кэш и Cookies очищены!", Toast.LENGTH_SHORT).show()
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))) {
+                                            Text("🗑 Очистить Кэш и Cookies", fontSize = 11.sp, color = Color.White)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1511,8 +1881,36 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== PERSISTENT WEBVIEW CONTAINER =====================
+            if (fullscreenCustomView != null) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
+                    AndroidView(
+                        factory = { ctx ->
+                            FrameLayout(ctx).apply {
+                                val v = fullscreenCustomView
+                                if (v != null) {
+                                    (v.parent as? ViewGroup)?.removeView(v)
+                                    addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    Button(
+                        onClick = {
+                            fullscreenCustomView = null
+                            fullscreenCallback?.onCustomViewHidden()
+                            fullscreenCallback = null
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC0F172A)),
+                        modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+                    ) {
+                        Text("✕ Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+
             Box(
-                modifier = if (currentSection == 0) {
+                modifier = if (currentSection == 0 && fullscreenCustomView == null) {
                     Modifier.weight(1f).fillMaxWidth()
                 } else {
                     Modifier.size(0.dp)

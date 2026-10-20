@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.ProxyInfo
 import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
@@ -47,26 +48,20 @@ data class TrafficSnapshot(
     val proxyPort: Int,
     val webViewInterceptActive: Boolean,
     val systemVpnActive: Boolean,
-    val loadedAssetPackMb: Int = 52
+    val isPaused: Boolean,
+    val activeCountry: String,
+    val loadedAssetPackMb: Int = 54
 )
 
 /**
- * Local High-Speed Anti-DPI Tunnel & Proxy Server (127.0.0.1:8899).
- *
- * - Binds synchronously to 127.0.0.1:8899 so port races (e.g. 37213) never occur.
- * - Resolves domains via direct-IP DNS-over-HTTPS (https://1.1.1.1/dns-query & https://8.8.8.8/resolve)
- *   plus verified Google Global Cache / Frontend edge IPs for YouTube.
- * - Slices TLS ClientHello right across the SNI hostname ("m.youtube.com" -> 6 separate TLS records)
- *   and flushes each record with TCP_NODELAY so ISP DPI (ТСПУ) cannot pattern-match the SNI.
- * - Verifies that the upstream server sends back a TLS ServerHello within 3.2 seconds; if DPI drops
- *   the first attempt, automatically replays the ClientHello on a backup edge IP with 2-byte micro-records.
- * - Measures 100% real incoming (RX) and outgoing (TX) bytes across both proxy sockets and device interfaces.
+ * High-Speed Local Anti-DPI Tunnel & Proxy Server (127.0.0.1:8899).
  */
 object BrowsecLocalProxyServer {
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
     private val dnsCache = ConcurrentHashMap<String, List<String>>()
+    private val openClientSockets = CopyOnWriteArraySet<Socket>()
 
     @Volatile
     var activePort: Int = 8899
@@ -74,6 +69,9 @@ object BrowsecLocalProxyServer {
 
     @Volatile
     var antiDpiSplitEnabled: Boolean = true
+
+    @Volatile
+    var dohProvider: String = "1.1.1.1" // "1.1.1.1", "8.8.8.8", "9.9.9.9"
 
     @Volatile
     var webViewProxyApplied: Boolean = false
@@ -104,7 +102,6 @@ object BrowsecLocalProxyServer {
     var currentTxSpeedBps: Long = 0L
         private set
 
-    // Verified unblocked Google / YouTube Anycast Frontend IPs (valid for *.youtube.com, m.youtube.com, youtu.be)
     private val YOUTUBE_EDGE_IPS = listOf(
         "142.250.185.174",
         "172.217.16.142",
@@ -133,7 +130,7 @@ object BrowsecLocalProxyServer {
                         val lines = conn.inputStream.bufferedReader().readLines()
                             .map { it.trim() }
                             .filter { it.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+")) }
-                            .take(35)
+                            .take(30)
                         for (candidate in lines) {
                             executor.execute {
                                 try {
@@ -162,20 +159,7 @@ object BrowsecLocalProxyServer {
                 loadedBundleBytes = afd.length
                 afd.close()
             } catch (_: Exception) {
-                try {
-                    val inp = context.assets.open("omni_antidpi_bundle.pak")
-                    val buf = ByteArray(65536)
-                    var total = 0L
-                    while (true) {
-                        val n = inp.read(buf)
-                        if (n <= 0) break
-                        total += n
-                    }
-                    inp.close()
-                    loadedBundleBytes = total
-                } catch (_: Exception) {
-                    loadedBundleBytes = 54L * 1024L * 1024L
-                }
+                loadedBundleBytes = 54L * 1024L * 1024L
             }
         }
     }
@@ -201,7 +185,6 @@ object BrowsecLocalProxyServer {
 
         val uidDeltaRx = (rawUidRx - baseUidRx).coerceAtLeast(0L)
         val uidDeltaTx = (rawUidTx - baseUidTx).coerceAtLeast(0L)
-        // WebView runs in an isolated sandboxed UID on Android 11+, so device total delta captures WebView QUIC/TCP too
         val devDeltaRx = (rawDevRx - baseTotalRx).coerceAtLeast(0L)
         val devDeltaTx = (rawDevTx - baseTotalTx).coerceAtLeast(0L)
         val tunRx = tunnelRxBytes.get()
@@ -228,23 +211,21 @@ object BrowsecLocalProxyServer {
         return TrafficSnapshot(
             rxBytesTotal = totalRx,
             txBytesTotal = totalTx,
-            rxSpeedBytesPerSec = currentRxSpeedBps,
-            txSpeedBytesPerSec = currentTxSpeedBps,
+            rxSpeedBytesPerSec = if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) 0L else currentRxSpeedBps,
+            txSpeedBytesPerSec = if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) 0L else currentTxSpeedBps,
             tunnelRxBytes = tunRx,
             tunnelTxBytes = tunTx,
             activeSockets = activeConnections.get(),
             interceptedRequests = interceptedRequests.get(),
             proxyPort = activePort,
             webViewInterceptActive = webViewProxyApplied,
-            systemVpnActive = BrowsecVpnService.isRunning,
+            systemVpnActive = BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused,
+            isPaused = BrowsecVpnService.isPaused,
+            activeCountry = BrowsecVpnService.activeCountry,
             loadedAssetPackMb = packMb
         )
     }
 
-    /**
-     * Synchronously binds ServerSocket on 127.0.0.1:8899 before returning so two threads
-     * NEVER race and bind a second ephemeral port (like 37213).
-     */
     @Synchronized
     fun ensureRunning(): Int {
         val existing = serverSocket
@@ -270,10 +251,39 @@ object BrowsecLocalProxyServer {
         return activePort
     }
 
+    /**
+     * Cleanly shuts down the local server socket and disconnects all active client sockets
+     * when the user turns off the server or closes the APK.
+     */
+    @Synchronized
+    fun shutdown() {
+        running.set(false)
+        applyWebViewProxy(false)
+        try {
+            serverSocket?.close()
+        } catch (_: Exception) {
+        }
+        serverSocket = null
+        for (s in openClientSockets) {
+            try {
+                s.close()
+            } catch (_: Exception) {
+            }
+        }
+        openClientSockets.clear()
+        activeConnections.set(0)
+    }
+
     private fun acceptLoop(ss: ServerSocket) {
         while (running.get() && !ss.isClosed) {
             try {
                 val client = ss.accept()
+                if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) {
+                    // When paused or stopped, reject proxy connections so apps are disconnected from tunnel
+                    try { client.close() } catch (_: Exception) {}
+                    continue
+                }
+                openClientSockets.add(client)
                 executor.execute { handleClient(client) }
             } catch (_: Exception) {
                 if (!running.get() || ss.isClosed) break
@@ -281,20 +291,16 @@ object BrowsecLocalProxyServer {
         }
     }
 
-    /**
-     * Routes Chromium WebView through 127.0.0.1:8899 (which also disables UDP QUIC so
-     * all TLS handshakes pass through our SNI-slicing anti-DPI engine).
-     */
     fun applyWebViewProxy(enabled: Boolean) {
-        val port = ensureRunning()
+        if (enabled) ensureRunning()
         try {
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
                 webViewProxyApplied = false
                 return
             }
-            if (enabled) {
+            if (enabled && !BrowsecVpnService.isPaused && BrowsecVpnService.isRunning) {
                 val proxyConfig = ProxyConfig.Builder()
-                    .addProxyRule("http://127.0.0.1:$port")
+                    .addProxyRule("http://127.0.0.1:$activePort")
                     .addBypassRule("localhost")
                     .addBypassRule("127.0.0.1")
                     .build()
@@ -316,12 +322,6 @@ object BrowsecLocalProxyServer {
         }
     }
 
-    /**
-     * Resolves candidate IPv4 addresses for [host] using:
-     * 1. Direct-IP DNS-over-HTTPS (https://1.1.1.1/dns-query & https://8.8.8.8/resolve) so ISP DNS cannot poison it.
-     * 2. System DNS fallback.
-     * 3. Verified Google/YouTube edge IPs for YouTube domains.
-     */
     fun resolveHostCandidates(host: String): List<String> {
         val clean = host.trim().lowercase()
         if (clean.isEmpty()) return listOf(host)
@@ -337,12 +337,18 @@ object BrowsecLocalProxyServer {
             clean == "youtu.be" ||
             clean.endsWith(".youtube.com")
 
-        // 1. Direct-IP DoH (Cloudflare 1.1.1.1 & Google 8.8.8.8) — no DNS needed to reach DoH!
+        val primaryDoh = when (dohProvider) {
+            "8.8.8.8" -> "https://8.8.8.8/resolve?name=$clean&type=A"
+            "9.9.9.9" -> "https://9.9.9.9:5053/dns-query?name=$clean&type=A"
+            else -> "https://1.1.1.1/dns-query?name=$clean&type=A"
+        }
         val dohUrls = listOf(
-            "https://1.1.1.1/dns-query?name=$clean&type=A" to "cloudflare-dns.com",
-            "https://8.8.8.8/resolve?name=$clean&type=A" to "dns.google"
-        )
-        for ((dohUrl, _) in dohUrls) {
+            primaryDoh,
+            "https://1.1.1.1/dns-query?name=$clean&type=A",
+            "https://8.8.8.8/resolve?name=$clean&type=A"
+        ).distinct()
+
+        for (dohUrl in dohUrls) {
             try {
                 val conn = (URL(dohUrl).openConnection(java.net.Proxy.NO_PROXY) as HttpsURLConnection).apply {
                     connectTimeout = 1800
@@ -375,7 +381,6 @@ object BrowsecLocalProxyServer {
             }
         }
 
-        // 2. System DNS
         try {
             val all = InetAddress.getAllByName(clean)
             for (addr in all) {
@@ -389,7 +394,6 @@ object BrowsecLocalProxyServer {
         } catch (_: Exception) {
         }
 
-        // 3. Append verified Google Anycast edge IPs for YouTube hosts
         if (isYouTubeHost) {
             results.addAll(YOUTUBE_EDGE_IPS)
         }
@@ -399,8 +403,9 @@ object BrowsecLocalProxyServer {
         return list
     }
 
-    private fun openOutboundSocketToIp(ipOrHost: String, port: Int, timeoutMs: Int = 4500): Socket {
+    private fun openOutboundSocketToIp(ipOrHost: String, port: Int, timeoutMs: Int = 4000): Socket {
         val sock = Socket()
+        BrowsecVpnService.protectSocket(sock)
         sock.tcpNoDelay = true
         sock.keepAlive = true
         sock.soTimeout = 25_000
@@ -413,7 +418,7 @@ object BrowsecLocalProxyServer {
         var lastErr: Exception? = null
         for (ip in candidates.take(4)) {
             try {
-                return openOutboundSocketToIp(ip, port, timeoutMs = 4000)
+                return openOutboundSocketToIp(ip, port, timeoutMs = 3800)
             } catch (e: Exception) {
                 lastErr = e
             }
@@ -421,11 +426,6 @@ object BrowsecLocalProxyServer {
         throw (lastErr ?: java.io.IOException("Unable to connect to $host:$port"))
     }
 
-    /**
-     * Slices a TLS ClientHello record (0x16 0x03 ...) into multiple valid TLS Handshake records
-     * right through the SNI domain name so DPI boxes never see the complete domain string in any
-     * TLS record or TCP segment.
-     */
     fun buildSniSplitTlsRecords(buf: ByteArray, len: Int, microSplit: Boolean = false): List<ByteArray> {
         if (len <= 10 || buf[0] != 0x16.toByte() || buf[1] != 0x03.toByte()) {
             return listOf(buf.copyOfRange(0, len))
@@ -439,19 +439,15 @@ object BrowsecLocalProxyServer {
 
         val payload = buf.copyOfRange(5, 5 + recPayloadLen)
         val cutPoints = sortedSetOf<Int>()
-
-        // Always cut after first 2 bytes of handshake header (ByeDPI disorder style)
         cutPoints.add(2)
 
         if (microSplit) {
-            // Ultra-fine 2-byte TLS record slicing across the entire SNI / extensions region
             var pos = 4
             while (pos < payload.size && cutPoints.size < 45) {
                 cutPoints.add(pos)
                 pos += if (pos in 80..260) 2 else 16
             }
         } else {
-            // Locate ASCII domain bytes inside ClientHello payload and slice every 2-3 chars
             var asciiRunStart = -1
             var i = 38
             while (i < payload.size) {
@@ -513,7 +509,6 @@ object BrowsecLocalProxyServer {
             System.arraycopy(payload, prev, rec, 5, fragLen)
             chunks.add(rec)
         }
-        // If there were trailing bytes after the first TLS record, append them as a final chunk
         if (5 + recPayloadLen < len) {
             chunks.add(buf.copyOfRange(5 + recPayloadLen, len))
         }
@@ -623,16 +618,12 @@ object BrowsecLocalProxyServer {
             }
         } catch (_: Exception) {
         } finally {
+            openClientSockets.remove(client)
             activeConnections.decrementAndGet()
             try { client.close() } catch (_: Exception) {}
         }
     }
 
-    /**
-     * Handles HTTP CONNECT (port 443) with SNI-slicing TLS Record Desync AND ServerHello verification.
-     * If candidate IP #1 drops the ClientHello (ISP DPI blackhole), automatically replays the
-     * ClientHello on candidate IP #2 using 2-byte micro-record fragmentation!
-     */
     private fun handleHttpsConnectWithAntiDpiFallback(
         host: String,
         port: Int,
@@ -653,13 +644,11 @@ object BrowsecLocalProxyServer {
         }
         val firstSock = initialUpstream ?: return
 
-        // Reply 200 Connection Established to Chromium so it immediately sends TLS ClientHello
         val establishedBytes = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
         clientOut.write(establishedBytes)
         clientOut.flush()
         tunnelRxBytes.addAndGet(establishedBytes.size.toLong())
 
-        // Read the first packet (TLS ClientHello) from Chromium
         val helloBuf = ByteArray(16384)
         val helloLen = try {
             clientIn.read(helloBuf)
@@ -675,7 +664,6 @@ object BrowsecLocalProxyServer {
         var activeUpstream: Socket = firstSock
         var serverHelloFirstByte: Int = -1
 
-        // Attempt 1: Send SNI-sliced TLS records and verify ServerHello arrives within 3.2s
         try {
             val upOut = activeUpstream.getOutputStream()
             if (antiDpiSplitEnabled && port == 443) {
@@ -695,7 +683,6 @@ object BrowsecLocalProxyServer {
             serverHelloFirstByte = -1
         }
 
-        // Attempt 2: If ISP DPI dropped the first attempt, replay ClientHello with 2-byte micro-records on next edge IP!
         if (serverHelloFirstByte == -1) {
             try { activeUpstream.close() } catch (_: Exception) {}
             val nextIp = candidates.getOrNull(usedCandidateIdx + 1) ?: candidates.firstOrNull() ?: host
@@ -715,7 +702,6 @@ object BrowsecLocalProxyServer {
             }
         }
 
-        // Attempt 3: If direct IP range is completely blocked by ISP, tunnel through verified remote upstream node!
         if (serverHelloFirstByte == -1 && verifiedUpstreamProxies.isNotEmpty()) {
             try { activeUpstream.close() } catch (_: Exception) {}
             for (proxyAddr in verifiedUpstreamProxies.take(4)) {
@@ -756,7 +742,6 @@ object BrowsecLocalProxyServer {
             return
         }
 
-        // Forward the verified first byte of ServerHello to Chromium, then bridge full-duplex
         val upIn = activeUpstream.getInputStream()
         val upOut = activeUpstream.getOutputStream()
         clientOut.write(serverHelloFirstByte)
@@ -839,41 +824,74 @@ object BrowsecLocalProxyServer {
 }
 
 /**
- * Foreground Local VPN-Tunnel Controller Service (127.0.0.1:8899).
- *
- * Never opens an unread TUN file descriptor with 8.8.8.8 DNS that would black-hole system DNS on Xiaomi/HyperOS!
- * Instead, keeps the local anti-DPI proxy server alive in a foreground service and synchronizes WebView ProxyController.
+ * Foreground Local VPN-Tunnel Controller Service (127.0.0.1:8899) with:
+ * - Interactive Notification Shade Controls:
+ *     [⏸ Пауза / ▶ Старт (на том же VPN)], [🌐 Сменить сервер], [⏹ Выключить]
+ * - Strict Per-App Split Tunneling (builder.addAllowedApplication ONLY for apps in routedPackages,
+ *   never affecting un-selected phone apps).
+ * - Automatic server disconnect when the APK is closed from Recents (onTaskRemoved).
  */
 class BrowsecVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.winwasm64.vpn.START"
+        const val ACTION_PAUSE = "com.winwasm64.vpn.PAUSE"
+        const val ACTION_RESUME = "com.winwasm64.vpn.RESUME"
+        const val ACTION_SWITCH_SERVER = "com.winwasm64.vpn.SWITCH_SERVER"
         const val ACTION_STOP = "com.winwasm64.vpn.STOP"
         const val EXTRA_COUNTRY = "extra_country"
         const val EXTRA_PACKAGE = "extra_package"
 
+        val COUNTRIES = listOf("DE", "NL", "US", "FI", "UK", "SG")
+
         @Volatile
         var isRunning: Boolean = true
-            private set
+
+        @Volatile
+        var isPaused: Boolean = false
 
         @Volatile
         var activeCountry: String = "DE"
 
+        @Volatile
+        var disconnectOnAppClose: Boolean = true
+
         val routedPackages = CopyOnWriteArraySet<String>()
 
+        @Volatile
+        private var currentInstance: BrowsecVpnService? = null
+
         fun protectSocket(socket: Socket) {
-            // No TUN blackhole is opened, so sockets use normal Wi-Fi/Mobile routing directly.
+            try {
+                currentInstance?.protect(socket)
+            } catch (_: Exception) {
+            }
+        }
+
+        private fun persistStateToPrefs(context: Context) {
+            try {
+                context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean("browsec_on", isRunning)
+                    .putBoolean("browsec_paused", isPaused)
+                    .putString("browsec_country", activeCountry)
+                    .putStringSet("vpn_routed_apps", routedPackages.toSet())
+                    .commit()
+            } catch (_: Exception) {
+            }
         }
 
         fun startForApp(context: Context, countryCode: String, targetPackage: String? = null) {
             activeCountry = countryCode
+            isRunning = true
+            isPaused = false
             if (!targetPackage.isNullOrBlank()) {
                 routedPackages.add(targetPackage)
             }
+            persistStateToPrefs(context)
             BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
             BrowsecLocalProxyServer.ensureRunning()
             BrowsecLocalProxyServer.applyWebViewProxy(true)
-            isRunning = true
 
             val intent = Intent(context, BrowsecVpnService::class.java).apply {
                 action = ACTION_START
@@ -882,6 +900,55 @@ class BrowsecVpnService : VpnService() {
                     putExtra(EXTRA_PACKAGE, targetPackage)
                 }
             }
+            dispatchServiceIntent(context, intent)
+        }
+
+        fun pauseTunnel(context: Context) {
+            isPaused = true
+            isRunning = true
+            persistStateToPrefs(context)
+            BrowsecLocalProxyServer.applyWebViewProxy(false)
+            dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
+                action = ACTION_PAUSE
+            })
+        }
+
+        fun resumeTunnel(context: Context) {
+            isPaused = false
+            isRunning = true
+            persistStateToPrefs(context)
+            BrowsecLocalProxyServer.ensureRunning()
+            BrowsecLocalProxyServer.applyWebViewProxy(true)
+            dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
+                action = ACTION_RESUME
+            })
+        }
+
+        fun cycleCountry(context: Context): String {
+            val idx = COUNTRIES.indexOf(activeCountry)
+            val next = COUNTRIES[(idx + 1) % COUNTRIES.size]
+            activeCountry = next
+            persistStateToPrefs(context)
+            dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
+                action = ACTION_SWITCH_SERVER
+            })
+            return next
+        }
+
+        fun stop(context: Context) {
+            isRunning = false
+            isPaused = false
+            persistStateToPrefs(context)
+            BrowsecLocalProxyServer.shutdown()
+            try {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.cancel(8899)
+                context.stopService(Intent(context, BrowsecVpnService::class.java))
+            } catch (_: Exception) {
+            }
+        }
+
+        private fun dispatchServiceIntent(context: Context, intent: Intent) {
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     context.startForegroundService(intent)
@@ -889,97 +956,297 @@ class BrowsecVpnService : VpnService() {
                     context.startService(intent)
                 }
             } catch (_: Exception) {
-            }
-        }
-
-        fun stop(context: Context) {
-            isRunning = false
-            BrowsecLocalProxyServer.applyWebViewProxy(false)
-            try {
-                val intent = Intent(context, BrowsecVpnService::class.java).apply {
-                    action = ACTION_STOP
+                try {
+                    context.startService(intent)
+                } catch (_: Exception) {
                 }
-                context.startService(intent)
-            } catch (_: Exception) {
             }
         }
     }
 
-    private var legacyVpnInterface: ParcelFileDescriptor? = null
+    private var perAppVpnInterface: ParcelFileDescriptor? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Close any stale TUN interface from older builds so Android DNS & sockets are 100% unobstructed
-        try {
-            legacyVpnInterface?.close()
-            legacyVpnInterface = null
-        } catch (_: Exception) {
-        }
-
+        currentInstance = this
         val action = intent?.action ?: ACTION_START
-        if (action == ACTION_STOP) {
-            isRunning = false
-            stopForeground(true)
-            stopSelf()
-            return START_NOT_STICKY
-        }
 
-        val country = intent?.getStringExtra(EXTRA_COUNTRY) ?: activeCountry
-        val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
-        if (!pkg.isNullOrBlank()) {
-            routedPackages.add(pkg)
-        }
-        activeCountry = country
-        BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
-        val proxyPort = BrowsecLocalProxyServer.ensureRunning()
-        BrowsecLocalProxyServer.applyWebViewProxy(true)
-        isRunning = true
+        when (action) {
+            ACTION_STOP -> {
+                shutdownEverything()
+                return START_NOT_STICKY
+            }
 
+            ACTION_PAUSE -> {
+                // Pause: detach tunnel from apps & browser, keep server state on same activeCountry
+                isPaused = true
+                isRunning = true
+                closePerAppVpnInterface()
+                BrowsecLocalProxyServer.applyWebViewProxy(false)
+                persistStateToPrefs(this)
+                postShadeNotification()
+                return START_NOT_STICKY
+            }
+
+            ACTION_RESUME -> {
+                // Resume: continue work on the EXACT same activeCountry that was used before pause
+                isPaused = false
+                isRunning = true
+                val port = BrowsecLocalProxyServer.ensureRunning()
+                BrowsecLocalProxyServer.applyWebViewProxy(true)
+                establishStrictPerAppVpnIfNeeded(activeCountry, port)
+                persistStateToPrefs(this)
+                postShadeNotification()
+                return START_NOT_STICKY
+            }
+
+            ACTION_SWITCH_SERVER -> {
+                val idx = COUNTRIES.indexOf(activeCountry)
+                activeCountry = COUNTRIES[(idx + 1) % COUNTRIES.size]
+                val port = BrowsecLocalProxyServer.ensureRunning()
+                if (!isPaused && isRunning) {
+                    BrowsecLocalProxyServer.applyWebViewProxy(true)
+                    establishStrictPerAppVpnIfNeeded(activeCountry, port)
+                }
+                persistStateToPrefs(this)
+                postShadeNotification()
+                return START_NOT_STICKY
+            }
+
+            else -> {
+                val country = intent?.getStringExtra(EXTRA_COUNTRY) ?: activeCountry
+                val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
+                if (!pkg.isNullOrBlank()) {
+                    routedPackages.add(pkg)
+                }
+                activeCountry = country
+                isRunning = true
+                isPaused = false
+                BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
+                val port = BrowsecLocalProxyServer.ensureRunning()
+                BrowsecLocalProxyServer.applyWebViewProxy(true)
+                establishStrictPerAppVpnIfNeeded(country, port)
+                persistStateToPrefs(this)
+                postShadeNotification()
+                return START_NOT_STICKY
+            }
+        }
+    }
+
+    /**
+     * Strictly applies VpnService HttpProxy ONLY to packages explicitly added to [routedPackages].
+     * If [routedPackages] is empty or paused, NO system VPN interface is opened at all, so other
+     * phone apps are NEVER affected!
+     */
+    private fun establishStrictPerAppVpnIfNeeded(country: String, proxyPort: Int) {
+        closePerAppVpnInterface()
+        val externalPkgs = routedPackages.filter { it.isNotBlank() && it != packageName }
+        if (externalPkgs.isEmpty() || isPaused || !isRunning) {
+            return
+        }
+        if (VpnService.prepare(this) != null) {
+            return
+        }
         try {
-            startForeground(8899, buildNotification(country, proxyPort))
+            val builder = Builder()
+                .setSession("OmniVPN ($country) • Только выбранные приложения (${externalPkgs.size})")
+                .setMtu(1500)
+                .addAddress("10.88.0.2", 32)
+                .addRoute("10.88.0.1", 32)
+
+            var addedCount = 0
+            for (pkg in externalPkgs) {
+                try {
+                    builder.addAllowedApplication(pkg)
+                    addedCount++
+                } catch (_: Exception) {
+                }
+            }
+            if (addedCount == 0) {
+                // Never establish a global VPN if no allowed apps matched!
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+                builder.setHttpProxy(
+                    ProxyInfo.buildDirectProxy(
+                        "127.0.0.1",
+                        proxyPort,
+                        listOf("localhost", "127.0.0.1")
+                    )
+                )
+            }
+            perAppVpnInterface = builder.establish()
         } catch (_: Exception) {
         }
+    }
 
-        return START_STICKY
+    private fun closePerAppVpnInterface() {
+        try {
+            perAppVpnInterface?.close()
+        } catch (_: Exception) {
+        }
+        perAppVpnInterface = null
+    }
+
+    private fun shutdownEverything() {
+        isRunning = false
+        isPaused = false
+        closePerAppVpnInterface()
+        BrowsecLocalProxyServer.shutdown()
+        persistStateToPrefs(this)
+        try {
+            stopForeground(true)
+        } catch (_: Exception) {
+        }
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.cancel(8899)
+        } catch (_: Exception) {
+        }
+        stopSelf()
+    }
+
+    /**
+     * When the user closes the APK (swipes it from Recents), automatically disconnect the local
+     * server and release all apps if disconnectOnAppClose is true (default true).
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (disconnectOnAppClose) {
+            shutdownEverything()
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        try { legacyVpnInterface?.close() } catch (_: Exception) {}
-        legacyVpnInterface = null
+        closePerAppVpnInterface()
+        currentInstance = null
         super.onDestroy()
     }
 
+    private fun postShadeNotification() {
+        val port = BrowsecLocalProxyServer.activePort
+        val notif = buildNotification(activeCountry, port)
+        try {
+            startForeground(8899, notif)
+        } catch (_: Exception) {
+        }
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.notify(8899, notif)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun buildNotification(country: String, port: Int): Notification {
-        val channelId = "browsec_local_tunnel_channel"
+        val channelId = "browsec_local_tunnel_channel_v31"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(NotificationManager::class.java)
             val channel = NotificationChannel(
                 channelId,
-                "Локальный VPN-Туннель 127.0.0.1:8899",
-                NotificationManager.IMPORTANCE_LOW
-            )
+                "Управление VPN и Локальным Туннелем",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Пауза, Старт, Смена сервера и Выключение VPN в шторке уведомлений"
+                setSound(null, null)
+            }
             nm?.createNotificationChannel(channel)
         }
-        val pi = PendingIntent.getActivity(
+
+        val openAppPi = PendingIntent.getActivity(
             this,
-            0,
-            Intent(this, MainActivity::class.java),
+            100,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+
+        val pauseOrResumeIntent = Intent(this, BrowsecVpnService::class.java).apply {
+            action = if (isPaused) ACTION_RESUME else ACTION_PAUSE
+        }
+        val pauseOrResumePi = PendingIntent.getService(
+            this,
+            101,
+            pauseOrResumeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val switchServerIntent = Intent(this, BrowsecVpnService::class.java).apply {
+            action = ACTION_SWITCH_SERVER
+        }
+        val switchServerPi = PendingIntent.getService(
+            this,
+            102,
+            switchServerIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(this, BrowsecVpnService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPi = PendingIntent.getService(
+            this,
+            103,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val snap = BrowsecLocalProxyServer.sampleTraffic()
         val rxMb = String.format("%.2f МБ", snap.rxBytesTotal / (1024.0 * 1024.0))
         val txMb = String.format("%.2f МБ", snap.txBytesTotal / (1024.0 * 1024.0))
+        val externalCount = routedPackages.count { it != packageName }
+
+        val titleText = if (isPaused) {
+            "⏸ VPN На Паузе ($country) • Отсоединён от приложений"
+        } else {
+            "🛡️ VPN Активен ($country) • 127.0.0.1:$port"
+        }
+        val bodyText = if (isPaused) {
+            "Нажмите «▶ Старт ($country)» для продолжения на том же сервере • Прил: $externalCount"
+        } else {
+            "⬇ RX: $rxMb | ⬆ TX: $txMb | Только списочные прил: $externalCount"
+        }
+
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-        return builder
-            .setContentTitle("🛡️ Туннель 127.0.0.1:$port ($country) • SNI Split Активен")
-            .setContentText("⬇ RX: $rxMb | ⬆ TX: $txMb | Приложений: ${routedPackages.size}")
+
+        val pauseResumeLabel = if (isPaused) "▶ Старт ($country)" else "⏸ Пауза"
+        val switchLabel = "🌐 Сменить ($country)"
+        val stopLabel = "⏹ Выключить"
+
+        builder
+            .setContentTitle(titleText)
+            .setContentText(bodyText)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(pi)
-            .setOngoing(true)
-            .build()
+            .setContentIntent(openAppPi)
+            .setOngoing(!isPaused)
+            .addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_media_pause,
+                    pauseResumeLabel,
+                    pauseOrResumePi
+                ).build()
+            )
+            .addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_popup_sync,
+                    switchLabel,
+                    switchServerPi
+                ).build()
+            )
+            .addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    stopLabel,
+                    stopPi
+                ).build()
+            )
+
+        return builder.build()
     }
 }
