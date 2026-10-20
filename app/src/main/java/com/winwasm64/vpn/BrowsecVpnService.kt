@@ -314,7 +314,8 @@ object BrowserDirectRepeater {
             h == "youtubei.googleapis.com" ||
             h == "i.ytimg.com" ||
             h == "s.ytimg.com" ||
-            h == "yt3.ggpht.com"
+            h == "yt3.ggpht.com" ||
+            h == "redirector.googlevideo.com"
     }
 
     fun resolveBrowserHost(host: String): String {
@@ -322,24 +323,12 @@ object BrowserDirectRepeater {
         if (clean.isEmpty()) return clean
         dohCache[clean]?.let { return it }
 
-        // Для видеопотоков *.googlevideo.com сначала пробуем системный DNS, чтобы попасть на ближайший CDN-кэш
-        if (clean.endsWith(".googlevideo.com", ignoreCase = true)) {
-            try {
-                val addr = InetAddress.getByName(clean)
-                val ip = addr.hostAddress
-                if (!ip.isNullOrBlank() && ip != "127.0.0.1" && ip != "0.0.0.0") {
-                    dohCache[clean] = ip
-                    return ip
-                }
-            } catch (_: Exception) {
-            }
-        }
-
-        // Быстрый запрос через DoH (Cloudflare / Google) с учётом выбранной страны
+        // Быстрый запрос через DoH (Google с европейским ECS выбранной страны + Cloudflare)
+        // в том числе для видеопотоков *.googlevideo.com, чтобы избегать отравленного DNS провайдера
         val node = getNode(countryCode)
         val dohUrls = listOf(
-            "https://1.1.1.1/dns-query?name=$clean&type=A",
-            "https://dns.google/resolve?name=$clean&type=A&edns_client_subnet=${node.ecsSubnet}"
+            "https://dns.google/resolve?name=$clean&type=A&edns_client_subnet=${node.ecsSubnet}",
+            "https://1.1.1.1/dns-query?name=$clean&type=A"
         )
         for (u in dohUrls) {
             try {
@@ -372,7 +361,11 @@ object BrowserDirectRepeater {
         }
 
         if (isYoutubeWebHost(clean)) {
-            val anycast = YOUTUBE_CLEAN_ANYCAST_IPS.first()
+            val anycast = if (clean.equals("redirector.googlevideo.com", ignoreCase = true)) {
+                "142.250.107.113"
+            } else {
+                YOUTUBE_CLEAN_ANYCAST_IPS.first()
+            }
             dohCache[clean] = anycast
             return anycast
         }
@@ -394,6 +387,17 @@ object BrowserDirectRepeater {
         candidates.add(resolveBrowserHost(host))
         if (isYoutubeWebHost(host)) {
             candidates.addAll(YOUTUBE_CLEAN_ANYCAST_IPS)
+            candidates.add("142.250.107.113")
+        } else if (host.endsWith(".googlevideo.com", ignoreCase = true)) {
+            try {
+                val sysIp = InetAddress.getByName(host).hostAddress
+                if (!sysIp.isNullOrBlank() && sysIp != "127.0.0.1") {
+                    candidates.add(sysIp)
+                }
+            } catch (_: Exception) {
+            }
+            candidates.add("142.250.107.113")
+            candidates.add("142.250.107.102")
         }
         var lastErr: Exception? = null
         for (ip in candidates) {
@@ -402,9 +406,10 @@ object BrowserDirectRepeater {
                 BrowsecVpnService.protectSocket(sock)
                 sock.tcpNoDelay = true
                 sock.keepAlive = true
+                sock.receiveBufferSize = 512 * 1024
                 sock.soTimeout = 25_000
                 browserTxBytes.addAndGet(128L)
-                sock.connect(InetSocketAddress(ip, port), 2800)
+                sock.connect(InetSocketAddress(ip, port), 2400)
                 browserRxBytes.addAndGet(128L)
                 dohCache[host] = ip
                 return sock
@@ -494,6 +499,8 @@ object BrowserDirectRepeater {
                 t1.join()
                 t2.join()
                 upstream.close()
+            } else if (method.isNotEmpty() && (target.startsWith("/ytstream") || target.contains("/ytstream?url="))) {
+                handleYtStreamAccelerator(target, lines, out)
             } else if (method.isNotEmpty() && target.isNotEmpty()) {
                 val uri = try { java.net.URI(target) } catch (_: Exception) { null }
                 val hostHeader = lines.drop(1).firstOrNull { it.startsWith("Host:", ignoreCase = true) }
@@ -543,18 +550,19 @@ object BrowserDirectRepeater {
     }
 
     /**
-     * Ищет позицию SNI-домена внутри TLS ClientHello и разрезает TLS-запись на 3 валидных
-     * TLS-записи прямо посередине имени хоста (например `m.you` | `tube.com`), чтобы ТСПУ/DPI
-     * не смог собрать сигнатуру блокируемого домена YouTube.
+     * Ищет позицию SNI-домена внутри TLS ClientHello (учитывая и буквы, и цифры в именах
+     * видеосерверов вида `rr1---sn-4g5edns7.googlevideo.com`) и разрезает всю область SNI
+     * на микро-записи TLS по 3 байта, чтобы ТСПУ/DPI не смог собрать сигнатуру `googlevideo.com`
+     * или `youtube.com`.
      */
     private fun findSniSplitPoint(buf: ByteArray, recLen: Int): Int {
         val limit = (5 + recLen).coerceAtMost(buf.size)
         for (i in 40 until (limit - 12)) {
-            // Ищем точки внутри ASCII-домена (напр. m.youtube.com или googlevideo.com)
-            if (buf[i] == '.'.code.toByte() &&
-                buf[i - 1] in 'a'.code.toByte()..'z'.code.toByte() &&
-                buf[i + 1] in 'a'.code.toByte()..'z'.code.toByte()
-            ) {
+            val prev = buf[i - 1].toInt() and 0xFF
+            val next = buf[i + 1].toInt() and 0xFF
+            val isPrevHostChar = (prev in 'a'.code..'z'.code) || (prev in '0'.code..'9'.code) || prev == '-'.code
+            val isNextHostChar = (next in 'a'.code..'z'.code) || (next in '0'.code..'9'.code)
+            if (buf[i] == '.'.code.toByte() && isPrevHostChar && isNextHostChar) {
                 val offsetInPayload = (i + 2) - 5
                 if (offsetInPayload in 12 until (recLen - 8)) {
                     return offsetInPayload
@@ -569,45 +577,31 @@ object BrowserDirectRepeater {
             val buf = ByteArray(32 * 1024)
             var firstPacket = true
             while (true) {
-                val n = inp.read(buf)
+                var n = inp.read(buf)
                 if (n <= 0) break
                 browserTxBytes.addAndGet(n.toLong())
-                if (firstPacket && isTls && n > 32 && buf[0] == 0x16.toByte() && buf[1] == 0x03.toByte()) {
+                if (firstPacket && isTls && n >= 5 && buf[0] == 0x16.toByte() && buf[1] == 0x03.toByte()) {
                     firstPacket = false
                     val recLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
-                    if (5 + recLen == n && recLen > 24) {
-                        val split1 = 2
-                        val split2 = findSniSplitPoint(buf, recLen)
-                        val frag1Len = split1
-                        val frag2Len = (split2 - split1).coerceAtLeast(1)
-                        val frag3Len = (recLen - frag1Len - frag2Len).coerceAtLeast(1)
-
-                        // Запись 1: первые 2 байта Handshake
-                        val r1 = ByteArray(5 + frag1Len)
-                        r1[0] = 0x16; r1[1] = buf[1]; r1[2] = buf[2]
-                        r1[3] = ((frag1Len shr 8) and 0xFF).toByte()
-                        r1[4] = (frag1Len and 0xFF).toByte()
-                        System.arraycopy(buf, 5, r1, 5, frag1Len)
-                        out.write(r1)
-                        out.flush()
-
-                        // Запись 2: до середины SNI-имени (например "m.you")
-                        val r2 = ByteArray(5 + frag2Len)
-                        r2[0] = 0x16; r2[1] = buf[1]; r2[2] = buf[2]
-                        r2[3] = ((frag2Len shr 8) and 0xFF).toByte()
-                        r2[4] = (frag2Len and 0xFF).toByte()
-                        System.arraycopy(buf, 5 + frag1Len, r2, 5, frag2Len)
-                        out.write(r2)
-                        out.flush()
-
-                        // Запись 3: вторая половина SNI-имени ("tube.com") + остаток ClientHello
-                        val r3 = ByteArray(5 + frag3Len)
-                        r3[0] = 0x16; r3[1] = buf[1]; r3[2] = buf[2]
-                        r3[3] = ((frag3Len shr 8) and 0xFF).toByte()
-                        r3[4] = (frag3Len and 0xFF).toByte()
-                        System.arraycopy(buf, 5 + frag1Len + frag2Len, r3, 5, frag3Len)
-                        out.write(r3)
-                        out.flush()
+                    val targetTotal = 5 + recLen
+                    if (recLen in 24..28000 && targetTotal <= buf.size) {
+                        while (n < targetTotal) {
+                            val extra = inp.read(buf, n, targetTotal - n)
+                            if (extra <= 0) break
+                            n += extra
+                            browserTxBytes.addAndGet(extra.toLong())
+                        }
+                    }
+                    if (n >= targetTotal && recLen > 24) {
+                        val records = BrowsecLocalProxyServer.buildSniSplitTlsRecords(buf, targetTotal, microSplit = true)
+                        for (r in records) {
+                            out.write(r)
+                            out.flush()
+                        }
+                        if (n > targetTotal) {
+                            out.write(buf, targetTotal, n - targetTotal)
+                            out.flush()
+                        }
                     } else {
                         out.write(buf, 0, n)
                         out.flush()
@@ -619,6 +613,204 @@ object BrowserDirectRepeater {
                 }
             }
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Прокачивает видеопоток `*.googlevideo.com/videoplayback` чанками по 256 КБ через
+     * микро-фрагментированные TLS-сокеты, полностью обходя 64-КБ лимит ТСПУ на поток.
+     */
+    private fun handleYtStreamAccelerator(target: String, reqLines: List<String>, clientOut: OutputStream) {
+        try {
+            val rawQuery = target.substringAfter("?", "")
+            val encodedUrl = rawQuery.split("&")
+                .firstOrNull { it.startsWith("url=") }
+                ?.substringAfter("url=")
+                .orEmpty()
+            val mediaUrl = java.net.URLDecoder.decode(encodedUrl, "UTF-8")
+            if (!mediaUrl.startsWith("http")) return
+
+            val clientRangeHeader = reqLines.firstOrNull { it.startsWith("Range:", ignoreCase = true) }
+                ?.substringAfter(":")?.trim().orEmpty()
+            var startByte = 0L
+            var requestedEndByte = -1L
+            if (clientRangeHeader.startsWith("bytes=", ignoreCase = true)) {
+                val spec = clientRangeHeader.substringAfter("=")
+                val s = spec.substringBefore("-").trim().toLongOrNull()
+                val e = spec.substringAfter("-", "").trim().toLongOrNull()
+                if (s != null && s >= 0L) startByte = s
+                if (e != null && e >= startByte) requestedEndByte = e
+            }
+
+            val chunkSize = 256 * 1024L
+            var currentUrl = mediaUrl
+            var cursor = startByte
+            var totalLength = -1L
+            var contentType = "video/mp4"
+            var headersSentToClient = false
+
+            for (chunkIdx in 0 until 256) {
+                val rangeEnd = if (requestedEndByte > 0L) {
+                    minOf(cursor + chunkSize - 1L, requestedEndByte)
+                } else {
+                    cursor + chunkSize - 1L
+                }
+                val chunkResult = fetchGooglevideoRangeChunk(currentUrl, cursor, rangeEnd)
+                    ?: fetchGooglevideoRangeChunk(
+                        currentUrl.replace(Regex("https://[^/]+\\.googlevideo\\.com"), "https://redirector.googlevideo.com"),
+                        cursor,
+                        rangeEnd
+                    )
+                    ?: break
+
+                if (chunkResult.redirectUrl != null) {
+                    currentUrl = chunkResult.redirectUrl
+                    continue
+                }
+                if (chunkResult.totalSize > 0L) totalLength = chunkResult.totalSize
+                if (chunkResult.contentType.isNotBlank()) contentType = chunkResult.contentType
+
+                if (!headersSentToClient) {
+                    headersSentToClient = true
+                    val respEnd = if (requestedEndByte > 0L && totalLength > 0L) {
+                        minOf(requestedEndByte, totalLength - 1L)
+                    } else if (totalLength > 0L) {
+                        totalLength - 1L
+                    } else {
+                        cursor + chunkResult.bytes.size - 1L
+                    }
+                    val contentLen = (respEnd - startByte + 1L).coerceAtLeast(chunkResult.bytes.size.toLong())
+                    val respHdr = buildString {
+                        append("HTTP/1.1 206 Partial Content\r\n")
+                        append("Content-Type: $contentType\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        if (totalLength > 0L) {
+                            append("Content-Range: bytes $startByte-$respEnd/$totalLength\r\n")
+                        }
+                        append("Content-Length: $contentLen\r\n")
+                        append("Access-Control-Allow-Origin: *\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    clientOut.write(respHdr.toByteArray(Charsets.ISO_8859_1))
+                    clientOut.flush()
+                }
+
+                if (chunkResult.bytes.isEmpty()) break
+                clientOut.write(chunkResult.bytes)
+                clientOut.flush()
+                browserRxBytes.addAndGet(chunkResult.bytes.size.toLong())
+                cursor += chunkResult.bytes.size.toLong()
+
+                if (requestedEndByte > 0L && cursor > requestedEndByte) break
+                if (totalLength > 0L && cursor >= totalLength) break
+                if (chunkResult.bytes.size < 16384) break
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private data class VideoRangeChunkResult(
+        val bytes: ByteArray,
+        val totalSize: Long,
+        val contentType: String,
+        val redirectUrl: String? = null
+    )
+
+    private fun fetchGooglevideoRangeChunk(targetUrl: String, rangeStart: Long, rangeEnd: Long): VideoRangeChunkResult? {
+        try {
+            val parsed = URL(targetUrl)
+            val host = parsed.host ?: return null
+            val port = if (parsed.port > 0) parsed.port else 443
+            val cleanQuery = (parsed.query ?: "").replace(Regex("(&|^)range=[^&]*"), "")
+            val pathAndQuery = (if (parsed.path.isNullOrEmpty()) "/videoplayback" else parsed.path) +
+                (if (cleanQuery.isEmpty()) "?range=$rangeStart-$rangeEnd" else "?$cleanQuery&range=$rangeStart-$rangeEnd")
+
+            val rawSocket = openBrowserOutboundSocket(host, port)
+            val splitSocket = object : Socket() {
+                override fun getInputStream(): InputStream = rawSocket.getInputStream()
+                override fun getOutputStream(): OutputStream = object : OutputStream() {
+                    private var firstWrite = true
+                    override fun write(b: Int) {
+                        browserTxBytes.incrementAndGet()
+                        rawSocket.getOutputStream().write(b)
+                    }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val slice = b.copyOfRange(off, off + len)
+                        browserTxBytes.addAndGet(len.toLong())
+                        if (firstWrite && len > 24 && slice[0] == 0x16.toByte() && slice[1] == 0x03.toByte()) {
+                            firstWrite = false
+                            val records = BrowsecLocalProxyServer.buildSniSplitTlsRecords(slice, len, microSplit = true)
+                            for (r in records) {
+                                rawSocket.getOutputStream().write(r)
+                                rawSocket.getOutputStream().flush()
+                            }
+                        } else {
+                            firstWrite = false
+                            rawSocket.getOutputStream().write(slice)
+                            rawSocket.getOutputStream().flush()
+                        }
+                    }
+                    override fun flush() = rawSocket.getOutputStream().flush()
+                    override fun close() = rawSocket.close()
+                }
+                override fun close() = rawSocket.close()
+                override fun isClosed(): Boolean = rawSocket.isClosed
+                override fun isConnected(): Boolean = true
+            }
+
+            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            val sslSock = sslFactory.createSocket(splitSocket, host, port, true) as SSLSocket
+            sslSock.sslParameters = SSLParameters().apply {
+                serverNames = listOf(SNIHostName(host))
+            }
+            sslSock.soTimeout = 8_000
+            sslSock.startHandshake()
+
+            val node = getNode(countryCode)
+            val req = buildString {
+                append("GET $pathAndQuery HTTP/1.1\r\n")
+                append("Host: $host\r\n")
+                append("User-Agent: Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36\r\n")
+                append("Accept: */*\r\n")
+                append("Origin: https://m.youtube.com\r\n")
+                append("Referer: https://m.youtube.com/\r\n")
+                append("X-Forwarded-For: ${node.remoteIp}\r\n")
+                append("Connection: close\r\n\r\n")
+            }
+            sslSock.outputStream.write(req.toByteArray(Charsets.ISO_8859_1))
+            sslSock.outputStream.flush()
+
+            val allBytes = sslSock.inputStream.readBytes()
+            sslSock.close()
+
+            var hdrEnd = -1
+            for (i in 0 until (allBytes.size - 3)) {
+                if (allBytes[i] == '\r'.code.toByte() && allBytes[i + 1] == '\n'.code.toByte() &&
+                    allBytes[i + 2] == '\r'.code.toByte() && allBytes[i + 3] == '\n'.code.toByte()
+                ) {
+                    hdrEnd = i
+                    break
+                }
+            }
+            if (hdrEnd <= 0) return null
+            val hdrText = String(allBytes, 0, hdrEnd, Charsets.ISO_8859_1)
+            val hdrLines = hdrText.split("\r\n")
+            val statusLine = hdrLines.firstOrNull().orEmpty()
+            if (statusLine.contains(" 301 ") || statusLine.contains(" 302 ") || statusLine.contains(" 307 ")) {
+                val loc = hdrLines.firstOrNull { it.startsWith("Location:", ignoreCase = true) }
+                    ?.substringAfter(":")?.trim()
+                if (!loc.isNullOrBlank()) {
+                    return VideoRangeChunkResult(ByteArray(0), -1L, "video/mp4", redirectUrl = loc)
+                }
+            }
+            val ct = hdrLines.firstOrNull { it.startsWith("Content-Type:", ignoreCase = true) }
+                ?.substringAfter(":")?.trim() ?: "video/mp4"
+            val cr = hdrLines.firstOrNull { it.startsWith("Content-Range:", ignoreCase = true) }
+                ?.substringAfter("/")?.trim()?.toLongOrNull() ?: -1L
+            val bodyBytes = allBytes.copyOfRange(hdrEnd + 4, allBytes.size)
+            return VideoRangeChunkResult(bodyBytes, cr, ct, null)
+        } catch (_: Exception) {
+            return null
         }
     }
 
@@ -1044,27 +1236,18 @@ object BrowsecLocalProxyServer {
         if (clean.isEmpty()) return clean
         dohCache[clean]?.let { return it }
 
-        try {
-            val addr = InetAddress.getByName(clean)
-            val ip = addr.hostAddress
-            if (!ip.isNullOrBlank() && ip != "127.0.0.1" && ip != "0.0.0.0") {
-                dohCache[clean] = ip
-                return ip
-            }
-        } catch (_: Exception) {
-        }
-
         if (useBrowsecTunnel) {
+            val node = getServerNode(BrowsecVpnService.activeCountry)
             val dohEndpoints = listOf(
-                "https://dns.google/resolve?name=$clean&type=A",
+                "https://dns.google/resolve?name=$clean&type=A&edns_client_subnet=${node.ecsSubnet}",
                 "https://1.1.1.1/dns-query?name=$clean&type=A"
             )
             for (endpoint in dohEndpoints) {
                 try {
                     tunnelTxBytes.addAndGet(220L)
                     val conn = (URL(endpoint).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
-                        connectTimeout = 2000
-                        readTimeout = 2000
+                        connectTimeout = 1800
+                        readTimeout = 1800
                         setRequestProperty("Accept", "application/dns-json")
                     }
                     if (conn.responseCode == 200) {
@@ -1077,7 +1260,7 @@ object BrowsecLocalProxyServer {
                                 val ans = answers.getJSONObject(i)
                                 if (ans.optInt("type") == 1) {
                                     val ip = ans.optString("data").trim()
-                                    if (ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) {
+                                    if (ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+")) && ip != "127.0.0.1" && ip != "0.0.0.0") {
                                         dohCache[clean] = ip
                                         return ip
                                     }
@@ -1089,18 +1272,57 @@ object BrowsecLocalProxyServer {
                 }
             }
         }
+
+        try {
+            val addr = InetAddress.getByName(clean)
+            val ip = addr.hostAddress
+            if (!ip.isNullOrBlank() && ip != "127.0.0.1" && ip != "0.0.0.0") {
+                dohCache[clean] = ip
+                return ip
+            }
+        } catch (_: Exception) {
+        }
         return clean
     }
 
     private fun openOutboundSocket(host: String, port: Int): Socket {
-        val resolvedIp = resolveHostSmart(host)
-        val sock = Socket()
-        BrowsecVpnService.protectSocket(sock)
-        sock.tcpNoDelay = true
-        sock.keepAlive = true
-        sock.soTimeout = 30_000
-        sock.connect(InetSocketAddress(resolvedIp, port), 8_000)
-        return sock
+        val candidates = LinkedHashSet<String>()
+        candidates.add(resolveHostSmart(host))
+        val h = host.lowercase()
+        if (h == "m.youtube.com" || h == "www.youtube.com" || h == "youtube.com" ||
+            h == "youtubei.googleapis.com" || h == "i.ytimg.com" || h == "yt3.ggpht.com"
+        ) {
+            candidates.add("142.250.185.174")
+            candidates.add("142.250.186.110")
+            candidates.add("172.217.16.142")
+        } else if (h.endsWith(".googlevideo.com")) {
+            try {
+                val sysIp = InetAddress.getByName(host).hostAddress
+                if (!sysIp.isNullOrBlank() && sysIp != "127.0.0.1") {
+                    candidates.add(sysIp)
+                }
+            } catch (_: Exception) {
+            }
+            candidates.add("142.250.107.113")
+            candidates.add("142.250.107.102")
+        }
+        var lastErr: Exception? = null
+        for (ip in candidates) {
+            try {
+                val sock = Socket()
+                BrowsecVpnService.protectSocket(sock)
+                sock.tcpNoDelay = true
+                sock.keepAlive = true
+                sock.receiveBufferSize = 512 * 1024
+                sock.soTimeout = 30_000
+                sock.connect(InetSocketAddress(ip, port), 3_000)
+                dohCache[host] = ip
+                return sock
+            } catch (e: Exception) {
+                lastErr = e
+            }
+        }
+        throw (lastErr ?: java.io.IOException("Failed to connect to $host:$port"))
     }
 
     private fun handleClient(client: Socket) {
@@ -1293,26 +1515,31 @@ object BrowsecLocalProxyServer {
             val buf = ByteArray(32 * 1024)
             var firstPacket = true
             while (true) {
-                val n = inp.read(buf)
+                var n = inp.read(buf)
                 if (n <= 0) break
                 tunnelTxBytes.addAndGet(n.toLong())
-                if (firstPacket && isTls && n > 32 && buf[0] == 0x16.toByte() && buf[1] == 0x03.toByte()) {
+                if (firstPacket && isTls && n >= 5 && buf[0] == 0x16.toByte() && buf[1] == 0x03.toByte()) {
                     firstPacket = false
                     val recLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
-                    if (5 + recLen == n && recLen > 24) {
-                        val frag1 = 16
-                        val frag2 = recLen - frag1
-                        val outBuf = ByteArrayOutputStream(n + 5)
-                        outBuf.write(byteArrayOf(0x16, buf[1], buf[2], (frag1 shr 8).toByte(), (frag1 and 0xFF).toByte()))
-                        outBuf.write(buf, 5, frag1)
-                        outBuf.write(byteArrayOf(0x16, buf[1], buf[2], (frag2 shr 8).toByte(), (frag2 and 0xFF).toByte()))
-                        outBuf.write(buf, 5 + frag1, frag2)
-                        val combined = outBuf.toByteArray()
-                        val firstChunk = 5 + frag1
-                        out.write(combined, 0, firstChunk)
-                        out.flush()
-                        out.write(combined, firstChunk, combined.size - firstChunk)
-                        out.flush()
+                    val targetTotal = 5 + recLen
+                    if (recLen in 24..28000 && targetTotal <= buf.size) {
+                        while (n < targetTotal) {
+                            val extra = inp.read(buf, n, targetTotal - n)
+                            if (extra <= 0) break
+                            n += extra
+                            tunnelTxBytes.addAndGet(extra.toLong())
+                        }
+                    }
+                    if (n >= targetTotal && recLen > 24) {
+                        val records = buildSniSplitTlsRecords(buf, targetTotal, microSplit = true)
+                        for (r in records) {
+                            out.write(r)
+                            out.flush()
+                        }
+                        if (n > targetTotal) {
+                            out.write(buf, targetTotal, n - targetTotal)
+                            out.flush()
+                        }
                     } else {
                         out.write(buf, 0, n)
                         out.flush()
@@ -1344,7 +1571,7 @@ object BrowsecLocalProxyServer {
     internal fun buildSniSplitTlsRecords(
         buf: ByteArray,
         length: Int,
-        microSplit: Boolean = false
+        microSplit: Boolean = true
     ): List<ByteArray> {
         if (length <= 21 || buf[0] != 0x16.toByte() || buf[1] != 0x03.toByte()) {
             return listOf(buf.copyOf(length))
@@ -1353,6 +1580,40 @@ object BrowsecLocalProxyServer {
         if (5 + recLen > length || recLen <= 16) {
             return listOf(buf.copyOf(length))
         }
+
+        val result = ArrayList<ByteArray>()
+        if (microSplit) {
+            // Нарезаем первые min(recLen, 260) байт ClientHello (где находится вся секция SNI:
+            // rr1---sn-*.googlevideo.com / m.youtube.com / youtubei.googleapis.com) на валидные
+            // TLS-записи по 3 байта, чтобы ни одно слово SNI не передавалось целиком.
+            val microRegionEnd = minOf(recLen, 260)
+            var offset = 0
+            while (offset < microRegionEnd) {
+                val chunkLen = minOf(3, microRegionEnd - offset)
+                val rec = ByteArray(5 + chunkLen)
+                rec[0] = 0x16
+                rec[1] = buf[1]
+                rec[2] = buf[2]
+                rec[3] = ((chunkLen shr 8) and 0xFF).toByte()
+                rec[4] = (chunkLen and 0xFF).toByte()
+                System.arraycopy(buf, 5 + offset, rec, 5, chunkLen)
+                result.add(rec)
+                offset += chunkLen
+            }
+            val remaining = recLen - microRegionEnd
+            if (remaining > 0) {
+                val tailRec = ByteArray(5 + remaining)
+                tailRec[0] = 0x16
+                tailRec[1] = buf[1]
+                tailRec[2] = buf[2]
+                tailRec[3] = ((remaining shr 8) and 0xFF).toByte()
+                tailRec[4] = (remaining and 0xFF).toByte()
+                System.arraycopy(buf, 5 + microRegionEnd, tailRec, 5, remaining)
+                result.add(tailRec)
+            }
+            return result
+        }
+
         val frag1Len = 16
         val frag2Len = recLen - frag1Len
         val rec1 = ByteArray(5 + frag1Len)

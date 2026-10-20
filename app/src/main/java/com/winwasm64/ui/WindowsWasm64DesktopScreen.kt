@@ -482,18 +482,49 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     fun injectActiveExtensions(wv: WebView) {
+        val repeaterPort = BrowserDirectRepeater.activePort
         val scripts = StringBuilder()
+        // 1. Всегда гарантируем видимость видеоплеера YouTube (#movie_player и <video>) и приоритет аппаратного H.264 (avc1)
+        scripts.append(
+            """
+            (function(){
+                try {
+                    if (!window.__omniCodecPatched && window.MediaSource && MediaSource.isTypeSupported) {
+                        window.__omniCodecPatched = true;
+                        const origSupported = MediaSource.isTypeSupported.bind(MediaSource);
+                        MediaSource.isTypeSupported = function(mime) {
+                            if (!mime) return false;
+                            const m = String(mime).toLowerCase();
+                            if (m.indexOf('av01') !== -1 || m.indexOf('vp9') !== -1 || m.indexOf('vp09') !== -1) {
+                                return false;
+                            }
+                            return origSupported(mime);
+                        };
+                    }
+                } catch(e){}
+                ['#movie_player', '.html5-video-player', '#player-container-id', '#player', 'ytm-player', 'video'].forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => {
+                        if (el.style.display === 'none') el.style.display = 'block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = '1';
+                    });
+                });
+            })();
+            """.trimIndent()
+        )
         if (adBlockEnabled) {
             scripts.append(
                 """
                 (function(){
-                    const sel = ['.ad-showing','.ytp-ad-module','.ytp-ad-overlay-container','ytd-ad-slot-renderer','ytm-promoted-sparkles-web-renderer','[id^="google_ads"]','.adsbygoogle'];
+                    // ВАЖНО: Никогда не скрываем .ad-showing целиком, так как этот класс вешается на сам #movie_player!
+                    const sel = ['.ytp-ad-module','.ytp-ad-overlay-container','.ytp-ad-player-overlay','ytd-ad-slot-renderer','ytm-promoted-sparkles-web-renderer','[id^="google_ads"]','.adsbygoogle'];
                     sel.forEach(s => document.querySelectorAll(s).forEach(el => el.style.display='none'));
-                    const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+                    const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-overlay-close-button');
                     if (skipBtn) skipBtn.click();
+                    const player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
                     const v = document.querySelector('video');
-                    if (v && document.querySelector('.ad-showing') && isFinite(v.duration) && v.duration > 0) {
-                        v.currentTime = v.duration;
+                    if (v && player && player.classList.contains('ad-showing') && isFinite(v.duration) && v.duration > 0 && v.duration < 300) {
+                        v.currentTime = v.duration - 0.1;
                     }
                 })();
                 """.trimIndent()
@@ -508,8 +539,25 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; }, configurable: true });
                     } catch(e){}
                     document.querySelectorAll('video, audio').forEach(v => {
+                        v.style.display = 'block';
+                        v.style.visibility = 'visible';
+                        v.style.opacity = '1';
                         v.muted = false;
                         if (v.volume < 1.0) v.volume = 1.0;
+                        const src = v.currentSrc || v.src || '';
+                        if (src.indexOf('googlevideo.com/videoplayback') !== -1 && src.indexOf('127.0.0.1') === -1) {
+                            if (v.readyState === 0 && !v.dataset.omniProxied) {
+                                if (!v.dataset.omniStallStart) {
+                                    v.dataset.omniStallStart = String(Date.now());
+                                } else if (Date.now() - Number(v.dataset.omniStallStart) > 2200) {
+                                    v.dataset.omniProxied = '1';
+                                    const t = v.currentTime || 0;
+                                    v.src = 'http://127.0.0.1:$repeaterPort/ytstream?url=' + encodeURIComponent(src);
+                                    v.currentTime = t;
+                                    v.play().catch(function(){});
+                                }
+                            }
+                        }
                     });
                 })();
                 """.trimIndent()
@@ -726,6 +774,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             webChromeClient = object : WebChromeClient() {
+                override fun getDefaultVideoPoster(): Bitmap? {
+                    return try {
+                        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                    } catch (_: Exception) {
+                        super.getDefaultVideoPoster()
+                    }
+                }
+
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
                     tab.loadingProgress = newProgress.coerceIn(5, 100)
                     tab.isLoading = newProgress < 100
@@ -736,7 +792,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     } else {
                         "✓ Загружено 100% • $host$vpnTag"
                     }
-                    if (newProgress >= 65 && view != null) {
+                    if (newProgress >= 15 && view != null) {
                         injectActiveExtensions(view)
                     }
                 }
@@ -836,6 +892,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             historyList.removeAll { it.endsWith("| $url") || it == url }
                             historyList.add(0, entry)
                         }
+                        if (view != null) {
+                            injectActiveExtensions(view)
+                        }
                         persistBrowserSettings()
                     }
                 }
@@ -849,6 +908,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         }
                         tab.canGoBack = view?.canGoBack() == true
                         tab.canGoForward = view?.canGoForward() == true
+                        if (view != null) {
+                            injectActiveExtensions(view)
+                        }
                         persistBrowserSettings()
                     }
                 }

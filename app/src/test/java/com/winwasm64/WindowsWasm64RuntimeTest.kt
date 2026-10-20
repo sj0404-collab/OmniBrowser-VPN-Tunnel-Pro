@@ -90,4 +90,38 @@ class OmniBrowserAntiDpiTest {
         assertTrue(BrowsecVpnService.routedPackages.contains("com.google.android.youtube"))
         assertTrue(BrowsecVpnService.routedPackages.contains("com.android.vending"))
     }
+
+    @Test
+    fun testMicroSplitShattersGooglevideoSniAndReassemblesLosslessly() {
+        val domain = "rr1---sn-4g5edns7.googlevideo.com".toByteArray(Charsets.US_ASCII)
+        val body = ByteArray(400)
+        body[0] = 0x01
+        body[4] = 0x03
+        body[5] = 0x03
+        System.arraycopy(domain, 0, body, 120, domain.size)
+
+        val record = ByteArray(5 + body.size)
+        record[0] = 0x16
+        record[1] = 0x03
+        record[2] = 0x01
+        record[3] = ((body.size shr 8) and 0xFF).toByte()
+        record[4] = (body.size and 0xFF).toByte()
+        System.arraycopy(body, 0, record, 5, body.size)
+
+        val microRecords = BrowsecLocalProxyServer.buildSniSplitTlsRecords(record, record.size, microSplit = true)
+        assertTrue("Expected > 50 micro-records across SNI", microRecords.size > 50)
+
+        val reassembled = java.io.ByteArrayOutputStream()
+        for (rec in microRecords) {
+            assertEquals(0x16.toByte(), rec[0])
+            assertEquals(0x03.toByte(), rec[1])
+            val len = ((rec[3].toInt() and 0xFF) shl 8) or (rec[4].toInt() and 0xFF)
+            assertEquals(rec.size - 5, len)
+            val payloadStr = String(rec, 5, len, Charsets.ISO_8859_1)
+            assertFalse("No single TLS record should contain googlevideo intact", payloadStr.contains("googlevideo"))
+            assertFalse("No single TLS record should contain sn-4g5edns7 intact", payloadStr.contains("sn-4g5edns7"))
+            reassembled.write(rec, 5, len)
+        }
+        assertEquals(body.size, reassembled.size())
+    }
 }
