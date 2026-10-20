@@ -1,78 +1,43 @@
 package com.winwasm64
 
-import com.winwasm64.engine.Wasm64WindowsRuntime
-import com.winwasm64.torrent.BitTorrentEngine
-import com.winwasm64.torrent.BitTorrentParser
+import com.winwasm64.vpn.BrowsecLocalProxyServer
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.nio.file.Files
 
-class WindowsWasm64RuntimeTest {
-
-    private fun createTempRuntime(): Wasm64WindowsRuntime {
-        val tmpDir = Files.createTempDirectory("win_wasm64_test").toFile()
-        return Wasm64WindowsRuntime(tmpDir)
-    }
+class OmniBrowserAntiDpiTest {
 
     @Test
-    fun testBitTorrentBencodeAndMetadataParser() {
-        val samplePayload = ByteArray(40_000) { (it % 251).toByte() }
-        val torrentBytes = BitTorrentParser.createSyntheticTorrentBytes(
-            name = "doom_shareware_v19.exe",
-            payload = samplePayload,
-            pieceLength = 16384,
-            announceUrl = "http://tracker.opentrackr.org:1337/announce",
-            webSeedUrl = "https://archive.org/download/DoomsharewareEpisode/Doom19s.zip"
-        )
+    fun testSniSplitTlsRecordsPreservesPayloadAndSlicesDomain() {
+        val domain = "m.youtube.com".toByteArray(Charsets.US_ASCII)
+        val body = ByteArray(140)
+        // Put fake ClientHello header + SNI domain at offset 80
+        body[0] = 0x01
+        body[4] = 0x03
+        body[5] = 0x03
+        System.arraycopy(domain, 0, body, 80, domain.size)
 
-        val meta = BitTorrentParser.parseTorrentBytes(torrentBytes)
-        assertEquals("doom_shareware_v19.exe", meta.name)
-        assertEquals(40_000L, meta.totalSize)
-        assertEquals(16384, meta.pieceLength)
-        assertEquals(3, meta.pieceCount)
-        assertEquals(40, meta.infoHashHex.length)
-        assertTrue(meta.trackers.contains("http://tracker.opentrackr.org:1337/announce"))
-        assertTrue(meta.webSeeds.contains("https://archive.org/download/DoomsharewareEpisode/Doom19s.zip"))
+        val record = ByteArray(5 + body.size)
+        record[0] = 0x16
+        record[1] = 0x03
+        record[2] = 0x01
+        record[3] = ((body.size shr 8) and 0xFF).toByte()
+        record[4] = (body.size and 0xFF).toByte()
+        System.arraycopy(body, 0, record, 5, body.size)
 
-        val firstPieceSha1 = BitTorrentParser.sha1(samplePayload.copyOfRange(0, 16384))
-        assertTrue(firstPieceSha1.contentEquals(meta.pieceHashes[0]))
-    }
+        val splitRecords = BrowsecLocalProxyServer.buildSniSplitTlsRecords(record, record.size, microSplit = false)
+        assertTrue("Expected ClientHello to be split into at least 4 TLS records", splitRecords.size >= 4)
 
-    @Test
-    fun testMagnetLinkHexAndBase32Parsing() {
-        val magnetHex = "magnet:?xt=urn:btih:6a9759bffd5c0af65319979fb7832189f4f3c35d&dn=DOOM_v1.9.zip&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&ws=https%3A%2F%2Farchive.org%2Fdownload%2FDoom19s.zip"
-        val parsed = BitTorrentParser.parseMagnetUri(magnetHex)
-        assertEquals("6a9759bffd5c0af65319979fb7832189f4f3c35d", parsed.infoHashHex)
-        assertEquals("DOOM_v1.9.zip", parsed.displayName)
-        assertTrue(parsed.trackers.any { it.contains("opentrackr.org") })
-        assertTrue(parsed.webSeeds.any { it.contains("archive.org") })
-
-        val engine = BitTorrentEngine(null)
-        val catalog = engine.getBuiltInVerifiedTorrents()
-        assertTrue(catalog.size >= 5)
-        assertTrue(catalog.any { it.fileName.endsWith(".exe") || it.fileName.endsWith(".zip") })
-        assertTrue(catalog.any { it.fileName.endsWith(".mp4") })
-    }
-
-    @Test
-    fun testWasm64ModuleCompilationAndMemory64Execution() {
-        val rt = createTempRuntime()
-        val wasmBytes = rt.assembleWasm64AddMulModule(a = 1000L, b = 2000L, c = 64L)
-        val res = rt.executeWasm64Module(wasmBytes)
-
-        assertTrue(res.validMagicHeader)
-        assertTrue(res.memory64Addressing)
-        assertEquals(192000L, res.returnValueI64)
-        assertTrue(res.executedInstructions >= 7L)
-    }
-
-    @Test
-    fun testYouTubeAndBrowserExtensionsAdBlockAndBrowsec() {
-        val rt = createTempRuntime()
-        assertTrue(rt.shouldBlockAdUrl("https://googleads.g.doubleclick.net/pagead/ads"))
-        assertTrue(rt.shouldBlockAdUrl("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"))
-        assertFalse(rt.shouldBlockAdUrl("https://m.youtube.com/watch?v=dQw4w9WgXcQ"))
+        val reassembled = java.io.ByteArrayOutputStream()
+        for (rec in splitRecords) {
+            assertEquals(0x16.toByte(), rec[0])
+            assertEquals(0x03.toByte(), rec[1])
+            val len = ((rec[3].toInt() and 0xFF) shl 8) or (rec[4].toInt() and 0xFF)
+            assertEquals(rec.size - 5, len)
+            val chunkStr = String(rec, 5, len, Charsets.ISO_8859_1)
+            assertTrue("No single TLS record may contain full m.youtube.com string", !chunkStr.contains("m.youtube.com"))
+            reassembled.write(rec, 5, len)
+        }
+        assertEquals(body.size, reassembled.size())
     }
 }

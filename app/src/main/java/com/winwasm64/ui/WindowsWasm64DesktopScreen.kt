@@ -47,6 +47,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -61,7 +64,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.winwasm64.engine.Wasm64WindowsRuntime
 import com.winwasm64.nativeapps.NativeAppEntry
 import com.winwasm64.nativeapps.NativeAppsManager
 import com.winwasm64.torrent.BitTorrentEngine
@@ -74,7 +76,45 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
+import kotlin.math.sin
 import kotlinx.coroutines.delay
+
+private fun playNativeAudioChime(freqHz: Double = 523.25, durationMs: Int = 110) {
+    thread(isDaemon = true) {
+        try {
+            val sampleRate = 44100
+            val count = (sampleRate * durationMs) / 1000
+            val samples = ShortArray(count)
+            for (i in 0 until count) {
+                val env = 1.0 - (i.toDouble() / count.toDouble())
+                samples[i] = (sin(2.0 * Math.PI * i * freqHz / sampleRate) * 14000 * env).toInt().toShort()
+            }
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(samples.size * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+            track.write(samples, 0, samples.size)
+            track.play()
+            Thread.sleep(durationMs.toLong() + 40L)
+            track.release()
+        } catch (_: Exception) {
+        }
+    }
+}
 
 class BrowserTabModel(
     val id: String,
@@ -90,6 +130,7 @@ class BrowserTabModel(
     var lastErrorText by mutableStateOf<String?>(null)
     var canGoBack by mutableStateOf(false)
     var canGoForward by mutableStateOf(false)
+    var autoRetryCount by mutableIntStateOf(0)
     var webView: WebView? = null
 }
 
@@ -175,11 +216,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
-    // Start local anti-DPI + DoH Tunnel Server (127.0.0.1:8899) immediately
-    var proxyInterceptBrowser by remember { mutableStateOf(prefs.getBoolean("proxy_intercept_browser", false)) }
+    // Start local anti-DPI + DoH Tunnel Server (127.0.0.1:8899) immediately with interception enabled by default
+    var proxyInterceptBrowser by remember { mutableStateOf(prefs.getBoolean("tunnel_proxy_active_v30", true)) }
     var trafficSnapshot by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
 
     LaunchedEffect(Unit) {
+        BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
         BrowsecLocalProxyServer.ensureRunning()
         BrowsecLocalProxyServer.applyWebViewProxy(proxyInterceptBrowser)
         while (true) {
@@ -469,10 +511,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
         if (useProxyTunnel) {
             proxyInterceptBrowser = true
-            prefs.edit().putBoolean("proxy_intercept_browser", true).apply()
+            prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
             BrowsecLocalProxyServer.applyWebViewProxy(true)
         }
 
+        tab.autoRetryCount = 0
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 12
@@ -584,9 +627,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             )
                         }
                     }
-                    if (browsecEnabled) {
-                        BrowsecLocalProxyServer.recordWebViewResourceNotice(2048L)
-                    }
                     return super.shouldInterceptRequest(view, request)
                 }
 
@@ -668,20 +708,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        // If local proxy override timed out, automatically fall back to direct Chromium QUIC
-                        if (proxyInterceptBrowser) {
-                            proxyInterceptBrowser = false
-                            prefs.edit().putBoolean("proxy_intercept_browser", false).apply()
-                            BrowsecLocalProxyServer.applyWebViewProxy(false)
+                        if (tab.autoRetryCount < 1) {
+                            tab.autoRetryCount++
+                            // Toggle proxy route once for this tab without overwriting user's saved preference
+                            val nextProxyState = !BrowsecLocalProxyServer.webViewProxyApplied
+                            BrowsecLocalProxyServer.applyWebViewProxy(nextProxyState)
                             tab.lastErrorText = null
-                            tab.loadingStatusText = "⚡ Переключено на прямой стек Chromium QUIC ($browsecCountry)..."
+                            tab.loadingStatusText = "⚡ Авто-переключение маршрута ($browsecCountry • порт ${BrowsecLocalProxyServer.activePort})..."
                             view?.loadUrl(failingUrl)
                             return
                         }
                         tab.isLoading = false
                         tab.loadingProgress = 0
                         tab.lastErrorText = "$desc ($failingUrl)"
-                        tab.loadingStatusText = "⚠️ Ошибка сети: $desc"
+                        tab.loadingStatusText = "⚠️ Ошибка соединения: $desc"
                     }
                 }
             }
@@ -1132,6 +1172,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         )
                                         Switch(checked = browsecEnabled, onCheckedChange = {
                                             browsecEnabled = it
+                                            if (it) {
+                                                proxyInterceptBrowser = true
+                                                prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
+                                            }
+                                            BrowsecLocalProxyServer.applyWebViewProxy(it && proxyInterceptBrowser)
                                             persistBrowserSettings()
                                             navigateTab(activeTab, activeTab.url)
                                         })
@@ -1144,7 +1189,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text(
-                                                "📊 МОНИТОР ТРАФИКА (Chromium + Локальный Сервер + VPN):",
+                                                "📊 МОНИТОР ТРАФИКА (Chromium + Туннель 127.0.0.1:${trafficSnapshot.proxyPort} • База ${trafficSnapshot.loadedAssetPackMb} МБ):",
                                                 color = Color(0xFF34D399),
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 11.sp
@@ -1182,7 +1227,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         )
                                         Switch(checked = proxyInterceptBrowser, onCheckedChange = {
                                             proxyInterceptBrowser = it
-                                            prefs.edit().putBoolean("proxy_intercept_browser", it).apply()
+                                            prefs.edit().putBoolean("tunnel_proxy_active_v30", it).apply()
                                             BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && it)
                                             navigateTab(activeTab, activeTab.url)
                                         })
@@ -1200,9 +1245,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 modifier = Modifier.clickable {
                                                     browsecCountry = node.code
                                                     browsecEnabled = true
+                                                    proxyInterceptBrowser = true
+                                                    prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
                                                     BrowsecVpnService.activeCountry = node.code
+                                                    BrowsecLocalProxyServer.applyWebViewProxy(true)
                                                     persistBrowserSettings()
-                                                    navigateTab(activeTab, activeTab.url)
+                                                    navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
                                                 }
                                             ) {
                                                 Text(
@@ -1345,7 +1393,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }
                                         Button(
                                             onClick = {
-                                                Wasm64WindowsRuntime(context.filesDir).playWindowsPcmSound(523.25, 110)
+                                                playNativeAudioChime(523.25, 110)
                                                 activeTab.webView?.evaluateJavascript(
                                                     """
                                                     (function(){

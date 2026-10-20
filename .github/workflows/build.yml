@@ -1,4 +1,4 @@
-name: Build OmniBrowser & Torrent Pro APK
+name: Build OmniBrowser & VPN Tunnel Pro APK
 
 on:
   push:
@@ -21,6 +21,10 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Generate 50MB+ Offline Anti-DPI & AdBlock Asset Bundle
+        run: |
+          python3 scripts/generate_omni_assets.py
+
       - name: Run Unit Tests & Assemble Signed Release APK (Unified Keystore)
         run: |
           chmod +x gradlew
@@ -29,11 +33,11 @@ jobs:
       - name: Prepare Signed APK Artifact
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-Torrent-Pro-v2.4.0-arm64-release.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-VPN-Tunnel-Pro-v3.0.0-arm64-release.apk
           ls -lh dist/
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OmniBrowser-Torrent-Pro-v2.4.0-arm64-release
-          path: dist/OmniBrowser-Torrent-Pro-v2.4.0-arm64-release.apk
+          name: OmniBrowser-VPN-Tunnel-Pro-v3.0.0-arm64-release
+          path: dist/OmniBrowser-VPN-Tunnel-Pro-v3.0.0-arm64-release.apk
