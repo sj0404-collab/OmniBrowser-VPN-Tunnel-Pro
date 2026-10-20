@@ -278,8 +278,8 @@ object BrowsecLocalProxyServer {
         while (running.get() && !ss.isClosed) {
             try {
                 val client = ss.accept()
-                if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) {
-                    // When paused or stopped, reject proxy connections so apps are disconnected from tunnel
+                if (!BrowsecVpnService.isRunning) {
+                    // Only reject when completely stopped; during Pause, the built-in Browser stays connected!
                     try { client.close() } catch (_: Exception) {}
                     continue
                 }
@@ -298,7 +298,8 @@ object BrowsecLocalProxyServer {
                 webViewProxyApplied = false
                 return
             }
-            if (enabled && !BrowsecVpnService.isPaused && BrowsecVpnService.isRunning) {
+            // Never disconnect the built-in Browser when paused (isPaused only detaches external phone apps)
+            if (enabled && BrowsecVpnService.isRunning) {
                 val proxyConfig = ProxyConfig.Builder()
                     .addProxyRule("http://127.0.0.1:$activePort")
                     .addBypassRule("localhost")
@@ -977,11 +978,12 @@ class BrowsecVpnService : VpnService() {
             }
 
             ACTION_PAUSE -> {
-                // Pause: detach tunnel from apps & browser, keep server state on same activeCountry
+                // Pause: detach system VPN tunnel from external phone apps, while keeping the built-in Browser connected to activeCountry!
                 isPaused = true
                 isRunning = true
                 closePerAppVpnInterface()
-                BrowsecLocalProxyServer.applyWebViewProxy(false)
+                BrowsecLocalProxyServer.ensureRunning()
+                BrowsecLocalProxyServer.applyWebViewProxy(true)
                 persistStateToPrefs(this)
                 postShadeNotification()
                 return START_NOT_STICKY
@@ -1003,9 +1005,11 @@ class BrowsecVpnService : VpnService() {
                 val idx = COUNTRIES.indexOf(activeCountry)
                 activeCountry = COUNTRIES[(idx + 1) % COUNTRIES.size]
                 val port = BrowsecLocalProxyServer.ensureRunning()
-                if (!isPaused && isRunning) {
+                if (isRunning) {
                     BrowsecLocalProxyServer.applyWebViewProxy(true)
-                    establishStrictPerAppVpnIfNeeded(activeCountry, port)
+                    if (!isPaused) {
+                        establishStrictPerAppVpnIfNeeded(activeCountry, port)
+                    }
                 }
                 persistStateToPrefs(this)
                 postShadeNotification()
@@ -1198,14 +1202,14 @@ class BrowsecVpnService : VpnService() {
         val externalCount = routedPackages.count { it != packageName }
 
         val titleText = if (isPaused) {
-            "⏸ VPN На Паузе ($country) • Отсоединён от приложений"
+            "⏸ Пауза для приложений ($country) • В браузере VPN активен"
         } else {
             "🛡️ VPN Активен ($country) • 127.0.0.1:$port"
         }
         val bodyText = if (isPaused) {
-            "Нажмите «▶ Старт ($country)» для продолжения на том же сервере • Прил: $externalCount"
+            "Браузер работает через $country • Нажмите «▶ Старт ($country)» для приложений"
         } else {
-            "⬇ RX: $rxMb | ⬆ TX: $txMb | Только списочные прил: $externalCount"
+            "⬇ RX: $rxMb | ⬆ TX: $txMb | Браузер + списочные прил: $externalCount"
         }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

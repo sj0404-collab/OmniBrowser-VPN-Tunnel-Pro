@@ -276,7 +276,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
         if (browsecEnabled) {
             BrowsecLocalProxyServer.ensureRunning()
-            BrowsecLocalProxyServer.applyWebViewProxy(!browsecPaused && proxyInterceptBrowser)
+            BrowsecLocalProxyServer.applyWebViewProxy(proxyInterceptBrowser)
             if (Build.VERSION.SDK_INT >= 33) {
                 notifPermLauncher.launch("android.permission.POST_NOTIFICATIONS")
             } else {
@@ -300,13 +300,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
-    // Sync Browsec state into BitTorrentEngine and WebView ProxyController
+    // Sync Browsec state into BitTorrentEngine and WebView ProxyController (Browser stays connected even during Pause!)
     LaunchedEffect(browsecEnabled, browsecPaused, browsecCountry, proxyInterceptBrowser) {
         val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
-        torrentEngine.useBrowsecVpn = browsecEnabled && !browsecPaused
+        torrentEngine.useBrowsecVpn = browsecEnabled
         torrentEngine.browsecCountryCode = node.code
         torrentEngine.browsecEdgeIp = node.edgeIp
-        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && !browsecPaused && proxyInterceptBrowser)
+        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && proxyInterceptBrowser)
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
@@ -1470,11 +1470,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     persistBrowserSettings()
                                                     Toast.makeText(context, "▶ Сервер продолжил работу на том же VPN ($browsecCountry)!", Toast.LENGTH_SHORT).show()
                                                 } else {
-                                                    // Pause: detach from app & browser while keeping activeCountry ready
+                                                    // Pause: detach from external phone apps while keeping the built-in Browser connected on activeCountry!
                                                     browsecPaused = true
                                                     BrowsecVpnService.pauseTunnel(context)
                                                     persistBrowserSettings()
-                                                    Toast.makeText(context, "⏸ VPN поставлен на паузу (отсоединён от приложений, сервер $browsecCountry сохранён)", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(context, "⏸ Пауза для приложений (в браузере VPN $browsecCountry продолжает работать!)", Toast.LENGTH_SHORT).show()
                                                 }
                                             },
                                             colors = ButtonDefaults.buttonColors(
@@ -1482,7 +1482,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             )
                                         ) {
                                             Text(
-                                                if (browsecPaused || !browsecEnabled) "▶ Старт ($browsecCountry — тот же VPN)" else "⏸ Пауза (Отсоединить)",
+                                                if (browsecPaused || !browsecEnabled) "▶ Старт ($browsecCountry — тот же VPN)" else "⏸ Пауза прил. (Браузер в VPN)",
                                                 fontSize = 11.sp,
                                                 color = Color.White
                                             )
