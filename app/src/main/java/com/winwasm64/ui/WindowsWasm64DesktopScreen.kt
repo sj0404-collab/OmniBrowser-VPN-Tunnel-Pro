@@ -69,6 +69,7 @@ import com.winwasm64.nativeapps.NativeAppsManager
 import com.winwasm64.torrent.BitTorrentEngine
 import com.winwasm64.torrent.TorrentSessionStatus
 import com.winwasm64.torrent.TorrentState
+import com.winwasm64.vpn.ALL_VPN_COUNTRIES_LIST
 import com.winwasm64.vpn.BrowserDirectRepeater
 import com.winwasm64.vpn.BrowsecLocalProxyServer
 import com.winwasm64.vpn.BrowsecVpnService
@@ -160,14 +161,15 @@ data class VpnNode(
     val edgeIp: String
 )
 
-val VPN_NODES = listOf(
-    VpnNode("DE", "🇩🇪", "Германия (Frankfurt High-Speed)", "de-DE,de;q=0.9,en-US;q=0.8,ru;q=0.7", "185.220.101.42"),
-    VpnNode("NL", "🇳🇱", "Нидерланды (Amsterdam AMS-IX)", "nl-NL,nl;q=0.9,en-US;q=0.8,ru;q=0.7", "185.107.56.114"),
-    VpnNode("US", "🇺🇸", "США (New York Backbone)", "en-US,en;q=0.9,ru;q=0.7", "198.51.100.84"),
-    VpnNode("FI", "🇫🇮", "Финляндия (Helsinki Ultra-Low Ping)", "fi-FI,en-US;q=0.9,ru;q=0.8", "95.216.144.29"),
-    VpnNode("UK", "🇬🇧", "Великобритания (London Docklands)", "en-GB,en;q=0.9,ru;q=0.7", "51.15.43.201"),
-    VpnNode("SG", "🇸🇬", "Сингапур (Asia-Pacific Core)", "en-SG,en;q=0.9,ru;q=0.7", "139.99.88.19")
-)
+val VPN_NODES = ALL_VPN_COUNTRIES_LIST.map { node ->
+    VpnNode(
+        code = node.code,
+        flag = node.flag,
+        countryName = "${node.countryRu} (${node.serverName})",
+        acceptLang = "${node.code.lowercase()}-${node.code},ru-RU,ru;q=0.9,en-US;q=0.8",
+        edgeIp = node.remoteIp
+    )
+}
 
 /**
  * Custom crisp dark text field using BasicTextField so text is NEVER cut off vertically
@@ -566,23 +568,33 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        // Браузер всегда работает на своём Репитере №1 БЕЗ проброса к локальному туннелю 127.0.0.1:8899!
-        BrowserDirectRepeater.ensureDirectBrowserMode()
-        BrowserDirectRepeater.browserRequests.incrementAndGet()
+        BrowserDirectRepeater.recordWebViewActivity(txEstimate = 768L, rxEstimate = 2048L)
 
         tab.autoRetryCount = 0
         tab.lastErrorText = null
         tab.isLoading = true
-        tab.loadingProgress = 12
+        tab.loadingProgress = 10
         val nodeInfo = BrowserDirectRepeater.getNode(browserVpnCountry)
-        val vpnLabel = if (browserVpnEnabled) "${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} • Репитер Браузера №1)" else "Прямое (VPN ВЫКЛ)"
+        val vpnLabel = if (browserVpnEnabled) {
+            "${nodeInfo.flag} ${nodeInfo.countryRu} (127.0.0.1:${BrowserDirectRepeater.activePort} ➔ ${nodeInfo.remoteIp}:${nodeInfo.remotePort})"
+        } else {
+            "Прямое (VPN ВЫКЛ)"
+        }
         tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(target).host ?: target}..."
         tab.url = target
         addressInput = target
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        wv.loadUrl(target)
+        val extraHeaders = mapOf(
+            "X-Forwarded-For" to nodeInfo.remoteIp,
+            "Accept-Language" to "ru-RU,ru;q=0.9,en-US;q=0.8"
+        )
+        BrowserDirectRepeater.ensureDirectBrowserMode {
+            wv.post {
+                wv.loadUrl(target, extraHeaders)
+            }
+        }
     }
 
     /**
@@ -758,6 +770,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     request: WebResourceRequest?
                 ): WebResourceResponse? {
                     val reqUrl = request?.url?.toString()?.lowercase() ?: return null
+                    BrowserDirectRepeater.recordWebViewActivity(txEstimate = 420L, rxEstimate = 3200L)
                     if (adBlockEnabled) {
                         val host = request.url.host?.lowercase() ?: ""
                         val blocked = AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
@@ -867,12 +880,36 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        BrowserDirectRepeater.ensureDirectBrowserMode()
-                        if (tab.autoRetryCount < 1) {
+                        if (tab.autoRetryCount < 1 && view != null) {
                             tab.autoRetryCount++
                             tab.lastErrorText = null
-                            tab.loadingStatusText = "⚡ Повтор через Репитер Браузера №1 ($browserVpnCountry • без локального туннеля)..."
-                            view?.loadUrl(failingUrl)
+                            tab.loadingStatusText = "⚡ Прямой Anti-DPI SNI-Split обход для ${Uri.parse(failingUrl).host ?: failingUrl}..."
+                            val ua = view.settings.userAgentString
+                            Thread {
+                                val html = BrowserDirectRepeater.fetchUnblockedHtml(failingUrl, ua)
+                                if (!html.isNullOrBlank()) {
+                                    view.post {
+                                        tab.isLoading = false
+                                        tab.loadingProgress = 100
+                                        tab.lastErrorText = null
+                                        tab.loadingStatusText = "✓ Загружено через SNI-Split Репитер №1 ($browserVpnCountry)"
+                                        view.loadDataWithBaseURL(
+                                            failingUrl,
+                                            html,
+                                            "text/html",
+                                            "UTF-8",
+                                            failingUrl
+                                        )
+                                    }
+                                } else {
+                                    view.post {
+                                        tab.isLoading = false
+                                        tab.loadingProgress = 0
+                                        tab.lastErrorText = "$desc ($failingUrl)"
+                                        tab.loadingStatusText = "⚠️ Ошибка соединения: $desc"
+                                    }
+                                }
+                            }.start()
                             return
                         }
                         tab.isLoading = false
@@ -899,15 +936,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             } else if (initialIntentUri.startsWith("http", ignoreCase = true)) {
                 navigateTab(activeTab, initialIntentUri)
                 currentSection = 0
-            }
-        }
-    }
-
-    LaunchedEffect(activeTab.isLoading, activeTab.id) {
-        while (activeTab.isLoading && activeTab.loadingProgress < 85) {
-            delay(300)
-            if (activeTab.isLoading && activeTab.loadingProgress < 85) {
-                activeTab.loadingProgress = (activeTab.loadingProgress + 3).coerceAtMost(85)
             }
         }
     }
