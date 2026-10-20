@@ -29,11 +29,11 @@ jobs:
       - name: Prepare Signed APK Artifact
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-Torrent-Pro-v2.2.0-arm64-release.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-Torrent-Pro-v2.3.0-arm64-release.apk
           ls -lh dist/
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OmniBrowser-Torrent-Pro-v2.2.0-arm64-release
-          path: dist/OmniBrowser-Torrent-Pro-v2.2.0-arm64-release.apk
+          name: OmniBrowser-Torrent-Pro-v2.3.0-arm64-release
+          path: dist/OmniBrowser-Torrent-Pro-v2.3.0-arm64-release.apk

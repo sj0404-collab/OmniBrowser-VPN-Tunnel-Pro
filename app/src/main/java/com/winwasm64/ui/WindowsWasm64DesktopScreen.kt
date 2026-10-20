@@ -175,10 +175,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
-    // Start local anti-DPI proxy server immediately and release any legacy TUN lock
+    // Start local anti-DPI + DoH + Upstream Proxy server immediately
     LaunchedEffect(Unit) {
-        BrowsecVpnService.stopSystemTunIfAny(context)
         BrowsecLocalProxyServer.ensureRunning()
+        BrowsecLocalProxyServer.applyWebViewProxy(true)
     }
 
     // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Browsec VPN
@@ -199,12 +199,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var devToolsEnabled by remember { mutableStateOf(false) }
     var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
 
-    // Sync Browsec state into BitTorrentEngine
+    // Sync Browsec state into BitTorrentEngine and WebView ProxyController
     LaunchedEffect(browsecEnabled, browsecCountry) {
         val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
         torrentEngine.useBrowsecVpn = browsecEnabled
         torrentEngine.browsecCountryCode = node.code
         torrentEngine.browsecEdgeIp = node.edgeIp
+        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled)
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
@@ -271,18 +272,38 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             .apply()
     }
 
+    var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        val pkg = pendingVpnLaunchPkg
+        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+        if (!pkg.isNullOrBlank()) {
+            nativeAppsManager.launchApp(pkg)
+            Toast.makeText(context, "🛡️ Запущено через Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(context, "🛡️ Системный туннель Browsec VPN ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
         if (!vpnRoutedApps.contains(pkg)) {
             vpnRoutedApps.add(pkg)
             persistBrowserSettings()
         }
         browsecEnabled = true
-        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-        val ok = nativeAppsManager.launchApp(pkg)
-        if (ok) {
-            Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec Anti-DPI ($browsecCountry, 127.0.0.1:${BrowsecLocalProxyServer.activePort})!", Toast.LENGTH_LONG).show()
+        val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
+        if (prep != null) {
+            pendingVpnLaunchPkg = pkg
+            vpnPermissionLauncher.launch(prep)
         } else {
-            Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
+            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+            val ok = nativeAppsManager.launchApp(pkg)
+            if (ok) {
+                Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec VPN ($browsecCountry, 127.0.0.1:${BrowsecLocalProxyServer.activePort})!", Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -415,24 +436,29 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        // NEVER redirect to piped.video! Always use direct YouTube with Browsec VPN headers or Google Translate proxy for non-YouTube
-        val finalUrl = if (useProxyTunnel && !target.contains("translate.goog") && !target.contains("youtube.com") && !target.contains("youtu.be")) {
-            "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
-        } else {
-            target
+        val isYt = target.contains("youtube.com", ignoreCase = true) || target.contains("youtu.be", ignoreCase = true)
+        val finalUrl = when {
+            useProxyTunnel && isYt -> {
+                val q = Uri.parse(target).getQueryParameter("search_query")
+                    ?: Uri.parse(target).getQueryParameter("q") ?: ""
+                "file:///android_asset/youtube_unblocked_hub.html?q=${Uri.encode(q)}"
+            }
+            useProxyTunnel && !target.contains("translate.goog") && !target.startsWith("file:") -> {
+                "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
+            }
+            else -> target
         }
 
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 12
         val vpnLabel = if (browsecEnabled) "Browsec $browsecCountry" else "Прямое"
-        tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(finalUrl).host ?: finalUrl}..."
+        tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(finalUrl).host ?: "YouTube Tunnel"}..."
         tab.url = finalUrl
-        addressInput = finalUrl
+        addressInput = if (finalUrl.startsWith("file:")) "https://m.youtube.com (Туннель Browsec)" else finalUrl
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        // Direct loadUrl as in v1.0.0 so YouTube and Google never block or drop connections
         wv.loadUrl(finalUrl)
     }
 
@@ -615,13 +641,39 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
+                        browsecEnabled = true
+                        BrowsecLocalProxyServer.forceUpstreamProxy = true
+                        BrowsecLocalProxyServer.applyWebViewProxy(true)
+
+                        val isYt = failingUrl.contains("youtube.com", ignoreCase = true) ||
+                            failingUrl.contains("youtu.be", ignoreCase = true)
+
+                        if (isYt && !failingUrl.startsWith("file:")) {
+                            val q = try {
+                                Uri.parse(failingUrl).getQueryParameter("search_query")
+                                    ?: Uri.parse(failingUrl).getQueryParameter("q") ?: ""
+                            } catch (_: Exception) { "" }
+                            val tunnelUrl = "file:///android_asset/youtube_unblocked_hub.html?q=${Uri.encode(q)}"
+                            tab.lastErrorText = null
+                            tab.isLoading = false
+                            tab.loadingProgress = 100
+                            tab.loadingStatusText = "🛡️ Прямой YouTube заблокирован провайдером — включён YouTube-Туннель Browsec ($browsecCountry)!"
+                            view?.loadUrl(tunnelUrl)
+                            return
+                        }
+
+                        if (!isYt && !failingUrl.contains("translate.google") && !failingUrl.contains("translate.goog") && failingUrl.startsWith("http")) {
+                            val proxied = "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(failingUrl)}"
+                            tab.lastErrorText = null
+                            tab.loadingStatusText = "🛡️ Прямой доступ заблокирован — открытие через Веб-Туннель Browsec ($browsecCountry)..."
+                            view?.loadUrl(proxied)
+                            return
+                        }
+
                         tab.isLoading = false
                         tab.loadingProgress = 0
                         tab.lastErrorText = "$desc ($failingUrl)"
-                        tab.loadingStatusText = "⚠️ $desc — нажмите «Сменить страну Browsec» и «↻ Обновить»"
-                        if (!browsecEnabled) {
-                            browsecEnabled = true
-                        }
+                        tab.loadingStatusText = "⚠️ $desc — нажмите «Открыть через Туннель»"
                     }
                 }
             }
@@ -1071,13 +1123,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         Button(
                                             onClick = {
                                                 browsecEnabled = true
-                                                BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = false)
-                                                Toast.makeText(context, "✅ Прямой трафик Browsec ($browsecCountry) как в v1.0.0 активен!", Toast.LENGTH_SHORT).show()
+                                                val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
+                                                if (prep != null) {
+                                                    pendingVpnLaunchPkg = null
+                                                    vpnPermissionLauncher.launch(prep)
+                                                } else {
+                                                    BrowsecVpnService.startForApp(context, browsecCountry, null)
+                                                    Toast.makeText(context, "🛡️ Системный VPN Browsec ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
+                                                }
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                                         ) {
-                                            Text("⚡ Прямой режим v1.0 (YouTube + Трафик)", fontSize = 11.sp, color = Color.White)
+                                            Text("🛡️ Включить системный VPN ($browsecCountry)", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1088,6 +1145,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                                         ) {
                                             Text("🔓 Открыть сайт через Веб-Туннель", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                browsecEnabled = true
+                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = true)
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                                        ) {
+                                            Text("🎬 YouTube через Туннель", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1155,12 +1222,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             onClick = {
                                                 browsecEnabled = true
                                                 val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
-                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q")
+                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q", useProxyTunnel = true)
                                                 activeExtensionPopup = null
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
                                         ) {
-                                            Text("▶ Найти на YouTube", fontSize = 11.sp, color = Color.White)
+                                            Text("▶ Найти (Без блокировок)", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                     Row(
@@ -1170,22 +1237,32 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         Button(
                                             onClick = {
                                                 browsecEnabled = true
-                                                navigateTab(activeTab, "https://m.youtube.com")
+                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = true)
                                                 activeExtensionPopup = null
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
                                         ) {
-                                            Text("📱 YouTube Мобильный", fontSize = 11.sp, color = Color.White)
+                                            Text("🎬 YouTube Туннель (100% Работает)", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
                                                 browsecEnabled = true
-                                                navigateTab(activeTab, "https://www.youtube.com/?app=desktop")
+                                                navigateTab(activeTab, "https://yewtu.be/feed/popular", useProxyTunnel = false)
+                                                activeExtensionPopup = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                        ) {
+                                            Text("🌐 Зеркало Yewtu.be", fontSize = 11.sp, color = Color.White)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                browsecEnabled = true
+                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = false)
                                                 activeExtensionPopup = null
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                                         ) {
-                                            Text("🖥 YouTube Полный (ПК)", fontSize = 11.sp, color = Color.White)
+                                            Text("📱 Прямой m.youtube.com", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {

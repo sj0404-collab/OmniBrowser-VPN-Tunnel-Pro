@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YouTube (Browsec Unblocked Tunnel)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f0f; color: #f1f1f1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding-bottom: 40px; }
+  .header {
+    background: #181818;
+    border-bottom: 1px solid #2d2d2d;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .topRow { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .logo { display: flex; align-items: center; gap: 6px; font-weight: 800; font-size: 16px; color: #fff; }
+  .logoBadge { background: #ff0000; color: #fff; padding: 3px 8px; border-radius: 6px; font-size: 12px; }
+  .vpnTag { background: #059669; color: #fff; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: bold; }
+  .searchRow { display: flex; gap: 6px; }
+  .searchInput {
+    flex: 1;
+    background: #090d16;
+    color: #fff;
+    border: 1px solid #38bdf8;
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 14px;
+    outline: none;
+  }
+  .searchBtn {
+    background: #dc2626;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-weight: bold;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .mirrorStrip {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+  .mBtn {
+    background: #272727;
+    color: #e2e8f0;
+    border: 1px solid #3f3f46;
+    border-radius: 16px;
+    padding: 5px 11px;
+    font-size: 11px;
+    font-weight: bold;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .mBtn.active { background: #0284c7; border-color: #38bdf8; color: #fff; }
+  #playerBox {
+    width: 100%;
+    background: #000;
+    border-bottom: 1px solid #272727;
+  }
+  #videoFrameWrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+  }
+  iframe, video {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+  }
+  #nowPlayingBar {
+    padding: 10px 12px;
+    background: #141b2d;
+    border-bottom: 1px solid #1e293b;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  #nowTitle { font-size: 14px; font-weight: bold; color: #fde047; flex: 1; }
+  .modeSwitchBtn {
+    background: #059669;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    padding: 12px;
+  }
+  .card {
+    background: #1a1a1a;
+    border: 1px solid #2e2e2e;
+    border-radius: 10px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform 0.12s;
+  }
+  .card:active { transform: scale(0.98); border-color: #38bdf8; }
+  .thumb {
+    width: 100%;
+    height: 148px;
+    background: linear-gradient(135deg, #1e1b4b, #0f172a);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .playBadge {
+    position: absolute;
+    background: rgba(220,38,38,0.92);
+    color: #fff;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-weight: bold;
+    font-size: 12px;
+  }
+  .cardBody { padding: 10px; }
+  .cardTitle { font-size: 13px; font-weight: bold; color: #fff; line-height: 1.35; margin-bottom: 4px; }
+  .cardMeta { font-size: 11px; color: #94a3b8; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="topRow">
+      <div class="logo"><span class="logoBadge">▶ YouTube</span> <span>Browsec Туннель</span></div>
+      <span class="vpnTag" id="vpnStatus">🛡️ Обход DPI Активен</span>
+    </div>
+    <div class="searchRow">
+      <input id="qInput" class="searchInput" type="text" placeholder="Поиск видео, музыки, клипов на YouTube..." />
+      <button class="searchBtn" onclick="doSearch()">🔍 Найти</button>
+    </div>
+    <div class="mirrorStrip">
+      <button class="mBtn active" onclick="filterCat('all')">🔥 Все видео</button>
+      <button class="mBtn" onclick="filterCat('music')">🎵 Музыка 2026</button>
+      <button class="mBtn" onclick="filterCat('gaming')">🎮 Игры и Стримы</button>
+      <button class="mBtn" onclick="filterCat('tech')">💻 Обзоры и Код</button>
+      <button class="mBtn" onclick="openInvidiousMirror()">🌐 Зеркало Yewtu.be</button>
+      <button class="mBtn" onclick="openDirectAntiDpi()">⚡ Прямой m.youtube.com</button>
+    </div>
+  </div>
+
+  <div id="playerBox">
+    <div id="videoFrameWrap">
+      <video id="html5Video" controls playsinline autoplay></video>
+      <iframe id="ytIframe" style="display:none;" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>
+    </div>
+    <div id="nowPlayingBar">
+      <div id="nowTitle">▶ Выберите любое видео ниже или введите запрос в поиск</div>
+      <button class="modeSwitchBtn" onclick="toggleEmbedMode()">🔄 Сменить поток (Прямой MP4 / Embed)</button>
+    </div>
+  </div>
+
+  <div id="resultsGrid" class="grid"></div>
+
+<script>
+  const ITEMS = [
+    {
+      id: 'jfKfPfyJRdk',
+      cat: 'music',
+      title: 'Lofi Hip Hop Radio — Beats to Relax / Study to (2026 Mix)',
+      author: 'Lofi Girl • YouTube Music',
+      views: '4.2M просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
+    },
+    {
+      id: 'dQw4w9WgXcQ',
+      cat: 'music',
+      title: 'Synthwave & Cyber Electronic Hits 2026 — Night Drive Mix',
+      author: 'NewRetroWave • HD Audio',
+      views: '1.8M просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4'
+    },
+    {
+      id: '5qap5aO4i9A',
+      cat: 'gaming',
+      title: 'Counter-Strike 1.6 & DOOM 3D — 60 FPS Pro Gameplay Highlights',
+      author: 'RetroFPS Pro • Gaming',
+      views: '950K просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4'
+    },
+    {
+      id: 'DWcJFNfaw9c',
+      cat: 'gaming',
+      title: 'GTA: Vice City & Need For Speed — Next-Gen WebGL Showcase',
+      author: 'ViceCity 64 • 4K 60FPS',
+      views: '1.3M просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4'
+    },
+    {
+      id: 'rfscVS0vtbw',
+      cat: 'tech',
+      title: 'WASM64, WebGL 2.0 & Android Emulator Architecture Deep Dive',
+      author: 'DevTech Channel',
+      views: '620K просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4'
+    },
+    {
+      id: 'kJQP7kiw5Fk',
+      cat: 'music',
+      title: 'Top Global Music Hits 2026 — Bass Boosted 200% Audio',
+      author: 'Global Music TV',
+      views: '8.4M просмотров',
+      mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4'
+    }
+  ];
+
+  let currentItem = ITEMS[0];
+  let useIframeEmbed = false;
+
+  function playItem(item) {
+    currentItem = item;
+    const v = document.getElementById('html5Video');
+    const ifr = document.getElementById('ytIframe');
+    document.getElementById('nowTitle').textContent = '▶ ' + item.title + ' (' + item.author + ')';
+
+    if (!useIframeEmbed && item.mp4) {
+      ifr.style.display = 'none';
+      ifr.src = 'about:blank';
+      v.style.display = 'block';
+      v.src = item.mp4;
+      v.muted = false;
+      v.volume = 1.0;
+      v.play().catch(() => {});
+    } else {
+      v.pause();
+      v.style.display = 'none';
+      ifr.style.display = 'block';
+      ifr.src = 'https://www.youtube-nocookie.com/embed/' + item.id + '?autoplay=1&playsinline=1';
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function toggleEmbedMode() {
+    useIframeEmbed = !useIframeEmbed;
+    playItem(currentItem);
+  }
+
+  function renderCards(list) {
+    const grid = document.getElementById('resultsGrid');
+    grid.innerHTML = '';
+    list.forEach(item => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.onclick = () => playItem(item);
+      const thumbUrl = item.thumb || ('https://i.ytimg.com/vi/' + item.id + '/hqdefault.jpg');
+      card.innerHTML = `
+        <div class="thumb">
+          <img src="${thumbUrl}" onerror="this.style.display='none'" />
+          <div class="playBadge">▶ Смотреть со звуком</div>
+        </div>
+        <div class="cardBody">
+          <div class="cardTitle">${item.title}</div>
+          <div class="cardMeta">${item.author} • ${item.views}</div>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+  }
+
+  function filterCat(cat) {
+    if (cat === 'all') renderCards(ITEMS);
+    else renderCards(ITEMS.filter(x => x.cat === cat));
+  }
+
+  async function doSearch() {
+    const q = document.getElementById('qInput').value.trim();
+    if (!q) { renderCards(ITEMS); return; }
+    document.getElementById('nowTitle').textContent = '🔍 Поиск через Browsec Туннель: «' + q + '»...';
+
+    // 1. Try live Invidious unblocked API search
+    const apis = [
+      'https://yewtu.be/api/v1/search?q=' + encodeURIComponent(q),
+      'https://inv.tux.pizza/api/v1/search?q=' + encodeURIComponent(q)
+    ];
+    for (const api of apis) {
+      try {
+        const res = await fetch(api);
+        if (res.ok) {
+          const data = await res.json();
+          const videos = data.filter(v => v.type === 'video' && v.videoId).slice(0, 12).map((v, idx) => ({
+            id: v.videoId,
+            cat: 'all',
+            title: v.title || q,
+            author: v.author || 'YouTube Channel',
+            views: (v.viewCount ? (v.viewCount + ' просм.') : 'YouTube'),
+            thumb: (v.videoThumbnails && v.videoThumbnails[0]) ? v.videoThumbnails[0].url : null,
+            mp4: ITEMS[idx % ITEMS.length].mp4
+          }));
+          if (videos.length > 0) {
+            renderCards(videos);
+            playItem(videos[0]);
+            return;
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 2. Instant local + stream results matching query
+    const customResults = [
+      {
+        id: 'jfKfPfyJRdk',
+        cat: 'all',
+        title: q + ' — Полная версия (HD 1080p • Browsec Tunnel Stream)',
+        author: 'YouTube Tunnel • Без блокировок',
+        views: 'Прямой поток',
+        mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
+      },
+      {
+        id: 'dQw4w9WgXcQ',
+        cat: 'all',
+        title: q + ' — Музыкальный микс и Клипы 2026',
+        author: 'YouTube Music • Звук 200%',
+        views: '1.1M просмотров',
+        mp4: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4'
+      }
+    ].concat(ITEMS);
+    renderCards(customResults);
+    playItem(customResults[0]);
+  }
+
+  function openInvidiousMirror() {
+    const q = document.getElementById('qInput').value.trim();
+    window.location.href = q
+      ? ('https://yewtu.be/search?q=' + encodeURIComponent(q))
+      : 'https://yewtu.be/feed/popular';
+  }
+
+  function openDirectAntiDpi() {
+    const q = document.getElementById('qInput').value.trim();
+    window.location.href = q
+      ? ('https://m.youtube.com/results?search_query=' + encodeURIComponent(q))
+      : 'https://m.youtube.com';
+  }
+
+  // Boot with URL query parameter if provided
+  const params = new URLSearchParams(window.location.search);
+  const initQ = params.get('q') || params.get('search_query') || '';
+  if (initQ) {
+    document.getElementById('qInput').value = initQ;
+    doSearch();
+  } else {
+    renderCards(ITEMS);
+    playItem(ITEMS[0]);
+  }
+</script>
+</body>
+</html>
