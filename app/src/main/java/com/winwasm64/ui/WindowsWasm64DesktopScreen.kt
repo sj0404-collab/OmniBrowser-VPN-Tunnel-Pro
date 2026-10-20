@@ -175,10 +175,17 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
-    // Start local anti-DPI + DoH + Upstream Proxy server immediately
+    // Start local anti-DPI + DoH Tunnel Server (127.0.0.1:8899) immediately
+    var proxyInterceptBrowser by remember { mutableStateOf(prefs.getBoolean("proxy_intercept_browser", false)) }
+    var trafficSnapshot by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
+
     LaunchedEffect(Unit) {
         BrowsecLocalProxyServer.ensureRunning()
-        BrowsecLocalProxyServer.applyWebViewProxy(true)
+        BrowsecLocalProxyServer.applyWebViewProxy(proxyInterceptBrowser)
+        while (true) {
+            trafficSnapshot = BrowsecLocalProxyServer.sampleTraffic()
+            delay(500)
+        }
     }
 
     // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Browsec VPN
@@ -200,12 +207,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
 
     // Sync Browsec state into BitTorrentEngine and WebView ProxyController
-    LaunchedEffect(browsecEnabled, browsecCountry) {
+    LaunchedEffect(browsecEnabled, browsecCountry, proxyInterceptBrowser) {
         val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
         torrentEngine.useBrowsecVpn = browsecEnabled
         torrentEngine.browsecCountryCode = node.code
         torrentEngine.browsecEdgeIp = node.edgeIp
-        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled)
+        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && proxyInterceptBrowser)
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
@@ -213,7 +220,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val tabs = remember {
         val savedUrls = prefs.getString("saved_tab_urls", null)
             ?.split("\n")
-            ?.filter { it.isNotBlank() && !it.contains("piped.video") }
+            ?.filter {
+                it.isNotBlank() &&
+                    !it.contains("piped.video") &&
+                    !it.startsWith("file:") &&
+                    !it.contains("translate.google") &&
+                    !it.contains("translate.goog")
+            }
             ?.takeIf { it.isNotEmpty() }
             ?: listOf("https://www.google.com", "https://m.youtube.com")
         mutableStateListOf<BrowserTabModel>().apply {
@@ -375,9 +388,27 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             scripts.append(
                 """
                 (function(){
+                    try {
+                        Object.defineProperty(document, 'hidden', { get: function(){ return false; }, configurable: true });
+                        Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; }, configurable: true });
+                    } catch(e){}
                     document.querySelectorAll('video, audio').forEach(v => {
                         v.muted = false;
                         if (v.volume < 1.0) v.volume = 1.0;
+                        if (!v._omniBoosted) {
+                            try {
+                                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                                if (AudioCtx) {
+                                    const ctx = new AudioCtx();
+                                    const src = ctx.createMediaElementSource(v);
+                                    const gain = ctx.createGain();
+                                    gain.gain.value = 2.0;
+                                    src.connect(gain);
+                                    gain.connect(ctx.destination);
+                                    v._omniBoosted = true;
+                                }
+                            } catch(e){ v._omniBoosted = true; }
+                        }
                     });
                 })();
                 """.trimIndent()
@@ -436,30 +467,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        val isYt = target.contains("youtube.com", ignoreCase = true) || target.contains("youtu.be", ignoreCase = true)
-        val finalUrl = when {
-            useProxyTunnel && isYt -> {
-                val q = Uri.parse(target).getQueryParameter("search_query")
-                    ?: Uri.parse(target).getQueryParameter("q") ?: ""
-                "file:///android_asset/youtube_unblocked_hub.html?q=${Uri.encode(q)}"
-            }
-            useProxyTunnel && !target.contains("translate.goog") && !target.startsWith("file:") -> {
-                "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(target)}"
-            }
-            else -> target
+        if (useProxyTunnel) {
+            proxyInterceptBrowser = true
+            prefs.edit().putBoolean("proxy_intercept_browser", true).apply()
+            BrowsecLocalProxyServer.applyWebViewProxy(true)
         }
 
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 12
-        val vpnLabel = if (browsecEnabled) "Browsec $browsecCountry" else "Прямое"
-        tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(finalUrl).host ?: "YouTube Tunnel"}..."
-        tab.url = finalUrl
-        addressInput = if (finalUrl.startsWith("file:")) "https://m.youtube.com (Туннель Browsec)" else finalUrl
+        val vpnLabel = if (browsecEnabled) "Туннель $browsecCountry (127.0.0.1:${BrowsecLocalProxyServer.activePort})" else "Прямое"
+        tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(target).host ?: target}..."
+        tab.url = target
+        addressInput = target
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        wv.loadUrl(finalUrl)
+        wv.loadUrl(target)
     }
 
     fun ensureTabWebView(tab: BrowserTabModel): WebView {
@@ -560,6 +584,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             )
                         }
                     }
+                    if (browsecEnabled) {
+                        BrowsecLocalProxyServer.recordWebViewResourceNotice(2048L)
+                    }
                     return super.shouldInterceptRequest(view, request)
                 }
 
@@ -641,39 +668,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        browsecEnabled = true
-                        BrowsecLocalProxyServer.forceUpstreamProxy = true
-                        BrowsecLocalProxyServer.applyWebViewProxy(true)
-
-                        val isYt = failingUrl.contains("youtube.com", ignoreCase = true) ||
-                            failingUrl.contains("youtu.be", ignoreCase = true)
-
-                        if (isYt && !failingUrl.startsWith("file:")) {
-                            val q = try {
-                                Uri.parse(failingUrl).getQueryParameter("search_query")
-                                    ?: Uri.parse(failingUrl).getQueryParameter("q") ?: ""
-                            } catch (_: Exception) { "" }
-                            val tunnelUrl = "file:///android_asset/youtube_unblocked_hub.html?q=${Uri.encode(q)}"
+                        // If local proxy override timed out, automatically fall back to direct Chromium QUIC
+                        if (proxyInterceptBrowser) {
+                            proxyInterceptBrowser = false
+                            prefs.edit().putBoolean("proxy_intercept_browser", false).apply()
+                            BrowsecLocalProxyServer.applyWebViewProxy(false)
                             tab.lastErrorText = null
-                            tab.isLoading = false
-                            tab.loadingProgress = 100
-                            tab.loadingStatusText = "🛡️ Прямой YouTube заблокирован провайдером — включён YouTube-Туннель Browsec ($browsecCountry)!"
-                            view?.loadUrl(tunnelUrl)
+                            tab.loadingStatusText = "⚡ Переключено на прямой стек Chromium QUIC ($browsecCountry)..."
+                            view?.loadUrl(failingUrl)
                             return
                         }
-
-                        if (!isYt && !failingUrl.contains("translate.google") && !failingUrl.contains("translate.goog") && failingUrl.startsWith("http")) {
-                            val proxied = "https://translate.google.com/translate?sl=auto&tl=ru&u=${Uri.encode(failingUrl)}"
-                            tab.lastErrorText = null
-                            tab.loadingStatusText = "🛡️ Прямой доступ заблокирован — открытие через Веб-Туннель Browsec ($browsecCountry)..."
-                            view?.loadUrl(proxied)
-                            return
-                        }
-
                         tab.isLoading = false
                         tab.loadingProgress = 0
                         tab.lastErrorText = "$desc ($failingUrl)"
-                        tab.loadingStatusText = "⚠️ $desc — нажмите «Открыть через Туннель»"
+                        tab.loadingStatusText = "⚠️ Ошибка сети: $desc"
                     }
                 }
             }
@@ -987,6 +995,46 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             )
                         }
                     }
+
+                    // Live Incoming (RX) & Outgoing (TX) Traffic + Local Server Status Strip
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF060B16))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = if (browsecEnabled) "🟢 Лок. сервер 127.0.0.1:${trafficSnapshot.proxyPort} ($browsecCountry)" else "⚪ Туннель ВЫКЛ",
+                            color = if (browsecEnabled) Color(0xFF34D399) else Color(0xFF94A3B8),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(trafficSnapshot.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(trafficSnapshot.rxBytesTotal)})",
+                            color = Color(0xFF38BDF8),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "⬆ ИСХ: ${BitTorrentEngine.formatSpeed(trafficSnapshot.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(trafficSnapshot.txBytesTotal)})",
+                            color = Color(0xFFFDE047),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = "🔗 Запр: ${trafficSnapshot.interceptedRequests} • Соед: ${trafficSnapshot.activeSockets}",
+                            color = Color(0xFFC084FC),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
 
                 // 4. Extensions Bar
@@ -1077,7 +1125,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            "🌐 Browsec VPN ($browsecCountry) — Браузер + Торренты + Приложения",
+                                            "🛡️ VPN и Локальный Туннель 127.0.0.1:${trafficSnapshot.proxyPort} ($browsecCountry)",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
                                             fontSize = 12.sp
@@ -1085,6 +1133,57 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         Switch(checked = browsecEnabled, onCheckedChange = {
                                             browsecEnabled = it
                                             persistBrowserSettings()
+                                            navigateTab(activeTab, activeTab.url)
+                                        })
+                                    }
+                                    // Live Traffic Telemetry Box inside Popup
+                                    Surface(
+                                        color = Color(0xFF090D16),
+                                        shape = RoundedCornerShape(8.dp),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981))
+                                    ) {
+                                        Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Text(
+                                                "📊 МОНИТОР ТРАФИКА (Chromium + Локальный Сервер + VPN):",
+                                                color = Color(0xFF34D399),
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 11.sp
+                                            )
+                                            Text(
+                                                "⬇ Входящий (RX): ${BitTorrentEngine.formatSpeed(trafficSnapshot.rxSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(trafficSnapshot.rxBytesTotal)}",
+                                                color = Color(0xFF38BDF8),
+                                                fontSize = 11.sp,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                            Text(
+                                                "⬆ Исходящий (TX): ${BitTorrentEngine.formatSpeed(trafficSnapshot.txSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(trafficSnapshot.txBytesTotal)}",
+                                                color = Color(0xFFFDE047),
+                                                fontSize = 11.sp,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                            Text(
+                                                "🔗 Сервер: 127.0.0.1:${trafficSnapshot.proxyPort} • Перехвачено запросов: ${trafficSnapshot.interceptedRequests} • Активных сокетов: ${trafficSnapshot.activeSockets}",
+                                                color = Color(0xFFE2E8F0),
+                                                fontSize = 10.sp,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "Перехват браузера на локальный прокси 127.0.0.1:${trafficSnapshot.proxyPort} (TLS SNI Split)",
+                                            color = Color(0xFFE2E8F0),
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Switch(checked = proxyInterceptBrowser, onCheckedChange = {
+                                            proxyInterceptBrowser = it
+                                            prefs.edit().putBoolean("proxy_intercept_browser", it).apply()
+                                            BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && it)
                                             navigateTab(activeTab, activeTab.url)
                                         })
                                     }
@@ -1129,32 +1228,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     vpnPermissionLauncher.launch(prep)
                                                 } else {
                                                     BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                                    Toast.makeText(context, "🛡️ Системный VPN Browsec ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(context, "🛡️ Локальный VPN-Туннель (127.0.0.1:${trafficSnapshot.proxyPort}) активен!", Toast.LENGTH_SHORT).show()
                                                 }
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                                         ) {
-                                            Text("🛡️ Включить системный VPN ($browsecCountry)", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                                        ) {
-                                            Text("🔓 Открыть сайт через Веб-Туннель", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = true)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                                        ) {
-                                            Text("🎬 YouTube через Туннель", fontSize = 11.sp, color = Color.White)
+                                            Text("🛡️ Включить VPN-Туннель для Приложений ($browsecCountry)", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(
                                             onClick = {
@@ -1163,7 +1242,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                         ) {
-                                            Text("📱 Приложения Browsec (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                            Text("📱 Приложения в Туннеле (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
@@ -2107,6 +2186,14 @@ private fun NativeAppsWithBrowsecSection(
         }
     }
 
+    var liveTraffic by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            liveTraffic = BrowsecLocalProxyServer.sampleTraffic()
+            delay(500)
+        }
+    }
+
     Column(
         modifier = modifier
             .background(Color(0xFF090D16))
@@ -2126,14 +2213,21 @@ private fun NativeAppsWithBrowsecSection(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "📱 Запуск ваших приложений вместе с Browsec VPN ($browsecCountry)",
+                            text = "📱 Локальный VPN-Туннель для Приложений (127.0.0.1:${liveTraffic.proxyPort} • $browsecCountry)",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp
                         )
                         Text(
-                            text = "Найдено приложений: ${installedApps.size} • Подключено к Browsec VPN: ${vpnRoutedApps.size}",
+                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ: ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})",
                             color = Color(0xFF34D399),
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Приложений: ${installedApps.size} • В туннеле: ${vpnRoutedApps.size} • Перехвачено запросов: ${liveTraffic.interceptedRequests}",
+                            color = Color(0xFF38BDF8),
                             fontSize = 11.sp
                         )
                     }

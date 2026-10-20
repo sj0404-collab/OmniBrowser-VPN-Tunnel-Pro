@@ -13,8 +13,8 @@ android {
         minSdk = 24
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
-        versionCode = 2300 + ciRunNumber
-        versionName = "2.3.0"
+        versionCode = 2400 + ciRunNumber
+        versionName = "2.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
