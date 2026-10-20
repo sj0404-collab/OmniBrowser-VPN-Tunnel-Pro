@@ -132,7 +132,16 @@ class NativeAppsManager(private val context: Context) {
                 else -> "📱 Все приложения устройства"
             }
 
-            val isSys = (ai.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            val isPriorityApp = pkg == "com.google.android.youtube" ||
+                pkg == "com.android.vending" ||
+                pkg.contains("youtube", ignoreCase = true) ||
+                pkg.contains("telegram", ignoreCase = true) ||
+                pkg.contains("ayugram", ignoreCase = true) ||
+                pkg.contains("discord", ignoreCase = true) ||
+                pkg.contains("tiktok", ignoreCase = true) ||
+                pkg.contains("instagram", ignoreCase = true)
+
+            val isSys = !isPriorityApp && ((ai.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0)
 
             entries.add(
                 NativeAppEntry(
@@ -147,7 +156,44 @@ class NativeAppsManager(private val context: Context) {
             )
         }
 
-        return entries.sortedWith(compareBy<NativeAppEntry> { it.isSystemApp }.thenBy { it.appName.lowercase() })
+        // Гарантируем присутствие нативного YouTube и Google Play Маркет в самом верху списка, даже если Android скрывает их из queryIntentActivities
+        val guaranteedApps = listOf(
+            Triple("YouTube (Нативное приложение)", "com.google.android.youtube", "🎬 Видео и Аудио плееры"),
+            Triple("Google Play Маркет (Нативное приложение)", "com.android.vending", "🌐 Браузеры и Мессенджеры"),
+            Triple("YouTube Music (Нативное приложение)", "com.google.android.apps.youtube.music", "🎬 Видео и Аудио плееры"),
+            Triple("Telegram (Нативное приложение)", "org.telegram.messenger", "🌐 Браузеры и Мессенджеры")
+        )
+        for ((title, gPkg, cat) in guaranteedApps) {
+            if (entries.none { it.packageName == gPkg }) {
+                val icon = try {
+                    drawableToImageBitmap(pm.getApplicationIcon(gPkg))
+                } catch (_: Exception) {
+                    null
+                }
+                entries.add(
+                    0,
+                    NativeAppEntry(
+                        appName = title,
+                        packageName = gPkg,
+                        activityName = "",
+                        category = cat,
+                        supportedFormats = listOf("📱 Нативное приложение", "🌐 Сеть / Ссылки"),
+                        iconBitmap = icon,
+                        isSystemApp = false
+                    )
+                )
+            }
+        }
+
+        return entries.sortedWith(
+            compareBy<NativeAppEntry> {
+                when (it.packageName) {
+                    "com.google.android.youtube" -> 0
+                    "com.android.vending" -> 1
+                    else -> if (it.isSystemApp) 3 else 2
+                }
+            }.thenBy { it.appName.lowercase() }
+        )
     }
 
     private fun queryPackagesForMime(pm: PackageManager, mime: String): Set<String> {
@@ -172,17 +218,43 @@ class NativeAppsManager(private val context: Context) {
         return try {
             val port = com.winwasm64.vpn.BrowsecLocalProxyServer.ensureRunning()
             val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
-            if (launchIntent != null) {
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                launchIntent.putExtra("proxy_host", "127.0.0.1")
-                launchIntent.putExtra("proxy_port", port)
-                launchIntent.putExtra("http.proxyHost", "127.0.0.1")
-                launchIntent.putExtra("http.proxyPort", port.toString())
-                context.startActivity(launchIntent)
-                true
-            } else false
+                ?: when (packageName) {
+                    "com.google.android.youtube" -> Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://")).apply {
+                        setPackage("com.google.android.youtube")
+                    }
+                    "com.android.vending" -> Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.android.youtube")).apply {
+                        setPackage("com.android.vending")
+                    }
+                    else -> Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                        setPackage(packageName)
+                    }
+                }
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            launchIntent.putExtra("proxy_host", "127.0.0.1")
+            launchIntent.putExtra("proxy_port", port)
+            launchIntent.putExtra("http.proxyHost", "127.0.0.1")
+            launchIntent.putExtra("http.proxyPort", port.toString())
+            context.startActivity(launchIntent)
+            true
         } catch (_: Exception) {
-            false
+            try {
+                val fallback = when (packageName) {
+                    "com.google.android.youtube" -> Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com")).apply {
+                        setPackage("com.google.android.youtube")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    "com.android.vending" -> Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_APP_MARKET)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    else -> return false
+                }
+                context.startActivity(fallback)
+                true
+            } catch (_: Exception) {
+                false
+            }
         }
     }
 

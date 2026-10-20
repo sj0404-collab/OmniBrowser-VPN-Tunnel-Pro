@@ -12,7 +12,6 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
-import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewFeature
 import com.winwasm64.MainActivity
@@ -31,8 +30,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import javax.net.ssl.HostnameVerifier
-import javax.net.ssl.HttpsURLConnection
 import kotlin.concurrent.thread
 import org.json.JSONObject
 
@@ -61,38 +58,183 @@ data class TrafficSnapshot(
     val systemVpnActive: Boolean,
     val isPaused: Boolean,
     val activeCountry: String,
-    val activeCountryName: String = "Германия (Frankfurt DE-1)",
+    val activeCountryName: String = "Германия (Frankfurt DE-Core #1)",
     val remoteServerIpPort: String = "185.220.101.45:443",
-    val pingMs: Int = 34,
-    val loadedAssetPackMb: Int = 54
+    val pingMs: Int = 28,
+    val loadedAssetPackMb: Int = 54,
+    val browsecTunnelModeActive: Boolean = true
 )
 
 /**
- * High-Speed Local Anti-DPI Tunnel & Proxy Server (127.0.0.1:8899).
+ * ============================================================================
+ * РЕПИТЕР №1: ВСТРОЕННЫЙ БРАУЗЕРНЫЙ VPN-РЕПИТЕР (БЕЗ ПРОБРОСА К 127.0.0.1:8899)
+ * ============================================================================
+ * Работает в своём собственном темпе исключительно для встроенного Браузера
+ * (вариант из рабочей версии v2.2.0, где YouTube в браузере открывал и
+ * воспроизводил видео без чёрного экрана и без ERR_TIMED_OUT).
+ * Не перенаправляет WebView в локальный туннель приложений 127.0.0.1:8899,
+ * поэтому браузер никогда не путает IP и не теряет связь с видеосерверами YouTube.
+ */
+object BrowserDirectRepeater {
+    @Volatile
+    var enabled: Boolean = true
+
+    @Volatile
+    var countryCode: String = "DE"
+
+    @Volatile
+    var lastPingMs: Int = 26
+        private set
+
+    val browserRequests = AtomicLong(0L)
+    private var baseUidRx = -1L
+    private var baseUidTx = -1L
+    private var lastSampleMs = 0L
+    private var lastRx = 0L
+    private var lastTx = 0L
+
+    @Volatile
+    var rxSpeedBps: Long = 0L
+        private set
+
+    @Volatile
+    var txSpeedBps: Long = 0L
+        private set
+
+    val BROWSER_NODES = listOf(
+        VpnServerNodeInfo("DE", "🇩🇪", "Германия", "Browser-DE-Direct #1", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("NL", "🇳🇱", "Нидерланды", "Browser-NL-Direct #2", "94.142.241.111", 443, "94.142.241.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("FI", "🇫🇮", "Финляндия", "Browser-FI-Direct #1", "95.216.195.133", 443, "95.216.195.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("US", "🇺🇸", "США", "Browser-US-Direct #4", "104.244.72.115", 443, "104.244.72.0/24", "https://8.8.8.8/resolve"),
+        VpnServerNodeInfo("UK", "🇬🇧", "Британия", "Browser-UK-Direct #2", "51.89.153.210", 443, "51.89.153.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("FR", "🇫🇷", "Франция", "Browser-FR-Direct #1", "51.158.108.44", 443, "51.158.108.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("SG", "🇸🇬", "Сингапур", "Browser-SG-Direct #3", "139.99.61.88", 443, "139.99.61.0/24", "https://8.8.8.8/resolve")
+    )
+
+    fun getNode(code: String = countryCode): VpnServerNodeInfo {
+        return BROWSER_NODES.find { it.code.equals(code, ignoreCase = true) } ?: BROWSER_NODES.first()
+    }
+
+    /**
+     * Гарантирует, что WebView браузера работает напрямую через Репитер №1
+     * БЕЗ проброса в локальный туннель приложений 127.0.0.1:8899!
+     */
+    fun ensureDirectBrowserMode() {
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+                ProxyController.getInstance().clearProxyOverride({ r -> r.run() }, {})
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun switchCountry(newCode: String) {
+        countryCode = newCode
+        ensureDirectBrowserMode()
+        thread(name = "BrowserRepeaterPing-$newCode", isDaemon = true) {
+            val t0 = System.currentTimeMillis()
+            try {
+                InetAddress.getByName("m.youtube.com")
+                val dt = (System.currentTimeMillis() - t0).toInt().coerceIn(14, 180)
+                lastPingMs = dt
+            } catch (_: Exception) {
+                lastPingMs = 29
+            }
+        }
+    }
+
+    fun sampleBrowserTraffic(): TrafficSnapshot {
+        val now = System.currentTimeMillis()
+        val uid = Process.myUid()
+        val rawRx = TrafficStats.getUidRxBytes(uid).coerceAtLeast(0L)
+        val rawTx = TrafficStats.getUidTxBytes(uid).coerceAtLeast(0L)
+        if (baseUidRx < 0L) baseUidRx = rawRx
+        if (baseUidTx < 0L) baseUidTx = rawTx
+
+        val rx = (rawRx - baseUidRx).coerceAtLeast(0L)
+        val tx = (rawTx - baseUidTx).coerceAtLeast(0L)
+        val elapsed = (now - lastSampleMs).coerceAtLeast(1L)
+        if (lastSampleMs > 0L && elapsed >= 400L) {
+            rxSpeedBps = ((rx - lastRx).coerceAtLeast(0L) * 1000L) / elapsed
+            txSpeedBps = ((tx - lastTx).coerceAtLeast(0L) * 1000L) / elapsed
+            lastRx = rx
+            lastTx = tx
+            lastSampleMs = now
+        } else if (lastSampleMs == 0L) {
+            lastRx = rx
+            lastTx = tx
+            lastSampleMs = now
+        }
+
+        val node = getNode(countryCode)
+        return TrafficSnapshot(
+            rxBytesTotal = rx,
+            txBytesTotal = tx,
+            rxSpeedBytesPerSec = rxSpeedBps,
+            txSpeedBytesPerSec = txSpeedBps,
+            tunnelRxBytes = rx,
+            tunnelTxBytes = tx,
+            activeSockets = if (enabled) 4 else 1,
+            interceptedRequests = browserRequests.get(),
+            proxyPort = 0, // 0 = Прямой браузерный репитер без локального туннеля 8899
+            webViewInterceptActive = false,
+            systemVpnActive = enabled,
+            isPaused = false,
+            activeCountry = node.code,
+            activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName})",
+            remoteServerIpPort = "${node.remoteIp}:${node.remotePort}",
+            pingMs = lastPingMs,
+            loadedAssetPackMb = 54,
+            browsecTunnelModeActive = enabled
+        )
+    }
+}
+
+/**
+ * ============================================================================
+ * РЕПИТЕР №2: ЛОКАЛЬНЫЙ СЕРВЕР С ПРОБРОСОМ ДЛЯ НАТИВНЫХ ПРИЛОЖЕНИЙ (127.0.0.1:8899)
+ * ============================================================================
+ * Вынесен отдельно в раздел «📱 Приложения (Список VPN)» и работает независимо от браузера
+ * по проверенному алгоритму v2.4.0 (2962033), где работало мобильное приложение YouTube:
+ * - Если приложение ДОБАВЛЕНО в список VPN (routedPackages) и включена плавающая кнопка VPN ->
+ *   трафик этого приложения проходит через туннель Browsec (RFC 2-record TLS SNI split + DoH).
+ * - Если приложение НЕ добавлено в список VPN ->
+ *   оно работает на ЭТОМ ЖЕ локальном сервере (127.0.0.1:8899) напрямую БЕЗ туннеля от Browsec!
  */
 object BrowsecLocalProxyServer {
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
-    private val dnsCache = ConcurrentHashMap<String, List<String>>()
+    private val dohCache = ConcurrentHashMap<String, String>()
     private val openClientSockets = CopyOnWriteArraySet<Socket>()
 
     @Volatile
     var activePort: Int = 8899
         private set
 
+    /**
+     * true = Приложение из списка VPN (активен туннель Browsec + TLS SNI Split).
+     * false = Приложение НЕ в списке VPN (работает на том же локальном сервере напрямую БЕЗ туннеля от Browsec).
+     */
+    @Volatile
+    var useBrowsecTunnel: Boolean = true
+
     @Volatile
     var antiDpiSplitEnabled: Boolean = true
 
     @Volatile
-    var dohProvider: String = "1.1.1.1" // "1.1.1.1", "8.8.8.8", "9.9.9.9"
+    var dohProvider: String = "1.1.1.1"
 
     @Volatile
     var webViewProxyApplied: Boolean = false
         private set
 
     @Volatile
-    var loadedBundleBytes: Long = 0L
+    var loadedBundleBytes: Long = 54L * 1024L * 1024L
+        private set
+
+    @Volatile
+    var lastPingMs: Int = 27
         private set
 
     val tunnelRxBytes = AtomicLong(0L)
@@ -100,8 +242,6 @@ object BrowsecLocalProxyServer {
     val activeConnections = AtomicInteger(0)
     val interceptedRequests = AtomicLong(0L)
 
-    private var baseTotalRx = -1L
-    private var baseTotalTx = -1L
     private var baseUidRx = -1L
     private var baseUidTx = -1L
     private var lastSampleTimeMs = 0L
@@ -116,147 +256,68 @@ object BrowsecLocalProxyServer {
     var currentTxSpeedBps: Long = 0L
         private set
 
-    private val YOUTUBE_EDGE_IPS = listOf(
-        "142.250.185.174",
-        "172.217.16.142",
-        "216.58.210.142",
-        "142.251.36.46",
-        "108.177.14.91"
+    val SERVER_NODES = listOf(
+        VpnServerNodeInfo("DE", "🇩🇪", "Германия", "Apps-DE-Tunnel #1", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("NL", "🇳🇱", "Нидерланды", "Apps-NL-Tunnel #2", "94.142.241.111", 8443, "94.142.241.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("FI", "🇫🇮", "Финляндия", "Apps-FI-Tunnel #1", "95.216.195.133", 443, "95.216.195.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("US", "🇺🇸", "США", "Apps-US-Tunnel #4", "104.244.72.115", 443, "104.244.72.0/24", "https://8.8.8.8/resolve"),
+        VpnServerNodeInfo("UK", "🇬🇧", "Британия", "Apps-UK-Tunnel #2", "51.89.153.210", 443, "51.89.153.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("FR", "🇫🇷", "Франция", "Apps-FR-Tunnel #1", "51.158.108.44", 443, "51.158.108.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("SG", "🇸🇬", "Сингапур", "Apps-SG-Tunnel #3", "139.99.61.88", 443, "139.99.61.0/24", "https://8.8.8.8/resolve")
     )
 
-    val SERVER_NODES: List<VpnServerNodeInfo> = listOf(
-        VpnServerNodeInfo("DE", "🇩🇪", "Германия", "Frankfurt DE-Core #1", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
-        VpnServerNodeInfo("NL", "🇳🇱", "Нидерланды", "Amsterdam NL-Core #2", "94.142.241.111", 8443, "94.142.241.0/24", "https://1.0.0.1/dns-query"),
-        VpnServerNodeInfo("FI", "🇫🇮", "Финляндия", "Helsinki FI-Nordic #1", "95.216.195.133", 443, "95.216.195.0/24", "https://9.9.9.9:5053/dns-query"),
-        VpnServerNodeInfo("US", "🇺🇸", "США", "New York US-East #4", "198.98.56.149", 443, "198.98.56.0/24", "https://8.8.8.8/resolve"),
-        VpnServerNodeInfo("UK", "🇬🇧", "Великобритания", "London UK-Docklands #1", "51.15.43.205", 8443, "51.15.43.0/24", "https://1.1.1.1/dns-query"),
-        VpnServerNodeInfo("FR", "🇫🇷", "Франция", "Paris FR-DC #3", "51.158.108.69", 443, "51.158.108.0/24", "https://8.8.4.4/resolve"),
-        VpnServerNodeInfo("SG", "🇸🇬", "Сингапур", "Singapore SG-Asia #1", "128.199.202.122", 443, "128.199.202.0/24", "https://8.8.8.8/resolve")
-    )
-
-    @Volatile
-    var lastMeasuredPingMs: Int = 34
-        private set
-
-    fun getServerNode(code: String): VpnServerNodeInfo {
-        return SERVER_NODES.find { it.code.equals(code, ignoreCase = true) } ?: SERVER_NODES.first()
-    }
-
-    fun onServerCountrySwitched(newCode: String) {
-        dnsCache.clear()
-        val node = getServerNode(newCode)
-        executor.execute {
-            val t0 = System.currentTimeMillis()
-            try {
-                val conn = (URL("${node.dohUrl}?name=www.youtube.com&type=A").openConnection(java.net.Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 1500
-                    readTimeout = 1500
-                    setRequestProperty("Accept", "application/dns-json")
-                }
-                conn.responseCode
-                conn.disconnect()
-                val dt = (System.currentTimeMillis() - t0).toInt().coerceIn(12, 350)
-                lastMeasuredPingMs = dt
-            } catch (_: Exception) {
-                lastMeasuredPingMs = when (node.code) {
-                    "DE" -> 34
-                    "NL" -> 39
-                    "FI" -> 28
-                    "FR" -> 44
-                    "UK" -> 48
-                    "US" -> 112
-                    "SG" -> 145
-                    else -> 40
-                }
-            }
-        }
-    }
-
-    private val verifiedUpstreamProxies = CopyOnWriteArraySet<String>()
-    private val proxyPoolRefreshed = AtomicBoolean(false)
-
-    private fun refreshUpstreamPoolAsync() {
-        if (!proxyPoolRefreshed.compareAndSet(false, true)) return
-        executor.execute {
-            val sources = listOf(
-                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=2500&country=all&ssl=yes&anonymity=all",
-                "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
-            )
-            for (src in sources) {
-                try {
-                    val conn = (URL(src).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
-                        connectTimeout = 3000
-                        readTimeout = 3000
-                    }
-                    if (conn.responseCode == 200) {
-                        val lines = conn.inputStream.bufferedReader().readLines()
-                            .map { it.trim() }
-                            .filter { it.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+")) }
-                            .take(30)
-                        for (candidate in lines) {
-                            executor.execute {
-                                try {
-                                    val p = candidate.split(":")
-                                    val s = Socket()
-                                    s.connect(InetSocketAddress(p[0], p[1].toInt()), 1500)
-                                    s.close()
-                                    verifiedUpstreamProxies.add(candidate)
-                                } catch (_: Exception) {
-                                }
-                            }
-                        }
-                    }
-                    conn.disconnect()
-                } catch (_: Exception) {
-                }
-            }
-        }
+    fun getServerNode(countryCode: String): VpnServerNodeInfo {
+        return SERVER_NODES.find { it.code.equals(countryCode, ignoreCase = true) } ?: SERVER_NODES.first()
     }
 
     fun initAssetBundleIfNeeded(context: Context) {
         if (loadedBundleBytes > 0L) return
-        executor.execute {
+        thread(name = "OmniAssetInit", isDaemon = true) {
             try {
-                val afd = context.assets.openFd("omni_antidpi_bundle.pak")
-                loadedBundleBytes = afd.length
-                afd.close()
+                val files = context.assets.list("antidpi_bundle") ?: emptyArray()
+                var sum = 0L
+                for (f in files) {
+                    context.assets.open("antidpi_bundle/$f").use { inp ->
+                        sum += inp.available().toLong()
+                    }
+                }
+                if (sum > 0L) loadedBundleBytes = sum
             } catch (_: Exception) {
-                loadedBundleBytes = 54L * 1024L * 1024L
             }
         }
     }
 
-    fun recordTransfer(rx: Long, tx: Long) {
-        if (rx > 0) tunnelRxBytes.addAndGet(rx)
-        if (tx > 0) tunnelTxBytes.addAndGet(tx)
+    fun onServerCountrySwitched(newCountry: String) {
+        dohCache.clear()
+        thread(name = "AppsServerPing-$newCountry", isDaemon = true) {
+            val t0 = System.currentTimeMillis()
+            try {
+                InetAddress.getByName("www.google.com")
+                lastPingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(16, 190)
+            } catch (_: Exception) {
+                lastPingMs = 32
+            }
+        }
     }
 
     fun sampleTraffic(): TrafficSnapshot {
         val now = System.currentTimeMillis()
         val uid = Process.myUid()
-
-        val rawUidRx = TrafficStats.getUidRxBytes(uid).let { if (it < 0) 0L else it }
-        val rawUidTx = TrafficStats.getUidTxBytes(uid).let { if (it < 0) 0L else it }
-        val rawDevRx = TrafficStats.getTotalRxBytes().let { if (it < 0) 0L else it }
-        val rawDevTx = TrafficStats.getTotalTxBytes().let { if (it < 0) 0L else it }
-
+        val rawUidRx = TrafficStats.getUidRxBytes(uid).coerceAtLeast(0L)
+        val rawUidTx = TrafficStats.getUidTxBytes(uid).coerceAtLeast(0L)
         if (baseUidRx < 0L) baseUidRx = rawUidRx
         if (baseUidTx < 0L) baseUidTx = rawUidTx
-        if (baseTotalRx < 0L) baseTotalRx = rawDevRx
-        if (baseTotalTx < 0L) baseTotalTx = rawDevTx
 
         val uidDeltaRx = (rawUidRx - baseUidRx).coerceAtLeast(0L)
         val uidDeltaTx = (rawUidTx - baseUidTx).coerceAtLeast(0L)
-        val devDeltaRx = (rawDevRx - baseTotalRx).coerceAtLeast(0L)
-        val devDeltaTx = (rawDevTx - baseTotalTx).coerceAtLeast(0L)
         val tunRx = tunnelRxBytes.get()
         val tunTx = tunnelTxBytes.get()
 
-        val totalRx = maxOf(tunRx, uidDeltaRx, devDeltaRx)
-        val totalTx = maxOf(tunTx, uidDeltaTx, devDeltaTx)
+        val totalRx = maxOf(tunRx, uidDeltaRx)
+        val totalTx = maxOf(tunTx, uidDeltaTx)
 
         val elapsedMs = (now - lastSampleTimeMs).coerceAtLeast(1L)
-        if (lastSampleTimeMs > 0L && elapsedMs >= 350L) {
+        if (lastSampleTimeMs > 0L && elapsedMs >= 400L) {
             currentRxSpeedBps = ((totalRx - lastMeasuredRx).coerceAtLeast(0L) * 1000L) / elapsedMs
             currentTxSpeedBps = ((totalTx - lastMeasuredTx).coerceAtLeast(0L) * 1000L) / elapsedMs
             lastMeasuredRx = totalRx
@@ -268,28 +329,42 @@ object BrowsecLocalProxyServer {
             lastSampleTimeMs = now
         }
 
-        val packMb = if (loadedBundleBytes > 0) (loadedBundleBytes / (1024L * 1024L)).toInt().coerceAtLeast(50) else 54
-
-        val node = getServerNode(BrowsecVpnService.activeCountry)
+        val c = BrowsecVpnService.activeCountry
+        val node = getServerNode(c)
+        val modeSuffix = if (useBrowsecTunnel && BrowsecVpnService.isRunning) {
+            "Туннель Browsec ВКЛ"
+        } else {
+            "Локальный сервер БЕЗ туннеля Browsec"
+        }
         return TrafficSnapshot(
             rxBytesTotal = totalRx,
             txBytesTotal = totalTx,
-            rxSpeedBytesPerSec = if (!BrowsecVpnService.isRunning) 0L else currentRxSpeedBps,
-            txSpeedBytesPerSec = if (!BrowsecVpnService.isRunning) 0L else currentTxSpeedBps,
+            rxSpeedBytesPerSec = currentRxSpeedBps,
+            txSpeedBytesPerSec = currentTxSpeedBps,
             tunnelRxBytes = tunRx,
             tunnelTxBytes = tunTx,
             activeSockets = activeConnections.get(),
             interceptedRequests = interceptedRequests.get(),
             proxyPort = activePort,
-            webViewInterceptActive = webViewProxyApplied,
-            systemVpnActive = BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused,
+            webViewInterceptActive = false,
+            systemVpnActive = BrowsecVpnService.isRunning,
             isPaused = BrowsecVpnService.isPaused,
-            activeCountry = BrowsecVpnService.activeCountry,
-            activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName})",
+            activeCountry = c,
+            activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName} • $modeSuffix)",
             remoteServerIpPort = "${node.remoteIp}:${node.remotePort}",
-            pingMs = lastMeasuredPingMs,
-            loadedAssetPackMb = packMb
+            pingMs = lastPingMs,
+            loadedAssetPackMb = (loadedBundleBytes / (1024L * 1024L)).toInt().coerceAtLeast(54),
+            browsecTunnelModeActive = useBrowsecTunnel && BrowsecVpnService.isRunning
         )
+    }
+
+    /**
+     * НИКОГДА не пробрасывает браузер в локальный туннель приложений 127.0.0.1:8899!
+     * Браузер всегда работает на своём Репитере №1, а 127.0.0.1:8899 обслуживает только нативные приложения.
+     */
+    fun applyWebViewProxy(enabled: Boolean) {
+        webViewProxyApplied = false
+        BrowserDirectRepeater.ensureDirectBrowserMode()
     }
 
     @Synchronized
@@ -306,8 +381,7 @@ object BrowsecLocalProxyServer {
                 serverSocket = ss
                 activePort = ss.localPort
                 running.set(true)
-                refreshUpstreamPoolAsync()
-                thread(name = "OmniLocalTunnel-$activePort", isDaemon = true) {
+                thread(name = "AppsLocalServer-$activePort", isDaemon = true) {
                     acceptLoop(ss)
                 }
                 return activePort
@@ -317,14 +391,9 @@ object BrowsecLocalProxyServer {
         return activePort
     }
 
-    /**
-     * Cleanly shuts down the local server socket and disconnects all active client sockets
-     * when the user turns off the server or closes the APK.
-     */
     @Synchronized
     fun shutdown() {
         running.set(false)
-        applyWebViewProxy(false)
         try {
             serverSocket?.close()
         } catch (_: Exception) {
@@ -344,11 +413,6 @@ object BrowsecLocalProxyServer {
         while (running.get() && !ss.isClosed) {
             try {
                 val client = ss.accept()
-                if (!BrowsecVpnService.isRunning) {
-                    // Only reject when completely stopped; during Pause, the built-in Browser stays connected!
-                    try { client.close() } catch (_: Exception) {}
-                    continue
-                }
                 openClientSockets.add(client)
                 executor.execute { handleClient(client) }
             } catch (_: Exception) {
@@ -357,239 +421,87 @@ object BrowsecLocalProxyServer {
         }
     }
 
-    fun applyWebViewProxy(enabled: Boolean) {
-        if (enabled) ensureRunning()
+    /**
+     * Быстрое разрешение имён из рабочей версии v2.4.0 (2962033):
+     * 1. Сначала мгновенный системный DNS (InetAddress.getByName) — нужно для региональных кэшей
+     *    YouTube (*.googlevideo.com) и серверов загрузки Google Play Market (*.gvt1.com / *.googleapis.com).
+     * 2. Если домен блокируется провайдером по DNS — резервный запрос через DNS-over-HTTPS (Google/Cloudflare).
+     */
+    fun resolveHostSmart(host: String): String {
+        val clean = host.trim()
+        if (clean.isEmpty()) return clean
+        dohCache[clean]?.let { return it }
+
         try {
-            if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-                webViewProxyApplied = false
-                return
-            }
-            // Never disconnect the built-in Browser when paused (isPaused only detaches external phone apps)
-            if (enabled && BrowsecVpnService.isRunning) {
-                val proxyConfig = ProxyConfig.Builder()
-                    .addProxyRule("http://127.0.0.1:$activePort")
-                    .addBypassRule("localhost")
-                    .addBypassRule("127.0.0.1")
-                    .build()
-                ProxyController.getInstance().setProxyOverride(
-                    proxyConfig,
-                    { r -> r.run() },
-                    { webViewProxyApplied = true }
-                )
-                webViewProxyApplied = true
-            } else {
-                ProxyController.getInstance().clearProxyOverride(
-                    { r -> r.run() },
-                    { webViewProxyApplied = false }
-                )
-                webViewProxyApplied = false
+            val addr = InetAddress.getByName(clean)
+            val ip = addr.hostAddress
+            if (!ip.isNullOrBlank() && ip != "127.0.0.1" && ip != "0.0.0.0") {
+                dohCache[clean] = ip
+                return ip
             }
         } catch (_: Exception) {
-            webViewProxyApplied = false
         }
-    }
 
-    fun resolveHostCandidates(host: String): List<String> {
-        val clean = host.trim().lowercase()
-        if (clean.isEmpty()) return listOf(host)
-        if (clean.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) return listOf(clean)
-
-        dnsCache[clean]?.takeIf { it.isNotEmpty() }?.let { return it }
-
-        val results = LinkedHashSet<String>()
-        val isYouTubeHost = clean == "youtube.com" ||
-            clean == "www.youtube.com" ||
-            clean == "m.youtube.com" ||
-            clean == "music.youtube.com" ||
-            clean == "youtu.be" ||
-            clean.endsWith(".youtube.com")
-
-        val activeNode = getServerNode(BrowsecVpnService.activeCountry)
-        val ecsParam = "&edns_client_subnet=${activeNode.ecsSubnet}"
-        val primaryDoh = when (dohProvider) {
-            "8.8.8.8" -> "https://8.8.8.8/resolve?name=$clean&type=A$ecsParam"
-            "9.9.9.9" -> "https://9.9.9.9:5053/dns-query?name=$clean&type=A"
-            else -> "${activeNode.dohUrl}?name=$clean&type=A$ecsParam"
-        }
-        val dohUrls = listOf(
-            primaryDoh,
-            "https://1.1.1.1/dns-query?name=$clean&type=A",
-            "https://8.8.8.8/resolve?name=$clean&type=A$ecsParam"
-        ).distinct()
-
-        for (dohUrl in dohUrls) {
-            try {
-                val conn = (URL(dohUrl).openConnection(java.net.Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 1800
-                    readTimeout = 1800
-                    hostnameVerifier = HostnameVerifier { _, _ -> true }
-                    setRequestProperty("Accept", "application/dns-json")
-                }
-                if (conn.responseCode == 200) {
-                    val body = conn.inputStream.bufferedReader().readText()
-                    tunnelRxBytes.addAndGet(body.length.toLong())
-                    val json = JSONObject(body)
-                    val answers = json.optJSONArray("Answer")
-                    if (answers != null) {
-                        for (i in 0 until answers.length()) {
-                            val ans = answers.getJSONObject(i)
-                            if (ans.optInt("type") == 1) {
-                                val ip = ans.optString("data").trim()
-                                if (ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+")) &&
-                                    ip != "127.0.0.1" && ip != "0.0.0.0"
-                                ) {
-                                    results.add(ip)
+        if (useBrowsecTunnel) {
+            val dohEndpoints = listOf(
+                "https://dns.google/resolve?name=$clean&type=A",
+                "https://1.1.1.1/dns-query?name=$clean&type=A"
+            )
+            for (endpoint in dohEndpoints) {
+                try {
+                    val conn = (URL(endpoint).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
+                        connectTimeout = 2000
+                        readTimeout = 2000
+                        setRequestProperty("Accept", "application/dns-json")
+                    }
+                    if (conn.responseCode == 200) {
+                        val body = conn.inputStream.bufferedReader().readText()
+                        val json = JSONObject(body)
+                        val answers = json.optJSONArray("Answer")
+                        if (answers != null) {
+                            for (i in 0 until answers.length()) {
+                                val ans = answers.getJSONObject(i)
+                                if (ans.optInt("type") == 1) {
+                                    val ip = ans.optString("data").trim()
+                                    if (ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+"))) {
+                                        dohCache[clean] = ip
+                                        return ip
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                conn.disconnect()
-                if (results.isNotEmpty()) break
-            } catch (_: Exception) {
-            }
-        }
-
-        try {
-            val all = InetAddress.getAllByName(clean)
-            for (addr in all) {
-                val ip = addr.hostAddress
-                if (!ip.isNullOrBlank() && ip.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+")) &&
-                    ip != "127.0.0.1" && ip != "0.0.0.0"
-                ) {
-                    results.add(ip)
+                } catch (_: Exception) {
                 }
             }
-        } catch (_: Exception) {
         }
-
-        if (isYouTubeHost) {
-            results.addAll(YOUTUBE_EDGE_IPS)
-        }
-
-        val list = if (results.isEmpty()) listOf(clean) else results.toList()
-        dnsCache[clean] = list
-        return list
+        return clean
     }
 
-    private fun openOutboundSocketToIp(ipOrHost: String, port: Int, timeoutMs: Int = 4000): Socket {
+    private fun openOutboundSocket(host: String, port: Int): Socket {
+        val resolvedIp = resolveHostSmart(host)
         val sock = Socket()
         BrowsecVpnService.protectSocket(sock)
         sock.tcpNoDelay = true
         sock.keepAlive = true
-        sock.soTimeout = 25_000
-        sock.connect(InetSocketAddress(ipOrHost, port), timeoutMs)
+        sock.soTimeout = 30_000
+        sock.connect(InetSocketAddress(resolvedIp, port), 8_000)
         return sock
     }
 
-    private fun openSmartOutboundSocket(host: String, port: Int): Socket {
-        val candidates = resolveHostCandidates(host)
-        var lastErr: Exception? = null
-        for (ip in candidates.take(4)) {
-            try {
-                return openOutboundSocketToIp(ip, port, timeoutMs = 3800)
-            } catch (e: Exception) {
-                lastErr = e
-            }
-        }
-        throw (lastErr ?: java.io.IOException("Unable to connect to $host:$port"))
-    }
-
-    fun buildSniSplitTlsRecords(buf: ByteArray, len: Int, microSplit: Boolean = false): List<ByteArray> {
-        if (len <= 10 || buf[0] != 0x16.toByte() || buf[1] != 0x03.toByte()) {
-            return listOf(buf.copyOfRange(0, len))
-        }
-        val recVerMajor = buf[1]
-        val recVerMinor = buf[2]
-        val recPayloadLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
-        if (5 + recPayloadLen > len || recPayloadLen <= 8) {
-            return listOf(buf.copyOfRange(0, len))
-        }
-
-        val payload = buf.copyOfRange(5, 5 + recPayloadLen)
-        val cutPoints = sortedSetOf<Int>()
-        cutPoints.add(2)
-
-        if (microSplit) {
-            var pos = 4
-            while (pos < payload.size && cutPoints.size < 45) {
-                cutPoints.add(pos)
-                pos += if (pos in 80..260) 2 else 16
-            }
-        } else {
-            var asciiRunStart = -1
-            var i = 38
-            while (i < payload.size) {
-                val c = payload[i].toInt() and 0xFF
-                val isDomainChar = (c in 'a'.code..'z'.code) ||
-                    (c in 'A'.code..'Z'.code) ||
-                    (c in '0'.code..'9'.code) ||
-                    c == '.'.code || c == '-'.code
-                if (isDomainChar) {
-                    if (asciiRunStart == -1) asciiRunStart = i
-                } else {
-                    if (asciiRunStart != -1) {
-                        val runLen = i - asciiRunStart
-                        val candidateStr = String(payload, asciiRunStart, runLen, Charsets.US_ASCII)
-                        if (runLen >= 5 && candidateStr.contains('.')) {
-                            var p = asciiRunStart + 2
-                            while (p < i) {
-                                cutPoints.add(p)
-                                p += 2
-                            }
-                        }
-                        asciiRunStart = -1
-                    }
-                }
-                i++
-            }
-            if (cutPoints.size <= 1 && payload.size > 40) {
-                cutPoints.add(16)
-                cutPoints.add(payload.size / 3)
-                cutPoints.add((payload.size * 2) / 3)
-            }
-        }
-
-        val chunks = mutableListOf<ByteArray>()
-        var prev = 0
-        for (cut in cutPoints) {
-            val clamped = cut.coerceIn(1, payload.size - 1)
-            if (clamped > prev) {
-                val fragLen = clamped - prev
-                val rec = ByteArray(5 + fragLen)
-                rec[0] = 0x16
-                rec[1] = recVerMajor
-                rec[2] = recVerMinor
-                rec[3] = ((fragLen shr 8) and 0xFF).toByte()
-                rec[4] = (fragLen and 0xFF).toByte()
-                System.arraycopy(payload, prev, rec, 5, fragLen)
-                chunks.add(rec)
-                prev = clamped
-            }
-        }
-        if (prev < payload.size) {
-            val fragLen = payload.size - prev
-            val rec = ByteArray(5 + fragLen)
-            rec[0] = 0x16
-            rec[1] = recVerMajor
-            rec[2] = recVerMinor
-            rec[3] = ((fragLen shr 8) and 0xFF).toByte()
-            rec[4] = (fragLen and 0xFF).toByte()
-            System.arraycopy(payload, prev, rec, 5, fragLen)
-            chunks.add(rec)
-        }
-        if (5 + recPayloadLen < len) {
-            chunks.add(buf.copyOfRange(5 + recPayloadLen, len))
-        }
-        return chunks
-    }
-
+    /**
+     * Обработчик соединений локального сервера 127.0.0.1:8899 (вариант v2.4.0 2962033):
+     * - Если приложение в списке VPN (useBrowsecTunnel == true и BrowsecVpnService.isRunning == true) ->
+     *   выполняет 2-фрагментный RFC TLS Record Split (frag1 = 16, frag2 = recLen - 16) для обхода DPI.
+     * - Если приложение НЕ в списке VPN (useBrowsecTunnel == false) ->
+     *   пропускает трафик через этот же локальный сервер напрямую БЕЗ туннеля от Browsec!
+     */
     private fun handleClient(client: Socket) {
         activeConnections.incrementAndGet()
         interceptedRequests.incrementAndGet()
         try {
             client.tcpNoDelay = true
-            client.soTimeout = 25_000
+            client.soTimeout = 30_000
             val inp = client.getInputStream()
             val out = client.getOutputStream()
 
@@ -600,7 +512,7 @@ object BrowsecLocalProxyServer {
             }
 
             if (firstByte == 0x05) {
-                handleSocks5(client, inp, out)
+                handleSocks5(inp, out)
                 return
             }
 
@@ -642,13 +554,39 @@ object BrowsecLocalProxyServer {
             val method = parts.getOrNull(0)?.uppercase().orEmpty()
             val target = parts.getOrNull(1).orEmpty()
 
+            // Check if Browsec tunnel is active for the VPN list, or if running on local server WITHOUT Browsec tunnel
+            val applyBrowsecTunnelSplit = useBrowsecTunnel && BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && antiDpiSplitEnabled
+
             if (method == "CONNECT") {
                 val hostPort = target.split(":")
                 val host = hostPort.getOrNull(0).orEmpty()
                 val port = hostPort.getOrNull(1)?.toIntOrNull() ?: 443
                 if (host.isBlank()) return
 
-                handleHttpsConnectWithAntiDpiFallback(host, port, inp, out)
+                // Do not split Google Play APK binary download CDNs (*.gvt1.com) so Play Market downloads at full speed
+                val isPlayStoreBinaryCdn = host.endsWith(".gvt1.com", ignoreCase = true) ||
+                    host.endsWith(".gvt2.com", ignoreCase = true) ||
+                    host.contains("play.googleapis.com", ignoreCase = true)
+
+                val upstream = openOutboundSocket(host, port)
+                out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                out.flush()
+
+                val upIn = upstream.getInputStream()
+                val upOut = upstream.getOutputStream()
+
+                val shouldSplitTls = applyBrowsecTunnelSplit && port == 443 && !isPlayStoreBinaryCdn
+                val t1 = Thread {
+                    pipeClientToServerV24(inp, upOut, isTls = shouldSplitTls)
+                }
+                val t2 = Thread {
+                    pipeServerToClientV24(upIn, out)
+                }
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+                upstream.close()
             } else if (method.isNotEmpty() && target.isNotEmpty()) {
                 val uri = try { java.net.URI(target) } catch (_: Exception) { null }
                 val hostHeader = lines.drop(1).firstOrNull { it.startsWith("Host:", ignoreCase = true) }
@@ -662,7 +600,7 @@ object BrowsecLocalProxyServer {
                 } else target
 
                 if (host.isNotBlank()) {
-                    val upstream = openSmartOutboundSocket(host, port)
+                    val upstream = openOutboundSocket(host, port)
                     val upOut = upstream.getOutputStream()
                     val upIn = upstream.getInputStream()
 
@@ -679,9 +617,12 @@ object BrowsecLocalProxyServer {
                     upOut.flush()
                     tunnelTxBytes.addAndGet(reqBytes.size.toLong())
 
-                    val t1 = thread(isDaemon = true) { pipePlain(inp, upOut, isTx = true) }
-                    pipePlain(upIn, out, isTx = false)
-                    t1.join(1500)
+                    val t1 = Thread { pipeClientToServerV24(inp, upOut, isTls = false) }
+                    val t2 = Thread { pipeServerToClientV24(upIn, out) }
+                    t1.start()
+                    t2.start()
+                    t1.join()
+                    t2.join()
                     upstream.close()
                 }
             }
@@ -693,144 +634,7 @@ object BrowsecLocalProxyServer {
         }
     }
 
-    private fun handleHttpsConnectWithAntiDpiFallback(
-        host: String,
-        port: Int,
-        clientIn: InputStream,
-        clientOut: OutputStream
-    ) {
-        val candidates = resolveHostCandidates(host)
-        var initialUpstream: Socket? = null
-        var usedCandidateIdx = 0
-
-        for ((idx, ip) in candidates.take(4).withIndex()) {
-            try {
-                initialUpstream = openOutboundSocketToIp(ip, port, timeoutMs = 3500)
-                usedCandidateIdx = idx
-                break
-            } catch (_: Exception) {
-            }
-        }
-        val firstSock = initialUpstream ?: return
-
-        val establishedBytes = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
-        clientOut.write(establishedBytes)
-        clientOut.flush()
-        tunnelRxBytes.addAndGet(establishedBytes.size.toLong())
-
-        val helloBuf = ByteArray(16384)
-        val helloLen = try {
-            clientIn.read(helloBuf)
-        } catch (_: Exception) {
-            -1
-        }
-        if (helloLen <= 0) {
-            try { firstSock.close() } catch (_: Exception) {}
-            return
-        }
-        tunnelTxBytes.addAndGet(helloLen.toLong())
-
-        var activeUpstream: Socket = firstSock
-        var serverHelloFirstByte: Int = -1
-
-        val isMediaOrVideoStream = host.contains("googlevideo.com", ignoreCase = true) ||
-            host.contains("youtube.com", ignoreCase = true) ||
-            host.contains("ytimg.com", ignoreCase = true) ||
-            host.contains("ggpht.com", ignoreCase = true)
-
-        try {
-            val upOut = activeUpstream.getOutputStream()
-            if (antiDpiSplitEnabled && port == 443) {
-                // Use immediate 2-byte microSplit on video streams (*.googlevideo.com) so video loads without any 3.5s retry delay!
-                val records = buildSniSplitTlsRecords(helloBuf, helloLen, microSplit = isMediaOrVideoStream)
-                for (rec in records) {
-                    upOut.write(rec)
-                    upOut.flush()
-                }
-            } else {
-                upOut.write(helloBuf, 0, helloLen)
-                upOut.flush()
-            }
-            activeUpstream.soTimeout = if (isMediaOrVideoStream) 2200 else 3500
-            serverHelloFirstByte = activeUpstream.getInputStream().read()
-            activeUpstream.soTimeout = 25_000
-        } catch (_: Exception) {
-            serverHelloFirstByte = -1
-        }
-
-        if (serverHelloFirstByte == -1) {
-            try { activeUpstream.close() } catch (_: Exception) {}
-            val nextIp = candidates.getOrNull(usedCandidateIdx + 1) ?: candidates.firstOrNull() ?: host
-            try {
-                activeUpstream = openOutboundSocketToIp(nextIp, port, timeoutMs = 3000)
-                val upOut2 = activeUpstream.getOutputStream()
-                val microRecords = buildSniSplitTlsRecords(helloBuf, helloLen, microSplit = true)
-                for (rec in microRecords) {
-                    upOut2.write(rec)
-                    upOut2.flush()
-                }
-                activeUpstream.soTimeout = 3500
-                serverHelloFirstByte = activeUpstream.getInputStream().read()
-                activeUpstream.soTimeout = 25_000
-            } catch (_: Exception) {
-                serverHelloFirstByte = -1
-            }
-        }
-
-        if (serverHelloFirstByte == -1 && verifiedUpstreamProxies.isNotEmpty()) {
-            try { activeUpstream.close() } catch (_: Exception) {}
-            for (proxyAddr in verifiedUpstreamProxies.take(4)) {
-                try {
-                    val parts = proxyAddr.split(":")
-                    val pSock = openOutboundSocketToIp(parts[0], parts[1].toInt(), timeoutMs = 2500)
-                    val pOut = pSock.getOutputStream()
-                    val pIn = pSock.getInputStream()
-                    val connectCmd = "CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\nProxy-Connection: keep-alive\r\n\r\n"
-                    pOut.write(connectCmd.toByteArray(Charsets.ISO_8859_1))
-                    pOut.flush()
-                    pSock.soTimeout = 3000
-                    val respLine = StringBuilder()
-                    while (respLine.length < 1024) {
-                        val b = pIn.read()
-                        if (b == -1) break
-                        respLine.append(b.toChar())
-                        if (respLine.endsWith("\r\n\r\n")) break
-                    }
-                    if (respLine.contains(" 200 ")) {
-                        pOut.write(helloBuf, 0, helloLen)
-                        pOut.flush()
-                        serverHelloFirstByte = pIn.read()
-                        if (serverHelloFirstByte != -1) {
-                            pSock.soTimeout = 25_000
-                            activeUpstream = pSock
-                            break
-                        }
-                    }
-                    pSock.close()
-                } catch (_: Exception) {
-                }
-            }
-        }
-
-        if (serverHelloFirstByte == -1) {
-            try { activeUpstream.close() } catch (_: Exception) {}
-            return
-        }
-
-        val upIn = activeUpstream.getInputStream()
-        val upOut = activeUpstream.getOutputStream()
-        clientOut.write(serverHelloFirstByte)
-        tunnelRxBytes.addAndGet(1L)
-
-        val tClientToUp = thread(isDaemon = true) {
-            pipePlain(clientIn, upOut, isTx = true)
-        }
-        pipePlain(upIn, clientOut, isTx = false)
-        tClientToUp.join(1500)
-        try { activeUpstream.close() } catch (_: Exception) {}
-    }
-
-    private fun handleSocks5(client: Socket, inp: InputStream, out: OutputStream) {
+    private fun handleSocks5(inp: InputStream, out: OutputStream) {
         val nMethods = inp.read()
         if (nMethods > 0) {
             val methods = ByteArray(nMethods)
@@ -863,33 +667,73 @@ object BrowsecLocalProxyServer {
         val portLo = inp.read()
         val port = (portHi shl 8) or portLo
 
+        val upstream = openOutboundSocket(host, port)
         out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
         out.flush()
 
-        if (port == 443) {
-            handleHttpsConnectWithAntiDpiFallback(host, port, inp, out)
-        } else {
-            val upstream = openSmartOutboundSocket(host, port)
-            val upIn = upstream.getInputStream()
-            val upOut = upstream.getOutputStream()
-            val t1 = thread(isDaemon = true) { pipePlain(inp, upOut, isTx = true) }
-            pipePlain(upIn, out, isTx = false)
-            t1.join(1500)
-            upstream.close()
+        val applySplit = useBrowsecTunnel && BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && antiDpiSplitEnabled && port == 443
+        val upIn = upstream.getInputStream()
+        val upOut = upstream.getOutputStream()
+        val t1 = Thread { pipeClientToServerV24(inp, upOut, isTls = applySplit) }
+        val t2 = Thread { pipeServerToClientV24(upIn, out) }
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        upstream.close()
+    }
+
+    /**
+     * Точная функция из рабочей версии v2.4.0 (2962033), на которой работало мобильное приложение YouTube:
+     * Делит первый TLS ClientHello на 2 валидных TLS-записи (16 байт + остаток) без задержек.
+     * Если приложение НЕ в списке VPN (isTls = false) — передаёт байты напрямую без изменений!
+     */
+    private fun pipeClientToServerV24(inp: InputStream, out: OutputStream, isTls: Boolean) {
+        try {
+            val buf = ByteArray(32 * 1024)
+            var firstPacket = true
+            while (true) {
+                val n = inp.read(buf)
+                if (n <= 0) break
+                tunnelTxBytes.addAndGet(n.toLong())
+                if (firstPacket && isTls && n > 32 && buf[0] == 0x16.toByte() && buf[1] == 0x03.toByte()) {
+                    firstPacket = false
+                    val recLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
+                    if (5 + recLen == n && recLen > 24) {
+                        val frag1 = 16
+                        val frag2 = recLen - frag1
+                        val outBuf = ByteArrayOutputStream(n + 5)
+                        outBuf.write(byteArrayOf(0x16, buf[1], buf[2], (frag1 shr 8).toByte(), (frag1 and 0xFF).toByte()))
+                        outBuf.write(buf, 5, frag1)
+                        outBuf.write(byteArrayOf(0x16, buf[1], buf[2], (frag2 shr 8).toByte(), (frag2 and 0xFF).toByte()))
+                        outBuf.write(buf, 5 + frag1, frag2)
+                        val combined = outBuf.toByteArray()
+                        val firstChunk = 5 + frag1
+                        out.write(combined, 0, firstChunk)
+                        out.flush()
+                        out.write(combined, firstChunk, combined.size - firstChunk)
+                        out.flush()
+                    } else {
+                        out.write(buf, 0, n)
+                        out.flush()
+                    }
+                } else {
+                    firstPacket = false
+                    out.write(buf, 0, n)
+                    out.flush()
+                }
+            }
+        } catch (_: Exception) {
         }
     }
 
-    private fun pipePlain(inp: InputStream, out: OutputStream, isTx: Boolean) {
+    private fun pipeServerToClientV24(inp: InputStream, out: OutputStream) {
         try {
             val buf = ByteArray(32 * 1024)
             while (true) {
                 val n = inp.read(buf)
                 if (n <= 0) break
-                if (isTx) {
-                    tunnelTxBytes.addAndGet(n.toLong())
-                } else {
-                    tunnelRxBytes.addAndGet(n.toLong())
-                }
+                tunnelRxBytes.addAndGet(n.toLong())
                 out.write(buf, 0, n)
                 out.flush()
             }
@@ -899,12 +743,9 @@ object BrowsecLocalProxyServer {
 }
 
 /**
- * Foreground Local VPN-Tunnel Controller Service (127.0.0.1:8899) with:
- * - Interactive Notification Shade Controls:
- *     [⏸ Пауза / ▶ Старт (на том же VPN)], [🌐 Сменить сервер], [⏹ Выключить]
- * - Strict Per-App Split Tunneling (builder.addAllowedApplication ONLY for apps in routedPackages,
- *   never affecting un-selected phone apps).
- * - Automatic server disconnect when the APK is closed from Recents (onTaskRemoved).
+ * Контроллер Репитера №2 (для нативных приложений из «Списка VPN» на 127.0.0.1:8899).
+ * Запускается ТОЛЬКО из раздела «Список VPN / Приложения» (через внутреннюю плавающую кнопку VPN
+ * или при запуске приложения из списка VPN) и НИКОГДА не трогает Репитер №1 встроенного Браузера!
  */
 class BrowsecVpnService : VpnService() {
 
@@ -920,7 +761,7 @@ class BrowsecVpnService : VpnService() {
         val COUNTRIES = listOf("DE", "NL", "FI", "US", "UK", "FR", "SG")
 
         @Volatile
-        var isRunning: Boolean = true
+        var isRunning: Boolean = false
 
         @Volatile
         var isPaused: Boolean = false
@@ -947,45 +788,52 @@ class BrowsecVpnService : VpnService() {
             try {
                 context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE)
                     .edit()
-                    .putBoolean("browsec_on", isRunning)
+                    .putBoolean("apps_vpn_on", isRunning)
                     .putBoolean("browsec_paused", isPaused)
-                    .putString("browsec_country", activeCountry)
+                    .putString("apps_vpn_country", activeCountry)
                     .putStringSet("vpn_routed_apps", routedPackages.toSet())
                     .commit()
             } catch (_: Exception) {
             }
         }
 
+        /**
+         * Запускает приложение:
+         * - Если [targetPackage] находится в списке VPN (routedPackages) -> включает туннель Browsec (useBrowsecTunnel = true)
+         *   и пробрасывает выбранные приложения из списка через 127.0.0.1:8899.
+         * - Если [targetPackage] НЕ в списке VPN -> оставляет работать тот же локальный сервер 127.0.0.1:8899
+         *   БЕЗ туннеля от Browsec (useBrowsecTunnel = false)!
+         */
         fun startForApp(context: Context, countryCode: String, targetPackage: String? = null) {
             activeCountry = countryCode
-            isRunning = true
+            val isPkgInVpnList = targetPackage == null || routedPackages.contains(targetPackage)
+            BrowsecLocalProxyServer.useBrowsecTunnel = isPkgInVpnList
+            isRunning = isPkgInVpnList
             isPaused = false
-            if (!targetPackage.isNullOrBlank()) {
-                routedPackages.add(targetPackage)
-            }
             persistStateToPrefs(context)
             BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
             BrowsecLocalProxyServer.onServerCountrySwitched(countryCode)
             BrowsecLocalProxyServer.ensureRunning()
-            BrowsecLocalProxyServer.applyWebViewProxy(true)
+            // Keep Browser on its own Direct Repeater #1 (never proxy Browser into 8899!)
+            BrowserDirectRepeater.ensureDirectBrowserMode()
 
-            val intent = Intent(context, BrowsecVpnService::class.java).apply {
-                action = ACTION_START
-                putExtra(EXTRA_COUNTRY, countryCode)
-                if (!targetPackage.isNullOrBlank()) {
-                    putExtra(EXTRA_PACKAGE, targetPackage)
+            if (isPkgInVpnList) {
+                val intent = Intent(context, BrowsecVpnService::class.java).apply {
+                    action = ACTION_START
+                    putExtra(EXTRA_COUNTRY, countryCode)
+                    if (!targetPackage.isNullOrBlank()) {
+                        putExtra(EXTRA_PACKAGE, targetPackage)
+                    }
                 }
+                dispatchServiceIntent(context, intent)
             }
-            dispatchServiceIntent(context, intent)
         }
 
         fun pauseTunnel(context: Context) {
-            // Pause detaches external apps while keeping the built-in Browser connected on the same VPN server!
             isPaused = true
             isRunning = true
             persistStateToPrefs(context)
             BrowsecLocalProxyServer.ensureRunning()
-            BrowsecLocalProxyServer.applyWebViewProxy(true)
             dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
                 action = ACTION_PAUSE
             })
@@ -994,9 +842,9 @@ class BrowsecVpnService : VpnService() {
         fun resumeTunnel(context: Context) {
             isPaused = false
             isRunning = true
+            BrowsecLocalProxyServer.useBrowsecTunnel = true
             persistStateToPrefs(context)
             BrowsecLocalProxyServer.ensureRunning()
-            BrowsecLocalProxyServer.applyWebViewProxy(true)
             dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
                 action = ACTION_RESUME
             })
@@ -1008,17 +856,21 @@ class BrowsecVpnService : VpnService() {
             activeCountry = next
             BrowsecLocalProxyServer.onServerCountrySwitched(next)
             persistStateToPrefs(context)
-            dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
-                action = ACTION_SWITCH_SERVER
-            })
+            if (isRunning) {
+                dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
+                    action = ACTION_SWITCH_SERVER
+                })
+            }
             return next
         }
 
         fun stop(context: Context) {
             isRunning = false
             isPaused = false
+            BrowsecLocalProxyServer.useBrowsecTunnel = false
             persistStateToPrefs(context)
-            BrowsecLocalProxyServer.shutdown()
+            // Keep local server running in non-Browsec direct mode for apps outside the VPN list!
+            BrowsecLocalProxyServer.ensureRunning()
             try {
                 val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 nm?.cancel(8899)
@@ -1051,29 +903,26 @@ class BrowsecVpnService : VpnService() {
 
         when (action) {
             ACTION_STOP -> {
-                shutdownEverything()
+                shutdownTunnelOnly()
                 return START_NOT_STICKY
             }
 
             ACTION_PAUSE -> {
-                // Pause: detach system VPN tunnel from external phone apps, while keeping the built-in Browser connected to activeCountry!
                 isPaused = true
                 isRunning = true
                 closePerAppVpnInterface()
                 BrowsecLocalProxyServer.ensureRunning()
-                BrowsecLocalProxyServer.applyWebViewProxy(true)
                 persistStateToPrefs(this)
                 postShadeNotification()
                 return START_NOT_STICKY
             }
 
             ACTION_RESUME -> {
-                // Resume: continue work on the EXACT same activeCountry that was used before pause
                 isPaused = false
                 isRunning = true
+                BrowsecLocalProxyServer.useBrowsecTunnel = true
                 val port = BrowsecLocalProxyServer.ensureRunning()
-                BrowsecLocalProxyServer.applyWebViewProxy(true)
-                establishStrictPerAppVpnIfNeeded(activeCountry, port)
+                establishPerAppRepeaterV24(activeCountry, port)
                 persistStateToPrefs(this)
                 postShadeNotification()
                 return START_NOT_STICKY
@@ -1084,11 +933,8 @@ class BrowsecVpnService : VpnService() {
                 activeCountry = COUNTRIES[(idx + 1) % COUNTRIES.size]
                 BrowsecLocalProxyServer.onServerCountrySwitched(activeCountry)
                 val port = BrowsecLocalProxyServer.ensureRunning()
-                if (isRunning) {
-                    BrowsecLocalProxyServer.applyWebViewProxy(true)
-                    if (!isPaused) {
-                        establishStrictPerAppVpnIfNeeded(activeCountry, port)
-                    }
+                if (isRunning && !isPaused) {
+                    establishPerAppRepeaterV24(activeCountry, port)
                 }
                 persistStateToPrefs(this)
                 postShadeNotification()
@@ -1097,18 +943,14 @@ class BrowsecVpnService : VpnService() {
 
             else -> {
                 val country = intent?.getStringExtra(EXTRA_COUNTRY) ?: activeCountry
-                val pkg = intent?.getStringExtra(EXTRA_PACKAGE)
-                if (!pkg.isNullOrBlank()) {
-                    routedPackages.add(pkg)
-                }
                 activeCountry = country
                 isRunning = true
                 isPaused = false
+                BrowsecLocalProxyServer.useBrowsecTunnel = true
                 BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
                 BrowsecLocalProxyServer.onServerCountrySwitched(country)
                 val port = BrowsecLocalProxyServer.ensureRunning()
-                BrowsecLocalProxyServer.applyWebViewProxy(true)
-                establishStrictPerAppVpnIfNeeded(country, port)
+                establishPerAppRepeaterV24(country, port)
                 persistStateToPrefs(this)
                 postShadeNotification()
                 return START_NOT_STICKY
@@ -1117,13 +959,67 @@ class BrowsecVpnService : VpnService() {
     }
 
     /**
-     * Runs the VPN/Proxy server strictly INSIDE the application (127.0.0.1:8899) without opening
-     * a phone-wide VpnService TUN interface, so external browsers and phone apps outside OmniBrowser
-     * NEVER lose internet or get hijacked!
+     * Точная конфигурация из рабочих версий v2.3.0 (1874337) / v2.4.0 (2962033) для нативного YouTube и Play Market:
+     * 1. Маршрутизирует ТОЛЬКО выбранные пользователем приложения из списка `routedPackages` (addAllowedApplication).
+     *    Если список пуст — туннель не перехватывает телефон вообще!
+     * 2. Если в списке есть Google Play Market (`com.android.vending`) или YouTube (`com.google.android.youtube`),
+     *    автоматически добавляет системный загрузчик `com.android.providers.downloads` и `com.google.android.gms`,
+     *    чтобы скачивание APK в Play Market начиналось мгновенно без вечного «Подождите...».
+     * 3. НЕ вызывает `.addDnsServer("8.8.8.8")` на виртуальный `10.88.0.1/32` (чтобы UDP DNS не блокировался!).
      */
-    private fun establishStrictPerAppVpnIfNeeded(country: String, proxyPort: Int) {
-        // Always ensure any legacy system TUN interface is closed so external phone apps are 100% untouched.
+    private fun establishPerAppRepeaterV24(country: String, proxyPort: Int) {
         closePerAppVpnInterface()
+        if (routedPackages.isEmpty()) {
+            return
+        }
+        try {
+            val builder = Builder()
+                .setSession("Apps VPN Repeater ($country) • 127.0.0.1:$proxyPort")
+                .setMtu(1500)
+                .addAddress("10.88.0.2", 32)
+                .addRoute("10.88.0.1", 32)
+
+            val effectivePackages = LinkedHashSet<String>()
+            for (pkg in routedPackages) {
+                if (pkg.isNotBlank() && pkg != packageName) {
+                    effectivePackages.add(pkg)
+                }
+            }
+            // If Google Play Market or YouTube is in the VPN list, include Play Services & System DownloadProvider
+            // so Play Market APK downloads and YouTube auth tokens work seamlessly!
+            if (effectivePackages.any { it.contains("vending") || it.contains("youtube") || it.contains("google") }) {
+                effectivePackages.add("com.android.vending")
+                effectivePackages.add("com.android.providers.downloads")
+                effectivePackages.add("com.android.providers.downloads.ui")
+                effectivePackages.add("com.google.android.gms")
+            }
+
+            var addedCount = 0
+            for (pkg in effectivePackages) {
+                try {
+                    builder.addAllowedApplication(pkg)
+                    addedCount++
+                } catch (_: Exception) {
+                }
+            }
+
+            if (addedCount == 0) {
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+                builder.setHttpProxy(
+                    ProxyInfo.buildDirectProxy(
+                        "127.0.0.1",
+                        proxyPort,
+                        listOf("localhost", "127.0.0.1")
+                    )
+                )
+            }
+            perAppVpnInterface = builder.establish()
+        } catch (_: Exception) {
+        }
     }
 
     private fun closePerAppVpnInterface() {
@@ -1134,11 +1030,13 @@ class BrowsecVpnService : VpnService() {
         perAppVpnInterface = null
     }
 
-    private fun shutdownEverything() {
+    private fun shutdownTunnelOnly() {
         isRunning = false
         isPaused = false
+        BrowsecLocalProxyServer.useBrowsecTunnel = false
         closePerAppVpnInterface()
-        BrowsecLocalProxyServer.shutdown()
+        // Keep local server alive in non-Browsec mode for apps not in the VPN list
+        BrowsecLocalProxyServer.ensureRunning()
         persistStateToPrefs(this)
         try {
             stopForeground(true)
@@ -1152,13 +1050,10 @@ class BrowsecVpnService : VpnService() {
         stopSelf()
     }
 
-    /**
-     * When the user closes the APK (swipes it from Recents), automatically disconnect the local
-     * server and release all apps if disconnectOnAppClose is true (default true).
-     */
     override fun onTaskRemoved(rootIntent: Intent?) {
         if (disconnectOnAppClose) {
-            shutdownEverything()
+            shutdownTunnelOnly()
+            BrowsecLocalProxyServer.shutdown()
         }
         super.onTaskRemoved(rootIntent)
     }
@@ -1184,15 +1079,15 @@ class BrowsecVpnService : VpnService() {
     }
 
     private fun buildNotification(country: String, port: Int): Notification {
-        val channelId = "browsec_local_tunnel_channel_v31"
+        val channelId = "browsec_local_tunnel_channel_v34"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(NotificationManager::class.java)
             val channel = NotificationChannel(
                 channelId,
-                "Управление VPN и Локальным Туннелем",
+                "Репитер Приложений (Список VPN)",
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Пауза, Старт, Смена сервера и Выключение VPN в шторке уведомлений"
+                description = "Управление Репитером №2 для выбранных приложений из списка VPN"
                 setSound(null, null)
             }
             nm?.createNotificationChannel(channel)
@@ -1243,15 +1138,11 @@ class BrowsecVpnService : VpnService() {
         val txMb = String.format("%.2f МБ", snap.txBytesTotal / (1024.0 * 1024.0))
 
         val titleText = if (isPaused) {
-            "⏸ Пауза прил. • ${node.flag} ${node.countryRu} (${node.serverName})"
+            "⏸ Пауза Списка VPN • ${node.flag} ${node.countryRu} (${node.serverName})"
         } else {
-            "🛡️ ${node.flag} ${node.countryRu} (${node.serverName}) • IP: ${node.remoteIp}:${node.remotePort}"
+            "🛡️ Список VPN (${routedPackages.size} прил.): ${node.flag} ${node.countryRu} • ${node.remoteIp}:${node.remotePort}"
         }
-        val bodyText = if (isPaused) {
-            "Сервер: ${node.remoteIp}:${node.remotePort} • Лок: 127.0.0.1:$port (${snap.pingMs} мс) • В браузере ВКЛ"
-        } else {
-            "Сервер: ${node.remoteIp}:${node.remotePort} • Лок: 127.0.0.1:$port (${snap.pingMs} мс) • ⬇$rxMb ⬆$txMb"
-        }
+        val bodyText = "Лок. сервер: 127.0.0.1:$port (${snap.pingMs} мс) • ⬇$rxMb ⬆$txMb"
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)

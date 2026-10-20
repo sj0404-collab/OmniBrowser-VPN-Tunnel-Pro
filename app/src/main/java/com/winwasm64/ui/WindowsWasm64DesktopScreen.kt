@@ -69,6 +69,7 @@ import com.winwasm64.nativeapps.NativeAppsManager
 import com.winwasm64.torrent.BitTorrentEngine
 import com.winwasm64.torrent.TorrentSessionStatus
 import com.winwasm64.torrent.TorrentState
+import com.winwasm64.vpn.BrowserDirectRepeater
 import com.winwasm64.vpn.BrowsecLocalProxyServer
 import com.winwasm64.vpn.BrowsecVpnService
 import java.io.ByteArrayInputStream
@@ -226,11 +227,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val torrentEngine = remember { BitTorrentEngine(context) }
     val nativeAppsManager = remember { NativeAppsManager(context) }
 
-    // Start local anti-DPI + DoH Tunnel Server (127.0.0.1:8899) immediately with interception enabled by default
-    var proxyInterceptBrowser by remember { mutableStateOf(prefs.getBoolean("tunnel_proxy_active_v30", true)) }
+    // Репитер №1: Встроенный сервер Браузера (БЕЗ проброса к локальному туннелю 127.0.0.1:8899)
+    var browserVpnEnabled by remember { mutableStateOf(prefs.getBoolean("browser_vpn_on", true)) }
+    var browserVpnCountry by remember { mutableStateOf(prefs.getString("browser_vpn_country", "DE") ?: "DE") }
+    var browserTrafficSnapshot by remember { mutableStateOf(BrowserDirectRepeater.sampleBrowserTraffic()) }
+
+    // Репитер №2: Локальный сервер с пробросом (127.0.0.1:8899) — вынесен отдельно в раздел «Приложения (Список VPN)»
+    var proxyInterceptBrowser by remember { mutableStateOf(false) }
     var trafficSnapshot by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
 
-    // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Browsec VPN
+    // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Список VPN
     var currentSection by remember { mutableIntStateOf(0) }
 
     var adBlockEnabled by remember { mutableStateOf(prefs.getBoolean("adblock_on", true)) }
@@ -241,9 +247,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
-    var browsecEnabled by remember { mutableStateOf(prefs.getBoolean("browsec_on", true)) }
+    // Состояние Репитера №2 (Список VPN для Приложений — запускается только из списка VPN / плавающей кнопки!)
+    var browsecEnabled by remember { mutableStateOf(prefs.getBoolean("apps_vpn_on", false)) }
     var browsecPaused by remember { mutableStateOf(prefs.getBoolean("browsec_paused", false)) }
-    var browsecCountry by remember { mutableStateOf(prefs.getString("browsec_country", "DE") ?: "DE") }
+    var browsecCountry by remember { mutableStateOf(prefs.getString("apps_vpn_country", "DE") ?: "DE") }
     var disconnectOnClose by remember { mutableStateOf(prefs.getBoolean("disconnect_on_close", true)) }
     var searchEngine by remember { mutableStateOf(prefs.getString("search_engine", "Google") ?: "Google") }
     var textZoomPercent by remember { mutableIntStateOf(prefs.getInt("text_zoom_pct", 100)) }
@@ -262,31 +269,24 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     val notifPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { _ ->
-        if (browsecEnabled) {
-            BrowsecVpnService.startForApp(context, browsecCountry, null)
-        }
     }
 
     LaunchedEffect(Unit) {
-        BrowsecVpnService.isRunning = browsecEnabled
-        BrowsecVpnService.isPaused = browsecPaused
+        // 1. Инициализируем Репитер №1 (Только для Браузера, без проброса в 127.0.0.1:8899)
+        BrowserDirectRepeater.enabled = browserVpnEnabled
+        BrowserDirectRepeater.countryCode = browserVpnCountry
+        BrowserDirectRepeater.ensureDirectBrowserMode()
+
+        // 2. Инициализируем Репитер №2 (Локальный сервер 127.0.0.1:8899 для раздела Приложений)
         BrowsecVpnService.activeCountry = browsecCountry
         BrowsecVpnService.disconnectOnAppClose = disconnectOnClose
         BrowsecLocalProxyServer.dohProvider = dohServer
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
-        if (browsecEnabled) {
-            BrowsecLocalProxyServer.ensureRunning()
-            BrowsecLocalProxyServer.applyWebViewProxy(proxyInterceptBrowser)
-            if (Build.VERSION.SDK_INT >= 33) {
-                notifPermLauncher.launch("android.permission.POST_NOTIFICATIONS")
-            } else {
-                if (browsecPaused) BrowsecVpnService.pauseTunnel(context)
-                else BrowsecVpnService.startForApp(context, browsecCountry, null)
-            }
-        }
+        BrowsecLocalProxyServer.ensureRunning()
+
         while (true) {
+            browserTrafficSnapshot = BrowserDirectRepeater.sampleBrowserTraffic()
             trafficSnapshot = BrowsecLocalProxyServer.sampleTraffic()
-            // Sync live Notification Shade button actions (Pause / Resume / Switch Country / Stop) back into UI!
             if (BrowsecVpnService.activeCountry != browsecCountry) {
                 browsecCountry = BrowsecVpnService.activeCountry
             }
@@ -300,13 +300,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
-    // Sync Browsec state into BitTorrentEngine and WebView ProxyController (Browser stays connected even during Pause!)
-    LaunchedEffect(browsecEnabled, browsecPaused, browsecCountry, proxyInterceptBrowser) {
-        val node = VPN_NODES.find { it.code == browsecCountry } ?: VPN_NODES.first()
-        torrentEngine.useBrowsecVpn = browsecEnabled
+    // Синхронизация Репитера №1 с Браузером (НИКОГДА не пробрасывает браузер в локальный туннель 8899!)
+    LaunchedEffect(browserVpnEnabled, browserVpnCountry) {
+        BrowserDirectRepeater.enabled = browserVpnEnabled
+        BrowserDirectRepeater.countryCode = browserVpnCountry
+        BrowserDirectRepeater.ensureDirectBrowserMode()
+        val node = VPN_NODES.find { it.code == browserVpnCountry } ?: VPN_NODES.first()
+        torrentEngine.useBrowsecVpn = browserVpnEnabled
         torrentEngine.browsecCountryCode = node.code
         torrentEngine.browsecEdgeIp = node.edgeIp
-        BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && proxyInterceptBrowser)
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
@@ -386,9 +388,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         prefs.edit()
             .putBoolean("adblock_on", adBlockEnabled)
             .putInt("adblock_count", adBlockedCount)
-            .putBoolean("browsec_on", browsecEnabled)
+            .putBoolean("browser_vpn_on", browserVpnEnabled)
+            .putString("browser_vpn_country", browserVpnCountry)
+            .putBoolean("apps_vpn_on", browsecEnabled)
             .putBoolean("browsec_paused", browsecPaused)
-            .putString("browsec_country", browsecCountry)
+            .putString("apps_vpn_country", browsecCountry)
             .putBoolean("disconnect_on_close", disconnectOnClose)
             .putString("search_engine", searchEngine)
             .putInt("text_zoom_pct", textZoomPercent)
@@ -503,20 +507,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     document.querySelectorAll('video, audio').forEach(v => {
                         v.muted = false;
                         if (v.volume < 1.0) v.volume = 1.0;
-                        if (!v._omniBoosted) {
-                            try {
-                                const AudioCtx = window.AudioContext || window.webkitAudioContext;
-                                if (AudioCtx) {
-                                    const ctx = new AudioCtx();
-                                    const src = ctx.createMediaElementSource(v);
-                                    const gain = ctx.createGain();
-                                    gain.gain.value = 2.0;
-                                    src.connect(gain);
-                                    gain.connect(ctx.destination);
-                                    v._omniBoosted = true;
-                                }
-                            } catch(e){ v._omniBoosted = true; }
-                        }
                     });
                 })();
                 """.trimIndent()
@@ -575,18 +565,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        if (useProxyTunnel && browsecEnabled) {
-            proxyInterceptBrowser = true
-            prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
-            BrowsecLocalProxyServer.applyWebViewProxy(true)
-        }
+        // Браузер всегда работает на своём Репитере №1 БЕЗ проброса к локальному туннелю 127.0.0.1:8899!
+        BrowserDirectRepeater.ensureDirectBrowserMode()
+        BrowserDirectRepeater.browserRequests.incrementAndGet()
 
         tab.autoRetryCount = 0
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 12
-        val nodeInfo = BrowsecLocalProxyServer.getServerNode(browsecCountry)
-        val vpnLabel = if (browsecEnabled) "${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} ➔ 127.0.0.1:${BrowsecLocalProxyServer.activePort})" else "Прямое (VPN ВЫКЛ)"
+        val nodeInfo = BrowserDirectRepeater.getNode(browserVpnCountry)
+        val vpnLabel = if (browserVpnEnabled) "${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} • Репитер Браузера №1)" else "Прямое (VPN ВЫКЛ)"
         tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(target).host ?: target}..."
         tab.url = target
         addressInput = target
@@ -596,48 +584,68 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         wv.loadUrl(target)
     }
 
+    var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val pkg = pendingVpnLaunchPkg
+            BrowsecLocalProxyServer.useBrowsecTunnel = true
+            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+            if (!pkg.isNullOrBlank()) {
+                nativeAppsManager.launchApp(pkg)
+            }
+        }
+    }
+
+    /**
+     * Запускает НАТИВНОЕ мобильное приложение (включая нативный YouTube и Play Market):
+     * - Если приложение ДОБАВЛЕНО в список VPN (`vpnRoutedApps.contains(pkg)`) -> запускается через
+     *   Репитер №2 (127.0.0.1:8899 с туннелем Browsec VPN и выбранной страной).
+     * - Если приложение НЕ добавлено в список VPN -> запускается на том же локальном сервере
+     *   (127.0.0.1:8899) напрямую БЕЗ туннеля от Browsec!
+     */
     fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
-        if (!vpnRoutedApps.contains(pkg)) {
-            vpnRoutedApps.add(pkg)
-        }
-        browsecEnabled = true
-        browsecPaused = false
-        proxyInterceptBrowser = true
-        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-        persistBrowserSettings()
-
-        val inAppPortalUrl = when {
-            pkg.contains("youtube.music", ignoreCase = true) -> "https://music.youtube.com"
-            pkg.contains("youtube", ignoreCase = true) -> "https://m.youtube.com"
-            pkg.contains("telegram", ignoreCase = true) -> "https://web.telegram.org"
-            pkg.contains("discord", ignoreCase = true) -> "https://discord.com/app"
-            pkg.contains("instagram", ignoreCase = true) -> "https://www.instagram.com"
-            pkg.contains("musically", ignoreCase = true) || pkg.contains("tiktok", ignoreCase = true) -> "https://www.tiktok.com"
-            pkg.contains("twitch", ignoreCase = true) -> "https://m.twitch.tv"
-            pkg.contains("vkontakte", ignoreCase = true) -> "https://m.vk.com"
-            pkg.contains("rutube", ignoreCase = true) -> "https://rutube.ru"
-            else -> null
-        }
-
+        val isInVpnList = vpnRoutedApps.contains(pkg)
         val nodeInfo = BrowsecLocalProxyServer.getServerNode(browsecCountry)
-        if (inAppPortalUrl != null) {
-            currentSection = 0
-            navigateTab(activeTab, inAppPortalUrl, useProxyTunnel = true)
-            Toast.makeText(
-                context,
-                "🛡️ $appName запущен ВНУТРИ браузера через ${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} ➔ 127.0.0.1:${BrowsecLocalProxyServer.activePort})!",
-                Toast.LENGTH_LONG
-            ).show()
-        } else {
+
+        if (isInVpnList) {
+            browsecEnabled = true
+            browsecPaused = false
+            BrowsecLocalProxyServer.useBrowsecTunnel = true
+            BrowsecVpnService.routedPackages.add(pkg)
+            persistBrowserSettings()
+
+            val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
+            if (prep != null) {
+                pendingVpnLaunchPkg = pkg
+                vpnPermissionLauncher.launch(prep)
+                return
+            }
+            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
             val ok = nativeAppsManager.launchApp(pkg)
             if (ok) {
                 Toast.makeText(
                     context,
-                    "🛡️ $appName открыт изнутри браузера • Сервер ${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort})",
+                    "🛡️ Нативное приложение $appName запущено ЧЕРЕЗ СПИСОК VPN (${nodeInfo.flag} ${nodeInfo.countryRu} • ${nodeInfo.remoteIp}:${nodeInfo.remotePort} ➔ 127.0.0.1:${BrowsecLocalProxyServer.activePort})!",
                     Toast.LENGTH_LONG
                 ).show()
             } else {
-                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Не удалось открыть нативное приложение $appName", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            // Приложение НЕ добавлено в список VPN -> работает на том же локальном сервере БЕЗ туннеля от Browsec!
+            BrowsecLocalProxyServer.useBrowsecTunnel = false
+            BrowsecLocalProxyServer.ensureRunning()
+            val ok = nativeAppsManager.launchApp(pkg)
+            if (ok) {
+                Toast.makeText(
+                    context,
+                    "⚡ Нативное приложение $appName запущено на локальном сервере (127.0.0.1:${BrowsecLocalProxyServer.activePort}) БЕЗ туннеля от Browsec!",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(context, "Не удалось открыть нативное приложение $appName", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -723,7 +731,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     tab.loadingProgress = newProgress.coerceIn(5, 100)
                     tab.isLoading = newProgress < 100
                     val host = Uri.parse(view?.url ?: tab.url).host ?: "сайт"
-                    val vpnTag = if (browsecEnabled) " • Browsec $browsecCountry" else ""
+                    val vpnTag = if (browserVpnEnabled) " • Репитер Браузера №1 ($browserVpnCountry)" else ""
                     tab.loadingStatusText = if (newProgress < 100) {
                         "⏳ Загрузка $newProgress% • $host$vpnTag"
                     } else {
@@ -872,13 +880,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
+                        BrowserDirectRepeater.ensureDirectBrowserMode()
                         if (tab.autoRetryCount < 1) {
                             tab.autoRetryCount++
-                            // Toggle proxy route once for this tab without overwriting user's saved preference
-                            val nextProxyState = !BrowsecLocalProxyServer.webViewProxyApplied
-                            BrowsecLocalProxyServer.applyWebViewProxy(nextProxyState)
                             tab.lastErrorText = null
-                            tab.loadingStatusText = "⚡ Авто-переключение маршрута ($browsecCountry • порт ${BrowsecLocalProxyServer.activePort})..."
+                            tab.loadingStatusText = "⚡ Повтор через Репитер Браузера №1 ($browserVpnCountry • без локального туннеля)..."
                             view?.loadUrl(failingUrl)
                             return
                         }
@@ -970,7 +976,134 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
 
             if (currentSection == 0) {
-                // 1. Multi-Tab Strip
+                // 1. САМЫЙ ВЕРХ: Горизонтально прокручиваемая панель ВСЕХ КНОПОК (История, Загрузки, Репитер №1, Список VPN, Торрент, Расширения)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0B1324))
+                        .padding(horizontal = 6.dp, vertical = 5.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    ExtensionChip(
+                        label = if (browserVpnEnabled) {
+                            "🌐 VPN Браузера: ${browserTrafficSnapshot.activeCountryName} (${browserTrafficSnapshot.remoteServerIpPort})"
+                        } else {
+                            "🌐 VPN Браузера: ВЫКЛ ($browserVpnCountry)"
+                        },
+                        active = browserVpnEnabled,
+                        activeColor = Color(0xFF0284C7)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "browsec") null else "browsec"
+                    }
+
+                    ExtensionChip(
+                        label = "🕘 История (${historyList.size})",
+                        active = false,
+                        activeColor = Color(0xFF0284C7)
+                    ) {
+                        currentSection = 2
+                    }
+
+                    ExtensionChip(
+                        label = "📥 Загрузки",
+                        active = false,
+                        activeColor = Color(0xFF059669)
+                    ) {
+                        currentSection = 2
+                    }
+
+                    ExtensionChip(
+                        label = "📱 Список VPN (${vpnRoutedApps.size})",
+                        active = browsecEnabled,
+                        activeColor = Color(0xFF7C3AED)
+                    ) {
+                        currentSection = 3
+                    }
+
+                    ExtensionChip(
+                        label = "🧲 Торрент (${torrentStatuses.size})",
+                        active = false,
+                        activeColor = Color(0xFF059669)
+                    ) {
+                        currentSection = 1
+                    }
+
+                    ExtensionChip(
+                        label = "🛡️ AdBlock ($adBlockedCount)",
+                        active = adBlockEnabled,
+                        activeColor = Color(0xFF059669)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
+                    }
+
+                    ExtensionChip(
+                        label = "🎬 YouTube со звуком",
+                        active = youtubeBoostEnabled,
+                        activeColor = Color(0xFFDC2626)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "youtube") null else "youtube"
+                    }
+
+                    ExtensionChip(
+                        label = if (desktopMode) "🖥 Режим ПК" else "📱 Мобильный",
+                        active = desktopMode,
+                        activeColor = Color(0xFF0284C7)
+                    ) {
+                        desktopMode = !desktopMode
+                        activeTab.webView?.settings?.userAgentString = if (desktopMode) {
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                        } else null
+                        navigateTab(activeTab, activeTab.url)
+                        persistBrowserSettings()
+                    }
+
+                    ExtensionChip(
+                        label = "🌙 Dark Reader",
+                        active = darkReaderEnabled,
+                        activeColor = Color(0xFF7C3AED)
+                    ) {
+                        darkReaderEnabled = !darkReaderEnabled
+                        activeTab.webView?.let { injectActiveExtensions(it) }
+                        persistBrowserSettings()
+                    }
+
+                    ExtensionChip(
+                        label = "⭐ Закладки",
+                        active = activeExtensionPopup == "bookmarks",
+                        activeColor = Color(0xFF2563EB)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
+                    }
+
+                    ExtensionChip(
+                        label = "🔍 Найти",
+                        active = activeExtensionPopup == "find",
+                        activeColor = Color(0xFF4F46E5)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "find") null else "find"
+                    }
+
+                    ExtensionChip(
+                        label = "🔧 DevTools (F12)",
+                        active = devToolsEnabled,
+                        activeColor = Color(0xFFD97706)
+                    ) {
+                        devToolsEnabled = !devToolsEnabled
+                        activeTab.webView?.let { injectActiveExtensions(it) }
+                    }
+
+                    ExtensionChip(
+                        label = "⚙️ Настройки",
+                        active = activeExtensionPopup == "settings",
+                        activeColor = Color(0xFF0EA5E9)
+                    ) {
+                        activeExtensionPopup = if (activeExtensionPopup == "settings") null else "settings"
+                    }
+                }
+
+                // 2. ПРЯМО ПОД КНОПКАМИ: Горизонтально прокручиваемая полоса ВКЛАДОК
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1083,7 +1216,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
-                // 2. Navigation Bar with ALWAYS-VISIBLE Reload ↻, Stop ✕, History 🕘, Downloads 📥, and Crisp URL Bar
+                // 3. Адресная панель навигации (←, →, ↻, ✕, URL, Перейти)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1098,11 +1231,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     SmallNavIconButton("→", enabled = activeTab.canGoForward) {
                         activeTab.webView?.goForward()
                     }
-                    // ALWAYS VISIBLE Reload button!
                     SmallNavIconButton("↻", enabled = true) {
                         navigateTab(activeTab, activeTab.url)
                     }
-                    // Separate Stop button when loading
                     if (activeTab.isLoading) {
                         SmallNavIconButton("✕", enabled = true) {
                             activeTab.webView?.stopLoading()
@@ -1129,7 +1260,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
-                // 3. Loading Progress Indicator & Quick Controls
+                // 4. Индикатор загрузки и прокручиваемая строка статуса Репитера №1 (только для Браузера, без локального туннеля!)
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1151,59 +1282,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = if (activeTab.isLoading) {
-                                "⏳ Загрузка: ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url} (Browsec $browsecCountry)"
-                            } else {
-                                "🔒 Готово (100%) • ${Uri.parse(activeTab.url).host ?: activeTab.url} • Browsec $browsecCountry"
-                            },
-                            color = if (activeTab.isLoading) Color(0xFF38BDF8) else Color(0xFF94A3B8),
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(
-                                text = "🕘 История (${historyList.size})",
-                                color = Color(0xFF38BDF8),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable { currentSection = 2 }
-                            )
-                            Text(
-                                text = "📥 Загрузки",
-                                color = Color(0xFF34D399),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable { currentSection = 2 }
-                            )
-                            Text(
-                                text = if (desktopMode) "🖥 ПК" else "📱 Моб",
-                                color = Color(0xFFE2E8F0),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable {
-                                    desktopMode = !desktopMode
-                                    activeTab.webView?.settings?.userAgentString = if (desktopMode) {
-                                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                                    } else null
-                                    navigateTab(activeTab, activeTab.url)
-                                    persistBrowserSettings()
-                                }
-                            )
-                        }
-                    }
-
-                    // Live Incoming (RX) & Outgoing (TX) Traffic + Local Server Status Strip
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
                             .background(Color(0xFF060B16))
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                             .horizontalScroll(rememberScrollState()),
@@ -1211,119 +1289,34 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = if (browsecEnabled) {
-                                "🟢 ${trafficSnapshot.activeCountryName} • Сервер: ${trafficSnapshot.remoteServerIpPort} • Лок: 127.0.0.1:${trafficSnapshot.proxyPort} (${trafficSnapshot.pingMs} мс)"
+                            text = if (activeTab.isLoading) {
+                                "⏳ ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
                             } else {
-                                "⚪ VPN-сервер ВЫКЛ (Прямое соединение)"
+                                "🔒 100% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
                             },
-                            color = if (browsecEnabled) Color(0xFF34D399) else Color(0xFF94A3B8),
+                            color = if (activeTab.isLoading) Color(0xFF38BDF8) else Color(0xFF34D399),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
                         Text(
-                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(trafficSnapshot.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(trafficSnapshot.rxBytesTotal)})",
-                            color = Color(0xFF38BDF8),
+                            text = if (browserVpnEnabled) {
+                                "🟢 Репитер Браузера №1: ${browserTrafficSnapshot.activeCountryName} • Сервер: ${browserTrafficSnapshot.remoteServerIpPort} (БЕЗ проброса в лок. туннель • ${browserTrafficSnapshot.pingMs} мс)"
+                            } else {
+                                "⚪ Репитер Браузера №1: ВЫКЛ (Прямое соединение)"
+                            },
+                            color = if (browserVpnEnabled) Color(0xFF34D399) else Color(0xFF94A3B8),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
                         Text(
-                            text = "⬆ ИСХ: ${BitTorrentEngine.formatSpeed(trafficSnapshot.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(trafficSnapshot.txBytesTotal)})",
+                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.rxSpeedBytesPerSec)} | ⬆ ИСХ: ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.txSpeedBytesPerSec)}",
                             color = Color(0xFFFDE047),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
-                        Text(
-                            text = "🔗 Запр: ${trafficSnapshot.interceptedRequests} • Соед: ${trafficSnapshot.activeSockets}",
-                            color = Color(0xFFC084FC),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                }
-
-                // 4. Extensions Bar
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0F172A))
-                        .padding(horizontal = 6.dp, vertical = 5.dp)
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    ExtensionChip(
-                        label = if (browsecEnabled) {
-                            "🌐 VPN: ${trafficSnapshot.activeCountryName} (${trafficSnapshot.remoteServerIpPort})"
-                        } else {
-                            "🌐 VPN ВЫКЛ ($browsecCountry)"
-                        },
-                        active = browsecEnabled,
-                        activeColor = Color(0xFF0284C7)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "browsec") null else "browsec"
-                    }
-
-                    ExtensionChip(
-                        label = "🛡️ AdBlock ($adBlockedCount)",
-                        active = adBlockEnabled,
-                        activeColor = Color(0xFF059669)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
-                    }
-
-                    ExtensionChip(
-                        label = "🎬 YouTube со звуком",
-                        active = youtubeBoostEnabled,
-                        activeColor = Color(0xFFDC2626)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "youtube") null else "youtube"
-                    }
-
-                    ExtensionChip(
-                        label = "🌙 Dark Reader",
-                        active = darkReaderEnabled,
-                        activeColor = Color(0xFF7C3AED)
-                    ) {
-                        darkReaderEnabled = !darkReaderEnabled
-                        activeTab.webView?.let { injectActiveExtensions(it) }
-                        persistBrowserSettings()
-                    }
-
-                    ExtensionChip(
-                        label = "⭐ Закладки",
-                        active = activeExtensionPopup == "bookmarks",
-                        activeColor = Color(0xFF2563EB)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
-                    }
-
-                    ExtensionChip(
-                        label = "🔧 DevTools (F12)",
-                        active = devToolsEnabled,
-                        activeColor = Color(0xFFD97706)
-                    ) {
-                        devToolsEnabled = !devToolsEnabled
-                        activeTab.webView?.let { injectActiveExtensions(it) }
-                    }
-
-                    ExtensionChip(
-                        label = "🔍 Найти",
-                        active = activeExtensionPopup == "find",
-                        activeColor = Color(0xFF4F46E5)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "find") null else "find"
-                    }
-
-                    ExtensionChip(
-                        label = "⚙️ Настройки",
-                        active = activeExtensionPopup == "settings",
-                        activeColor = Color(0xFF0EA5E9)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "settings") null else "settings"
                     }
                 }
 
@@ -1391,26 +1384,21 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            "🛡️ ${trafficSnapshot.activeCountryName} • IP: ${trafficSnapshot.remoteServerIpPort}",
+                                            "🌐 Репитер Браузера №1: ${browserTrafficSnapshot.activeCountryName} • IP: ${browserTrafficSnapshot.remoteServerIpPort}",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
                                             fontSize = 12.sp,
                                             modifier = Modifier.weight(1f)
                                         )
-                                        Switch(checked = browsecEnabled, onCheckedChange = { enabled ->
-                                            browsecEnabled = enabled
-                                            browsecPaused = false
-                                            if (enabled) {
-                                                proxyInterceptBrowser = true
-                                                prefs.edit().putBoolean("tunnel_proxy_active_v30", true).commit()
-                                                BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                            } else {
-                                                BrowsecVpnService.stop(context)
-                                            }
+                                        Switch(checked = browserVpnEnabled, onCheckedChange = { enabled ->
+                                            browserVpnEnabled = enabled
+                                            BrowserDirectRepeater.enabled = enabled
+                                            BrowserDirectRepeater.ensureDirectBrowserMode()
                                             persistBrowserSettings()
+                                            navigateTab(activeTab, activeTab.url)
                                         })
                                     }
-                                    // Live Traffic Telemetry Box inside Popup
+
                                     Surface(
                                         color = Color(0xFF090D16),
                                         shape = RoundedCornerShape(8.dp),
@@ -1418,76 +1406,50 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text(
-                                                "🌍 СЕРВЕР: ${trafficSnapshot.activeCountryName} | IP: ${trafficSnapshot.remoteServerIpPort} | Пинг: ${trafficSnapshot.pingMs} мс",
+                                                "🌍 СЕРВЕР БРАУЗЕРА №1: ${browserTrafficSnapshot.activeCountryName} | IP: ${browserTrafficSnapshot.remoteServerIpPort} | Пинг: ${browserTrafficSnapshot.pingMs} мс",
                                                 color = Color(0xFF34D399),
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 11.sp
                                             )
                                             Text(
-                                                "🔒 Локальный туннель (только внутри браузера): 127.0.0.1:${trafficSnapshot.proxyPort}",
+                                                "✓ Режим: Прямой Репитер Браузера №1 (БЕЗ проброса к локальному туннелю 127.0.0.1:8899 — видео YouTube в браузере работает без черного экрана!)",
                                                 color = Color(0xFFFACC15),
-                                                fontSize = 11.sp,
-                                                fontFamily = FontFamily.Monospace
+                                                fontSize = 11.sp
                                             )
                                             Text(
-                                                "⬇ Входящий (RX): ${BitTorrentEngine.formatSpeed(trafficSnapshot.rxSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(trafficSnapshot.rxBytesTotal)}",
+                                                "⬇ Входящий (RX): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.rxSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.rxBytesTotal)}",
                                                 color = Color(0xFF38BDF8),
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace
                                             )
                                             Text(
-                                                "⬆ Исходящий (TX): ${BitTorrentEngine.formatSpeed(trafficSnapshot.txSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(trafficSnapshot.txBytesTotal)}",
+                                                "⬆ Исходящий (TX): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.txSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.txBytesTotal)}",
                                                 color = Color(0xFFFDE047),
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace
                                             )
-                                            Text(
-                                                "🔗 Перехвачено запросов: ${trafficSnapshot.interceptedRequests} • Активных сокетов: ${trafficSnapshot.activeSockets}",
-                                                color = Color(0xFFE2E8F0),
-                                                fontSize = 10.sp,
-                                                fontFamily = FontFamily.Monospace
-                                            )
                                         }
                                     }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            "Перехват браузера на локальный прокси 127.0.0.1:${trafficSnapshot.proxyPort} (TLS SNI Split)",
-                                            color = Color(0xFFE2E8F0),
-                                            fontSize = 11.sp,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        Switch(checked = proxyInterceptBrowser, onCheckedChange = {
-                                            proxyInterceptBrowser = it
-                                            prefs.edit().putBoolean("tunnel_proxy_active_v30", it).apply()
-                                            BrowsecLocalProxyServer.applyWebViewProxy(browsecEnabled && it)
-                                            navigateTab(activeTab, activeTab.url)
-                                        })
-                                    }
+
                                     Row(
                                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
-                                        BrowsecLocalProxyServer.SERVER_NODES.forEach { node ->
-                                            val selected = browsecCountry == node.code
+                                        BrowserDirectRepeater.BROWSER_NODES.forEach { node ->
+                                            val selected = browserVpnCountry == node.code
                                             Surface(
                                                 color = if (selected) Color(0xFF0284C7) else Color(0xFF0F172A),
                                                 shape = RoundedCornerShape(8.dp),
                                                 border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
                                                 modifier = Modifier.clickable {
-                                                    browsecCountry = node.code
-                                                    browsecEnabled = true
-                                                    browsecPaused = false
-                                                    proxyInterceptBrowser = true
-                                                    prefs.edit().putBoolean("tunnel_proxy_active_v30", true).commit()
-                                                    BrowsecVpnService.startForApp(context, node.code, null)
+                                                    browserVpnCountry = node.code
+                                                    browserVpnEnabled = true
+                                                    BrowserDirectRepeater.switchCountry(node.code)
                                                     persistBrowserSettings()
+                                                    navigateTab(activeTab, activeTab.url)
                                                     Toast.makeText(
                                                         context,
-                                                        "🌍 Подключён сервер: ${node.flag} ${node.countryRu} (${node.serverName}) • IP: ${node.remoteIp}:${node.remotePort}",
+                                                        "🌍 Репитер Браузера №1: ${node.flag} ${node.countryRu} (${node.serverName}) • IP: ${node.remoteIp}:${node.remotePort}",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -1512,85 +1474,30 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             }
                                         }
                                     }
+
                                     Row(
                                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Button(
                                             onClick = {
-                                                if (browsecPaused || !browsecEnabled) {
-                                                    // Resume on the EXACT same VPN country that was active before pause!
-                                                    browsecEnabled = true
-                                                    browsecPaused = false
-                                                    proxyInterceptBrowser = true
-                                                    BrowsecVpnService.resumeTunnel(context)
-                                                    persistBrowserSettings()
-                                                    Toast.makeText(context, "▶ Сервер продолжил работу на том же VPN ($browsecCountry)!", Toast.LENGTH_SHORT).show()
-                                                } else {
-                                                    // Pause: detach from external phone apps while keeping the built-in Browser connected on activeCountry!
-                                                    browsecPaused = true
-                                                    BrowsecVpnService.pauseTunnel(context)
-                                                    persistBrowserSettings()
-                                                    Toast.makeText(context, "⏸ Пауза для приложений (в браузере VPN $browsecCountry продолжает работать!)", Toast.LENGTH_SHORT).show()
-                                                }
+                                                browserVpnEnabled = !browserVpnEnabled
+                                                BrowserDirectRepeater.enabled = browserVpnEnabled
+                                                BrowserDirectRepeater.ensureDirectBrowserMode()
+                                                persistBrowserSettings()
+                                                navigateTab(activeTab, activeTab.url)
                                             },
                                             colors = ButtonDefaults.buttonColors(
-                                                containerColor = if (browsecPaused || !browsecEnabled) Color(0xFF059669) else Color(0xFFD97706)
+                                                containerColor = if (browserVpnEnabled) Color(0xFFDC2626) else Color(0xFF059669)
                                             )
                                         ) {
                                             Text(
-                                                if (browsecPaused || !browsecEnabled) "▶ Старт ($browsecCountry — тот же VPN)" else "⏸ Пауза прил. (Браузер в VPN)",
+                                                if (browserVpnEnabled) "⏹ Выключить VPN Браузера" else "▶ Включить VPN Браузера ($browserVpnCountry)",
                                                 fontSize = 11.sp,
                                                 color = Color.White
                                             )
                                         }
-                                        Button(
-                                            onClick = {
-                                                val nextCode = BrowsecVpnService.cycleCountry(context)
-                                                browsecCountry = nextCode
-                                                browsecEnabled = true
-                                                browsecPaused = false
-                                                persistBrowserSettings()
-                                                Toast.makeText(context, "🌐 Сервер переключён на $nextCode", Toast.LENGTH_SHORT).show()
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                                        ) {
-                                            Text("🌐 Сменить сервер ($browsecCountry ↻)", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = false
-                                                browsecPaused = false
-                                                BrowsecVpnService.stop(context)
-                                                persistBrowserSettings()
-                                                Toast.makeText(context, "⏹ Локальный сервер и VPN полностью выключены", Toast.LENGTH_SHORT).show()
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                                        ) {
-                                            Text("⏹ Выключить", fontSize = 11.sp, color = Color.White)
-                                        }
-                                    }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                browsecPaused = false
-                                                val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
-                                                if (prep != null) {
-                                                    pendingVpnLaunchPkg = null
-                                                    vpnPermissionLauncher.launch(prep)
-                                                } else {
-                                                    BrowsecVpnService.startForApp(context, browsecCountry, null)
-                                                    Toast.makeText(context, "🛡️ Управление VPN добавлено в шторку уведомлений ($browsecCountry)!", Toast.LENGTH_SHORT).show()
-                                                }
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
-                                        ) {
-                                            Text("🛡️ Шторка Уведомлений + Туннель Приложений (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
-                                        }
+
                                         Button(
                                             onClick = {
                                                 activeExtensionPopup = null
@@ -1598,25 +1505,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
                                         ) {
-                                            Text("📱 Выбрать Приложения (${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                            Text("📱 Перейти во 2-й Сервер (Список VPN Приложений: ${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
-                                    }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            "Отключать локальный сервер при закрытии АПК (и работать строго только со списком приложений)",
-                                            color = Color(0xFF94A3B8),
-                                            fontSize = 10.sp,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        Switch(checked = disconnectOnClose, onCheckedChange = {
-                                            disconnectOnClose = it
-                                            BrowsecVpnService.disconnectOnAppClose = it
-                                            persistBrowserSettings()
-                                        })
                                     }
                                 }
 
@@ -2050,14 +1940,50 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     nativeAppsManager = nativeAppsManager,
                     installedApps = installedApps,
+                    browsecEnabled = browsecEnabled,
+                    browsecPaused = browsecPaused,
                     browsecCountry = browsecCountry,
                     vpnRoutedApps = vpnRoutedApps,
                     downloadedFiles = torrentEngine.getDownloadDirectory().listFiles()?.toList().orEmpty(),
                     onSelectCountry = { code ->
                         browsecCountry = code
-                        browsecEnabled = true
                         BrowsecVpnService.activeCountry = code
+                        if (browsecEnabled) {
+                            BrowsecVpnService.startForApp(context, code, null)
+                        }
                         persistBrowserSettings()
+                    },
+                    onToggleFloatingVpn = {
+                        val nextState = !browsecEnabled
+                        if (nextState) {
+                            browsecEnabled = true
+                            browsecPaused = false
+                            BrowsecLocalProxyServer.useBrowsecTunnel = true
+                            persistBrowserSettings()
+                            val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
+                            if (prep != null) {
+                                pendingVpnLaunchPkg = null
+                                vpnPermissionLauncher.launch(prep)
+                            } else {
+                                BrowsecVpnService.startForApp(context, browsecCountry, null)
+                                Toast.makeText(
+                                    context,
+                                    "🛡️ Внутренний VPN для Списка Приложений (${vpnRoutedApps.size}) ВКЛЮЧЁН ($browsecCountry)!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        } else {
+                            browsecEnabled = false
+                            browsecPaused = false
+                            BrowsecLocalProxyServer.useBrowsecTunnel = false
+                            BrowsecVpnService.stop(context)
+                            persistBrowserSettings()
+                            Toast.makeText(
+                                context,
+                                "⏹ Туннель Browsec для приложений выключен (локальный сервер 127.0.0.1:${BrowsecLocalProxyServer.activePort} работает без туннеля)",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
                     },
                     onLaunchAppWithBrowsec = { pkg, name ->
                         startBrowsecAndLaunchNativeApp(pkg, name)
@@ -2069,6 +1995,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         } else {
                             vpnRoutedApps.add(pkg)
                             BrowsecVpnService.routedPackages.add(pkg)
+                        }
+                        if (browsecEnabled) {
+                            BrowsecVpnService.startForApp(context, browsecCountry, null)
                         }
                         persistBrowserSettings()
                     },
@@ -2088,7 +2017,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 BottomSectionButton(
                     modifier = Modifier.weight(1f),
                     title = "🌐 Браузер (${tabs.size})",
-                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Browsec $browsecCountry",
+                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Репитер №1 ($browserVpnCountry)",
                     selected = currentSection == 0,
                     activeColor = Color(0xFF0284C7)
                 ) { currentSection = 0 }
@@ -2111,8 +2040,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                 BottomSectionButton(
                     modifier = Modifier.weight(1f),
-                    title = "📱 Приложения",
-                    subtitle = "Запуск с VPN",
+                    title = "📱 Список VPN",
+                    subtitle = if (browsecEnabled) "Репитер №2 ВКЛ ($browsecCountry)" else "Репитер №2 (${vpnRoutedApps.size})",
                     selected = currentSection == 3,
                     activeColor = Color(0xFF7C3AED)
                 ) { currentSection = 3 }
@@ -2662,10 +2591,13 @@ private fun NativeAppsWithBrowsecSection(
     modifier: Modifier,
     nativeAppsManager: NativeAppsManager,
     installedApps: List<NativeAppEntry>,
+    browsecEnabled: Boolean,
+    browsecPaused: Boolean,
     browsecCountry: String,
     vpnRoutedApps: List<String>,
     downloadedFiles: List<File>,
     onSelectCountry: (String) -> Unit,
+    onToggleFloatingVpn: () -> Unit,
     onLaunchAppWithBrowsec: (String, String) -> Unit,
     onToggleAppInVpn: (String) -> Unit,
     onRefreshApps: () -> Unit
@@ -2676,7 +2608,8 @@ private fun NativeAppsWithBrowsecSection(
 
     val categories = listOf(
         "Все",
-        "🛡️ В туннеле Browsec (${vpnRoutedApps.size})",
+        "🛡️ В списке VPN (${vpnRoutedApps.size})",
+        "⚡ На лок. сервере без VPN",
         "🎬 Видео и Аудио плееры",
         "📦 Файлы и Архиваторы",
         "🖥️ Эмуляторы и ОС (.EXE)",
@@ -2688,6 +2621,7 @@ private fun NativeAppsWithBrowsecSection(
             val matchCat = when {
                 selectedCategory == "Все" -> true
                 selectedCategory.startsWith("🛡️") -> vpnRoutedApps.contains(app.packageName)
+                selectedCategory.startsWith("⚡") -> !vpnRoutedApps.contains(app.packageName)
                 else -> app.category == selectedCategory
             }
             val matchQuery = appSearchQuery.isBlank() ||
@@ -2705,207 +2639,278 @@ private fun NativeAppsWithBrowsecSection(
         }
     }
 
-    Column(
+    Box(
         modifier = modifier
             .background(Color(0xFF090D16))
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Surface(
-            color = Color(0xFF111827),
-            shape = RoundedCornerShape(12.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF7C3AED))
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "📱 Локальный VPN-Туннель для Приложений (127.0.0.1:${liveTraffic.proxyPort} • $browsecCountry)",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                        Text(
-                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ: ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})",
-                            color = Color(0xFF34D399),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "Приложений: ${installedApps.size} • В туннеле: ${vpnRoutedApps.size} • Перехвачено запросов: ${liveTraffic.interceptedRequests}",
-                            color = Color(0xFF38BDF8),
-                            fontSize = 11.sp
-                        )
-                    }
-                    OutlinedButton(
-                        onClick = onRefreshApps,
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.height(32.dp)
+            Surface(
+                color = Color(0xFF111827),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    if (browsecEnabled) Color(0xFF10B981) else Color(0xFF7C3AED)
+                )
+            ) {
+                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("↻ Обновить", fontSize = 11.sp, color = Color.White)
-                    }
-                }
-
-                // Country selector for Native Apps VPN
-                Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Узел VPN:", color = Color(0xFF94A3B8), fontSize = 11.sp)
-                    VPN_NODES.forEach { node ->
-                        val isSel = browsecCountry == node.code
-                        Surface(
-                            color = if (isSel) Color(0xFF0284C7) else Color(0xFF1E293B),
-                            shape = RoundedCornerShape(8.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, if (isSel) Color(0xFF38BDF8) else Color(0xFF334155)),
-                            modifier = Modifier.clickable { onSelectCountry(node.code) }
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "${node.flag} ${node.code}",
+                                text = "📱 Репитер №2 (с пробросом 127.0.0.1:${liveTraffic.proxyPort}) • Список VPN ($browsecCountry)",
                                 color = Color.White,
-                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                fontSize = 13.sp
                             )
+                            Text(
+                                text = if (browsecEnabled) {
+                                    "🟢 ВНУТРЕННИЙ VPN ВКЛ: Приложения В СПИСКЕ (${vpnRoutedApps.size}) идут через туннель Browsec ($browsecCountry • ${liveTraffic.remoteServerIpPort}), остальные — на лок. сервере без туннеля"
+                                } else {
+                                    "⚪ ВНУТРЕННИЙ VPN ВЫКЛ: Нажмите плавающую кнопку VPN внизу справа или запустите приложение из списка VPN"
+                                },
+                                color = if (browsecEnabled) Color(0xFF34D399) else Color(0xFFFACC15),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ: ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)}) • Запр: ${liveTraffic.interceptedRequests}",
+                                color = Color(0xFF38BDF8),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onRefreshApps,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.height(32.dp)
+                        ) {
+                            Text("↻ Обновить", fontSize = 11.sp, color = Color.White)
+                        }
+                    }
+
+                    // Country selector for Native Apps Repeater #2
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Сервер Репитера №2:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        BrowsecLocalProxyServer.SERVER_NODES.forEach { node ->
+                            val isSel = browsecCountry == node.code
+                            Surface(
+                                color = if (isSel) Color(0xFF0284C7) else Color(0xFF1E293B),
+                                shape = RoundedCornerShape(8.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, if (isSel) Color(0xFF38BDF8) else Color(0xFF334155)),
+                                modifier = Modifier.clickable { onSelectCountry(node.code) }
+                            ) {
+                                Text(
+                                    text = "${node.flag} ${node.countryRu} (${node.remoteIp}:${node.remotePort})",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    CompactDarkTextField(
+                        value = appSearchQuery,
+                        onValueChange = { appSearchQuery = it },
+                        placeholder = "Поиск нативного приложения (YouTube, Play Market, Telegram, Discord)...",
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        categories.forEach { cat ->
+                            val isSel = selectedCategory == cat
+                            Surface(
+                                color = if (isSel) Color(0xFF7C3AED) else Color(0xFF1E293B),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable { selectedCategory = cat }
+                            ) {
+                                Text(
+                                    text = cat,
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
                         }
                     }
                 }
+            }
 
-                // Crisp non-clipped Search field
-                CompactDarkTextField(
-                    value = appSearchQuery,
-                    onValueChange = { appSearchQuery = it },
-                    placeholder = "Поиск приложения (например: AyuGram, YouTube, BitTorrent)...",
-                    modifier = Modifier.fillMaxWidth()
-                )
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 84.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(filteredApps, key = { it.packageName }) { app ->
+                    val isInVpn = vpnRoutedApps.contains(app.packageName)
+                    Surface(
+                        color = Color(0xFF111827),
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            if (isInVpn) Color(0xFF10B981) else Color(0xFF334155)
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                if (app.iconBitmap != null) {
+                                    Image(
+                                        bitmap = app.iconBitmap,
+                                        contentDescription = app.appName,
+                                        modifier = Modifier.size(42.dp).clip(RoundedCornerShape(8.dp))
+                                    )
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(42.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF1E293B)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text("📱", fontSize = 18.sp)
+                                    }
+                                }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    categories.forEach { cat ->
-                        val isSel = selectedCategory == cat
-                        Surface(
-                            color = if (isSel) Color(0xFF7C3AED) else Color(0xFF1E293B),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.clickable { selectedCategory = cat }
-                        ) {
-                            Text(
-                                text = cat,
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                            )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "${app.appName} (НАТИВНОЕ АПК)",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp
+                                    )
+                                    Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                    Text(
+                                        text = if (isInVpn) {
+                                            "🟢 В СПИСКЕ VPN: Запускается через туннель Browsec ($browsecCountry • 127.0.0.1:${liveTraffic.proxyPort})"
+                                        } else {
+                                            "⚪ НЕ В СПИСКЕ VPN: Работает на локальном сервере (127.0.0.1:${liveTraffic.proxyPort}) БЕЗ туннеля от Browsec"
+                                        },
+                                        color = if (isInVpn) Color(0xFF34D399) else Color(0xFFFACC15),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Button(
+                                    onClick = { onLaunchAppWithBrowsec(app.packageName, app.appName) },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                    modifier = Modifier.weight(1.4f).height(38.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isInVpn) Color(0xFF059669) else Color(0xFF0284C7)
+                                    )
+                                ) {
+                                    Text(
+                                        text = if (isInVpn) {
+                                            "🛡️🚀 Запустить через VPN ($browsecCountry)"
+                                        } else {
+                                            "⚡🚀 Запустить (Лок. сервер БЕЗ VPN)"
+                                        },
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+
+                                OutlinedButton(
+                                    onClick = { onToggleAppInVpn(app.packageName) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                    modifier = Modifier.weight(0.9f).height(38.dp)
+                                ) {
+                                    Text(
+                                        text = if (isInVpn) "✓ В списке VPN (Убрать)" else "+ Добавить в список VPN",
+                                        fontSize = 11.sp,
+                                        color = if (isInVpn) Color(0xFF34D399) else Color.White,
+                                        maxLines = 1
+                                    )
+                                }
+
+                                if (selectedFileForOpen != null) {
+                                    Button(
+                                        onClick = {
+                                            nativeAppsManager.openFileInNativeApp(selectedFileForOpen!!, app.packageName)
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                        modifier = Modifier.height(38.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                    ) {
+                                        Text("📂 Файл", fontSize = 11.sp, color = Color.White)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+        // ВНУТРЕННЯЯ ПЛАВАЮЩАЯ КНОПКА VPN В СПИСКЕ ПРИЛОЖЕНИЙ (Floating VPN Button inside VPN List)
+        Surface(
+            color = if (browsecEnabled) Color(0xFF059669) else Color(0xFF1E293B),
+            shape = RoundedCornerShape(28.dp),
+            shadowElevation = 10.dp,
+            border = androidx.compose.foundation.BorderStroke(
+                2.dp,
+                if (browsecEnabled) Color(0xFF34D399) else Color(0xFF38BDF8)
+            ),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 16.dp, bottom = 14.dp)
+                .clickable { onToggleFloatingVpn() }
         ) {
-            items(filteredApps, key = { it.packageName }) { app ->
-                val isInVpn = vpnRoutedApps.contains(app.packageName)
-                Surface(
-                    color = Color(0xFF111827),
-                    shape = RoundedCornerShape(10.dp),
-                    border = androidx.compose.foundation.BorderStroke(
-                        1.dp,
-                        if (isInVpn) Color(0xFF10B981) else Color(0xFF1E293B)
+            Row(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = if (browsecEnabled) "🟢🛡️" else "⚪🛡️",
+                    fontSize = 16.sp
+                )
+                Column {
+                    Text(
+                        text = if (browsecEnabled) {
+                            "VPN Списка: ВКЛ ($browsecCountry • ${vpnRoutedApps.size} прил.)"
+                        } else {
+                            "Включить VPN Списка ($browsecCountry • ${vpnRoutedApps.size} прил.)"
+                        },
+                        color = Color.White,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 12.sp
                     )
-                ) {
-                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            if (app.iconBitmap != null) {
-                                Image(
-                                    bitmap = app.iconBitmap,
-                                    contentDescription = app.appName,
-                                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(8.dp))
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .size(42.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFF1E293B)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text("📱", fontSize = 18.sp)
-                                }
-                            }
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(app.appName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                                Text(
-                                    text = if (isInVpn) "🟢 Туннель Browsec VPN ($browsecCountry) АКТИВЕН" else app.supportedFormats.joinToString(" • "),
-                                    color = if (isInVpn) Color(0xFF34D399) else Color(0xFF38BDF8),
-                                    fontSize = 11.sp,
-                                    fontWeight = if (isInVpn) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Button(
-                                onClick = { onLaunchAppWithBrowsec(app.packageName, app.appName) },
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                                modifier = Modifier.weight(1.4f).height(38.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
-                            ) {
-                                Text(
-                                    text = "🛡️🚀 Запустить с Browsec ($browsecCountry)",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-
-                            OutlinedButton(
-                                onClick = { onToggleAppInVpn(app.packageName) },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                                modifier = Modifier.weight(0.9f).height(38.dp)
-                            ) {
-                                Text(
-                                    text = if (isInVpn) "✓ В VPN списке" else "+ В VPN список",
-                                    fontSize = 11.sp,
-                                    color = if (isInVpn) Color(0xFF34D399) else Color.White,
-                                    maxLines = 1
-                                )
-                            }
-
-                            if (selectedFileForOpen != null) {
-                                Button(
-                                    onClick = {
-                                        nativeAppsManager.openFileInNativeApp(selectedFileForOpen!!, app.packageName)
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                                    modifier = Modifier.height(38.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
-                                ) {
-                                    Text("📂 Файл", fontSize = 11.sp, color = Color.White)
-                                }
-                            }
-                        }
-                    }
+                    Text(
+                        text = "Репитер №2: 127.0.0.1:${liveTraffic.proxyPort} ➔ ${liveTraffic.remoteServerIpPort}",
+                        color = if (browsecEnabled) Color(0xFFD1FAE5) else Color(0xFF94A3B8),
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
                 }
             }
         }
