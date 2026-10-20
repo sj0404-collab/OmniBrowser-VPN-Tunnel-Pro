@@ -740,6 +740,39 @@ object BrowsecLocalProxyServer {
         } catch (_: Exception) {
         }
     }
+
+    internal fun buildSniSplitTlsRecords(
+        buf: ByteArray,
+        length: Int,
+        microSplit: Boolean = false
+    ): List<ByteArray> {
+        if (length <= 21 || buf[0] != 0x16.toByte() || buf[1] != 0x03.toByte()) {
+            return listOf(buf.copyOf(length))
+        }
+        val recLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
+        if (5 + recLen > length || recLen <= 16) {
+            return listOf(buf.copyOf(length))
+        }
+        val frag1Len = 16
+        val frag2Len = recLen - frag1Len
+        val rec1 = ByteArray(5 + frag1Len)
+        rec1[0] = 0x16
+        rec1[1] = buf[1]
+        rec1[2] = buf[2]
+        rec1[3] = 0x00
+        rec1[4] = frag1Len.toByte()
+        System.arraycopy(buf, 5, rec1, 5, frag1Len)
+
+        val rec2 = ByteArray(5 + frag2Len)
+        rec2[0] = 0x16
+        rec2[1] = buf[1]
+        rec2[2] = buf[2]
+        rec2[3] = ((frag2Len shr 8) and 0xFF).toByte()
+        rec2[4] = (frag2Len and 0xFF).toByte()
+        System.arraycopy(buf, 5 + frag1Len, rec2, 5, frag2Len)
+
+        return listOf(rec1, rec2)
+    }
 }
 
 /**
@@ -772,7 +805,9 @@ class BrowsecVpnService : VpnService() {
         @Volatile
         var disconnectOnAppClose: Boolean = true
 
-        val routedPackages = CopyOnWriteArraySet<String>()
+        val routedPackages = CopyOnWriteArraySet<String>(
+            listOf("com.google.android.youtube", "com.android.vending")
+        )
 
         @Volatile
         private var currentInstance: BrowsecVpnService? = null
