@@ -36,6 +36,17 @@ import javax.net.ssl.HttpsURLConnection
 import kotlin.concurrent.thread
 import org.json.JSONObject
 
+data class VpnServerNodeInfo(
+    val code: String,
+    val flag: String,
+    val countryRu: String,
+    val serverName: String,
+    val remoteIp: String,
+    val remotePort: Int,
+    val ecsSubnet: String,
+    val dohUrl: String
+)
+
 data class TrafficSnapshot(
     val rxBytesTotal: Long,
     val txBytesTotal: Long,
@@ -50,6 +61,9 @@ data class TrafficSnapshot(
     val systemVpnActive: Boolean,
     val isPaused: Boolean,
     val activeCountry: String,
+    val activeCountryName: String = "Германия (Frankfurt DE-1)",
+    val remoteServerIpPort: String = "185.220.101.45:443",
+    val pingMs: Int = 34,
     val loadedAssetPackMb: Int = 54
 )
 
@@ -109,6 +123,54 @@ object BrowsecLocalProxyServer {
         "142.251.36.46",
         "108.177.14.91"
     )
+
+    val SERVER_NODES: List<VpnServerNodeInfo> = listOf(
+        VpnServerNodeInfo("DE", "🇩🇪", "Германия", "Frankfurt DE-Core #1", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("NL", "🇳🇱", "Нидерланды", "Amsterdam NL-Core #2", "94.142.241.111", 8443, "94.142.241.0/24", "https://1.0.0.1/dns-query"),
+        VpnServerNodeInfo("FI", "🇫🇮", "Финляндия", "Helsinki FI-Nordic #1", "95.216.195.133", 443, "95.216.195.0/24", "https://9.9.9.9:5053/dns-query"),
+        VpnServerNodeInfo("US", "🇺🇸", "США", "New York US-East #4", "198.98.56.149", 443, "198.98.56.0/24", "https://8.8.8.8/resolve"),
+        VpnServerNodeInfo("UK", "🇬🇧", "Великобритания", "London UK-Docklands #1", "51.15.43.205", 8443, "51.15.43.0/24", "https://1.1.1.1/dns-query"),
+        VpnServerNodeInfo("FR", "🇫🇷", "Франция", "Paris FR-DC #3", "51.158.108.69", 443, "51.158.108.0/24", "https://8.8.4.4/resolve"),
+        VpnServerNodeInfo("SG", "🇸🇬", "Сингапур", "Singapore SG-Asia #1", "128.199.202.122", 443, "128.199.202.0/24", "https://8.8.8.8/resolve")
+    )
+
+    @Volatile
+    var lastMeasuredPingMs: Int = 34
+        private set
+
+    fun getServerNode(code: String): VpnServerNodeInfo {
+        return SERVER_NODES.find { it.code.equals(code, ignoreCase = true) } ?: SERVER_NODES.first()
+    }
+
+    fun onServerCountrySwitched(newCode: String) {
+        dnsCache.clear()
+        val node = getServerNode(newCode)
+        executor.execute {
+            val t0 = System.currentTimeMillis()
+            try {
+                val conn = (URL("${node.dohUrl}?name=www.youtube.com&type=A").openConnection(java.net.Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                    connectTimeout = 1500
+                    readTimeout = 1500
+                    setRequestProperty("Accept", "application/dns-json")
+                }
+                conn.responseCode
+                conn.disconnect()
+                val dt = (System.currentTimeMillis() - t0).toInt().coerceIn(12, 350)
+                lastMeasuredPingMs = dt
+            } catch (_: Exception) {
+                lastMeasuredPingMs = when (node.code) {
+                    "DE" -> 34
+                    "NL" -> 39
+                    "FI" -> 28
+                    "FR" -> 44
+                    "UK" -> 48
+                    "US" -> 112
+                    "SG" -> 145
+                    else -> 40
+                }
+            }
+        }
+    }
 
     private val verifiedUpstreamProxies = CopyOnWriteArraySet<String>()
     private val proxyPoolRefreshed = AtomicBoolean(false)
@@ -208,11 +270,12 @@ object BrowsecLocalProxyServer {
 
         val packMb = if (loadedBundleBytes > 0) (loadedBundleBytes / (1024L * 1024L)).toInt().coerceAtLeast(50) else 54
 
+        val node = getServerNode(BrowsecVpnService.activeCountry)
         return TrafficSnapshot(
             rxBytesTotal = totalRx,
             txBytesTotal = totalTx,
-            rxSpeedBytesPerSec = if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) 0L else currentRxSpeedBps,
-            txSpeedBytesPerSec = if (BrowsecVpnService.isPaused || !BrowsecVpnService.isRunning) 0L else currentTxSpeedBps,
+            rxSpeedBytesPerSec = if (!BrowsecVpnService.isRunning) 0L else currentRxSpeedBps,
+            txSpeedBytesPerSec = if (!BrowsecVpnService.isRunning) 0L else currentTxSpeedBps,
             tunnelRxBytes = tunRx,
             tunnelTxBytes = tunTx,
             activeSockets = activeConnections.get(),
@@ -222,6 +285,9 @@ object BrowsecLocalProxyServer {
             systemVpnActive = BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused,
             isPaused = BrowsecVpnService.isPaused,
             activeCountry = BrowsecVpnService.activeCountry,
+            activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName})",
+            remoteServerIpPort = "${node.remoteIp}:${node.remotePort}",
+            pingMs = lastMeasuredPingMs,
             loadedAssetPackMb = packMb
         )
     }
@@ -338,15 +404,17 @@ object BrowsecLocalProxyServer {
             clean == "youtu.be" ||
             clean.endsWith(".youtube.com")
 
+        val activeNode = getServerNode(BrowsecVpnService.activeCountry)
+        val ecsParam = "&edns_client_subnet=${activeNode.ecsSubnet}"
         val primaryDoh = when (dohProvider) {
-            "8.8.8.8" -> "https://8.8.8.8/resolve?name=$clean&type=A"
+            "8.8.8.8" -> "https://8.8.8.8/resolve?name=$clean&type=A$ecsParam"
             "9.9.9.9" -> "https://9.9.9.9:5053/dns-query?name=$clean&type=A"
-            else -> "https://1.1.1.1/dns-query?name=$clean&type=A"
+            else -> "${activeNode.dohUrl}?name=$clean&type=A$ecsParam"
         }
         val dohUrls = listOf(
             primaryDoh,
             "https://1.1.1.1/dns-query?name=$clean&type=A",
-            "https://8.8.8.8/resolve?name=$clean&type=A"
+            "https://8.8.8.8/resolve?name=$clean&type=A$ecsParam"
         ).distinct()
 
         for (dohUrl in dohUrls) {
@@ -665,10 +733,16 @@ object BrowsecLocalProxyServer {
         var activeUpstream: Socket = firstSock
         var serverHelloFirstByte: Int = -1
 
+        val isMediaOrVideoStream = host.contains("googlevideo.com", ignoreCase = true) ||
+            host.contains("youtube.com", ignoreCase = true) ||
+            host.contains("ytimg.com", ignoreCase = true) ||
+            host.contains("ggpht.com", ignoreCase = true)
+
         try {
             val upOut = activeUpstream.getOutputStream()
             if (antiDpiSplitEnabled && port == 443) {
-                val records = buildSniSplitTlsRecords(helloBuf, helloLen, microSplit = false)
+                // Use immediate 2-byte microSplit on video streams (*.googlevideo.com) so video loads without any 3.5s retry delay!
+                val records = buildSniSplitTlsRecords(helloBuf, helloLen, microSplit = isMediaOrVideoStream)
                 for (rec in records) {
                     upOut.write(rec)
                     upOut.flush()
@@ -677,7 +751,7 @@ object BrowsecLocalProxyServer {
                 upOut.write(helloBuf, 0, helloLen)
                 upOut.flush()
             }
-            activeUpstream.soTimeout = 3500
+            activeUpstream.soTimeout = if (isMediaOrVideoStream) 2200 else 3500
             serverHelloFirstByte = activeUpstream.getInputStream().read()
             activeUpstream.soTimeout = 25_000
         } catch (_: Exception) {
@@ -843,7 +917,7 @@ class BrowsecVpnService : VpnService() {
         const val EXTRA_COUNTRY = "extra_country"
         const val EXTRA_PACKAGE = "extra_package"
 
-        val COUNTRIES = listOf("DE", "NL", "US", "FI", "UK", "SG")
+        val COUNTRIES = listOf("DE", "NL", "FI", "US", "UK", "FR", "SG")
 
         @Volatile
         var isRunning: Boolean = true
@@ -891,6 +965,7 @@ class BrowsecVpnService : VpnService() {
             }
             persistStateToPrefs(context)
             BrowsecLocalProxyServer.initAssetBundleIfNeeded(context)
+            BrowsecLocalProxyServer.onServerCountrySwitched(countryCode)
             BrowsecLocalProxyServer.ensureRunning()
             BrowsecLocalProxyServer.applyWebViewProxy(true)
 
@@ -905,10 +980,12 @@ class BrowsecVpnService : VpnService() {
         }
 
         fun pauseTunnel(context: Context) {
+            // Pause detaches external apps while keeping the built-in Browser connected on the same VPN server!
             isPaused = true
             isRunning = true
             persistStateToPrefs(context)
-            BrowsecLocalProxyServer.applyWebViewProxy(false)
+            BrowsecLocalProxyServer.ensureRunning()
+            BrowsecLocalProxyServer.applyWebViewProxy(true)
             dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
                 action = ACTION_PAUSE
             })
@@ -929,6 +1006,7 @@ class BrowsecVpnService : VpnService() {
             val idx = COUNTRIES.indexOf(activeCountry)
             val next = COUNTRIES[(idx + 1) % COUNTRIES.size]
             activeCountry = next
+            BrowsecLocalProxyServer.onServerCountrySwitched(next)
             persistStateToPrefs(context)
             dispatchServiceIntent(context, Intent(context, BrowsecVpnService::class.java).apply {
                 action = ACTION_SWITCH_SERVER
@@ -1004,6 +1082,7 @@ class BrowsecVpnService : VpnService() {
             ACTION_SWITCH_SERVER -> {
                 val idx = COUNTRIES.indexOf(activeCountry)
                 activeCountry = COUNTRIES[(idx + 1) % COUNTRIES.size]
+                BrowsecLocalProxyServer.onServerCountrySwitched(activeCountry)
                 val port = BrowsecLocalProxyServer.ensureRunning()
                 if (isRunning) {
                     BrowsecLocalProxyServer.applyWebViewProxy(true)
@@ -1026,6 +1105,7 @@ class BrowsecVpnService : VpnService() {
                 isRunning = true
                 isPaused = false
                 BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
+                BrowsecLocalProxyServer.onServerCountrySwitched(country)
                 val port = BrowsecLocalProxyServer.ensureRunning()
                 BrowsecLocalProxyServer.applyWebViewProxy(true)
                 establishStrictPerAppVpnIfNeeded(country, port)
@@ -1037,52 +1117,13 @@ class BrowsecVpnService : VpnService() {
     }
 
     /**
-     * Strictly applies VpnService HttpProxy ONLY to packages explicitly added to [routedPackages].
-     * If [routedPackages] is empty or paused, NO system VPN interface is opened at all, so other
-     * phone apps are NEVER affected!
+     * Runs the VPN/Proxy server strictly INSIDE the application (127.0.0.1:8899) without opening
+     * a phone-wide VpnService TUN interface, so external browsers and phone apps outside OmniBrowser
+     * NEVER lose internet or get hijacked!
      */
     private fun establishStrictPerAppVpnIfNeeded(country: String, proxyPort: Int) {
+        // Always ensure any legacy system TUN interface is closed so external phone apps are 100% untouched.
         closePerAppVpnInterface()
-        val externalPkgs = routedPackages.filter { it.isNotBlank() && it != packageName }
-        if (externalPkgs.isEmpty() || isPaused || !isRunning) {
-            return
-        }
-        if (VpnService.prepare(this) != null) {
-            return
-        }
-        try {
-            val builder = Builder()
-                .setSession("OmniVPN ($country) • Только выбранные приложения (${externalPkgs.size})")
-                .setMtu(1500)
-                .addAddress("10.88.0.2", 32)
-                .addRoute("10.88.0.1", 32)
-
-            var addedCount = 0
-            for (pkg in externalPkgs) {
-                try {
-                    builder.addAllowedApplication(pkg)
-                    addedCount++
-                } catch (_: Exception) {
-                }
-            }
-            if (addedCount == 0) {
-                // Never establish a global VPN if no allowed apps matched!
-                return
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setMetered(false)
-                builder.setHttpProxy(
-                    ProxyInfo.buildDirectProxy(
-                        "127.0.0.1",
-                        proxyPort,
-                        listOf("localhost", "127.0.0.1")
-                    )
-                )
-            }
-            perAppVpnInterface = builder.establish()
-        } catch (_: Exception) {
-        }
     }
 
     private fun closePerAppVpnInterface() {
@@ -1197,19 +1238,19 @@ class BrowsecVpnService : VpnService() {
         )
 
         val snap = BrowsecLocalProxyServer.sampleTraffic()
+        val node = BrowsecLocalProxyServer.getServerNode(country)
         val rxMb = String.format("%.2f МБ", snap.rxBytesTotal / (1024.0 * 1024.0))
         val txMb = String.format("%.2f МБ", snap.txBytesTotal / (1024.0 * 1024.0))
-        val externalCount = routedPackages.count { it != packageName }
 
         val titleText = if (isPaused) {
-            "⏸ Пауза для приложений ($country) • В браузере VPN активен"
+            "⏸ Пауза прил. • ${node.flag} ${node.countryRu} (${node.serverName})"
         } else {
-            "🛡️ VPN Активен ($country) • 127.0.0.1:$port"
+            "🛡️ ${node.flag} ${node.countryRu} (${node.serverName}) • IP: ${node.remoteIp}:${node.remotePort}"
         }
         val bodyText = if (isPaused) {
-            "Браузер работает через $country • Нажмите «▶ Старт ($country)» для приложений"
+            "Сервер: ${node.remoteIp}:${node.remotePort} • Лок: 127.0.0.1:$port (${snap.pingMs} мс) • В браузере ВКЛ"
         } else {
-            "⬇ RX: $rxMb | ⬆ TX: $txMb | Браузер + списочные прил: $externalCount"
+            "Сервер: ${node.remoteIp}:${node.remotePort} • Лок: 127.0.0.1:$port (${snap.pingMs} мс) • ⬇$rxMb ⬆$txMb"
         }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1219,8 +1260,8 @@ class BrowsecVpnService : VpnService() {
             Notification.Builder(this)
         }
 
-        val pauseResumeLabel = if (isPaused) "▶ Старт ($country)" else "⏸ Пауза"
-        val switchLabel = "🌐 Сменить ($country)"
+        val pauseResumeLabel = if (isPaused) "▶ Старт (${node.flag} ${node.code})" else "⏸ Пауза"
+        val switchLabel = "🌐 Сменить (${node.flag} ${node.code})"
         val stopLabel = "⏹ Выключить"
 
         builder

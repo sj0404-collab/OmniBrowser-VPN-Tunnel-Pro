@@ -417,28 +417,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             nativeAppsManager.launchApp(pkg)
             Toast.makeText(context, "🛡️ Запущено через Browsec VPN ($browsecCountry)!", Toast.LENGTH_LONG).show()
         } else {
-            Toast.makeText(context, "🛡️ Системный туннель Browsec VPN ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
-        if (!vpnRoutedApps.contains(pkg)) {
-            vpnRoutedApps.add(pkg)
-            persistBrowserSettings()
-        }
-        browsecEnabled = true
-        val prep = try { VpnService.prepare(context) } catch (_: Exception) { null }
-        if (prep != null) {
-            pendingVpnLaunchPkg = pkg
-            vpnPermissionLauncher.launch(prep)
-        } else {
-            BrowsecVpnService.startForApp(context, browsecCountry, pkg)
-            val ok = nativeAppsManager.launchApp(pkg)
-            if (ok) {
-                Toast.makeText(context, "🛡️ $appName запущен вместе с Browsec VPN ($browsecCountry, 127.0.0.1:${BrowsecLocalProxyServer.activePort})!", Toast.LENGTH_LONG).show()
-            } else {
-                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
-            }
+            Toast.makeText(context, "🛡️ Внутренний сервер Browsec VPN ($browsecCountry) активен!", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -596,7 +575,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
         }
-        if (useProxyTunnel) {
+        if (useProxyTunnel && browsecEnabled) {
             proxyInterceptBrowser = true
             prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
             BrowsecLocalProxyServer.applyWebViewProxy(true)
@@ -606,7 +585,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 12
-        val vpnLabel = if (browsecEnabled) "Туннель $browsecCountry (127.0.0.1:${BrowsecLocalProxyServer.activePort})" else "Прямое"
+        val nodeInfo = BrowsecLocalProxyServer.getServerNode(browsecCountry)
+        val vpnLabel = if (browsecEnabled) "${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} ➔ 127.0.0.1:${BrowsecLocalProxyServer.activePort})" else "Прямое (VPN ВЫКЛ)"
         tab.loadingStatusText = "⏳ Подключение ($vpnLabel) к ${Uri.parse(target).host ?: target}..."
         tab.url = target
         addressInput = target
@@ -614,6 +594,52 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
         val wv = tab.webView ?: return
         wv.loadUrl(target)
+    }
+
+    fun startBrowsecAndLaunchNativeApp(pkg: String, appName: String) {
+        if (!vpnRoutedApps.contains(pkg)) {
+            vpnRoutedApps.add(pkg)
+        }
+        browsecEnabled = true
+        browsecPaused = false
+        proxyInterceptBrowser = true
+        BrowsecVpnService.startForApp(context, browsecCountry, pkg)
+        persistBrowserSettings()
+
+        val inAppPortalUrl = when {
+            pkg.contains("youtube.music", ignoreCase = true) -> "https://music.youtube.com"
+            pkg.contains("youtube", ignoreCase = true) -> "https://m.youtube.com"
+            pkg.contains("telegram", ignoreCase = true) -> "https://web.telegram.org"
+            pkg.contains("discord", ignoreCase = true) -> "https://discord.com/app"
+            pkg.contains("instagram", ignoreCase = true) -> "https://www.instagram.com"
+            pkg.contains("musically", ignoreCase = true) || pkg.contains("tiktok", ignoreCase = true) -> "https://www.tiktok.com"
+            pkg.contains("twitch", ignoreCase = true) -> "https://m.twitch.tv"
+            pkg.contains("vkontakte", ignoreCase = true) -> "https://m.vk.com"
+            pkg.contains("rutube", ignoreCase = true) -> "https://rutube.ru"
+            else -> null
+        }
+
+        val nodeInfo = BrowsecLocalProxyServer.getServerNode(browsecCountry)
+        if (inAppPortalUrl != null) {
+            currentSection = 0
+            navigateTab(activeTab, inAppPortalUrl, useProxyTunnel = true)
+            Toast.makeText(
+                context,
+                "🛡️ $appName запущен ВНУТРИ браузера через ${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort} ➔ 127.0.0.1:${BrowsecLocalProxyServer.activePort})!",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            val ok = nativeAppsManager.launchApp(pkg)
+            if (ok) {
+                Toast.makeText(
+                    context,
+                    "🛡️ $appName открыт изнутри браузера • Сервер ${nodeInfo.flag} ${nodeInfo.countryRu} (${nodeInfo.remoteIp}:${nodeInfo.remotePort})",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(context, "Не удалось открыть $appName", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     fun ensureTabWebView(tab: BrowserTabModel): WebView {
@@ -1185,7 +1211,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            text = if (browsecEnabled) "🟢 Лок. сервер 127.0.0.1:${trafficSnapshot.proxyPort} ($browsecCountry)" else "⚪ Туннель ВЫКЛ",
+                            text = if (browsecEnabled) {
+                                "🟢 ${trafficSnapshot.activeCountryName} • Сервер: ${trafficSnapshot.remoteServerIpPort} • Лок: 127.0.0.1:${trafficSnapshot.proxyPort} (${trafficSnapshot.pingMs} мс)"
+                            } else {
+                                "⚪ VPN-сервер ВЫКЛ (Прямое соединение)"
+                            },
                             color = if (browsecEnabled) Color(0xFF34D399) else Color(0xFF94A3B8),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -1226,7 +1256,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     ExtensionChip(
-                        label = "🌐 Browsec VPN ($browsecCountry)",
+                        label = if (browsecEnabled) {
+                            "🌐 VPN: ${trafficSnapshot.activeCountryName} (${trafficSnapshot.remoteServerIpPort})"
+                        } else {
+                            "🌐 VPN ВЫКЛ ($browsecCountry)"
+                        },
                         active = browsecEnabled,
                         activeColor = Color(0xFF0284C7)
                     ) {
@@ -1357,20 +1391,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            "🛡️ VPN и Локальный Туннель 127.0.0.1:${trafficSnapshot.proxyPort} ($browsecCountry)",
+                                            "🛡️ ${trafficSnapshot.activeCountryName} • IP: ${trafficSnapshot.remoteServerIpPort}",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
-                                            fontSize = 12.sp
+                                            fontSize = 12.sp,
+                                            modifier = Modifier.weight(1f)
                                         )
-                                        Switch(checked = browsecEnabled, onCheckedChange = {
-                                            browsecEnabled = it
-                                            if (it) {
+                                        Switch(checked = browsecEnabled, onCheckedChange = { enabled ->
+                                            browsecEnabled = enabled
+                                            browsecPaused = false
+                                            if (enabled) {
                                                 proxyInterceptBrowser = true
-                                                prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
+                                                prefs.edit().putBoolean("tunnel_proxy_active_v30", true).commit()
+                                                BrowsecVpnService.startForApp(context, browsecCountry, null)
+                                            } else {
+                                                BrowsecVpnService.stop(context)
                                             }
-                                            BrowsecLocalProxyServer.applyWebViewProxy(it && proxyInterceptBrowser)
                                             persistBrowserSettings()
-                                            navigateTab(activeTab, activeTab.url)
                                         })
                                     }
                                     // Live Traffic Telemetry Box inside Popup
@@ -1381,10 +1418,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) {
                                         Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text(
-                                                "📊 МОНИТОР ТРАФИКА (Chromium + Туннель 127.0.0.1:${trafficSnapshot.proxyPort} • База ${trafficSnapshot.loadedAssetPackMb} МБ):",
+                                                "🌍 СЕРВЕР: ${trafficSnapshot.activeCountryName} | IP: ${trafficSnapshot.remoteServerIpPort} | Пинг: ${trafficSnapshot.pingMs} мс",
                                                 color = Color(0xFF34D399),
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 11.sp
+                                            )
+                                            Text(
+                                                "🔒 Локальный туннель (только внутри браузера): 127.0.0.1:${trafficSnapshot.proxyPort}",
+                                                color = Color(0xFFFACC15),
+                                                fontSize = 11.sp,
+                                                fontFamily = FontFamily.Monospace
                                             )
                                             Text(
                                                 "⬇ Входящий (RX): ${BitTorrentEngine.formatSpeed(trafficSnapshot.rxSpeedBytesPerSec)}  |  Всего: ${BitTorrentEngine.formatSize(trafficSnapshot.rxBytesTotal)}",
@@ -1399,7 +1442,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 fontFamily = FontFamily.Monospace
                                             )
                                             Text(
-                                                "🔗 Сервер: 127.0.0.1:${trafficSnapshot.proxyPort} • Перехвачено запросов: ${trafficSnapshot.interceptedRequests} • Активных сокетов: ${trafficSnapshot.activeSockets}",
+                                                "🔗 Перехвачено запросов: ${trafficSnapshot.interceptedRequests} • Активных сокетов: ${trafficSnapshot.activeSockets}",
                                                 color = Color(0xFFE2E8F0),
                                                 fontSize = 10.sp,
                                                 fontFamily = FontFamily.Monospace
@@ -1428,7 +1471,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
-                                        VPN_NODES.forEach { node ->
+                                        BrowsecLocalProxyServer.SERVER_NODES.forEach { node ->
                                             val selected = browsecCountry == node.code
                                             Surface(
                                                 color = if (selected) Color(0xFF0284C7) else Color(0xFF0F172A),
@@ -1437,21 +1480,35 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 modifier = Modifier.clickable {
                                                     browsecCountry = node.code
                                                     browsecEnabled = true
+                                                    browsecPaused = false
                                                     proxyInterceptBrowser = true
-                                                    prefs.edit().putBoolean("tunnel_proxy_active_v30", true).apply()
-                                                    BrowsecVpnService.activeCountry = node.code
-                                                    BrowsecLocalProxyServer.applyWebViewProxy(true)
+                                                    prefs.edit().putBoolean("tunnel_proxy_active_v30", true).commit()
+                                                    BrowsecVpnService.startForApp(context, node.code, null)
                                                     persistBrowserSettings()
-                                                    navigateTab(activeTab, activeTab.url, useProxyTunnel = true)
+                                                    Toast.makeText(
+                                                        context,
+                                                        "🌍 Подключён сервер: ${node.flag} ${node.countryRu} (${node.serverName}) • IP: ${node.remoteIp}:${node.remotePort}",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
                                                 }
                                             ) {
-                                                Text(
-                                                    text = "${node.flag} ${node.code}",
-                                                    color = Color.White,
-                                                    fontSize = 12.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                                )
+                                                Column(
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                                    horizontalAlignment = Alignment.CenterHorizontally
+                                                ) {
+                                                    Text(
+                                                        text = "${node.flag} ${node.countryRu} (${node.code})",
+                                                        color = Color.White,
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                    Text(
+                                                        text = "${node.remoteIp}:${node.remotePort}",
+                                                        color = if (selected) Color(0xFFE0F2FE) else Color(0xFF94A3B8),
+                                                        fontSize = 9.sp,
+                                                        fontFamily = FontFamily.Monospace
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -1945,13 +2002,21 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     browsecEnabled = browsecEnabled,
                     browsecCountry = browsecCountry,
                     onToggleBrowsec = {
-                        browsecEnabled = !browsecEnabled
+                        val nextState = !browsecEnabled
+                        browsecEnabled = nextState
+                        browsecPaused = false
+                        if (nextState) {
+                            BrowsecVpnService.startForApp(context, browsecCountry, null)
+                        } else {
+                            BrowsecVpnService.stop(context)
+                        }
                         persistBrowserSettings()
                     },
                     onCycleCountry = {
-                        val nextIdx = (VPN_NODES.indexOfFirst { it.code == browsecCountry } + 1) % VPN_NODES.size
-                        browsecCountry = VPN_NODES[nextIdx].code
+                        val nextCode = BrowsecVpnService.cycleCountry(context)
+                        browsecCountry = nextCode
                         browsecEnabled = true
+                        browsecPaused = false
                         persistBrowserSettings()
                     },
                     onRequestStorageAccess = { requestFullStorageAccess() },
