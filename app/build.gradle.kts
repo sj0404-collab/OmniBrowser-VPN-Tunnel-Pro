@@ -107,4 +107,5 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.webkit)
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20240303")
 }
