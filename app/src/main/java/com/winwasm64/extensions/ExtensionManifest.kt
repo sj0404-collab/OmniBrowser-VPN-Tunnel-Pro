@@ -213,7 +213,8 @@ object ManifestParser {
         order.add("en")
         var chosen: String? = null
         // Сначала самый общий (default), поверх — более точный язык.
-        for (loc in order.reversed()) {
+        // asReversed(): только Kotlin-функция; LinkedHashSet.reversed() из Android 15 упал бы на старых Android.
+        for (loc in order.toList().asReversed()) {
             val f = File(locales, "$loc/messages.json")
             if (!f.isFile) continue
             try {
