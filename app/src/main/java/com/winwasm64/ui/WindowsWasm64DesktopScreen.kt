@@ -95,6 +95,7 @@ import com.winwasm64.vpn.ALL_VPN_COUNTRIES_LIST
 import com.winwasm64.vpn.BrowserDirectRepeater
 import com.winwasm64.vpn.BrowsecLocalProxyServer
 import com.winwasm64.vpn.BrowsecVpnService
+import com.winwasm64.vpn.TransparentTunEngine
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.text.SimpleDateFormat
@@ -155,6 +156,7 @@ class BrowserTabModel(
     var canGoBack by mutableStateOf(false)
     var canGoForward by mutableStateOf(false)
     var autoRetryCount by mutableIntStateOf(0)
+    var proxyRepairCount by mutableIntStateOf(0)
     var webView: WebView? = null
     val numericId: Int = BrowserSessionVault.nextNumericId()
 }
@@ -726,6 +728,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         BrowserDirectRepeater.recordWebViewActivity(txEstimate = 768L, rxEstimate = 2048L)
 
         tab.autoRetryCount = 0
+        tab.proxyRepairCount = 0
         tab.lastErrorText = null
         tab.isLoading = true
         tab.loadingProgress = 10
@@ -1204,6 +1207,22 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
+                        // v4.0.2: локальный прокси перестал принимать соединения → перезапускаем его и сразу повторяем
+                        // (сервер и настройки не меняются, страница перезагружается для проверки)
+                        if (desc.contains("ERR_PROXY_CONNECTION_FAILED") && tab.proxyRepairCount < 2 && view != null) {
+                            tab.proxyRepairCount++
+                            tab.lastErrorText = null
+                            tab.loadingStatusText = "Перезапуск локального прокси и повтор загрузки…"
+                            Thread {
+                                if (ExtensionProxy.isActive) {
+                                    ExtensionProxy.repairNow { view.postDelayed({ view.loadUrl(failingUrl) }, 300) }
+                                } else {
+                                    BrowserDirectRepeater.healthCheckAndRepair(force = true)
+                                    view.postDelayed({ view.loadUrl(failingUrl) }, 700)
+                                }
+                            }.start()
+                            return
+                        }
                         // 1. Как в v3.6.0: мгновенно загружаем страницу через десинхронизированный сокет Репитера №1
                         // (с перебором чистых Anycast IP), чтобы экран net::ERR_CONNECTION_CLOSED никогда не оставался!
                         if (browserVpnEnabled && !ExtensionProxy.isActive && tab.autoRetryCount < 4 && view != null) {
@@ -2218,23 +2237,48 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             ) {
                                 Button(
                                     onClick = {
-                                        browserVpnEnabled = true
-                                        BrowserDirectRepeater.enabled = true
-                                        val msg = BrowserDirectRepeater.triggerAutoHealOrFailover()
-                                        browserVpnCountry = BrowserDirectRepeater.countryCode
-                                        persistBrowserSettings()
-                                        navigateTab(activeTab, activeTab.url)
-                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        if (ExtensionProxy.isActive) {
+                                            // Страница идёт через прокси расширения — чиним именно его, а не встроенный VPN
+                                            ExtensionProxy.repairNow {
+                                                android.os.Handler(android.os.Looper.getMainLooper()).post { navigateTab(activeTab, activeTab.url) }
+                                            }
+                                            Toast.makeText(context, "Прокси расширения перезапущен", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            browserVpnEnabled = true
+                                            BrowserDirectRepeater.enabled = true
+                                            BrowserDirectRepeater.healthCheckAndRepair()
+                                            val msg = BrowserDirectRepeater.triggerAutoHealOrFailover()
+                                            browserVpnCountry = BrowserDirectRepeater.countryCode
+                                            persistBrowserSettings()
+                                            navigateTab(activeTab, activeTab.url)
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        }
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                 ) {
-                                    Text("Сменить настройку / сервер ($browserVpnCountry) и Обновить страницу", fontSize = 11.sp, color = Color.White)
+                                    Text(
+                                        if (ExtensionProxy.isActive) "Перезапустить прокси (${ExtensionProxy.ownerName ?: "расширение"}) и обновить"
+                                        else "Сменить настройку / сервер ($browserVpnCountry) и Обновить страницу",
+                                        fontSize = 11.sp,
+                                        color = Color.White
+                                    )
                                 }
                                 Button(
-                                    onClick = { navigateTab(activeTab, "https://m.youtube.com") },
+                                    onClick = {
+                                        if (ExtensionProxy.isActive) {
+                                            ExtensionProxy.release(null)
+                                            navigateTab(activeTab, activeTab.url)
+                                        } else {
+                                            navigateTab(activeTab, "https://m.youtube.com")
+                                        }
+                                    },
                                     colors = ButtonDefaults.buttonColors(containerColor = Omni.DangerContainer)
                                 ) {
-                                    Text("Открыть m.youtube.com", fontSize = 11.sp, color = Color.White)
+                                    Text(
+                                        if (ExtensionProxy.isActive) "Отключить прокси расширения" else "Открыть m.youtube.com",
+                                        fontSize = 11.sp,
+                                        color = Color.White
+                                    )
                                 }
                             }
                         }
@@ -3195,23 +3239,29 @@ private fun NativeAppsWithBrowsecSection(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Индивидуальный Туннель Приложений • По-приложенный проброс ($browsecCountry) • ⚡ Пинг: ${liveTraffic.pingMs} мс",
+                                text = "VPN приложений · $browsecCountry · пинг ${liveTraffic.pingMs} мс",
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp
                             )
                             Text(
-                                text = if (browsecEnabled) {
-                                    "🟢 VPN ПРИЛОЖЕНИЙ ВКЛ: Только выбранные (${vpnRoutedApps.size}) идут через СВОЙ сервер (${liveTraffic.remoteServerIpPort} • Пинг: ${liveTraffic.pingMs} мс) и порт; остальные работают напрямую без VPN!"
-                                } else {
-                                    "⚪ VPN ПРИЛОЖЕНИЙ ВЫКЛ: Приложения работают напрямую без обхода блокировок"
+                                text = when {
+                                    !browsecEnabled -> "Выключен: приложения работают напрямую, без обхода"
+                                    vpnRoutedApps.isEmpty() -> "Включён, но список пуст — добавьте приложение кнопкой «+ Добавить в VPN»"
+                                    !BrowsecVpnService.tunnelEstablished -> "⚠ Туннель не поднят (нет разрешения VPN или его занял другой VPN) — выключите и включите VPN списка"
+                                    BrowsecVpnService.transparentActive -> "Включён: ${vpnRoutedApps.size} прил. целиком идут через туннель (TCP с обходом DPI, QUIC → TCP), остальные — напрямую"
+                                    else -> "Включён (режим прокси): ${vpnRoutedApps.size} прил. через системный прокси; что игнорирует прокси — идёт напрямую"
                                 },
-                                color = if (browsecEnabled) Omni.Success else Omni.Warning,
+                                color = when {
+                                    !browsecEnabled -> Omni.TextDim
+                                    vpnRoutedApps.isEmpty() || !BrowsecVpnService.tunnelEstablished -> Omni.Warning
+                                    else -> Omni.Success
+                                },
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "ВХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})  |  ⚡ Пинг: ${liveTraffic.pingMs} мс",
+                                text = "⬇ ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})   ⬆ ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})   соединений: ${TransparentTunEngine.activeSessionCount()}",
                                 color = Omni.Accent,
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace
@@ -3582,43 +3632,33 @@ private fun NativeAppsWithBrowsecSection(
         Surface(
             color = if (browsecEnabled) Omni.AccentContainer else Omni.SurfaceHighest,
             shape = RoundedCornerShape(28.dp),
-            shadowElevation = 10.dp,
+            shadowElevation = 4.dp,
             border = androidx.compose.foundation.BorderStroke(
-                2.dp,
+                1.dp,
                 if (browsecEnabled) Omni.Accent else Omni.TextDim
             ),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 16.dp, bottom = 14.dp)
+                .padding(end = 12.dp, bottom = 10.dp)
                 .clickable { onToggleFloatingVpn() }
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Text(text = if (browsecEnabled) "🛡️" else "⏻", fontSize = 13.sp)
                 Text(
-                    text = if (browsecEnabled) "🟢🛡️" else "⚪🛡️",
-                    fontSize = 16.sp
+                    text = if (browsecEnabled) {
+                        "$browsecCountry · ${vpnRoutedApps.size} · ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}"
+                    } else {
+                        "VPN списка выкл · $browsecCountry"
+                    },
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 11.sp,
+                    maxLines = 1
                 )
-                Column {
-                    Text(
-                        text = if (browsecEnabled) {
-                            "VPN Списка: ВКЛ ($browsecCountry • ${vpnRoutedApps.size} прил.)"
-                        } else {
-                            "Включить VPN Списка ($browsecCountry • ${vpnRoutedApps.size} прил.)"
-                        },
-                        color = Color.White,
-                        fontWeight = FontWeight.ExtraBold,
-                        fontSize = 12.sp
-                    )
-                    Text(
-                        text = "Пинг: ${liveTraffic.pingMs} мс • ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}",
-                        color = if (browsecEnabled) Omni.Text else Omni.TextDim,
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
             }
         }
     }

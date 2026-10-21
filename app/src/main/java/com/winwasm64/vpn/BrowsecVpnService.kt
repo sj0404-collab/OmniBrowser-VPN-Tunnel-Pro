@@ -6,12 +6,14 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
 import android.net.ProxyInfo
 import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
+import android.system.OsConstants
 import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewFeature
@@ -19,6 +21,7 @@ import com.winwasm64.MainActivity
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PushbackInputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.HttpURLConnection
@@ -26,6 +29,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
@@ -977,7 +981,38 @@ object BrowserDirectRepeater {
             } catch (_: Exception) {
             }
         }
-        return activePort
+        running.set(false)
+        serverSocket = null
+        return -1
+    }
+
+    /** true — порт локального репитера принимает соединения. */
+    fun probeLocalPort(port: Int): Boolean {
+        if (port <= 0) return false
+        return try {
+            Socket().use { s ->
+                s.connect(InetSocketAddress("127.0.0.1", port), 400)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Проверяет репитер №1; если он не принимает соединения — перезапускает и заново направляет WebView. */
+    fun healthCheckAndRepair(force: Boolean = false): Boolean {
+        if (!enabled || externalProxyOverride != null) return true
+        if (!force && probeLocalPort(activePort)) return true
+        synchronized(this) {
+            try { serverSocket?.close() } catch (_: Exception) {}
+            serverSocket = null
+            running.set(false)
+        }
+        appliedProxyKey = ""
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            try { ensureDirectBrowserMode(null) } catch (_: Exception) {}
+        }
+        return false
     }
 
     /**
@@ -995,6 +1030,12 @@ object BrowserDirectRepeater {
                         activeSt.updateSpeedSample(isActiveServer = true)
                         if (tick % 10 == 0) {
                             VpnProfileProber.measureActiveLink(activeSt)
+                        }
+                        // v4.0.2: каждые ~6 с проверяем, что репитер жив (иначе WebView получит ERR_PROXY_CONNECTION_FAILED)
+                        if (tick % 4 == 3 && externalProxyOverride == null && appliedProxyKey.startsWith("ON:") &&
+                            !probeLocalPort(activePort)
+                        ) {
+                            healthCheckAndRepair(force = true)
                         }
                     }
                     tick++
@@ -1019,6 +1060,20 @@ object BrowserDirectRepeater {
             return
         }
         val port = ensureServerRunning()
+        if (enabled && port <= 0) {
+            // Локальный репитер не смог запуститься — не направляем WebView в «мёртвый» порт
+            appliedProxyKey = "DIRECT-FALLBACK"
+            try {
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+                    ProxyController.getInstance().clearProxyOverride({ r -> r.run() }, { onReady?.invoke() })
+                } else {
+                    onReady?.invoke()
+                }
+            } catch (_: Exception) {
+                onReady?.invoke()
+            }
+            return
+        }
         val desiredKey = if (enabled) "ON:$port" else "OFF"
         if (appliedProxyKey == desiredKey) {
             onReady?.invoke()
@@ -2105,6 +2160,7 @@ object BrowsecLocalProxyServer {
             st.updateSpeedSample(isActiveServer = true)
         }
         st.lastRxTimestampMs.set(System.currentTimeMillis())
+        lastAutoHealEventRu = "Сервер приложений: ${st.node.flag} ${st.node.countryRu} (${st.currentStrategy.shortRu})"
 
         thread(name = "AppsServerPing-$normalized", isDaemon = true) {
             val t0 = System.currentTimeMillis()
@@ -2292,14 +2348,171 @@ object BrowsecLocalProxyServer {
     }
 
     private fun acceptLoop(ss: ServerSocket) {
+        var errors = 0
         while (running.get() && !ss.isClosed) {
             try {
                 val client = ss.accept()
+                errors = 0
                 openClientSockets.add(client)
-                executor.execute { handleClient(client, appProfile = null) }
+                // v4.0.2: определяем, какое приложение открыло соединение — его сервер, стратегия и счётчики
+                executor.execute { handleClient(client, appProfile = profileForLoopbackClient(client)) }
             } catch (_: Exception) {
                 if (!running.get() || ss.isClosed) break
+                errors++
+                try { Thread.sleep(if (errors > 50) 200L else 10L) } catch (_: InterruptedException) {}
             }
+        }
+    }
+
+    // ===================== v4.0.2: чьё соединение + прозрачный туннель =====================
+
+    private val uidPackageCache = ConcurrentHashMap<Int, String>()
+
+    /** Профиль приложения-владельца TCP-соединения (Android 10+: getConnectionOwnerUid, доступно активному VPN). */
+    fun profileForConnection(local: InetSocketAddress, remote: InetSocketAddress): AppTunnelProfile? {
+        val routed = BrowsecVpnService.routedPackages
+        val ctx = BrowsecVpnService.appContext
+        if (ctx != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val cm = ctx.getSystemService(ConnectivityManager::class.java)
+                val uid = cm?.getConnectionOwnerUid(OsConstants.IPPROTO_TCP, local, remote) ?: -1
+                if (uid >= 0) {
+                    val pkg = uidPackageCache[uid] ?: run {
+                        val pkgs = ctx.packageManager.getPackagesForUid(uid) ?: emptyArray()
+                        (pkgs.firstOrNull { routed.contains(it) } ?: pkgs.firstOrNull())?.also { uidPackageCache[uid] = it }
+                    }
+                    if (pkg != null && (routed.contains(pkg) || !BrowsecVpnService.perAppMode)) {
+                        return getOrCreateAppProfile(pkg)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        if (BrowsecVpnService.perAppMode && routed.size == 1) {
+            return getOrCreateAppProfile(routed.first())
+        }
+        return null
+    }
+
+    private fun profileForLoopbackClient(client: Socket): AppTunnelProfile? = try {
+        profileForConnection(
+            InetSocketAddress(client.inetAddress, client.port),
+            InetSocketAddress(client.localAddress, client.localPort)
+        )
+    } catch (_: Exception) {
+        null
+    }
+
+    private var transparentServer: ServerSocket? = null
+
+    @Volatile
+    var transparentPort: Int = 0
+        private set
+
+    /** Обработчик прозрачного туннеля: сюда NAT направляет TCP выбранных приложений. */
+    @Synchronized
+    fun ensureTransparentListener(): Int {
+        val existing = transparentServer
+        if (existing != null && !existing.isClosed) return transparentPort
+        return try {
+            val ss = ServerSocket()
+            ss.reuseAddress = true
+            ss.bind(InetSocketAddress(0), 512)
+            transparentServer = ss
+            transparentPort = ss.localPort
+            thread(name = "AppsTransparent-$transparentPort", isDaemon = true) {
+                var errors = 0
+                while (!ss.isClosed) {
+                    try {
+                        val c = ss.accept()
+                        errors = 0
+                        openClientSockets.add(c)
+                        executor.execute { handleTransparentClient(c) }
+                    } catch (_: Exception) {
+                        if (ss.isClosed) break
+                        errors++
+                        try { Thread.sleep(if (errors > 50) 200L else 10L) } catch (_: InterruptedException) {}
+                    }
+                }
+            }
+            transparentPort
+        } catch (_: Exception) {
+            0
+        }
+    }
+
+    private fun handleTransparentClient(client: Socket) {
+        val remoteAddr = client.inetAddress
+        val appPort = client.port
+        val sess = TransparentTunEngine.lookupSession(remoteAddr, appPort)
+        if (sess == null) {
+            openClientSockets.remove(client)
+            try { client.close() } catch (_: Exception) {}
+            return
+        }
+        val origPort = sess.remotePort
+        val profile = sess.profilePackage?.let { getOrCreateAppProfile(it) }
+            ?: profileForConnection(
+                InetSocketAddress(TunPackets.ipToInet(TunPackets.TUN_IP), appPort),
+                InetSocketAddress(remoteAddr, origPort)
+            )?.also { sess.profilePackage = it.packageName }
+        val st = getServerState(profile?.countryCode ?: BrowsecVpnService.activeCountry)
+        val allowBypass = useBrowsecTunnel && BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && antiDpiSplitEnabled
+        st.activeConnections.incrementAndGet()
+        st.requestsCount.incrementAndGet()
+        profile?.activeSockets?.incrementAndGet()
+        profile?.requests?.incrementAndGet()
+        var upstream: Socket? = null
+        try {
+            client.tcpNoDelay = true
+            val target = if (TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP) {
+                InetSocketAddress(InetAddress.getByName("1.1.1.1"), 53)
+            } else {
+                InetSocketAddress(remoteAddr, origPort)
+            }
+            val up = Socket()
+            BrowsecVpnService.protectSocket(up)
+            up.tcpNoDelay = true
+            up.keepAlive = true
+            up.receiveBufferSize = 512 * 1024
+            val t0 = System.currentTimeMillis()
+            up.connect(target, 6000)
+            st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+            up.soTimeout = 10 * 60_000
+            upstream = up
+
+            val pin = PushbackInputStream(client.getInputStream(), 32 * 1024)
+            var host = remoteAddr.hostAddress ?: ""
+            if (origPort == 443 || origPort == 853 || origPort == 8443) {
+                client.soTimeout = 1500
+                val first = ByteArray(32 * 1024)
+                val n = try { pin.read(first) } catch (_: SocketTimeoutException) { 0 }
+                if (n < 0) return
+                if (n > 0) {
+                    TlsSni.extract(first, n)?.let { host = it }
+                    pin.unread(first, 0, n)
+                }
+            }
+            client.soTimeout = 10 * 60_000
+            val shouldBypass = allowBypass && !host.endsWith(".gvt1.com") && !host.endsWith(".gvt2.com")
+            val upIn = up.getInputStream()
+            val upOut = up.getOutputStream()
+            val out = client.getOutputStream()
+            val t1 = thread(name = "TunC2S-$origPort", isDaemon = true) {
+                pipeClientToServerV38(pin, upOut, host, origPort, st, profile, shouldBypass)
+                try { up.shutdownOutput() } catch (_: Exception) {}
+            }
+            pipeServerToClientV38(upIn, out, st, profile, true)
+            try { client.shutdownOutput() } catch (_: Exception) {}
+            t1.join(2000)
+        } catch (_: Exception) {
+        } finally {
+            openClientSockets.remove(client)
+            st.activeConnections.decrementAndGet()
+            profile?.activeSockets?.decrementAndGet()
+            try { upstream?.close() } catch (_: Exception) {}
+            try { client.close() } catch (_: Exception) {}
+            sess.closing = true
         }
     }
 
@@ -2843,6 +3056,22 @@ class BrowsecVpnService : VpnService() {
         @Volatile
         private var activeInstance: BrowsecVpnService? = null
 
+        /** Контекст приложения (нужен, чтобы понять, какому приложению принадлежит соединение). */
+        @Volatile
+        var appContext: Context? = null
+
+        /** Туннель реально поднят системой (в статус-баре есть значок ключа). */
+        @Volatile
+        var tunnelEstablished: Boolean = false
+
+        /** Прозрачный режим: весь TCP выбранных приложений идёт через обход DPI, QUIC переводится на TCP. */
+        @Volatile
+        var transparentActive: Boolean = false
+
+        /** Самопроверка NAT не прошла на этом устройстве — работаем через системный прокси. */
+        @Volatile
+        var transparentUnsupported: Boolean = false
+
         val routedPackages = CopyOnWriteArraySet<String>().apply {
             add("com.google.android.youtube")
             add("com.android.vending")
@@ -2983,6 +3212,7 @@ class BrowsecVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        appContext = applicationContext
         createNotificationChannel()
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
         BrowsecLocalProxyServer.ensureRunning()
@@ -3073,17 +3303,34 @@ class BrowsecVpnService : VpnService() {
         }
     }
 
+    @Volatile
+    private var tunEngine: TransparentTunEngine? = null
+
+    @Synchronized
     private fun rebuildPerAppVpnInterface() {
         closeVpnInterface()
         if (!isRunning || isPaused) return
         try {
             val port = BrowsecLocalProxyServer.ensureRunning()
+            val transparentPort = BrowsecLocalProxyServer.ensureTransparentListener()
+            val wantTransparent = !transparentUnsupported && transparentPort > 0
             val builder = Builder()
                 .setSession("OmniBrowser Per-App VPN ($activeCountry)")
-                .setMtu(1400)
-                .addAddress("10.215.173.1", 30)
+                .setMtu(1500)
+                .addAddress("10.215.173.1", 24)
                 .addDnsServer("10.215.173.2")
-                .addRoute("10.215.173.2", 32)
+            if (wantTransparent) {
+                // Весь трафик выбранных приложений идёт в туннель: TCP — через обход DPI, QUIC — переводится на TCP
+                builder.addRoute("0.0.0.0", 0)
+                try {
+                    builder.addAddress("fd00:7a:d7ad::1", 64)
+                    builder.addRoute("::", 0)
+                } catch (_: Exception) {
+                }
+            } else {
+                builder.addRoute("10.215.173.2", 32)
+            }
+            try { builder.setBlocking(false) } catch (_: Exception) {}
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -3112,9 +3359,48 @@ class BrowsecVpnService : VpnService() {
                 }
             }
 
-            perAppVpnInterface = builder.establish()
-            startTunDnsForwarderLoop()
+            val pfd = builder.establish()
+            perAppVpnInterface = pfd
+            if (pfd == null) {
+                tunnelEstablished = false
+                transparentActive = false
+                return
+            }
+            tunnelEstablished = true
+            val engine = TransparentTunEngine(
+                pfd = pfd,
+                listenerPort = transparentPort,
+                protectDatagram = { sock -> try { protect(sock) } catch (_: Exception) {} },
+                onDnsQuery = { pkt, len, ihl, out ->
+                    val st = BrowsecLocalProxyServer.activeServerState()
+                    st.recordTx((len - ihl - 8).toLong().coerceAtLeast(0L))
+                    tunExecutor.execute {
+                        forwardTunDnsQuery(pkt.copyOf(ihl + 8), ihl, pkt.copyOfRange(ihl + 8, len), out, st)
+                    }
+                },
+                onUdpTraffic = { tx, rx ->
+                    val st = BrowsecLocalProxyServer.activeServerState()
+                    st.recordTx(tx)
+                    st.recordRx(rx)
+                }
+            )
+            tunEngine = engine
+            engine.start()
+            transparentActive = wantTransparent
+            if (wantTransparent) {
+                thread(name = "OmniTunSelfTest", isDaemon = true) {
+                    val ok = engine.selfTest()
+                    if (!ok && tunEngine === engine && isRunning && !isPaused) {
+                        // Устройство не пропускает NAT через TUN — откат на системный прокси, чтобы ничего не сломать
+                        transparentUnsupported = true
+                        transparentActive = false
+                        rebuildPerAppVpnInterface()
+                        updateNotificationShade()
+                    }
+                }
+            }
         } catch (_: Exception) {
+            tunnelEstablished = perAppVpnInterface != null
         }
     }
 
@@ -3222,9 +3508,14 @@ class BrowsecVpnService : VpnService() {
         }
     }
 
+    @Synchronized
     private fun closeVpnInterface() {
+        try { tunEngine?.stop() } catch (_: Exception) {}
+        tunEngine = null
         try { perAppVpnInterface?.close() } catch (_: Exception) {}
         perAppVpnInterface = null
+        tunnelEstablished = false
+        transparentActive = false
     }
 
     override fun onDestroy() {

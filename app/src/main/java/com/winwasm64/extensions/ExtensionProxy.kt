@@ -489,20 +489,74 @@ function alert(){}
             server = ss
             port = ss.localPort
             pool.execute { acceptLoop(ss) }
+            startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "не удалось запустить локальный прокси", e)
         }
     }
 
     private fun acceptLoop(ss: ServerSocket) {
+        var errors = 0
         while (!ss.isClosed) {
             val s = try {
                 ss.accept()
             } catch (_: Exception) {
-                break
+                if (ss.isClosed) break
+                // Временная ошибка (например, кончились дескрипторы при Shorts) — НЕ выходим, иначе прокси «умирает»
+                errors++
+                try { Thread.sleep(if (errors > 50) 200L else 10L) } catch (_: InterruptedException) {}
+                continue
             }
+            errors = 0
             pool.execute { handle(s) }
         }
+    }
+
+    private fun probe(p: Int): Boolean {
+        if (p <= 0) return false
+        return try {
+            Socket().use {
+                it.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 500)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Перезапускает локальный прокси расширения на новом порту и заново подключает к нему WebView. */
+    fun repairNow(onReady: (() -> Unit)? = null) {
+        if (control == null) {
+            main.post { onReady?.invoke() }
+            return
+        }
+        try { server?.close() } catch (_: Exception) {}
+        server = null
+        ensureServer()
+        appliedKey = ""
+        main.post { applyOverride(onReady) }
+    }
+
+    /** true — прокси жив (или не используется); false — пришлось перезапустить. */
+    fun ensureHealthy(): Boolean {
+        if (control == null) return true
+        if (probe(port)) return true
+        repairNow(null)
+        return false
+    }
+
+    @Volatile
+    private var watchdogStarted = false
+
+    private fun startWatchdog() {
+        if (watchdogStarted) return
+        watchdogStarted = true
+        Thread({
+            while (true) {
+                try { Thread.sleep(5000) } catch (_: InterruptedException) {}
+                try { if (control != null) ensureHealthy() } catch (_: Exception) {}
+            }
+        }, "omni-extproxy-watchdog").apply { isDaemon = true }.start()
     }
 
     private fun closeQuietly(s: Socket?) {
