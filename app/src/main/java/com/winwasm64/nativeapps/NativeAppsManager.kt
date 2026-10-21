@@ -214,9 +214,47 @@ class NativeAppsManager(private val context: Context) {
         }
     }
 
-    fun launchApp(packageName: String): Boolean {
+    fun isTelegramPackage(packageName: String): Boolean {
+        val lower = packageName.lowercase()
+        return lower.contains("telegram") ||
+            lower.contains("ayugram") ||
+            lower.contains("nekogram") ||
+            lower.contains("challegram") ||
+            lower.contains("plusmessenger")
+    }
+
+    /**
+     * Подключает встроенный движок Telegram (tgnet DC1..DC5) к выделенному локальному SOCKS5-порту
+     * этого приложения (`tg://socks?server=127.0.0.1&port=<localPort>`), чтобы видео (DC2),
+     * кружочки, голосовые и файлы в Telegram скачивались без бесконечного «Соединение...».
+     */
+    fun connectTelegramBuiltInProxy(packageName: String): Int {
+        com.winwasm64.vpn.BrowsecLocalProxyServer.ensureRunning()
+        val profile = com.winwasm64.vpn.BrowsecLocalProxyServer.getOrCreateAppProfile(packageName)
+        val port = profile.localPort.takeIf { it > 0 } ?: com.winwasm64.vpn.BrowsecLocalProxyServer.activePort
+        try {
+            val tgUri = Uri.parse("tg://socks?server=127.0.0.1&port=$port")
+            val intent = Intent(Intent.ACTION_VIEW, tgUri).apply {
+                setPackage(packageName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            try {
+                val fallbackUri = Uri.parse("https://t.me/socks?server=127.0.0.1&port=$port")
+                val intent = Intent(Intent.ACTION_VIEW, fallbackUri).apply {
+                    setPackage(packageName)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            } catch (_: Exception) {
+            }
+        }
+        return port
+    }
+
+    fun launchApp(packageName: String, useVpnTunnel: Boolean = false): Boolean {
         return try {
-            val port = com.winwasm64.vpn.BrowsecLocalProxyServer.ensureRunning()
             val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
                 ?: when (packageName) {
                     "com.google.android.youtube" -> Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://")).apply {
@@ -231,10 +269,15 @@ class NativeAppsManager(private val context: Context) {
                     }
                 }
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            launchIntent.putExtra("proxy_host", "127.0.0.1")
-            launchIntent.putExtra("proxy_port", port)
-            launchIntent.putExtra("http.proxyHost", "127.0.0.1")
-            launchIntent.putExtra("http.proxyPort", port.toString())
+            if (useVpnTunnel) {
+                com.winwasm64.vpn.BrowsecLocalProxyServer.ensureRunning()
+                val profile = com.winwasm64.vpn.BrowsecLocalProxyServer.getOrCreateAppProfile(packageName)
+                val dedicatedPort = profile.localPort.takeIf { it > 0 } ?: com.winwasm64.vpn.BrowsecLocalProxyServer.activePort
+                launchIntent.putExtra("proxy_host", "127.0.0.1")
+                launchIntent.putExtra("proxy_port", dedicatedPort)
+                launchIntent.putExtra("http.proxyHost", "127.0.0.1")
+                launchIntent.putExtra("http.proxyPort", dedicatedPort.toString())
+            }
             context.startActivity(launchIntent)
             true
         } catch (_: Exception) {
