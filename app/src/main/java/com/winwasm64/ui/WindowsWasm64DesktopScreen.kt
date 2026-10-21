@@ -254,7 +254,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var browsecPaused by remember { mutableStateOf(prefs.getBoolean("browsec_paused", false)) }
     var browsecCountry by remember { mutableStateOf(prefs.getString("apps_vpn_country", "DE") ?: "DE") }
     var syncBothVpnsAuto by remember { mutableStateOf(prefs.getBoolean("sync_both_vpns_auto", false)) }
-    var autoHealEnabled by remember { mutableStateOf(prefs.getBoolean("auto_heal_vpn_enabled", true)) }
+    var autoHealEnabled by remember { mutableStateOf(prefs.getBoolean("auto_heal_vpn_enabled", false)) }
     var showServerPickerModal by remember { mutableStateOf(false) }
     var serverPickerTarget by remember { mutableStateOf("both") } // "browser", "apps", "both", или "app:<pkg>"
     var lastHandledPickerReq by remember { mutableIntStateOf(BrowsecVpnService.openServerPickerRequestCount) }
@@ -993,20 +993,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        // Если VPN Браузера включён, автоматически переключаем настройку/сервер и перезагружаем страницу
+                        // 1. Как в v3.6.0: сначала мгновенно пробуем загрузить страницу напрямую через десинхронизированный сокет Репитера №1
                         if (browserVpnEnabled && tab.autoRetryCount < 2 && view != null) {
                             tab.autoRetryCount++
                             tab.lastErrorText = null
-                            val healMsg = BrowserDirectRepeater.triggerAutoHealOrFailover()
-                            browserVpnCountry = BrowserDirectRepeater.countryCode
-                            tab.loadingStatusText = "⚡ $healMsg..."
-                            if (tab.autoRetryCount == 1) {
-                                view.postDelayed({
-                                    view.loadUrl(failingUrl)
-                                }, 250L)
-                                return
-                            }
                             val ua = view.settings.userAgentString
+                            tab.loadingStatusText = "⚡ Прямой обход DPI через Репитер №1 ($browserVpnCountry)..."
                             Thread {
                                 val html = BrowserDirectRepeater.fetchUnblockedHtml(failingUrl, ua)
                                 if (!html.isNullOrBlank()) {
@@ -1022,6 +1014,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             "UTF-8",
                                             failingUrl
                                         )
+                                    }
+                                } else if (autoHealEnabled) {
+                                    // 2. Если пользователь включил авто-смену настроек — меняем настройку/сервер и ОБЯЗАТЕЛЬНО перезагружаем страницу для проверки!
+                                    val healMsg = BrowserDirectRepeater.triggerAutoHealOrFailover()
+                                    view.post {
+                                        browserVpnCountry = BrowserDirectRepeater.countryCode
+                                        tab.loadingStatusText = healMsg
+                                        view.loadUrl(failingUrl)
                                     }
                                 } else {
                                     view.post {
@@ -1648,16 +1648,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 modifier = Modifier.clickable {
                                                     browserVpnCountry = node.code
                                                     browserVpnEnabled = true
-                                                    BrowserDirectRepeater.switchCountry(node.code, resetSessionTraffic = true)
+                                                    BrowserDirectRepeater.switchCountry(node.code, resetSessionTraffic = false)
                                                     if (syncBothVpnsAuto) {
                                                         browsecCountry = node.code
-                                                        BrowsecVpnService.selectSpecificCountry(context, node.code, resetTraffic = true)
+                                                        BrowsecVpnService.selectSpecificCountry(context, node.code, resetTraffic = false)
                                                     }
                                                     persistBrowserSettings()
                                                     navigateTab(activeTab, activeTab.url)
                                                     Toast.makeText(
                                                         context,
-                                                        "🌍 Выбран сервер Браузера: ${node.flag} ${node.countryRu} (${node.remoteIp}:${node.remotePort})",
+                                                        "🌍 Выбран сервер Браузера: ${node.flag} ${node.countryRu} (${node.remoteIp}:${node.remotePort}) • Страница обновляется!",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -2014,14 +2014,17 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             ) {
                                 Button(
                                     onClick = {
-                                        browsecEnabled = true
-                                        val nextIdx = (VPN_NODES.indexOfFirst { it.code == browsecCountry } + 1) % VPN_NODES.size
-                                        browsecCountry = VPN_NODES[nextIdx].code
+                                        browserVpnEnabled = true
+                                        BrowserDirectRepeater.enabled = true
+                                        val msg = BrowserDirectRepeater.triggerAutoHealOrFailover()
+                                        browserVpnCountry = BrowserDirectRepeater.countryCode
+                                        persistBrowserSettings()
                                         navigateTab(activeTab, activeTab.url)
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                     },
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
                                 ) {
-                                    Text("🌐 Сменить страну Browsec ($browsecCountry) и Обновить", fontSize = 11.sp, color = Color.White)
+                                    Text("🌐 Сменить настройку / сервер ($browserVpnCountry) и Обновить страницу", fontSize = 11.sp, color = Color.White)
                                 }
                                 Button(
                                     onClick = { navigateTab(activeTab, "https://m.youtube.com") },
@@ -2159,7 +2162,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     downloadedFiles = torrentEngine.getDownloadDirectory().listFiles()?.toList().orEmpty(),
                     onSelectCountry = { code ->
                         browsecCountry = code
-                        BrowsecVpnService.selectSpecificCountry(context, code, resetTraffic = true)
+                        BrowsecVpnService.selectSpecificCountry(context, code, resetTraffic = false)
                         if (syncBothVpnsAuto) {
                             browserVpnCountry = code
                         }
@@ -2217,7 +2220,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                     },
                     onSelectAppSpecificCountry = { pkg, code ->
-                        BrowsecLocalProxyServer.setAppServerCountry(pkg, code, resetTraffic = true)
+                        BrowsecLocalProxyServer.setAppServerCountry(pkg, code, resetTraffic = false)
                         if (!vpnRoutedApps.contains(pkg)) {
                             vpnRoutedApps.add(pkg)
                             BrowsecVpnService.routedPackages.add(pkg)
@@ -2293,16 +2296,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             serverPickerTarget == "browser" -> {
                                 browserVpnCountry = chosenCode
                                 browserVpnEnabled = true
-                                BrowserDirectRepeater.switchCountry(chosenCode, resetSessionTraffic = true)
+                                BrowserDirectRepeater.switchCountry(chosenCode, resetSessionTraffic = false)
                                 navigateTab(activeTab, activeTab.url)
                             }
                             serverPickerTarget == "apps" -> {
                                 browsecCountry = chosenCode
-                                BrowsecVpnService.selectSpecificCountry(context, chosenCode, resetTraffic = true)
+                                BrowsecVpnService.selectSpecificCountry(context, chosenCode, resetTraffic = false)
                             }
                             serverPickerTarget.startsWith("app:") -> {
                                 val pkg = serverPickerTarget.removePrefix("app:")
-                                BrowsecLocalProxyServer.setAppServerCountry(pkg, chosenCode, resetTraffic = true)
+                                BrowsecLocalProxyServer.setAppServerCountry(pkg, chosenCode, resetTraffic = false)
                                 if (!vpnRoutedApps.contains(pkg)) {
                                     vpnRoutedApps.add(pkg)
                                     BrowsecVpnService.routedPackages.add(pkg)
@@ -2317,10 +2320,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 browserVpnCountry = chosenCode
                                 browsecCountry = chosenCode
                                 browserVpnEnabled = true
-                                BrowserDirectRepeater.switchCountry(chosenCode, resetSessionTraffic = true)
-                                BrowsecVpnService.selectSpecificCountry(context, chosenCode, resetTraffic = true)
+                                BrowserDirectRepeater.switchCountry(chosenCode, resetSessionTraffic = false)
+                                BrowsecVpnService.selectSpecificCountry(context, chosenCode, resetTraffic = false)
                                 for (pkg in vpnRoutedApps) {
-                                    BrowsecLocalProxyServer.setAppServerCountry(pkg, chosenCode, resetTraffic = true)
+                                    BrowsecLocalProxyServer.setAppServerCountry(pkg, chosenCode, resetTraffic = false)
                                 }
                                 appServerMapVersion++
                                 navigateTab(activeTab, activeTab.url)
