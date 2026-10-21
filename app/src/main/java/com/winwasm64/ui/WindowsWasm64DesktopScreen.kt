@@ -1150,7 +1150,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                     ExtensionChip(
                         label = if (browsecEnabled) {
-                            "📱 Список VPN (${vpnRoutedApps.size} • ⚡ ${liveTraffic.pingMs} мс)"
+                            "📱 Список VPN (${vpnRoutedApps.size} • ⚡ ${trafficSnapshot.pingMs} мс)"
                         } else {
                             "📱 Список VPN (${vpnRoutedApps.size})"
                         },
