@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import com.winwasm64.ui.WindowsWasm64DesktopScreen
+import com.winwasm64.ui.theme.OmniTheme
 import com.winwasm64.vpn.BrowsecVpnService
 
 class MainActivity : ComponentActivity() {
@@ -13,7 +14,9 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
         val initialUri = intent?.dataString
         setContent {
-            WindowsWasm64DesktopScreen(initialIntentUri = initialUri)
+            OmniTheme {
+                WindowsWasm64DesktopScreen(initialIntentUri = initialUri)
+            }
         }
     }
 

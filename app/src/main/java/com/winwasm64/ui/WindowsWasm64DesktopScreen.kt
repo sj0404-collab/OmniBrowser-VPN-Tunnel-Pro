@@ -1,5 +1,25 @@
 package com.winwasm64.ui
 
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
+import android.os.Handler
+import android.os.Looper
+import android.webkit.ValueCallback
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.verticalScroll
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ProfileStore
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import com.winwasm64.extensions.ChromeWebStore
+import com.winwasm64.extensions.ExtTab
+import com.winwasm64.extensions.ExtensionRuntime
+import com.winwasm64.extensions.ExtensionStore
+import com.winwasm64.extensions.ExtensionTabHost
+import com.winwasm64.ui.browser.*
+import com.winwasm64.ui.theme.Omni
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
@@ -134,6 +154,7 @@ class BrowserTabModel(
     var canGoForward by mutableStateOf(false)
     var autoRetryCount by mutableIntStateOf(0)
     var webView: WebView? = null
+    val numericId: Int = BrowserSessionVault.nextNumericId()
 }
 
 /**
@@ -144,6 +165,8 @@ object BrowserSessionVault {
     val tabs = mutableStateListOf<BrowserTabModel>()
     var activeTabIndex by mutableIntStateOf(0)
     var initialized = false
+    private var numericCounter = 1
+    fun nextNumericId(): Int = numericCounter++
 }
 
 private val AD_DOMAINS = setOf(
@@ -187,15 +210,15 @@ fun CompactDarkTextField(
         modifier = modifier
             .height(40.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF0B1120))
-            .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(8.dp))
+            .background(Omni.Surface)
+            .border(1.dp, Omni.Accent, RoundedCornerShape(8.dp))
             .padding(horizontal = 10.dp),
         contentAlignment = Alignment.CenterStart
     ) {
         if (value.isEmpty()) {
             Text(
                 text = placeholder,
-                color = Color(0xFF94A3B8),
+                color = Omni.TextDim,
                 fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -210,7 +233,7 @@ fun CompactDarkTextField(
                 fontSize = 13.sp,
                 fontFamily = FontFamily.Monospace
             ),
-            cursorBrush = SolidColor(Color(0xFF38BDF8)),
+            cursorBrush = SolidColor(Omni.Accent),
             keyboardOptions = KeyboardOptions(imeAction = if (onGo != null) ImeAction.Go else ImeAction.Done),
             keyboardActions = KeyboardActions(
                 onGo = { onGo?.invoke() },
@@ -353,6 +376,28 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     var activeExtensionPopup by remember { mutableStateOf<String?>(null) }
+    remember {
+        // Инкогнито-профиль очищается при каждом запуске (если WebView поддерживает профили).
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+            try {
+                ProfileStore.getInstance().deleteProfile("omni_incognito")
+            } catch (_: Throwable) {
+            }
+        }
+        ExtensionRuntime.init(context.applicationContext)
+        true
+    }
+    var extPopupFor by remember { mutableStateOf<String?>(null) }
+    var extOptionsFor by remember { mutableStateOf<String?>(null) }
+    var showExtensionsSheet by remember { mutableStateOf(false) }
+    var showTabsSheet by remember { mutableStateOf(false) }
+    var showMenuSheet by remember { mutableStateOf(false) }
+    var findBarVisible by remember { mutableStateOf(false) }
+    var findTotal by remember { mutableIntStateOf(0) }
+    var findCurrent by remember { mutableIntStateOf(0) }
+    var longPressImageUrl by remember { mutableStateOf<String?>(null) }
+    var fileChooserCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    val blobBridge = remember { BlobDownloadBridge(context.applicationContext) }
 
     val tabs = remember {
         if (!BrowserSessionVault.initialized || BrowserSessionVault.tabs.isEmpty()) {
@@ -395,14 +440,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var findInPageQuery by remember { mutableStateOf("") }
 
     val bookmarks = remember {
-        mutableStateListOf(
-            "https://www.google.com" to "🔍 Google Поиск",
-            "https://m.youtube.com" to "🎬 YouTube Моб. (Прямой)",
-            "https://www.youtube.com/?app=desktop" to "🖥 YouTube ПК (Через Browsec)",
-            "https://archive.org/details/software" to "🧲 Archive.org Программы и Игры",
-            "https://rutracker.org" to "🧲 RuTracker (С Browsec VPN)",
-            "https://github.com" to "💻 GitHub"
-        )
+        val list = mutableStateListOf<Pair<String, String>>()
+        val saved = prefs.getString("bookmarks_v4", null)
+        if (saved != null) {
+            saved.split("\n").forEach { line ->
+                val i = line.indexOf('\t')
+                if (i > 0) list.add(line.substring(0, i) to line.substring(i + 1))
+            }
+        } else {
+            list.add("https://www.google.com" to "Google")
+            list.add("https://m.youtube.com" to "YouTube")
+            list.add("https://github.com" to "GitHub")
+            list.add("https://archive.org" to "Internet Archive")
+        }
+        list
     }
 
     val historyList = remember {
@@ -422,11 +473,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     fun persistBrowserSettings() {
-        val currentUrls = tabs.map { t ->
+        val currentUrls = tabs.filter { !it.isIncognito }.map { t ->
             val liveUrl = t.webView?.url
             if (!liveUrl.isNullOrBlank() && liveUrl != "about:blank") liveUrl else t.url
         }
-        prefs.edit()
         val appServerSet = vpnRoutedApps.map { pkg ->
             "$pkg=${BrowsecLocalProxyServer.getAppServerCountry(pkg)}"
         }.toSet()
@@ -456,7 +506,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             .putStringSet("custom_ad_domains", customBlockedDomains.toSet())
             .putStringSet("vpn_routed_apps", vpnRoutedApps.toSet())
             .putStringSet("vpn_app_server_map", appServerSet)
-            .commit()
+            .putString("bookmarks_v4", bookmarks.joinToString("\n") { "${it.first}\t${it.second}" })
+            .apply()
     }
 
     var pendingVpnLaunchPkg by remember { mutableStateOf<String?>(null) }
@@ -686,10 +737,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        val extraHeaders = mapOf(
-            "X-Forwarded-For" to nodeInfo.remoteIp,
-            "Accept-Language" to "ru-RU,ru;q=0.9,en-US;q=0.8"
-        )
+        val extraHeaders = buildMap {
+            put("X-Forwarded-For", nodeInfo.remoteIp)
+            put("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
+            if (doNotTrackEnabled) {
+                put("DNT", "1")
+                put("Sec-GPC", "1")
+            }
+        }
         BrowserDirectRepeater.ensureDirectBrowserMode {
             wv.post {
                 wv.loadUrl(target, extraHeaders)
@@ -748,6 +803,97 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
+    val fileChooserLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val cb = fileChooserCallback
+        fileChooserCallback = null
+        val data = result.data
+        val uris: Array<Uri>? = if (result.resultCode == Activity.RESULT_OK && data != null) {
+            val clip = data.clipData
+            if (clip != null && clip.itemCount > 0) Array(clip.itemCount) { clip.getItemAt(it).uri } else data.data?.let { arrayOf(it) }
+        } else {
+            null
+        }
+        cb?.onReceiveValue(uris)
+    }
+
+    val extensionFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes != null && bytes.isNotEmpty()) {
+                    ExtensionRuntime.installFromBytes(bytes) { err, ext ->
+                        Toast.makeText(context, if (err != null) "Не удалось установить: $err" else "Установлено: ${ext?.manifest?.name}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка чтения файла: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun extTabOf(t: BrowserTabModel): ExtTab {
+        val idx = tabs.indexOf(t)
+        return ExtTab(t.numericId, idx.coerceAtLeast(0), t.url, t.title, idx == activeTabIndex, t.isIncognito, t.isLoading)
+    }
+
+    fun copyToClipboard(text: String) {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("text", text))
+        Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+    }
+
+    fun shareText(text: String) {
+        try {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+            }
+            context.startActivity(Intent.createChooser(send, "Поделиться").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Toast.makeText(context, "Не удалось поделиться: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun startWebDownload(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        when {
+            url.startsWith("blob:", ignoreCase = true) -> {
+                tab.webView?.evaluateJavascript(blobBridge.scriptFor(url, fileName), null)
+                Toast.makeText(context, "Сохраняю $fileName…", Toast.LENGTH_SHORT).show()
+            }
+            url.startsWith("data:", ignoreCase = true) -> {
+                try {
+                    val decoded = DownloadSaver.decodeDataUrl(url) ?: throw IllegalArgumentException("неверная data:-ссылка")
+                    val where = DownloadSaver.saveBytes(context, fileName, mimeType?.ifBlank { null } ?: decoded.first, decoded.second)
+                    Toast.makeText(context, "Сохранено: $where", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Не удалось сохранить: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            else -> {
+                try {
+                    val req = DownloadManager.Request(Uri.parse(url)).apply {
+                        if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                        if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+                        if (!tab.isIncognito) {
+                            CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                        }
+                        val ref = tab.webView?.url
+                        if (ref != null && ref.startsWith("http")) addRequestHeader("Referer", ref)
+                        setTitle(fileName)
+                        setDescription("OmniBrowser")
+                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    }
+                    (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+                    Toast.makeText(context, "Загрузка началась: $fileName", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Не удалось начать загрузку: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     fun ensureTabWebView(tab: BrowserTabModel): WebView {
         tab.webView?.let { existing ->
             val oldParent = existing.parent as? ViewGroup
@@ -760,6 +906,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             return existing
         }
         val wv = WebView(context).apply {
+            if (tab.isIncognito && WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+                try {
+                    ProfileStore.getInstance().getOrCreateProfile("omni_incognito")
+                    WebViewCompat.setProfile(this, "omni_incognito")
+                } catch (_: Throwable) {
+                }
+            }
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -779,6 +932,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             settings.setSupportMultipleWindows(false)
             settings.cacheMode = WebSettings.LOAD_DEFAULT
             settings.textZoom = textZoomPercent
+            if (tab.isIncognito) settings.cacheMode = WebSettings.LOAD_NO_CACHE
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, !blockThirdPartyCookies)
@@ -786,11 +940,31 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             setOnLongClickListener {
                 val hit = hitTestResult
                 val extra = hit.extra
-                if (!extra.isNullOrBlank() && (extra.startsWith("http") || extra.startsWith("magnet:"))) {
-                    longPressedUrl = extra
-                    true
-                } else {
-                    false
+                when (hit.type) {
+                    WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> {
+                        val msg = Handler(Looper.getMainLooper()).obtainMessage()
+                        requestFocusNodeHref(msg)
+                        val href = msg.data?.getString("url")
+                        longPressImageUrl = extra?.takeIf { it.isNotBlank() }
+                        longPressedUrl = href?.takeIf { it.isNotBlank() } ?: extra
+                        true
+                    }
+                    WebView.HitTestResult.IMAGE_TYPE -> {
+                        if (!extra.isNullOrBlank()) {
+                            longPressImageUrl = extra
+                            longPressedUrl = null
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    else -> if (!extra.isNullOrBlank() && (extra.startsWith("http") || extra.startsWith("magnet:"))) {
+                        longPressImageUrl = null
+                        longPressedUrl = extra
+                        true
+                    } else {
+                        false
+                    }
                 }
             }
 
@@ -801,27 +975,17 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 ) {
                     torrentEngine.startFromMagnetOrUrl(url)
                     currentSection = 1
-                    Toast.makeText(context, "🧲 Перехвачен .torrent файл — скачивание начато!", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Торрент добавлен в загрузчик", Toast.LENGTH_LONG).show()
                 } else {
-                    try {
-                        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                        val req = DownloadManager.Request(Uri.parse(url)).apply {
-                            setMimeType(mimeType)
-                            addRequestHeader("User-Agent", userAgent)
-                            setTitle(fileName)
-                            setDescription("Скачивание через OmniBrowser Pro")
-                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                        }
-                        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                        dm.enqueue(req)
-                        Toast.makeText(context, "📥 Загрузка начата: $fileName (см. раздел История и Загрузки)", Toast.LENGTH_LONG).show()
-                    } catch (e: Exception) {
-                        torrentEngine.startFromMagnetOrUrl(url)
-                        currentSection = 1
-                        Toast.makeText(context, "📥 Загрузка через встроенный движок: ${e.message ?: ""}", Toast.LENGTH_SHORT).show()
-                    }
+                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
                 }
+            }
+
+            addJavascriptInterface(blobBridge, "OmniBlobSaver")
+
+            setFindListener { activeMatch, matches, _ ->
+                findCurrent = activeMatch
+                findTotal = matches
             }
 
             webChromeClient = object : WebChromeClient() {
@@ -849,8 +1013,33 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 }
 
                 override fun onReceivedTitle(view: WebView?, title: String?) {
-                    if (!title.isNullOrBlank()) {
+                    if (!title.isNullOrBlank() && title != tab.title) {
                         tab.title = title
+                        if (!tab.isIncognito) ExtensionRuntime.onTabUpdated(extTabOf(tab), null, false, true)
+                    }
+                }
+
+                override fun onShowFileChooser(
+                    webView: WebView?,
+                    filePathCallback: ValueCallback<Array<Uri>>?,
+                    fileChooserParams: FileChooserParams?
+                ): Boolean {
+                    fileChooserCallback?.onReceiveValue(null)
+                    fileChooserCallback = filePathCallback
+                    return try {
+                        val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                        }
+                        if (fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        }
+                        fileChooserLauncher.launch(intent)
+                        true
+                    } catch (e: Exception) {
+                        fileChooserCallback = null
+                        Toast.makeText(context, "Не удалось открыть выбор файла: ${e.message}", Toast.LENGTH_SHORT).show()
+                        false
                     }
                 }
 
@@ -878,6 +1067,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 ): WebResourceResponse? {
                     val reqUrl = request?.url?.toString()?.lowercase() ?: return null
                     BrowserDirectRepeater.recordWebViewActivity(txEstimate = 420L, rxEstimate = 3200L)
+                    if (!tab.isIncognito) {
+                        ExtensionRuntime.interceptTabRequest(tab.numericId, request)?.let { return it }
+                    }
                     if (adBlockEnabled) {
                         val host = request.url.host?.lowercase() ?: ""
                         val blocked = AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
@@ -937,6 +1129,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         tab.lastErrorText = null
                         val host = Uri.parse(url).host ?: url
                         tab.loadingStatusText = "⏳ Загрузка страницы $host..."
+                        if (!tab.isIncognito) ExtensionRuntime.onTabUpdated(extTabOf(tab), "loading", true, false)
                         if (!tab.isIncognito) {
                             val stamp = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
                             val entry = "$stamp | $url"
@@ -959,6 +1152,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         }
                         tab.canGoBack = view?.canGoBack() == true
                         tab.canGoForward = view?.canGoForward() == true
+                        if (!tab.isIncognito) ExtensionRuntime.onTabHistoryStateUpdated(extTabOf(tab))
                         if (view != null) {
                             injectActiveExtensions(view)
                         }
@@ -980,7 +1174,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                     if (view != null) {
                         injectActiveExtensions(view)
+                        if (!tab.isIncognito) ExtensionRuntime.injectFallback(view)
                     }
+                    if (!tab.isIncognito) ExtensionRuntime.onTabUpdated(extTabOf(tab), "complete", false, false)
                     persistBrowserSettings()
                 }
 
@@ -1041,8 +1237,89 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
         tab.webView = wv
         webViewContainer.addView(wv)
+        if (!tab.isIncognito) {
+            ExtensionRuntime.attachTab(wv, tab.numericId)
+            ExtensionRuntime.onTabCreated(extTabOf(tab))
+        }
         navigateTab(tab, tab.url)
         return wv
+    }
+
+    fun openNewTab(url: String, incognito: Boolean = false, activate: Boolean = true): BrowserTabModel {
+        val t = BrowserTabModel(
+            id = (if (incognito) "inc_" else "tab_") + System.nanoTime(),
+            initialUrl = url,
+            initialTitle = if (incognito) "Инкогнито" else "Новая вкладка",
+            isIncognito = incognito
+        )
+        tabs.add(t)
+        if (activate) {
+            activeTabIndex = tabs.size - 1
+            currentSection = 0
+        }
+        ensureTabWebView(t)
+        persistBrowserSettings()
+        return t
+    }
+
+    fun closeTabAt(index: Int) {
+        val t = tabs.getOrNull(index) ?: return
+        t.webView?.let { w ->
+            if (!t.isIncognito) ExtensionRuntime.detachTab(w, t.numericId)
+            webViewContainer.removeView(w)
+            w.destroy()
+        }
+        t.webView = null
+        tabs.removeAt(index)
+        if (tabs.isEmpty()) {
+            // Раньше закрытие последней вкладки роняло приложение (coerceIn(0, -1)).
+            tabs.add(BrowserTabModel(id = "tab_" + System.nanoTime(), initialUrl = homePageUrl, initialTitle = "Новая вкладка"))
+            activeTabIndex = 0
+        } else if (index < activeTabIndex || activeTabIndex >= tabs.size) {
+            activeTabIndex = (activeTabIndex - 1).coerceIn(0, tabs.size - 1)
+        }
+        persistBrowserSettings()
+    }
+
+    val extTabHost = remember {
+        object : ExtensionTabHost {
+            override fun tabs(): List<ExtTab> = tabs.filter { !it.isIncognito }.map { extTabOf(it) }
+            override fun createTab(url: String, active: Boolean): ExtTab? = extTabOf(openNewTab(url, false, active))
+            override fun updateTab(tabId: Int, url: String?, active: Boolean?): ExtTab? {
+                val idx = tabs.indexOfFirst { it.numericId == tabId }
+                if (idx < 0) return null
+                val t = tabs[idx]
+                if (active == true) {
+                    activeTabIndex = idx
+                    currentSection = 0
+                }
+                if (!url.isNullOrBlank()) navigateTab(t, url)
+                return extTabOf(t)
+            }
+            override fun removeTab(tabId: Int) {
+                val idx = tabs.indexOfFirst { it.numericId == tabId }
+                if (idx >= 0) closeTabAt(idx)
+            }
+            override fun reloadTab(tabId: Int) {
+                tabs.firstOrNull { it.numericId == tabId }?.webView?.reload()
+            }
+            override fun webViewOf(tabId: Int): WebView? = tabs.firstOrNull { it.numericId == tabId }?.webView
+            override fun openPopup(extId: String) {
+                extPopupFor = extId
+            }
+            override fun closePopup(extId: String) {
+                if (extPopupFor == extId) extPopupFor = null
+            }
+            override fun toast(text: String) {
+                Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    DisposableEffect(extTabHost) {
+        ExtensionRuntime.tabHost = extTabHost
+        onDispose {
+            if (ExtensionRuntime.tabHost === extTabHost) ExtensionRuntime.tabHost = null
+        }
     }
 
     LaunchedEffect(initialIntentUri) {
@@ -1062,6 +1339,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     LaunchedEffect(activeTabIndex, tabs.size, desktopMode) {
         val current = tabs.getOrNull(activeTabIndex) ?: return@LaunchedEffect
         ensureTabWebView(current)
+        if (!current.isIncognito) ExtensionRuntime.onTabActivated(current.numericId)
         for (i in 0 until webViewContainer.childCount) {
             val child = webViewContainer.getChildAt(i)
             child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
@@ -1103,417 +1381,327 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
+    val hostActivity = remember(context) { context.findOmniActivity() }
+    BackHandler(enabled = true) {
+        when {
+            fullscreenCustomView != null -> {
+                fullscreenCustomView = null
+                fullscreenCallback?.onCustomViewHidden()
+                fullscreenCallback = null
+            }
+            findBarVisible -> {
+                findBarVisible = false
+                findInPageQuery = ""
+                activeTab.webView?.clearMatches()
+            }
+            currentSection != 0 -> currentSection = 0
+            activeTab.webView?.canGoBack() == true -> activeTab.webView?.goBack()
+            else -> hostActivity?.moveTaskToBack(true)
+        }
+    }
+    DisposableEffect(fullscreenCustomView != null) {
+        val act = hostActivity
+        val win = act?.window
+        if (fullscreenCustomView != null && act != null && win != null) {
+            val ctrl = WindowCompat.getInsetsController(win, win.decorView)
+            ctrl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            ctrl.hide(WindowInsetsCompat.Type.systemBars())
+            act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+        onDispose {
+            if (act != null && win != null && act.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
+                WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
+                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }
+    }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = Color(0xFF090D16)
+        color = Omni.Bg
     ) {
         Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
 
             if (currentSection == 0) {
-                // 1. САМЫЙ ВЕРХ: Горизонтально прокручиваемая панель ВСЕХ КНОПОК (История, Загрузки, Репитер №1, Список VPN, Торрент, Расширения)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0B1324))
-                        .padding(horizontal = 6.dp, vertical = 5.dp)
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    ExtensionChip(
-                        label = if (browserVpnEnabled) {
-                            "🌐 VPN Браузера: ${browserTrafficSnapshot.activeCountryName} • ⚡ ${browserTrafficSnapshot.pingMs} мс (${browserTrafficSnapshot.remoteServerIpPort})"
-                        } else {
-                            "🌐 VPN Браузера: ВЫКЛ ($browserVpnCountry)"
-                        },
-                        active = browserVpnEnabled,
-                        activeColor = Color(0xFF0284C7)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "browsec") null else "browsec"
-                    }
-
-                    ExtensionChip(
-                        label = "🕘 История (${historyList.size})",
-                        active = false,
-                        activeColor = Color(0xFF0284C7)
-                    ) {
-                        currentSection = 2
-                    }
-
-                    ExtensionChip(
-                        label = "📥 Загрузки",
-                        active = false,
-                        activeColor = Color(0xFF059669)
-                    ) {
-                        currentSection = 2
-                    }
-
-                    ExtensionChip(
-                        label = if (browsecEnabled) {
-                            "📱 Список VPN (${vpnRoutedApps.size} • ⚡ ${trafficSnapshot.pingMs} мс)"
-                        } else {
-                            "📱 Список VPN (${vpnRoutedApps.size})"
-                        },
-                        active = browsecEnabled,
-                        activeColor = Color(0xFF7C3AED)
-                    ) {
-                        currentSection = 3
-                    }
-
-                    ExtensionChip(
-                        label = "🧲 Торрент (${torrentStatuses.size})",
-                        active = false,
-                        activeColor = Color(0xFF059669)
-                    ) {
-                        currentSection = 1
-                    }
-
-                    ExtensionChip(
-                        label = "🛡️ AdBlock ($adBlockedCount)",
-                        active = adBlockEnabled,
-                        activeColor = Color(0xFF059669)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "adblock") null else "adblock"
-                    }
-
-                    ExtensionChip(
-                        label = "🎬 YouTube со звуком",
-                        active = youtubeBoostEnabled,
-                        activeColor = Color(0xFFDC2626)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "youtube") null else "youtube"
-                    }
-
-                    ExtensionChip(
-                        label = if (desktopMode) "🖥 Режим ПК" else "📱 Мобильный",
-                        active = desktopMode,
-                        activeColor = Color(0xFF0284C7)
-                    ) {
-                        desktopMode = !desktopMode
-                        activeTab.webView?.settings?.userAgentString = if (desktopMode) {
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                        } else null
-                        navigateTab(activeTab, activeTab.url)
-                        persistBrowserSettings()
-                    }
-
-                    ExtensionChip(
-                        label = "🌙 Dark Reader",
-                        active = darkReaderEnabled,
-                        activeColor = Color(0xFF7C3AED)
-                    ) {
-                        darkReaderEnabled = !darkReaderEnabled
-                        activeTab.webView?.let { injectActiveExtensions(it) }
-                        persistBrowserSettings()
-                    }
-
-                    ExtensionChip(
-                        label = "⭐ Закладки",
-                        active = activeExtensionPopup == "bookmarks",
-                        activeColor = Color(0xFF2563EB)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "bookmarks") null else "bookmarks"
-                    }
-
-                    ExtensionChip(
-                        label = "🔍 Найти",
-                        active = activeExtensionPopup == "find",
-                        activeColor = Color(0xFF4F46E5)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "find") null else "find"
-                    }
-
-                    ExtensionChip(
-                        label = "🔧 DevTools (F12)",
-                        active = devToolsEnabled,
-                        activeColor = Color(0xFFD97706)
-                    ) {
-                        devToolsEnabled = !devToolsEnabled
-                        activeTab.webView?.let { injectActiveExtensions(it) }
-                    }
-
-                    ExtensionChip(
-                        label = "⚙️ Настройки",
-                        active = activeExtensionPopup == "settings",
-                        activeColor = Color(0xFF0EA5E9)
-                    ) {
-                        activeExtensionPopup = if (activeExtensionPopup == "settings") null else "settings"
-                    }
-                }
-
-                // 2. ПРЯМО ПОД КНОПКАМИ: Горизонтально прокручиваемая полоса ВКЛАДОК
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0F1624))
-                        .padding(horizontal = 6.dp, vertical = 4.dp)
-                        .horizontalScroll(rememberScrollState()),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    tabs.forEachIndexed { idx, tab ->
-                        val isSelected = idx == activeTabIndex
-                        Surface(
-                            color = if (isSelected) Color(0xFF1E293B) else Color(0xFF111827),
-                            shape = RoundedCornerShape(8.dp),
-                            border = androidx.compose.foundation.BorderStroke(
-                                1.dp,
-                                if (isSelected) Color(0xFF38BDF8) else Color(0xFF334155)
-                            ),
-                            modifier = Modifier.clickable {
-                                activeTabIndex = idx
-                                addressInput = tab.url
-                                persistBrowserSettings()
-                            }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                if (tab.isLoading) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(12.dp),
-                                        strokeWidth = 2.dp,
-                                        color = Color(0xFF38BDF8)
-                                    )
+                // 1. Верхняя панель: VPN · адрес · вкладки · расширения · меню
+                if (fullscreenCustomView == null) {
+                    if (findBarVisible) {
+                        FindInPageBar(
+                            query = findInPageQuery,
+                            onQueryChange = { q ->
+                                findInPageQuery = q
+                                if (q.isEmpty()) {
+                                    activeTab.webView?.clearMatches()
+                                    findTotal = 0
+                                    findCurrent = 0
                                 } else {
-                                    Text(if (tab.isIncognito) "🕶" else "🌐", fontSize = 11.sp)
+                                    activeTab.webView?.findAllAsync(q)
                                 }
-                                Text(
-                                    text = tab.title.take(18).ifBlank { "Вкладка ${idx + 1}" },
-                                    color = if (isSelected) Color.White else Color(0xFF94A3B8),
-                                    fontSize = 12.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                if (tabs.size > 1) {
-                                    Text(
-                                        text = "✕",
-                                        color = Color(0xFFEF4444),
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.clickable {
-                                            tab.webView?.let { webViewContainer.removeView(it); it.destroy() }
-                                            tabs.removeAt(idx)
-                                            activeTabIndex = activeTabIndex.coerceIn(0, tabs.size - 1)
-                                            persistBrowserSettings()
-                                        }
-                                    )
-                                }
+                            },
+                            current = findCurrent,
+                            total = findTotal,
+                            onPrev = { activeTab.webView?.findNext(false) },
+                            onNext = { activeTab.webView?.findNext(true) },
+                            onClose = {
+                                findBarVisible = false
+                                findInPageQuery = ""
+                                findTotal = 0
+                                findCurrent = 0
+                                activeTab.webView?.clearMatches()
                             }
-                        }
-                    }
-
-                    Surface(
-                        color = Color(0xFF0284C7),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.clickable {
-                            val newTab = BrowserTabModel(
-                                id = "tab_${System.currentTimeMillis()}",
-                                initialUrl = "https://www.google.com",
-                                initialTitle = "Google"
-                            )
-                            tabs.add(newTab)
-                            activeTabIndex = tabs.size - 1
-                            ensureTabWebView(newTab)
-                            persistBrowserSettings()
-                        }
-                    ) {
-                        Text(
-                            text = "+ Вкладка",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                        )
-                    }
-
-                    Surface(
-                        color = Color(0xFF312E81),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.clickable {
-                            val incTab = BrowserTabModel(
-                                id = "inc_${System.currentTimeMillis()}",
-                                initialUrl = "https://duckduckgo.com",
-                                initialTitle = "Инкогнито",
-                                isIncognito = true
-                            )
-                            tabs.add(incTab)
-                            activeTabIndex = tabs.size - 1
-                            ensureTabWebView(incTab)
-                        }
-                    ) {
-                        Text(
-                            text = "🕶 Инкогнито",
-                            color = Color(0xFFE0E7FF),
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
-                        )
-                    }
-                }
-
-                // 3. Адресная панель навигации (←, →, ↻, ✕, URL, Перейти)
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF111827))
-                        .padding(horizontal = 6.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    SmallNavIconButton("←", enabled = activeTab.canGoBack) {
-                        activeTab.webView?.goBack()
-                    }
-                    SmallNavIconButton("→", enabled = activeTab.canGoForward) {
-                        activeTab.webView?.goForward()
-                    }
-                    SmallNavIconButton("↻", enabled = true) {
-                        navigateTab(activeTab, activeTab.url)
-                    }
-                    if (activeTab.isLoading) {
-                        SmallNavIconButton("✕", enabled = true) {
-                            activeTab.webView?.stopLoading()
-                            activeTab.isLoading = false
-                            activeTab.loadingProgress = 0
-                        }
-                    }
-
-                    CompactDarkTextField(
-                        value = addressInput,
-                        onValueChange = { addressInput = it },
-                        placeholder = "Введите URL, поисковый запрос или magnet:?...",
-                        modifier = Modifier.weight(1f),
-                        onGo = { navigateTab(activeTab, addressInput) }
-                    )
-
-                    Button(
-                        onClick = { navigateTab(activeTab, addressInput) },
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                        modifier = Modifier.height(38.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                    ) {
-                        Text("Перейти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
-                    }
-                }
-
-                // 4. Индикатор загрузки и прокручиваемая строка статуса Репитера №1 (только для Браузера, без локального туннеля!)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0B1324))
-                ) {
-                    if (activeTab.isLoading || activeTab.loadingProgress in 1..99) {
-                        LinearProgressIndicator(
-                            progress = { (activeTab.loadingProgress / 100f).coerceIn(0.05f, 1f) },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(4.dp),
-                            color = Color(0xFF38BDF8),
-                            trackColor = Color(0xFF1E293B)
                         )
                     } else {
-                        HorizontalDivider(color = Color(0xFF1E293B), thickness = 1.dp)
+                        val extBadge = remember(ExtensionRuntime.stateVersion) {
+                            ExtensionStore.installed.count { it.enabled }.takeIf { it > 0 }?.toString()
+                        }
+                        OmniTopBar(
+                            url = activeTab.url,
+                            isLoading = activeTab.isLoading,
+                            progress = activeTab.loadingProgress,
+                            isIncognito = activeTab.isIncognito,
+                            vpnOn = browserVpnEnabled,
+                            tabsCount = tabs.size,
+                            extensionsBadge = extBadge,
+                            onSubmit = { input -> navigateTab(activeTab, input) },
+                            onReload = {
+                                val w = activeTab.webView
+                                if (w != null) w.reload() else navigateTab(activeTab, activeTab.url)
+                            },
+                            onStop = {
+                                activeTab.webView?.stopLoading()
+                                activeTab.isLoading = false
+                            },
+                            onVpnClick = { activeExtensionPopup = "browsec" },
+                            onTabsClick = { showTabsSheet = true },
+                            onExtensionsClick = { showExtensionsSheet = true },
+                            onMenuClick = { showMenuSheet = true }
+                        )
                     }
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF060B16))
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                            .horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = if (activeTab.isLoading) {
-                                "⏳ ${activeTab.loadingProgress}% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
-                            } else {
-                                "🔒 100% • ${Uri.parse(activeTab.url).host ?: activeTab.url}"
-                            },
-                            color = if (activeTab.isLoading) Color(0xFF38BDF8) else Color(0xFF34D399),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        Text(
-                            text = if (browserVpnEnabled) {
-                                "🟢 Репитер Браузера №1: ${browserTrafficSnapshot.activeCountryName} • Сервер: ${browserTrafficSnapshot.remoteServerIpPort} (БЕЗ проброса в лок. туннель • ${browserTrafficSnapshot.pingMs} мс)"
-                            } else {
-                                "⚪ Репитер Браузера №1: ВЫКЛ (Прямое соединение)"
-                            },
-                            color = if (browserVpnEnabled) Color(0xFF34D399) else Color(0xFF94A3B8),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        Text(
-                            text = "⬇ ВХ: ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.rxSpeedBytesPerSec)} | ⬆ ИСХ: ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.txSpeedBytesPerSec)}",
-                            color = Color(0xFFFDE047),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
+                    val storeId = if (ChromeWebStore.isDetailPage(activeTab.url)) ChromeWebStore.extractId(activeTab.url) else null
+                    if (storeId != null) {
+                        val installedNow = remember(ExtensionRuntime.stateVersion, storeId) { ExtensionStore.get(storeId) != null }
+                        StoreInstallBanner(
+                            installed = installedNow,
+                            busyText = ExtensionRuntime.busy[storeId],
+                            onInstall = {
+                                ExtensionRuntime.installFromStore(storeId) { err, ext ->
+                                    Toast.makeText(context, if (err != null) "Не удалось установить: $err" else "Установлено: ${ext?.manifest?.name}", Toast.LENGTH_LONG).show()
+                                }
+                            }
                         )
                     }
                 }
 
-                // Long-press Link / Image Context Dialog
-                if (longPressedUrl != null) {
-                    val targetLink = longPressedUrl ?: ""
-                    Surface(
-                        color = Color(0xFF0F172A),
-                        shape = RoundedCornerShape(10.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
-                        modifier = Modifier.fillMaxWidth().padding(6.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("🔗 Ссылка: $targetLink", color = Color(0xFF38BDF8), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            Row(
-                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Button(onClick = {
-                                    tabs.add(BrowserTabModel(id = "tab_${System.currentTimeMillis()}", initialUrl = targetLink, initialTitle = "Вкладка"))
-                                    activeTabIndex = tabs.size - 1
-                                    persistBrowserSettings()
-                                    longPressedUrl = null
-                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))) {
-                                    Text("➕ В новой вкладке", fontSize = 11.sp, color = Color.White)
-                                }
-                                Button(onClick = {
-                                    tabs.add(BrowserTabModel(id = "incog_${System.currentTimeMillis()}", initialUrl = targetLink, initialTitle = "🕶 Инкогнито", isIncognito = true))
-                                    activeTabIndex = tabs.size - 1
-                                    longPressedUrl = null
-                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))) {
-                                    Text("🕶 В Инкогнито", fontSize = 11.sp, color = Color.White)
-                                }
-                                Button(onClick = {
-                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                    cm.setPrimaryClip(android.content.ClipData.newPlainText("URL", targetLink))
-                                    Toast.makeText(context, "📋 Ссылка скопирована", Toast.LENGTH_SHORT).show()
-                                    longPressedUrl = null
-                                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))) {
-                                    Text("📋 Копировать", fontSize = 11.sp, color = Color.White)
-                                }
-                                OutlinedButton(onClick = { longPressedUrl = null }) {
-                                    Text("✕ Закрыть", fontSize = 11.sp, color = Color.White)
-                                }
+                // Шторка вкладок
+                if (showTabsSheet) {
+                    OmniSheet(onDismiss = { showTabsSheet = false }) {
+                        TabsSheetContent(
+                            tabs = tabs.map { TabRowInfo(it.title, it.url, it.isIncognito, it.isLoading) },
+                            activeIndex = activeTabIndex,
+                            onSelect = { i ->
+                                activeTabIndex = i
+                                showTabsSheet = false
+                            },
+                            onClose = { i -> closeTabAt(i) },
+                            onNewTab = {
+                                showTabsSheet = false
+                                openNewTab(homePageUrl)
+                            },
+                            onNewIncognito = {
+                                showTabsSheet = false
+                                openNewTab("https://duckduckgo.com", incognito = true)
                             }
+                        )
+                    }
+                }
+
+                // Шторка расширений Chrome
+                if (showExtensionsSheet) {
+                    OmniSheet(onDismiss = { showExtensionsSheet = false }) {
+                        ExtensionsSheetContent(
+                            onOpenPopup = { id ->
+                                showExtensionsSheet = false
+                                extPopupFor = id
+                            },
+                            onOpenOptions = { id ->
+                                showExtensionsSheet = false
+                                extOptionsFor = id
+                            },
+                            onOpenUrl = { u ->
+                                showExtensionsSheet = false
+                                openNewTab(u)
+                            },
+                            onPickFile = { extensionFilePicker.launch("*/*") }
+                        )
+                    }
+                }
+                extPopupFor?.let { id -> ExtensionPageDialog(id, options = false) { extPopupFor = null } }
+                extOptionsFor?.let { id -> ExtensionPageDialog(id, options = true) { extOptionsFor = null } }
+
+                // Главное меню
+                if (showMenuSheet) {
+                    val isBookmarked = bookmarks.any { it.first == activeTab.url }
+                    OmniSheet(onDismiss = { showMenuSheet = false }) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            OmniIconButton(OmniIcons.Back, "Назад", {
+                                activeTab.webView?.goBack()
+                                showMenuSheet = false
+                            }, enabled = activeTab.canGoBack)
+                            OmniIconButton(OmniIcons.Forward, "Вперёд", {
+                                activeTab.webView?.goForward()
+                                showMenuSheet = false
+                            }, enabled = activeTab.canGoForward)
+                            OmniIconButton(if (isBookmarked) OmniIcons.Star else OmniIcons.StarOutline, "Закладка", {
+                                if (isBookmarked) {
+                                    bookmarks.removeAll { it.first == activeTab.url }
+                                } else {
+                                    bookmarks.add(0, activeTab.url to activeTab.title.ifBlank { activeTab.url })
+                                }
+                                persistBrowserSettings()
+                            }, tint = if (isBookmarked) Omni.Accent else Omni.Text)
+                            OmniIconButton(OmniIcons.Refresh, "Обновить", {
+                                activeTab.webView?.reload()
+                                showMenuSheet = false
+                            })
+                            OmniIconButton(OmniIcons.Home, "Домой", {
+                                navigateTab(activeTab, homePageUrl)
+                                showMenuSheet = false
+                            })
+                        }
+                        SheetDivider()
+                        SheetItem(OmniIcons.Add, "Новая вкладка", onClick = {
+                            showMenuSheet = false
+                            openNewTab(homePageUrl)
+                        })
+                        SheetItem(OmniIcons.Incognito, "Новая вкладка инкогнито", onClick = {
+                            showMenuSheet = false
+                            openNewTab("https://duckduckgo.com", incognito = true)
+                        })
+                        SheetItem(OmniIcons.Star, "Закладки", subtitle = "Сохранено: ${bookmarks.size}", onClick = {
+                            showMenuSheet = false
+                            activeExtensionPopup = "bookmarks"
+                        })
+                        SheetItem(OmniIcons.History, "История и загрузки", onClick = {
+                            showMenuSheet = false
+                            currentSection = 2
+                        })
+                        SheetItem(OmniIcons.Search, "Найти на странице", onClick = {
+                            showMenuSheet = false
+                            findBarVisible = true
+                        })
+                        SheetItem(OmniIcons.Share, "Поделиться", onClick = {
+                            showMenuSheet = false
+                            shareText(activeTab.url)
+                        })
+                        SheetItem(OmniIcons.Copy, "Копировать адрес", onClick = {
+                            showMenuSheet = false
+                            copyToClipboard(activeTab.url)
+                        })
+                        SheetDivider()
+                        SheetItem(OmniIcons.Extension, "Расширения", subtitle = "Chrome Web Store", onClick = {
+                            showMenuSheet = false
+                            showExtensionsSheet = true
+                        })
+                        SheetItem(
+                            OmniIcons.Shield,
+                            "VPN браузера",
+                            subtitle = if (browserVpnEnabled) "Включён · $browserVpnCountry" else "Выключен",
+                            tint = if (browserVpnEnabled) Omni.Success else Omni.TextDim,
+                            onClick = {
+                                showMenuSheet = false
+                                activeExtensionPopup = "browsec"
+                            }
+                        )
+                        SheetItem(OmniIcons.Block, "Блокировка рекламы", subtitle = if (adBlockEnabled) "Заблокировано: $adBlockedCount" else "Выключена", onClick = {
+                            showMenuSheet = false
+                            activeExtensionPopup = "adblock"
+                        })
+                        SheetItem(OmniIcons.Play, "YouTube", onClick = {
+                            showMenuSheet = false
+                            activeExtensionPopup = "youtube"
+                        })
+                        SheetSwitchItem(OmniIcons.Desktop, "Версия для ПК", checked = desktopMode, onCheckedChange = { v ->
+                            desktopMode = v
+                            activeTab.webView?.settings?.userAgentString = if (v) ExtensionStore.DESKTOP_UA else null
+                            activeTab.webView?.reload()
+                            persistBrowserSettings()
+                        })
+                        SheetSwitchItem(OmniIcons.Contrast, "Инверсия цветов", subtitle = "Для настоящей тёмной темы установите Dark Reader", checked = darkReaderEnabled, onCheckedChange = { v ->
+                            darkReaderEnabled = v
+                            activeTab.webView?.let { injectActiveExtensions(it) }
+                            persistBrowserSettings()
+                        })
+                        SheetItem(OmniIcons.Settings, "Настройки", onClick = {
+                            showMenuSheet = false
+                            activeExtensionPopup = "settings"
+                        })
+                    }
+                }
+
+                // Долгое нажатие на ссылку или картинку
+                if (longPressedUrl != null || longPressImageUrl != null) {
+                    val link = longPressedUrl
+                    val img = longPressImageUrl
+                    OmniSheet(onDismiss = {
+                        longPressedUrl = null
+                        longPressImageUrl = null
+                    }) {
+                        SheetTitle(if (link != null) "Ссылка" else "Изображение", link ?: img)
+                        if (link != null) {
+                            SheetItem(OmniIcons.Add, "Открыть в новой вкладке", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                openNewTab(link)
+                            })
+                            SheetItem(OmniIcons.Incognito, "Открыть в инкогнито", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                openNewTab(link, incognito = true)
+                            })
+                            SheetItem(OmniIcons.Copy, "Копировать ссылку", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                copyToClipboard(link)
+                            })
+                            SheetItem(OmniIcons.Download, "Скачать по ссылке", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                startWebDownload(activeTab, link, activeTab.webView?.settings?.userAgentString, null, null)
+                            })
+                            SheetItem(OmniIcons.Share, "Поделиться ссылкой", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                shareText(link)
+                            })
+                        }
+                        if (img != null) {
+                            if (link != null) SheetDivider()
+                            SheetItem(OmniIcons.Image, "Открыть изображение", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                openNewTab(img)
+                            })
+                            SheetItem(OmniIcons.Save, "Сохранить изображение", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                startWebDownload(activeTab, img, activeTab.webView?.settings?.userAgentString, null, null)
+                            })
+                            SheetItem(OmniIcons.Copy, "Копировать адрес изображения", onClick = {
+                                longPressedUrl = null
+                                longPressImageUrl = null
+                                copyToClipboard(img)
+                            })
                         }
                     }
                 }
 
-                // 5. Interactive Extension Popups (With Crisp Non-Clipped Inputs)
-                AnimatedVisibility(visible = activeExtensionPopup != null) {
-                    Surface(
-                        color = Color(0xFF1E293B),
-                        shape = RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, Color(0xFF38BDF8), RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp))
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                // 5. Панели (VPN, блокировщик, YouTube, закладки, настройки) — единая шторка
+                if (activeExtensionPopup != null) {
+                    OmniSheet(onDismiss = { activeExtensionPopup = null }) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
                             when (activeExtensionPopup) {
                                 "browsec" -> {
                                     Row(
@@ -1522,7 +1710,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            "🌐 Репитер Браузера №1: ${browserTrafficSnapshot.activeCountryName} • IP: ${browserTrafficSnapshot.remoteServerIpPort}",
+                                            "Репитер Браузера №1: ${browserTrafficSnapshot.activeCountryName} • IP: ${browserTrafficSnapshot.remoteServerIpPort}",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
                                             fontSize = 12.sp,
@@ -1538,31 +1726,31 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     }
 
                                     Surface(
-                                        color = Color(0xFF090D16),
+                                        color = Omni.Bg,
                                         shape = RoundedCornerShape(8.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981))
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent)
                                     ) {
                                         Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                             Text(
-                                                "🌍 СЕРВЕР БРАУЗЕРА №1: ${browserTrafficSnapshot.activeCountryName} | IP: ${browserTrafficSnapshot.remoteServerIpPort} | Пинг: ${browserTrafficSnapshot.pingMs} мс",
-                                                color = Color(0xFF34D399),
+                                                "СЕРВЕР БРАУЗЕРА №1: ${browserTrafficSnapshot.activeCountryName} | IP: ${browserTrafficSnapshot.remoteServerIpPort} | Пинг: ${browserTrafficSnapshot.pingMs} мс",
+                                                color = Omni.Success,
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 11.sp
                                             )
                                             Text(
-                                                "⚙️ Настройка сервера: ${browserTrafficSnapshot.currentStrategyName} • ${browserTrafficSnapshot.watchdogStatusText}",
-                                                color = Color(0xFFFACC15),
+                                                "Настройка сервера: ${browserTrafficSnapshot.currentStrategyName} • ${browserTrafficSnapshot.watchdogStatusText}",
+                                                color = Omni.Warning,
                                                 fontSize = 10.sp
                                             )
                                             Text(
-                                                "⬇ Входящий (только этот сервер): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.rxSpeedBytesPerSec)}  |  Объём сервера: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.rxBytesTotal)}",
-                                                color = Color(0xFF38BDF8),
+                                                "Входящий (только этот сервер): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.rxSpeedBytesPerSec)}  |  Объём сервера: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.rxBytesTotal)}",
+                                                color = Omni.Accent,
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace
                                             )
                                             Text(
-                                                "⬆ Исходящий (только этот сервер): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.txSpeedBytesPerSec)}  |  Объём сервера: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.txBytesTotal)}",
-                                                color = Color(0xFFFDE047),
+                                                "Исходящий (только этот сервер): ${BitTorrentEngine.formatSpeed(browserTrafficSnapshot.txSpeedBytesPerSec)}  |  Объём сервера: ${BitTorrentEngine.formatSize(browserTrafficSnapshot.txBytesTotal)}",
+                                                color = Omni.Warning,
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace
                                             )
@@ -1579,9 +1767,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 serverPickerTarget = "browser"
                                                 showServerPickerModal = true
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                         ) {
-                                            Text("🎯 Выбрать сервер из списка (22 страны)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                            Text("Выбрать сервер из списка (22 страны)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                                         }
 
                                         Button(
@@ -1596,9 +1784,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     Toast.LENGTH_LONG
                                                 ).show()
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                         ) {
-                                            Text("📲 Синхр.: Браузер ➔ Приложения", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                            Text("Синхр.: Браузер ➔ Приложения", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                                         }
 
                                         Button(
@@ -1613,9 +1801,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     Toast.LENGTH_LONG
                                                 ).show()
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                         ) {
-                                            Text("🌐 Синхр.: Приложения ➔ Браузер", fontSize = 11.sp, color = Color.White)
+                                            Text("Синхр.: Приложения ➔ Браузер", fontSize = 11.sp, color = Color.White)
                                         }
 
                                         Button(
@@ -1629,9 +1817,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 navigateTab(activeTab, activeTab.url)
                                                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                         ) {
-                                            Text("🔧 Авто-смена настроек / переход (с возвратом прошлого)", fontSize = 11.sp, color = Color.White)
+                                            Text("Авто-смена настроек / переход (с возвратом прошлого)", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
 
@@ -1643,9 +1831,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             val selected = browserVpnCountry == node.code
                                             val st = BrowserDirectRepeater.getServerState(node.code)
                                             Surface(
-                                                color = if (selected) Color(0xFF0284C7) else Color(0xFF0F172A),
+                                                color = if (selected) Omni.AccentContainer else Omni.Surface,
                                                 shape = RoundedCornerShape(8.dp),
-                                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                                                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
                                                 modifier = Modifier.clickable {
                                                     browserVpnCountry = node.code
                                                     browserVpnEnabled = true
@@ -1675,13 +1863,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     )
                                                     Text(
                                                         text = "${node.remoteIp}:${node.remotePort}",
-                                                        color = if (selected) Color(0xFFD1FAE5) else Color(0xFF94A3B8),
+                                                        color = if (selected) Omni.Text else Omni.TextDim,
                                                         fontSize = 9.sp,
                                                         fontFamily = FontFamily.Monospace
                                                     )
                                                     Text(
-                                                        text = "⬇${BrowsecVpnService.formatBytesShort(st.rxBytes.get())} ⬆${BrowsecVpnService.formatBytesShort(st.txBytes.get())}",
-                                                        color = if (selected) Color(0xFFFDE047) else Color(0xFF38BDF8),
+                                                        text = "${BrowsecVpnService.formatBytesShort(st.rxBytes.get())} ⬆${BrowsecVpnService.formatBytesShort(st.txBytes.get())}",
+                                                        color = if (selected) Omni.Warning else Omni.Accent,
                                                         fontSize = 9.sp,
                                                         fontFamily = FontFamily.Monospace
                                                     )
@@ -1703,7 +1891,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 navigateTab(activeTab, activeTab.url)
                                             },
                                             colors = ButtonDefaults.buttonColors(
-                                                containerColor = if (browserVpnEnabled) Color(0xFFDC2626) else Color(0xFF059669)
+                                                containerColor = if (browserVpnEnabled) Omni.DangerContainer else Omni.AccentContainer
                                             )
                                         ) {
                                             Text(
@@ -1718,9 +1906,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 activeExtensionPopup = null
                                                 currentSection = 3
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                         ) {
-                                            Text("📱 Перейти во 2-й Сервер (Список VPN Приложений: ${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
+                                            Text("Перейти во 2-й Сервер (Список VPN Приложений: ${vpnRoutedApps.size})", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
@@ -1731,14 +1919,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("🛡️ AdBlock Pro + YouTube Анти-Реклама", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        Text("AdBlock Pro + YouTube Анти-Реклама", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                         Switch(checked = adBlockEnabled, onCheckedChange = {
                                             adBlockEnabled = it
                                             persistBrowserSettings()
                                             activeTab.webView?.reload()
                                         })
                                     }
-                                    Text("Заблокировано рекламных запросов и трекеров: $adBlockedCount", color = Color(0xFF34D399), fontSize = 12.sp)
+                                    Text("Заблокировано рекламных запросов и трекеров: $adBlockedCount", color = Omni.Success, fontSize = 12.sp)
                                     var customDomain by remember { mutableStateOf("") }
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                                         CompactDarkTextField(
@@ -1760,158 +1948,145 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 }
 
                                 "youtube" -> {
-                                    Text("🎬 Прямой YouTube со звуком (Через Browsec VPN $browsecCountry)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                     var ytSearch by remember { mutableStateOf("") }
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    var audioBoost by remember { mutableStateOf(false) }
+                                    Text("YouTube", color = Omni.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                                    Text(
+                                        if (browserVpnEnabled) "Страницы идут через VPN браузера (обход DPI, $browserVpnCountry)." else "VPN браузера выключен — YouTube открывается напрямую.",
+                                        color = Omni.TextDim,
+                                        fontSize = 12.sp
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                         CompactDarkTextField(
                                             value = ytSearch,
                                             onValueChange = { ytSearch = it },
-                                            placeholder = "Введите название видео или песни для YouTube...",
+                                            placeholder = "Поиск видео на YouTube",
                                             modifier = Modifier.weight(1f),
                                             onGo = {
-                                                browsecEnabled = true
-                                                val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
-                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q")
-                                                activeExtensionPopup = null
+                                                if (ytSearch.isNotBlank()) {
+                                                    navigateTab(activeTab, "https://m.youtube.com/results?search_query=" + Uri.encode(ytSearch))
+                                                    activeExtensionPopup = null
+                                                }
                                             }
                                         )
                                         Button(
                                             onClick = {
-                                                browsecEnabled = true
-                                                val q = Uri.encode(ytSearch.ifBlank { "music 2026" })
-                                                navigateTab(activeTab, "https://m.youtube.com/results?search_query=$q", useProxyTunnel = true)
-                                                activeExtensionPopup = null
+                                                if (ytSearch.isNotBlank()) {
+                                                    navigateTab(activeTab, "https://m.youtube.com/results?search_query=" + Uri.encode(ytSearch))
+                                                    activeExtensionPopup = null
+                                                }
                                             },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                                        ) {
-                                            Text("▶ Найти (Без блокировок)", fontSize = 11.sp, color = Color.White)
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Accent, contentColor = Color.White)
+                                        ) { Text("Найти") }
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(onClick = {
+                                            navigateTab(activeTab, "https://m.youtube.com")
+                                            activeExtensionPopup = null
+                                        }) { Text("Мобильная версия", color = Omni.Text, fontSize = 13.sp) }
+                                        OutlinedButton(onClick = {
+                                            navigateTab(activeTab, "https://www.youtube.com/?app=desktop")
+                                            activeExtensionPopup = null
+                                        }) { Text("Версия для ПК", color = Omni.Text, fontSize = 13.sp) }
+                                    }
+                                    SettingSwitchRow(
+                                        "Громкость ×2",
+                                        "Настоящее усиление через WebAudio для видео на этой странице (видео с чужих доменов без CORS пропускаются, иначе они бы замолчали).",
+                                        audioBoost
+                                    ) { on ->
+                                        audioBoost = on
+                                        activeTab.webView?.evaluateJavascript(omniAudioBoostJs(if (on) 2.0 else 1.0)) { r ->
+                                            val res = r?.trim('"') ?: ""
+                                            val msg = when {
+                                                res == "no-webaudio" || res.startsWith("err") -> "WebAudio недоступен на этой странице"
+                                                res.startsWith("0/") -> "На странице нет подходящих видео"
+                                                on -> "Громкость ×2 включена"
+                                                else -> "Обычная громкость"
+                                            }
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                         }
                                     }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = true)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
-                                        ) {
-                                            Text("🎬 YouTube Туннель (100% Работает)", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                navigateTab(activeTab, "https://yewtu.be/feed/popular", useProxyTunnel = false)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
-                                        ) {
-                                            Text("🌐 Зеркало Yewtu.be", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                browsecEnabled = true
-                                                navigateTab(activeTab, "https://m.youtube.com", useProxyTunnel = false)
-                                                activeExtensionPopup = null
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
-                                        ) {
-                                            Text("📱 Прямой m.youtube.com", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        Button(
-                                            onClick = {
-                                                playNativeAudioChime(523.25, 110)
-                                                activeTab.webView?.evaluateJavascript(
-                                                    """
-                                                    (function(){
-                                                        document.querySelectorAll('video, audio').forEach(v => {
-                                                            v.muted = false;
-                                                            v.volume = 1.0;
-                                                            v.play();
-                                                        });
-                                                    })();
-                                                    """.trimIndent(),
-                                                    null
-                                                )
-                                                Toast.makeText(context, "🔊 Звук разблокирован и усилен!", Toast.LENGTH_SHORT).show()
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
-                                        ) {
-                                            Text("🔊 Усилить Звук 200%", fontSize = 11.sp, color = Color.White)
-                                        }
-                                    }
+                                    Text("SponsorBlock, Return YouTube Dislike и блокировщики рекламы ставятся в разделе «Расширения».", color = Omni.TextFaint, fontSize = 12.sp)
                                 }
 
                                 "bookmarks" -> {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text("⭐ Закладки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                        Button(onClick = {
-                                            bookmarks.add(0, activeTab.url to activeTab.title.ifBlank { activeTab.url })
-                                            Toast.makeText(context, "⭐ Добавлено в закладки", Toast.LENGTH_SHORT).show()
-                                        }) {
-                                            Text("+ Сохранить вкладку", fontSize = 11.sp, color = Color.White)
-                                        }
-                                    }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        bookmarks.forEach { (bUrl, bTitle) ->
-                                            OutlinedButton(onClick = {
-                                                navigateTab(activeTab, bUrl)
-                                                activeExtensionPopup = null
-                                            }) {
-                                                Text(bTitle, fontSize = 11.sp, color = Color.White)
+                                    val isBookmarked = bookmarks.any { it.first == activeTab.url }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Закладки", color = Omni.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, modifier = Modifier.weight(1f))
+                                        TextButton(onClick = {
+                                            if (isBookmarked) {
+                                                bookmarks.removeAll { it.first == activeTab.url }
+                                            } else {
+                                                bookmarks.add(0, activeTab.url to activeTab.title.ifBlank { activeTab.url })
                                             }
-                                        }
+                                            persistBrowserSettings()
+                                        }) { Text(if (isBookmarked) "Убрать эту страницу" else "Добавить эту страницу", color = Omni.Accent) }
                                     }
-                                }
-
-                                "find" -> {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        CompactDarkTextField(
-                                            value = findInPageQuery,
-                                            onValueChange = {
-                                                findInPageQuery = it
-                                                activeTab.webView?.findAllAsync(it)
-                                            },
-                                            placeholder = "Найти слово на странице...",
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        Button(onClick = { activeTab.webView?.findNext(true) }) {
-                                            Text("Далее ↓", fontSize = 11.sp, color = Color.White)
-                                        }
-                                        OutlinedButton(onClick = {
-                                            activeTab.webView?.clearMatches()
-                                            activeExtensionPopup = null
-                                        }) {
-                                            Text("✕", fontSize = 11.sp, color = Color.White)
+                                    if (bookmarks.isEmpty()) Text("Закладок пока нет", color = Omni.TextDim, fontSize = 13.sp)
+                                    bookmarks.toList().forEach { (bUrl, bTitle) ->
+                                        Row(
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(Omni.SurfaceHigh)
+                                                .clickable {
+                                                    navigateTab(activeTab, bUrl)
+                                                    activeExtensionPopup = null
+                                                }
+                                                .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(Modifier.weight(1f)) {
+                                                Text(bTitle, color = Omni.Text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(omniDisplayUrl(bUrl), color = Omni.TextDim, fontSize = 12.sp, maxLines = 1)
+                                            }
+                                            OmniIconButton(OmniIcons.Delete, "Удалить закладку", {
+                                                bookmarks.removeAll { it.first == bUrl }
+                                                persistBrowserSettings()
+                                            }, tint = Omni.TextDim, size = 36.dp, iconSize = 18.dp)
                                         }
                                     }
                                 }
 
                                 "settings" -> {
-                                    Text("⚙️ Основные Настройки Браузера и Приватности", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text("Настройки", color = Omni.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                                    SettingSwitchRow("Не отслеживать (DNT и GPC)", "Отправлять сайтам запрет на отслеживание", doNotTrackEnabled) { v ->
+                                        doNotTrackEnabled = v
+                                        persistBrowserSettings()
+                                    }
+                                    SettingSwitchRow("Блокировать сторонние cookies", "Меньше слежки; вход через Google/VK на некоторых сайтах может сломаться", blockThirdPartyCookies) { v ->
+                                        blockThirdPartyCookies = v
+                                        tabs.forEach { t -> t.webView?.let { CookieManager.getInstance().setAcceptThirdPartyCookies(it, !v) } }
+                                        persistBrowserSettings()
+                                    }
+                                    SettingSwitchRow("Версия для ПК", "Открывать сайты как на компьютере", desktopMode) { v ->
+                                        desktopMode = v
+                                        activeTab.webView?.settings?.userAgentString = if (v) ExtensionStore.DESKTOP_UA else null
+                                        activeTab.webView?.reload()
+                                        persistBrowserSettings()
+                                    }
+                                    SettingSwitchRow("Инверсия цветов", "Простая тёмная тема для любых сайтов", darkReaderEnabled) { v ->
+                                        darkReaderEnabled = v
+                                        activeTab.webView?.let { injectActiveExtensions(it) }
+                                        persistBrowserSettings()
+                                    }
+                                    SettingSwitchRow("Консоль разработчика (Eruda)", "Загружается с jsdelivr на текущую страницу", devToolsEnabled) { v ->
+                                        devToolsEnabled = v
+                                        activeTab.webView?.let { injectActiveExtensions(it) }
+                                    }
                                     // 1. Search Engine Selector
                                     Row(
                                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("🔍 Поиск:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        Text("Поиск:", color = Omni.TextDim, fontSize = 11.sp)
                                         listOf("Google", "Яндекс", "DuckDuckGo", "Bing", "Brave").forEach { eng ->
                                             val sel = searchEngine == eng
                                             Surface(
-                                                color = if (sel) Color(0xFF0284C7) else Color(0xFF0F172A),
+                                                color = if (sel) Omni.AccentContainer else Omni.Surface,
                                                 shape = RoundedCornerShape(6.dp),
-                                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                                                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
                                                 modifier = Modifier.clickable {
                                                     searchEngine = eng
                                                     persistBrowserSettings()
@@ -1927,11 +2102,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("🔠 Масштаб:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        Text("Масштаб:", color = Omni.TextDim, fontSize = 11.sp)
                                         listOf(75, 100, 115, 130, 150, 175).forEach { pct ->
                                             val sel = textZoomPercent == pct
                                             Surface(
-                                                color = if (sel) Color(0xFF059669) else Color(0xFF0F172A),
+                                                color = if (sel) Omni.AccentContainer else Omni.Surface,
                                                 shape = RoundedCornerShape(6.dp),
                                                 modifier = Modifier.clickable {
                                                     textZoomPercent = pct
@@ -1949,11 +2124,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("🛡 DoH DNS:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                        Text("DoH DNS:", color = Omni.TextDim, fontSize = 11.sp)
                                         listOf("1.1.1.1" to "Cloudflare 1.1.1.1", "8.8.8.8" to "Google 8.8.8.8", "9.9.9.9" to "Quad9 9.9.9.9").forEach { (ip, label) ->
                                             val sel = dohServer == ip
                                             Surface(
-                                                color = if (sel) Color(0xFF7C3AED) else Color(0xFF0F172A),
+                                                color = if (sel) Omni.AccentContainer else Omni.Surface,
                                                 shape = RoundedCornerShape(6.dp),
                                                 modifier = Modifier.clickable {
                                                     dohServer = ip
@@ -1974,8 +2149,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             homePageUrl = activeTab.url
                                             persistBrowserSettings()
                                             Toast.makeText(context, "🏠 Домашняя страница: $homePageUrl", Toast.LENGTH_SHORT).show()
-                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))) {
-                                            Text("🏠 Сделать Домашней", fontSize = 11.sp, color = Color.White)
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)) {
+                                            Text("Сделать Домашней", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(onClick = {
                                             try {
@@ -1985,16 +2160,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                 Toast.makeText(context, "📄 Сохранено офлайн: ${mhtFile.name}", Toast.LENGTH_LONG).show()
                                             } catch (_: Exception) {
                                             }
-                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))) {
-                                            Text("📄 Сохранить страницу (.MHT)", fontSize = 11.sp, color = Color.White)
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)) {
+                                            Text("Сохранить страницу (.MHT)", fontSize = 11.sp, color = Color.White)
                                         }
                                         Button(onClick = {
                                             activeTab.webView?.clearCache(true)
                                             CookieManager.getInstance().removeAllCookies(null)
                                             CookieManager.getInstance().flush()
                                             Toast.makeText(context, "🗑 Кэш и Cookies очищены!", Toast.LENGTH_SHORT).show()
-                                        }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))) {
-                                            Text("🗑 Очистить Кэш и Cookies", fontSize = 11.sp, color = Color.White)
+                                        }, colors = ButtonDefaults.buttonColors(containerColor = Omni.DangerContainer)) {
+                                            Text("Очистить Кэш и Cookies", fontSize = 11.sp, color = Color.White)
                                         }
                                     }
                                 }
@@ -2005,13 +2180,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                 if (activeTab.lastErrorText != null) {
                     Surface(
-                        color = Color(0xFF3B0764),
+                        color = Omni.DangerContainer,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(
-                                text = "⚠️ Таймаут или блокировка: ${activeTab.lastErrorText}",
-                                color = Color(0xFFFDE047),
+                                text = "Таймаут или блокировка: ${activeTab.lastErrorText}",
+                                color = Omni.Warning,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -2029,15 +2204,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         navigateTab(activeTab, activeTab.url)
                                         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                     },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                 ) {
-                                    Text("🌐 Сменить настройку / сервер ($browserVpnCountry) и Обновить страницу", fontSize = 11.sp, color = Color.White)
+                                    Text("Сменить настройку / сервер ($browserVpnCountry) и Обновить страницу", fontSize = 11.sp, color = Color.White)
                                 }
                                 Button(
                                     onClick = { navigateTab(activeTab, "https://m.youtube.com") },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.DangerContainer)
                                 ) {
-                                    Text("🎬 Открыть m.youtube.com", fontSize = 11.sp, color = Color.White)
+                                    Text("Открыть m.youtube.com", fontSize = 11.sp, color = Color.White)
                                 }
                             }
                         }
@@ -2066,10 +2241,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             fullscreenCallback?.onCustomViewHidden()
                             fullscreenCallback = null
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC0F172A)),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
                         modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
                     ) {
-                        Text("✕ Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                        Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
                     }
                 }
             }
@@ -2352,46 +2527,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
-            // ===================== BOTTOM NAVIGATION BAR (4 SECTIONS) =====================
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF0F172A))
-                    .padding(horizontal = 6.dp, vertical = 5.dp),
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                BottomSectionButton(
-                    modifier = Modifier.weight(1f),
-                    title = "🌐 Браузер (${tabs.size})",
-                    subtitle = if (activeTab.isLoading) "Загрузка ${activeTab.loadingProgress}%" else "Репитер №1 ($browserVpnCountry)",
-                    selected = currentSection == 0,
-                    activeColor = Color(0xFF0284C7)
-                ) { currentSection = 0 }
-
-                BottomSectionButton(
-                    modifier = Modifier.weight(1f),
-                    title = "🧲 Торрент (${torrentStatuses.size})",
-                    subtitle = "+ Browsec VPN",
-                    selected = currentSection == 1,
-                    activeColor = Color(0xFF059669)
-                ) { currentSection = 1 }
-
-                BottomSectionButton(
-                    modifier = Modifier.weight(1f),
-                    title = "📥 Загрузки",
-                    subtitle = "🕘 История (${historyList.size})",
-                    selected = currentSection == 2,
-                    activeColor = Color(0xFFD97706)
-                ) { currentSection = 2 }
-
-                BottomSectionButton(
-                    modifier = Modifier.weight(1f),
-                    title = "📱 Список VPN",
-                    subtitle = if (browsecEnabled) "Репитер №2 ВКЛ ($browsecCountry)" else "Репитер №2 (${vpnRoutedApps.size})",
-                    selected = currentSection == 3,
-                    activeColor = Color(0xFF7C3AED)
-                ) { currentSection = 3 }
+            // ===================== НИЖНЯЯ НАВИГАЦИЯ =====================
+            if (fullscreenCustomView == null) {
+                OmniBottomBar(
+                    selected = currentSection,
+                    items = listOf(
+                        OmniNavItem("Браузер", OmniIcons.Globe),
+                        OmniNavItem("Торренты", OmniIcons.Torrent),
+                        OmniNavItem("История", OmniIcons.History),
+                        OmniNavItem("Приложения", OmniIcons.Apps)
+                    ),
+                    onSelect = { currentSection = it }
+                )
             }
         }
     }
@@ -2418,14 +2565,14 @@ private fun TorrentClientSection(
 
     Column(
         modifier = modifier
-            .background(Color(0xFF090D16))
+            .background(Omni.Bg)
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Surface(
-            color = Color(0xFF111827),
+            color = Omni.Surface,
             shape = RoundedCornerShape(12.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF059669))
+            border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
         ) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
@@ -2435,14 +2582,14 @@ private fun TorrentClientSection(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "🧲 BitTorrent Клиент + Browsec VPN ($browsecCountry)",
+                            text = "BitTorrent Клиент + Browsec VPN ($browsecCountry)",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp
                         )
                         Text(
                             text = "Папка: ${torrentEngine.getPublicDisplayPath()}",
-                            color = Color(0xFF34D399),
+                            color = Omni.Success,
                             fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -2450,11 +2597,11 @@ private fun TorrentClientSection(
                     }
                     Button(
                         onClick = onPickTorrentFile,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                         modifier = Modifier.height(34.dp)
                     ) {
-                        Text("📂 Файл .torrent", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text("Файл .torrent", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
 
@@ -2465,7 +2612,7 @@ private fun TorrentClientSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Surface(
-                        color = if (browsecEnabled) Color(0xFF0284C7) else Color(0xFF1E293B),
+                        color = if (browsecEnabled) Omni.AccentContainer else Omni.SurfaceHighest,
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.clickable { onToggleBrowsec() }
                     ) {
@@ -2479,13 +2626,13 @@ private fun TorrentClientSection(
                     }
 
                     Surface(
-                        color = Color(0xFF1E293B),
+                        color = Omni.SurfaceHighest,
                         shape = RoundedCornerShape(8.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
                         modifier = Modifier.clickable { onCycleCountry() }
                     ) {
                         Text(
-                            text = "🌍 Сменить страну ($browsecCountry)",
+                            text = "Сменить страну ($browsecCountry)",
                             color = Color.White,
                             fontSize = 11.sp,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
@@ -2493,12 +2640,12 @@ private fun TorrentClientSection(
                     }
 
                     Surface(
-                        color = Color(0xFF065F46),
+                        color = Omni.SurfaceHighest,
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.clickable { onRequestStorageAccess() }
                     ) {
                         Text(
-                            text = "🔓 Доступ к памяти (/Download)",
+                            text = "Доступ к памяти (/Download)",
                             color = Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
@@ -2535,9 +2682,9 @@ private fun TorrentClientSection(
                         },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                     ) {
-                        Text("⬇ Скачать", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text("Скачать", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
 
@@ -2570,7 +2717,7 @@ private fun TorrentClientSection(
                         },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                     ) {
                         Text(if (isSearching) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
@@ -2585,8 +2732,8 @@ private fun TorrentClientSection(
             if (statuses.isNotEmpty()) {
                 item {
                     Text(
-                        text = "📥 Активные и завершённые торрент-загрузки (${statuses.size}):",
-                        color = Color(0xFF38BDF8),
+                        text = "Активные и завершённые торрент-загрузки (${statuses.size}):",
+                        color = Omni.Accent,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
@@ -2594,11 +2741,11 @@ private fun TorrentClientSection(
 
                 items(statuses, key = { it.id }) { st ->
                     Surface(
-                        color = Color(0xFF151F32),
+                        color = Omni.SurfaceHigh,
                         shape = RoundedCornerShape(12.dp),
                         border = androidx.compose.foundation.BorderStroke(
                             1.dp,
-                            if (st.state == TorrentState.COMPLETED) Color(0xFF10B981) else Color(0xFF38BDF8)
+                            if (st.state == TorrentState.COMPLETED) Omni.Accent else Omni.TextDim
                         )
                     ) {
                         Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -2618,7 +2765,7 @@ private fun TorrentClientSection(
                                 )
                                 Text(
                                     text = "${(st.progressFraction * 100).toInt()}%",
-                                    color = Color(0xFF34D399),
+                                    color = Omni.Success,
                                     fontWeight = FontWeight.ExtraBold,
                                     fontSize = 14.sp
                                 )
@@ -2627,8 +2774,8 @@ private fun TorrentClientSection(
                             LinearProgressIndicator(
                                 progress = { st.progressFraction },
                                 modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
-                                color = if (st.state == TorrentState.COMPLETED) Color(0xFF10B981) else Color(0xFF38BDF8),
-                                trackColor = Color(0xFF0F172A)
+                                color = if (st.state == TorrentState.COMPLETED) Omni.Success else Omni.Accent,
+                                trackColor = Omni.Surface
                             )
 
                             Canvas(
@@ -2636,14 +2783,14 @@ private fun TorrentClientSection(
                                     .fillMaxWidth()
                                     .height(8.dp)
                                     .clip(RoundedCornerShape(3.dp))
-                                    .background(Color(0xFF090D16))
+                                    .background(Omni.Bg)
                             ) {
                                 val count = st.pieceBitfield.size.coerceAtLeast(1)
                                 val cellW = size.width / count
                                 for (i in 0 until count) {
                                     if (st.pieceBitfield[i]) {
                                         drawRect(
-                                            color = Color(0xFF10B981),
+                                            color = Omni.Success,
                                             topLeft = Offset(i * cellW, 0f),
                                             size = Size(cellW.coerceAtLeast(2f), size.height)
                                         )
@@ -2653,12 +2800,12 @@ private fun TorrentClientSection(
 
                             Text(
                                 text = "${st.state.labelRu} • Скорость: ${BitTorrentEngine.formatSpeed(st.downloadSpeedBytesPerSec)} • Пиры: ${st.connectedPeers}/${st.knownPeers}",
-                                color = Color(0xFF94A3B8),
+                                color = Omni.TextDim,
                                 fontSize = 11.sp
                             )
                             Text(
                                 text = st.statusDetail,
-                                color = Color(0xFFE2E8F0),
+                                color = Omni.Text,
                                 fontSize = 11.sp
                             )
 
@@ -2676,9 +2823,9 @@ private fun TorrentClientSection(
                                     },
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                                     modifier = Modifier.weight(1.2f).height(36.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                 ) {
-                                    Text("📱 Открыть файл", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
+                                    Text("Открыть файл", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
                                 }
 
                                 OutlinedButton(
@@ -2694,7 +2841,7 @@ private fun TorrentClientSection(
                                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                                     modifier = Modifier.weight(0.9f).height(36.dp)
                                 ) {
-                                    Text("🗑 Удалить", fontSize = 11.sp, color = Color(0xFFEF4444), maxLines = 1)
+                                    Text("Удалить", fontSize = 11.sp, color = Omni.Danger, maxLines = 1)
                                 }
                             }
                         }
@@ -2704,8 +2851,8 @@ private fun TorrentClientSection(
 
             item {
                 Text(
-                    text = "🔥 Проверенные торренты (Игры .EXE, Программы 32/64-bit, Видео MP4, APK):",
-                    color = Color(0xFFFBBF24),
+                    text = "Проверенные торренты (Игры .EXE, Программы 32/64-bit, Видео MP4, APK):",
+                    color = Omni.Warning,
                     fontWeight = FontWeight.Bold,
                     fontSize = 13.sp
                 )
@@ -2713,9 +2860,9 @@ private fun TorrentClientSection(
 
             items(catalogItems) { item ->
                 Surface(
-                    color = Color(0xFF111827),
+                    color = Omni.Surface,
                     shape = RoundedCornerShape(10.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B))
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
                 ) {
                     Row(
                         modifier = Modifier
@@ -2726,8 +2873,8 @@ private fun TorrentClientSection(
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                             Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                            Text("${item.category} • Размер: ${item.sizeLabel}", color = Color(0xFF38BDF8), fontSize = 11.sp)
-                            Text(item.description, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 2)
+                            Text("${item.category} • Размер: ${item.sizeLabel}", color = Omni.Accent, fontSize = 11.sp)
+                            Text(item.description, color = Omni.TextDim, fontSize = 11.sp, maxLines = 2)
                         }
                         Button(
                             onClick = {
@@ -2735,9 +2882,9 @@ private fun TorrentClientSection(
                                 Toast.makeText(context, "🧲 Скачивание начато: ${item.title}", Toast.LENGTH_SHORT).show()
                             },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                         ) {
-                            Text("⬇ Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     }
                 }
@@ -2776,7 +2923,7 @@ private fun HistoryAndDownloadsSection(
 
     Column(
         modifier = modifier
-            .background(Color(0xFF090D16))
+            .background(Omni.Bg)
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -2787,24 +2934,24 @@ private fun HistoryAndDownloadsSection(
             Button(
                 onClick = { subTab = 0; refreshTrigger++ },
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 0) Color(0xFF059669) else Color(0xFF1E293B))
+                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 0) Omni.AccentContainer else Omni.SurfaceHighest)
             ) {
-                Text("📥 Загрузки (${downloadedFiles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                Text("Загрузки (${downloadedFiles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
             }
             Button(
                 onClick = { subTab = 1 },
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 1) Color(0xFF0284C7) else Color(0xFF1E293B))
+                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 1) Omni.AccentContainer else Omni.SurfaceHighest)
             ) {
-                Text("🕘 История (${historyList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                Text("История (${historyList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
             }
         }
 
         if (subTab == 0) {
             Surface(
-                color = Color(0xFF111827),
+                color = Omni.Surface,
                 shape = RoundedCornerShape(10.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF059669))
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(10.dp),
@@ -2812,15 +2959,15 @@ private fun HistoryAndDownloadsSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("📂 Скачанные файлы (/Download/OmniTorrents)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Text("Файлы синхронизированы с системной папкой Загрузки Android", color = Color(0xFF34D399), fontSize = 11.sp)
+                        Text("Скачанные файлы (/Download/OmniTorrents)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text("Файлы синхронизированы с системной папкой Загрузки Android", color = Omni.Success, fontSize = 11.sp)
                     }
                     Button(
                         onClick = onRequestStorageAccess,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                     ) {
-                        Text("🔓 Доступ к памяти", fontSize = 11.sp, color = Color.White)
+                        Text("Доступ к памяти", fontSize = 11.sp, color = Color.White)
                     }
                 }
             }
@@ -2833,7 +2980,7 @@ private fun HistoryAndDownloadsSection(
                     item {
                         Text(
                             "Пока нет скачанных файлов. Перейдите во вкладку «🧲 Торрент» или скачайте файл в браузере.",
-                            color = Color(0xFF94A3B8),
+                            color = Omni.TextDim,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(12.dp)
                         )
@@ -2841,9 +2988,9 @@ private fun HistoryAndDownloadsSection(
                 }
                 items(downloadedFiles, key = { it.absolutePath }) { file ->
                     Surface(
-                        color = Color(0xFF151F32),
+                        color = Omni.SurfaceHigh,
                         shape = RoundedCornerShape(10.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155))
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(10.dp),
@@ -2854,7 +3001,7 @@ private fun HistoryAndDownloadsSection(
                                 Text(file.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                 Text(
                                     "${BitTorrentEngine.formatSize(file.length())} • ${file.absolutePath}",
-                                    color = Color(0xFF38BDF8),
+                                    color = Omni.Accent,
                                     fontSize = 10.sp,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
@@ -2868,9 +3015,9 @@ private fun HistoryAndDownloadsSection(
                                         }
                                     },
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                 ) {
-                                    Text("📱 Открыть", fontSize = 11.sp, color = Color.White)
+                                    Text("Открыть", fontSize = 11.sp, color = Color.White)
                                 }
                                 OutlinedButton(
                                     onClick = {
@@ -2879,7 +3026,7 @@ private fun HistoryAndDownloadsSection(
                                     },
                                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                                 ) {
-                                    Text("🗑", fontSize = 11.sp, color = Color(0xFFEF4444))
+                                    Text("🗑", fontSize = 11.sp, color = Omni.Danger)
                                 }
                             }
                         }
@@ -2892,9 +3039,9 @@ private fun HistoryAndDownloadsSection(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("🕘 История посещённых сайтов (${historyList.size}):", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("История посещённых сайтов (${historyList.size}):", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 OutlinedButton(onClick = onClearHistory) {
-                    Text("🗑 Очистить историю", fontSize = 11.sp, color = Color(0xFFEF4444))
+                    Text("Очистить историю", fontSize = 11.sp, color = Omni.Danger)
                 }
             }
 
@@ -2904,9 +3051,9 @@ private fun HistoryAndDownloadsSection(
             ) {
                 items(historyList) { entry ->
                     Surface(
-                        color = Color(0xFF111827),
+                        color = Omni.Surface,
                         shape = RoundedCornerShape(8.dp),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { onOpenUrlInBrowser(entry) }
@@ -2924,7 +3071,7 @@ private fun HistoryAndDownloadsSection(
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f)
                             )
-                            Text("Перейти →", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Перейти →", color = Omni.Accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -3002,7 +3149,7 @@ private fun NativeAppsWithBrowsecSection(
 
     Box(
         modifier = modifier
-            .background(Color(0xFF090D16))
+            .background(Omni.Bg)
     ) {
         Column(
             modifier = Modifier
@@ -3011,11 +3158,11 @@ private fun NativeAppsWithBrowsecSection(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Surface(
-                color = Color(0xFF111827),
+                color = Omni.Surface,
                 shape = RoundedCornerShape(12.dp),
                 border = androidx.compose.foundation.BorderStroke(
                     1.dp,
-                    if (browsecEnabled) Color(0xFF10B981) else Color(0xFF7C3AED)
+                    if (browsecEnabled) Omni.Accent else Omni.TextDim
                 )
             ) {
                 Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -3026,7 +3173,7 @@ private fun NativeAppsWithBrowsecSection(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "📱 Индивидуальный Туннель Приложений • По-приложенный проброс ($browsecCountry) • ⚡ Пинг: ${liveTraffic.pingMs} мс",
+                                text = "Индивидуальный Туннель Приложений • По-приложенный проброс ($browsecCountry) • ⚡ Пинг: ${liveTraffic.pingMs} мс",
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp
@@ -3037,19 +3184,19 @@ private fun NativeAppsWithBrowsecSection(
                                 } else {
                                     "⚪ VPN ПРИЛОЖЕНИЙ ВЫКЛ: Приложения работают напрямую без обхода блокировок"
                                 },
-                                color = if (browsecEnabled) Color(0xFF34D399) else Color(0xFFFACC15),
+                                color = if (browsecEnabled) Omni.Success else Omni.Warning,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "⬇ ВХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})  |  ⚡ Пинг: ${liveTraffic.pingMs} мс",
-                                color = Color(0xFF38BDF8),
+                                text = "ВХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})  |  ⚡ Пинг: ${liveTraffic.pingMs} мс",
+                                color = Omni.Accent,
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace
                             )
                             Text(
-                                text = "⚙️ ${liveTraffic.currentStrategyName} • Пинг: ${liveTraffic.pingMs} мс • ${liveTraffic.watchdogStatusText}",
-                                color = Color(0xFFFDE047),
+                                text = "${liveTraffic.currentStrategyName} • Пинг: ${liveTraffic.pingMs} мс • ${liveTraffic.watchdogStatusText}",
+                                color = Omni.Warning,
                                 fontSize = 10.sp
                             )
                         }
@@ -3058,7 +3205,7 @@ private fun NativeAppsWithBrowsecSection(
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                             modifier = Modifier.height(32.dp)
                         ) {
-                            Text("↻ Обновить", fontSize = 11.sp, color = Color.White)
+                            Text("Обновить", fontSize = 11.sp, color = Color.White)
                         }
                     }
 
@@ -3070,38 +3217,38 @@ private fun NativeAppsWithBrowsecSection(
                     ) {
                         Button(
                             onClick = { onOpenServerPicker("apps") },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
-                            Text("🎯 Выбрать сервер самостоятельно (22 страны)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("Выбрать сервер самостоятельно (22 страны)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
 
                         Button(
                             onClick = onSyncFromBrowserToApps,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
-                            Text("📲 Взять рабочий сервер из Браузера ($browserVpnCountry)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("Взять рабочий сервер из Браузера ($browserVpnCountry)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
 
                         Button(
                             onClick = onSyncFromAppsToBrowser,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED)),
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
-                            Text("🌐 Передать этот сервер в Браузер ($browsecCountry)", fontSize = 11.sp, color = Color.White)
+                            Text("Передать этот сервер в Браузер ($browsecCountry)", fontSize = 11.sp, color = Color.White)
                         }
 
                         Button(
                             onClick = onTriggerAutoHealNow,
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
-                            Text("🔧 Авто-смена настроек / переход (возврат прошлого)", fontSize = 11.sp, color = Color.White)
+                            Text("Авто-смена настроек / переход (возврат прошлого)", fontSize = 11.sp, color = Color.White)
                         }
                     }
 
@@ -3112,9 +3259,9 @@ private fun NativeAppsWithBrowsecSection(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Surface(
-                            color = if (syncBothVpnsAuto) Color(0xFF065F46) else Color(0xFF1E293B),
+                            color = if (syncBothVpnsAuto) Omni.AccentContainer else Omni.SurfaceHighest,
                             shape = RoundedCornerShape(8.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981)),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
                             modifier = Modifier.clickable { onToggleAutoSync(!syncBothVpnsAuto) }
                         ) {
                             Text(
@@ -3127,9 +3274,9 @@ private fun NativeAppsWithBrowsecSection(
                         }
 
                         Surface(
-                            color = if (autoHealEnabled) Color(0xFF1E3A8A) else Color(0xFF1E293B),
+                            color = if (autoHealEnabled) Omni.AccentContainer else Omni.SurfaceHighest,
                             shape = RoundedCornerShape(8.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8)),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
                             modifier = Modifier.clickable { onToggleAutoHeal(!autoHealEnabled) }
                         ) {
                             Text(
@@ -3148,14 +3295,14 @@ private fun NativeAppsWithBrowsecSection(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Общий сервер:", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        Text("Общий сервер:", color = Omni.TextDim, fontSize = 11.sp)
                         BrowsecLocalProxyServer.SERVER_NODES.forEach { node ->
                             val isSel = browsecCountry == node.code
                             val st = BrowsecLocalProxyServer.getServerState(node.code)
                             Surface(
-                                color = if (isSel) Color(0xFF0284C7) else Color(0xFF1E293B),
+                                color = if (isSel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, if (isSel) Color(0xFF38BDF8) else Color(0xFF334155)),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, if (isSel) Omni.Accent else Omni.Outline),
                                 modifier = Modifier.clickable { onSelectCountry(node.code) }
                             ) {
                                 Text(
@@ -3183,7 +3330,7 @@ private fun NativeAppsWithBrowsecSection(
                         categories.forEach { cat ->
                             val isSel = selectedCategory == cat
                             Surface(
-                                color = if (isSel) Color(0xFF7C3AED) else Color(0xFF1E293B),
+                                color = if (isSel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.clickable { selectedCategory = cat }
                             ) {
@@ -3215,11 +3362,11 @@ private fun NativeAppsWithBrowsecSection(
                     val isTelegramApp = nativeAppsManager.isTelegramPackage(app.packageName)
 
                     Surface(
-                        color = Color(0xFF111827),
+                        color = Omni.Surface,
                         shape = RoundedCornerShape(10.dp),
                         border = androidx.compose.foundation.BorderStroke(
                             1.dp,
-                            if (isInVpn) Color(0xFF10B981) else Color(0xFF334155)
+                            if (isInVpn) Omni.Accent else Omni.Outline
                         )
                     ) {
                         Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -3239,7 +3386,7 @@ private fun NativeAppsWithBrowsecSection(
                                         modifier = Modifier
                                             .size(42.dp)
                                             .clip(CircleShape)
-                                            .background(Color(0xFF1E293B)),
+                                            .background(Omni.SurfaceHighest),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Text("📱", fontSize = 18.sp)
@@ -3253,21 +3400,21 @@ private fun NativeAppsWithBrowsecSection(
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 13.sp
                                     )
-                                    Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                    Text(app.packageName, color = Omni.TextFaint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                                     Text(
                                         text = if (isInVpn) {
                                             "🟢 В СПИСКЕ VPN • Свой сервер: ${appNode.flag} ${appNode.countryRu} (${appNode.remoteIp}:${appNode.remotePort}) • ⚡ Пинг: ${appServerState.pingMs} мс • Порт: 127.0.0.1:${appProfile.localPort}"
                                         } else {
                                             "⚪ НЕ В СПИСКЕ VPN: Идёт напрямую через обычную сеть БЕЗ туннеля и БЕЗ обхода блокировок"
                                         },
-                                        color = if (isInVpn) Color(0xFF34D399) else Color(0xFFFACC15),
+                                        color = if (isInVpn) Omni.Success else Omni.Warning,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
                                     )
                                     if (isInVpn) {
                                         Text(
-                                            text = "📊 Трафик этого приложения: ⬇ ВХ: ${BrowsecVpnService.formatSpeedShort(appProfile.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.rxBytes.get())})  |  ⬆ ИСХ: ${BrowsecVpnService.formatSpeedShort(appProfile.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.txBytes.get())})",
-                                            color = Color(0xFF38BDF8),
+                                            text = "Трафик этого приложения: ⬇ ВХ: ${BrowsecVpnService.formatSpeedShort(appProfile.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.rxBytes.get())})  |  ⬆ ИСХ: ${BrowsecVpnService.formatSpeedShort(appProfile.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.txBytes.get())})",
+                                            color = Omni.Accent,
                                             fontSize = 10.sp,
                                             fontFamily = FontFamily.Monospace
                                         )
@@ -3282,14 +3429,14 @@ private fun NativeAppsWithBrowsecSection(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Surface(
-                                    color = Color(0xFF0284C7),
+                                    color = Omni.AccentContainer,
                                     shape = RoundedCornerShape(6.dp),
                                     modifier = Modifier.clickable {
                                         onOpenServerPicker("app:${app.packageName}")
                                     }
                                 ) {
                                     Text(
-                                        text = "🎯 Свой сервер (${appNode.flag} ${appNode.code})",
+                                        text = "Свой сервер (${appNode.flag} ${appNode.code})",
                                         color = Color.White,
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
@@ -3300,7 +3447,7 @@ private fun NativeAppsWithBrowsecSection(
                                 ALL_VPN_COUNTRIES_LIST.take(10).forEach { n ->
                                     val sel = appProfile.countryCode == n.code
                                     Surface(
-                                        color = if (sel) Color(0xFF059669) else Color(0xFF1E293B),
+                                        color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                         shape = RoundedCornerShape(6.dp),
                                         modifier = Modifier.clickable {
                                             onSelectAppSpecificCountry(app.packageName, n.code)
@@ -3338,10 +3485,10 @@ private fun NativeAppsWithBrowsecSection(
                                     },
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                                     modifier = Modifier.fillMaxWidth().height(36.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                 ) {
                                     Text(
-                                        text = "✈️ Подключить SOCKS5 туннель (DC1-DC5 / Видео DC2 и Файлы) в Telegram (127.0.0.1:${appProfile.localPort})",
+                                        text = "Подключить SOCKS5 туннель (DC1-DC5 / Видео DC2 и Файлы) в Telegram (127.0.0.1:${appProfile.localPort})",
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = Color.White,
@@ -3360,7 +3507,7 @@ private fun NativeAppsWithBrowsecSection(
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                                     modifier = Modifier.weight(1.4f).height(38.dp),
                                     colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (isInVpn) Color(0xFF059669) else Color(0xFF334155)
+                                        containerColor = if (isInVpn) Omni.AccentContainer else Omni.SurfaceHighest
                                     )
                                 ) {
                                     Text(
@@ -3385,7 +3532,7 @@ private fun NativeAppsWithBrowsecSection(
                                     Text(
                                         text = if (isInVpn) "✓ В VPN (Убрать)" else "+ Добавить в VPN",
                                         fontSize = 11.sp,
-                                        color = if (isInVpn) Color(0xFF34D399) else Color.White,
+                                        color = if (isInVpn) Omni.Success else Color.White,
                                         maxLines = 1
                                     )
                                 }
@@ -3397,9 +3544,9 @@ private fun NativeAppsWithBrowsecSection(
                                         },
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
                                         modifier = Modifier.height(38.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                     ) {
-                                        Text("📂 Файл", fontSize = 11.sp, color = Color.White)
+                                        Text("Файл", fontSize = 11.sp, color = Color.White)
                                     }
                                 }
                             }
@@ -3411,12 +3558,12 @@ private fun NativeAppsWithBrowsecSection(
 
         // ВНУТРЕННЯЯ ПЛАВАЮЩАЯ КНОПКА VPN В СПИСКЕ ПРИЛОЖЕНИЙ (Floating VPN Button inside VPN List)
         Surface(
-            color = if (browsecEnabled) Color(0xFF059669) else Color(0xFF1E293B),
+            color = if (browsecEnabled) Omni.AccentContainer else Omni.SurfaceHighest,
             shape = RoundedCornerShape(28.dp),
             shadowElevation = 10.dp,
             border = androidx.compose.foundation.BorderStroke(
                 2.dp,
-                if (browsecEnabled) Color(0xFF34D399) else Color(0xFF38BDF8)
+                if (browsecEnabled) Omni.Accent else Omni.TextDim
             ),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
@@ -3444,8 +3591,8 @@ private fun NativeAppsWithBrowsecSection(
                         fontSize = 12.sp
                     )
                     Text(
-                        text = "⚡ Пинг: ${liveTraffic.pingMs} мс • ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}",
-                        color = if (browsecEnabled) Color(0xFFD1FAE5) else Color(0xFF94A3B8),
+                        text = "Пинг: ${liveTraffic.pingMs} мс • ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}",
+                        color = if (browsecEnabled) Omni.Text else Omni.TextDim,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace
                     )
@@ -3473,9 +3620,9 @@ private fun ManualServerPickerDialog(
 ) {
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Surface(
-            color = Color(0xFF0F172A),
+            color = Omni.Surface,
             shape = RoundedCornerShape(14.dp),
-            border = androidx.compose.foundation.BorderStroke(2.dp, Color(0xFF38BDF8)),
+            border = androidx.compose.foundation.BorderStroke(2.dp, Omni.Accent),
             modifier = Modifier
                 .fillMaxWidth()
                 .fillMaxHeight(0.88f)
@@ -3492,7 +3639,7 @@ private fun ManualServerPickerDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "🎯 Выбор Сервера VPN (22 страны)",
+                        text = "Выбор Сервера VPN (22 страны)",
                         color = Color.White,
                         fontWeight = FontWeight.ExtraBold,
                         fontSize = 14.sp
@@ -3502,7 +3649,7 @@ private fun ManualServerPickerDialog(
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                         modifier = Modifier.height(32.dp)
                     ) {
-                        Text("✕ Закрыть", fontSize = 11.sp, color = Color.White)
+                        Text("Закрыть", fontSize = 11.sp, color = Color.White)
                     }
                 }
 
@@ -3519,9 +3666,9 @@ private fun ManualServerPickerDialog(
                     modes.forEach { (mKey, mTitle) ->
                         val sel = targetMode == mKey
                         Surface(
-                            color = if (sel) Color(0xFF0284C7) else Color(0xFF1E293B),
+                            color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                             shape = RoundedCornerShape(8.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, if (sel) Color(0xFF38BDF8) else Color(0xFF334155)),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, if (sel) Omni.Accent else Omni.Outline),
                             modifier = Modifier.clickable { onChangeTargetMode(mKey) }
                         ) {
                             Text(
@@ -3538,8 +3685,8 @@ private fun ManualServerPickerDialog(
                 if (targetMode.startsWith("app:")) {
                     val pkg = targetMode.removePrefix("app:")
                     Text(
-                        text = "📲 Индивидуальный сервер для приложения: $pkg",
-                        color = Color(0xFF34D399),
+                        text = "Индивидуальный сервер для приложения: $pkg",
+                        color = Omni.Success,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -3556,11 +3703,11 @@ private fun ManualServerPickerDialog(
                         val isActiveApps = appsVpnCountry == node.code
 
                         Surface(
-                            color = if (isActiveBrowser || isActiveApps) Color(0xFF1E293B) else Color(0xFF111827),
+                            color = if (isActiveBrowser || isActiveApps) Omni.SurfaceHighest else Omni.Surface,
                             shape = RoundedCornerShape(10.dp),
                             border = androidx.compose.foundation.BorderStroke(
                                 1.dp,
-                                if (isActiveBrowser || isActiveApps) Color(0xFF10B981) else Color(0xFF334155)
+                                if (isActiveBrowser || isActiveApps) Omni.Accent else Omni.Outline
                             ),
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -3582,28 +3729,28 @@ private fun ManualServerPickerDialog(
                                         fontSize = 12.sp
                                     )
                                     Text(
-                                        text = "⚡ ${brState.pingMs} мс / ${apState.pingMs} мс",
-                                        color = Color(0xFF34D399),
+                                        text = "${brState.pingMs} мс / ${apState.pingMs} мс",
+                                        color = Omni.Success,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
 
                                 Text(
-                                    text = "🌐 Браузер: ⬇${BrowsecVpnService.formatSpeedShort(brState.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(brState.rxBytes.get())}) | ⬆${BrowsecVpnService.formatSpeedShort(brState.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(brState.txBytes.get())})",
-                                    color = Color(0xFF38BDF8),
+                                    text = "Браузер: ⬇${BrowsecVpnService.formatSpeedShort(brState.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(brState.rxBytes.get())}) | ⬆${BrowsecVpnService.formatSpeedShort(brState.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(brState.txBytes.get())})",
+                                    color = Omni.Accent,
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace
                                 )
                                 Text(
-                                    text = "📱 Прилож.: ⬇${BrowsecVpnService.formatSpeedShort(apState.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(apState.rxBytes.get())}) | ⬆${BrowsecVpnService.formatSpeedShort(apState.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(apState.txBytes.get())})",
-                                    color = Color(0xFFFDE047),
+                                    text = "Прилож.: ⬇${BrowsecVpnService.formatSpeedShort(apState.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(apState.rxBytes.get())}) | ⬆${BrowsecVpnService.formatSpeedShort(apState.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(apState.txBytes.get())})",
+                                    color = Omni.Warning,
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace
                                 )
                                 Text(
-                                    text = "⚙️ Настройка: ${apState.currentStrategy.shortRu} (DNS: ${apState.currentDoh})",
-                                    color = Color(0xFF94A3B8),
+                                    text = "Настройка: ${apState.currentStrategy.shortRu} (DNS: ${apState.currentDoh})",
+                                    color = Omni.TextDim,
                                     fontSize = 10.sp
                                 )
 
@@ -3615,9 +3762,9 @@ private fun ManualServerPickerDialog(
                                         onClick = { onPickServer(node.code) },
                                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                                         modifier = Modifier.weight(1f).height(32.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                                     ) {
-                                        Text("✅ Подключить ${node.flag} ${node.countryRu}", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                        Text("Подключить ${node.flag} ${node.countryRu}", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                                     }
 
                                     if (apState.tuningStep > 0 || brState.tuningStep > 0) {
@@ -3626,7 +3773,7 @@ private fun ManualServerPickerDialog(
                                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                                             modifier = Modifier.height(32.dp)
                                         ) {
-                                            Text("🔄 В исходное", fontSize = 10.sp, color = Color(0xFFFDE047))
+                                            Text("В исходное", fontSize = 10.sp, color = Omni.Warning)
                                         }
                                     }
                                 }
@@ -3642,9 +3789,9 @@ private fun ManualServerPickerDialog(
 @Composable
 private fun SmallNavIconButton(text: String, enabled: Boolean, onClick: () -> Unit) {
     Surface(
-        color = if (enabled) Color(0xFF1E293B) else Color(0xFF0F172A),
+        color = if (enabled) Omni.SurfaceHighest else Omni.Surface,
         shape = RoundedCornerShape(8.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
         modifier = Modifier
             .size(36.dp)
             .clickable(enabled = enabled) { onClick() }
@@ -3652,7 +3799,7 @@ private fun SmallNavIconButton(text: String, enabled: Boolean, onClick: () -> Un
         Box(contentAlignment = Alignment.Center) {
             Text(
                 text = text,
-                color = if (enabled) Color.White else Color(0xFF475569),
+                color = if (enabled) Color.White else Omni.TextFaint,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -3668,11 +3815,11 @@ private fun ExtensionChip(
     onClick: () -> Unit
 ) {
     Surface(
-        color = if (active) activeColor.copy(alpha = 0.28f) else Color(0xFF1E293B),
+        color = if (active) activeColor.copy(alpha = 0.28f) else Omni.SurfaceHighest,
         shape = RoundedCornerShape(16.dp),
         border = androidx.compose.foundation.BorderStroke(
             1.dp,
-            if (active) activeColor else Color(0xFF334155)
+            if (active) activeColor else Omni.Outline
         ),
         modifier = Modifier.clickable { onClick() }
     ) {
@@ -3697,11 +3844,11 @@ private fun BottomSectionButton(
 ) {
     Surface(
         modifier = modifier.clickable { onClick() },
-        color = if (selected) activeColor.copy(alpha = 0.25f) else Color(0xFF1E293B),
+        color = if (selected) activeColor.copy(alpha = 0.25f) else Omni.SurfaceHighest,
         shape = RoundedCornerShape(10.dp),
         border = androidx.compose.foundation.BorderStroke(
             1.dp,
-            if (selected) activeColor else Color(0xFF334155)
+            if (selected) activeColor else Omni.Outline
         )
     ) {
         Column(
@@ -3718,7 +3865,7 @@ private fun BottomSectionButton(
             )
             Text(
                 text = subtitle,
-                color = if (selected) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                color = if (selected) Omni.Accent else Omni.TextDim,
                 fontSize = 9.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -3726,3 +3873,41 @@ private fun BottomSectionButton(
         }
     }
 }
+
+private fun Context.findOmniActivity(): Activity? {
+    var c: Context? = this
+    while (c is ContextWrapper) {
+        if (c is Activity) return c
+        c = c.baseContext
+    }
+    return null
+}
+
+/** Усиление громкости через WebAudio. Чужие (не same-origin, без CORS) медиа пропускаются — иначе они замолчат. */
+private fun omniAudioBoostJs(gain: Double): String = """
+(function(g){
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return 'no-webaudio';
+    var ctx = window.__omniAudioCtx || (window.__omniAudioCtx = new AC());
+    if (ctx.state === 'suspended') ctx.resume();
+    var n = 0, skipped = 0;
+    document.querySelectorAll('video, audio').forEach(function(m){
+      if (!m.__omniGain) {
+        var src = m.currentSrc || m.src || '';
+        var foreign = false;
+        try { foreign = !!src && src.indexOf('blob:') !== 0 && src.indexOf('data:') !== 0 && new URL(src, location.href).origin !== location.origin && !m.crossOrigin; } catch (e) {}
+        if (foreign) { skipped++; return; }
+        try {
+          var node = ctx.createMediaElementSource(m);
+          var gn = ctx.createGain();
+          node.connect(gn); gn.connect(ctx.destination);
+          m.__omniGain = gn;
+        } catch (e) { skipped++; return; }
+      }
+      m.__omniGain.gain.value = g; n++;
+    });
+    return n + '/' + skipped;
+  } catch (e) { return 'err:' + e.message; }
+})($gain);
+"""
