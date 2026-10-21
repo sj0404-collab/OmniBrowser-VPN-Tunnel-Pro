@@ -2,8 +2,12 @@ name: Build OmniBrowser & VPN Tunnel Pro APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "v4.*" ]
+    tags: [ "v*" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -29,13 +33,25 @@ jobs:
       - name: Prepare Signed APK Artifact
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.2-arm64-release.apk
+          VER=$(grep -h -m1 -oE 'versionName *=? *"[^"]+"' app/build.gradle* | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then BASE="OmniBrowser-VPN-Tunnel-Pro-${GITHUB_REF_NAME}-arm64-release"; else BASE="OmniBrowser-VPN-Tunnel-Pro-v${VER}-arm64-release"; fi
+          cp app/build/outputs/apk/release/app-release.apk "dist/${BASE}.apk"
+          echo "APK_BASE=${BASE}" >> "$GITHUB_ENV"
           ls -lh dist/
-          echo "APK size (bytes): $(stat -c %s dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.2-arm64-release.apk)"
-          unzip -l dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.2-arm64-release.apk | sort -k1 -n -r | head -n 15
+          unzip -l "dist/${BASE}.apk" | sort -k1 -n -r | head -n 15
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OmniBrowser-VPN-Tunnel-Pro-v4.0.2-arm64-release
-          path: dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.2-arm64-release.apk
+          name: ${{ env.APK_BASE }}
+          path: dist/${{ env.APK_BASE }}.apk
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OmniBrowser VPN Tunnel Pro ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: dist/${{ env.APK_BASE }}.apk
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
