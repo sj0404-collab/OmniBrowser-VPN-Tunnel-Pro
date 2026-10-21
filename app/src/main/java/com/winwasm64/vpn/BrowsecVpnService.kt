@@ -90,29 +90,37 @@ class ServerNodeRuntimeState(
     @Volatile
     var tuningStep: Int = 0
 
-    // Стартовый проверочный пакет рукопожатия туннеля, чтобы сервер сразу был в бою и не спал с 0 Б
-    val rxBytes = AtomicLong(18_432L + (seedIndex * 3_120L))
-    val txBytes = AtomicLong(6_144L + (seedIndex * 1_040L))
-    val requestsCount = AtomicLong(4L + (seedIndex % 5))
-    val activeConnections = AtomicInteger(1)
+    // Счётчики начинаются с нуля и растут только от реально переданных через профиль байт
+    val rxBytes = AtomicLong(0L)
+    val txBytes = AtomicLong(0L)
+    val requestsCount = AtomicLong(0L)
+    val activeConnections = AtomicInteger(0)
     val consecutiveFailures = AtomicInteger(0)
     val lastRxTimestampMs = AtomicLong(System.currentTimeMillis())
     val lastAutoTuneTimestampMs = AtomicLong(0L)
 
     @Volatile
-    var rxSpeedBps: Long = 1_480L + (seedIndex * 190L)
+    var rxSpeedBps: Long = 0L
 
     @Volatile
-    var txSpeedBps: Long = 520L + (seedIndex * 75L)
+    var txSpeedBps: Long = 0L
+
+    /** Реально измеренная задержка (мс). 0 — ещё не измерялась. */
+    @Volatile
+    var pingMs: Int = 0
+
+    /** Результат последней реальной проверки профиля: null — не проверялся. */
+    @Volatile
+    var lastProbeOk: Boolean? = null
 
     @Volatile
-    var pingMs: Int = (14 + (seedIndex * 3) % 48)
+    var lastProbeAtMs: Long = 0L
 
     val lastPingMs: Int
         get() = pingMs
 
     @Volatile
-    var statusNoteRu: String = "🟢 Активен • Исходный режим (${originalStrategy.shortRu})"
+    var statusNoteRu: String = "Не проверялся • ${originalStrategy.shortRu}"
 
     private var lastSampleMs: Long = 0L
     private var lastSampleRx: Long = rxBytes.get()
@@ -165,7 +173,8 @@ class ServerNodeRuntimeState(
     }
 
     fun updateSpeedSample(isActiveServer: Boolean = false) {
-        syncUidTrafficDelta(isActiveServer)
+        // Байты считают сами ретрансляторы (recordRx/recordTx), поэтому общий трафик UID
+        // больше не прибавляется — иначе каждый байт учитывался дважды.
         val now = System.currentTimeMillis()
         val curRx = rxBytes.get()
         val curTx = txBytes.get()
@@ -179,14 +188,9 @@ class ServerNodeRuntimeState(
         if (elapsed >= 450L) {
             val measuredRxBps = ((curRx - lastSampleRx).coerceAtLeast(0L) * 1000L) / elapsed
             val measuredTxBps = ((curTx - lastSampleTx).coerceAtLeast(0L) * 1000L) / elapsed
-            if (isActiveServer) {
-                // Если туннель включён и активен, поддерживаем отображение пульса канала даже между кликами
-                rxSpeedBps = if (measuredRxBps > 0L) measuredRxBps else 960L
-                txSpeedBps = if (measuredTxBps > 0L) measuredTxBps else 340L
-            } else {
-                rxSpeedBps = measuredRxBps
-                txSpeedBps = measuredTxBps
-            }
+            // Только реально измеренная скорость — без подставных «пульсов» 960/340 Б/с
+            rxSpeedBps = measuredRxBps
+            txSpeedBps = measuredTxBps
             lastSampleRx = curRx
             lastSampleTx = curTx
             lastSampleMs = now
@@ -264,16 +268,16 @@ class AppTunnelProfile(
     @Volatile var countryCode: String,
     val localPort: Int
 ) {
-    val rxBytes = AtomicLong(4_096L)
-    val txBytes = AtomicLong(1_536L)
-    val activeSockets = AtomicInteger(1)
-    val requests = AtomicLong(2L)
+    val rxBytes = AtomicLong(0L)
+    val txBytes = AtomicLong(0L)
+    val activeSockets = AtomicInteger(0)
+    val requests = AtomicLong(0L)
 
     @Volatile
-    var rxSpeedBps: Long = 820L
+    var rxSpeedBps: Long = 0L
 
     @Volatile
-    var txSpeedBps: Long = 290L
+    var txSpeedBps: Long = 0L
 
     @Volatile
     var strategy: AntiDpiStrategy = AntiDpiStrategy.MICRO_SHATTER_SNI
@@ -296,8 +300,8 @@ class AppTunnelProfile(
         if (elapsed >= 450L) {
             val rBps = ((curRx - lastSampleRx).coerceAtLeast(0L) * 1000L) / elapsed
             val tBps = ((curTx - lastSampleTx).coerceAtLeast(0L) * 1000L) / elapsed
-            rxSpeedBps = if (rBps > 0L) rBps else if (BrowsecVpnService.isRunning) 640L else 0L
-            txSpeedBps = if (tBps > 0L) tBps else if (BrowsecVpnService.isRunning) 210L else 0L
+            rxSpeedBps = rBps
+            txSpeedBps = tBps
             lastSampleRx = curRx
             lastSampleTx = curTx
             lastSampleMs = now
@@ -325,7 +329,7 @@ data class TrafficSnapshot(
     val activeCountryName: String = "Литва (Vilnius LT-Baltic #1)",
     val remoteServerIpPort: String = "185.150.189.201:443",
     val pingMs: Int = 18,
-    val loadedAssetPackMb: Int = 54,
+    val loadedAssetPackMb: Int = 0,
     val browsecTunnelModeActive: Boolean = true,
     val currentStrategyLabel: String = "Micro-SNI (Исходный)",
     val autoHealStatusNote: String = "🟢 Активен • Исходный режим",
@@ -969,63 +973,23 @@ object BrowserDirectRepeater {
     }
 
     /**
-     * Поддерживает живой пульс активного сервера каждые 1.5 сек и фоновый опрос всех 22 серверов,
-     * чтобы ни один сервер не спал с 0 Б, а активный сервер всегда показывал живую скорость и трафик!
+     * Каждые 1.5 с пересчитывает реальную скорость активного профиля, а раз в 15 с выполняет
+     * настоящую проверку связи (HEAD generate_204). Никаких подставных байт и «бодрых» резервных серверов.
      */
     private fun startAllServersHeartbeatIfNeeded() {
         if (!heartbeatRunning.compareAndSet(false, true)) return
-        thread(name = "Browser22ServersHeartbeat", isDaemon = true) {
-            var roundRobinIdx = 0
+        thread(name = "BrowserActiveProfileCheck", isDaemon = true) {
+            var tick = 0
             while (running.get()) {
                 try {
                     if (enabled) {
                         val activeSt = activeServerState()
-                        val node = activeSt.node
-                        val t0 = System.currentTimeMillis()
-                        activeSt.recordTx(420L)
-                        activeSt.requestsCount.incrementAndGet()
-                        try {
-                            val conn = (URL("https://connectivitycheck.gstatic.com/generate_204")
-                                .openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
-                                connectTimeout = 2000
-                                readTimeout = 2000
-                                requestMethod = "HEAD"
-                                setRequestProperty("X-Forwarded-For", node.remoteIp)
-                            }
-                            val code = conn.responseCode
-                            if (code in 200..399) {
-                                activeSt.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(11, 135)
-                                activeSt.recordRx(1_640L)
-                            }
-                            conn.disconnect()
-                        } catch (_: Exception) {
-                            try {
-                                val tTcp = System.currentTimeMillis()
-                                Socket().use { s ->
-                                    BrowsecVpnService.protectSocket(s)
-                                    s.connect(InetSocketAddress("142.250.185.174", 443), 1200)
-                                }
-                                activeSt.pingMs = (System.currentTimeMillis() - tTcp).toInt().coerceIn(11, 135)
-                            } catch (_: Exception) {
-                                activeSt.pingMs = (activeSt.pingMs + Random.nextInt(-3, 4)).coerceIn(14, 85)
-                            }
-                            activeSt.recordRx(980L)
-                        }
                         activeSt.updateSpeedSample(isActiveServer = true)
-
-                        // Также поддерживаем бодрое состояние и живой пинг остальных 21 серверов по кругу
-                        val allStates = getAllServerStates()
-                        if (allStates.isNotEmpty()) {
-                            val standbySt = allStates[roundRobinIdx % allStates.size]
-                            roundRobinIdx++
-                            if (!standbySt.node.code.equals(countryCode, ignoreCase = true)) {
-                                standbySt.recordTx(256L)
-                                standbySt.recordRx(768L)
-                                standbySt.pingMs = (activeSt.pingMs + ((roundRobinIdx % 7) - 3) * 2).coerceIn(12, 115)
-                                standbySt.updateSpeedSample(isActiveServer = false)
-                            }
+                        if (tick % 10 == 0) {
+                            VpnProfileProber.measureActiveLink(activeSt)
                         }
                     }
+                    tick++
                     Thread.sleep(1500L)
                 } catch (_: Exception) {
                 }
@@ -1112,8 +1076,6 @@ object BrowserDirectRepeater {
         if (resetSessionTraffic) {
             st.resetTrafficCounters()
         } else {
-            st.recordTx(640L)
-            st.recordRx(1_820L)
             st.updateSpeedSample(isActiveServer = true)
         }
         st.lastRxTimestampMs.set(System.currentTimeMillis())
@@ -1138,7 +1100,7 @@ object BrowserDirectRepeater {
                     }
                 )
                 if (ip.isNotBlank()) {
-                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(12, 130)
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 }
             } catch (_: Exception) {
             }
@@ -1224,7 +1186,7 @@ object BrowserDirectRepeater {
                 sock.soTimeout = 25_000
                 st.recordTx(128L)
                 sock.connect(InetSocketAddress(ip, port), 2400)
-                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(8, 150)
+                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 st.recordRx(128L)
                 FastMultiDnsResolver.rememberWorkingIp(host, ip)
                 return sock
@@ -1300,7 +1262,7 @@ object BrowserDirectRepeater {
                 sock.soTimeout = 6_000
                 if (enabled) st.recordTx(128L)
                 sock.connect(InetSocketAddress(ip, port), 2200)
-                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(8, 150)
+                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 if (enabled) st.recordRx(128L)
                 upstream = sock
 
@@ -1828,7 +1790,7 @@ object BrowserDirectRepeater {
                     sock.soTimeout = 8_000
                     st.recordTx(128L)
                     sock.connect(InetSocketAddress(ip, port), 2200)
-                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(8, 150)
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                     st.recordRx(128L)
                     rawSocket = sock
 
@@ -1939,7 +1901,7 @@ object BrowserDirectRepeater {
             activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName})",
             remoteServerIpPort = "${node.remoteIp}:${node.remotePort}",
             pingMs = st.pingMs,
-            loadedAssetPackMb = 54,
+            loadedAssetPackMb = 0,
             browsecTunnelModeActive = enabled,
             currentStrategyLabel = st.currentStrategy.shortRu,
             autoHealStatusNote = lastAutoHealEventRu
@@ -1987,7 +1949,7 @@ object BrowsecLocalProxyServer {
         private set
 
     @Volatile
-    var loadedBundleBytes: Long = 54L * 1024L * 1024L
+    var loadedBundleBytes: Long = 0L
         private set
 
     @Volatile
@@ -2069,9 +2031,6 @@ object BrowsecLocalProxyServer {
             profile.txBytes.set(0L)
             profile.rxSpeedBps = 0L
             profile.txSpeedBps = 0L
-        } else {
-            profile.rxBytes.addAndGet(2048L)
-            profile.txBytes.addAndGet(640L)
         }
         return profile
     }
@@ -2111,21 +2070,9 @@ object BrowsecLocalProxyServer {
         }
     }
 
+    /** Раньше «загружал» фиктивный 48-МБ пакет. Пакет удалён — метод оставлен пустым для совместимости. */
+    @Suppress("UNUSED_PARAMETER")
     fun initAssetBundleIfNeeded(context: Context) {
-        if (loadedBundleBytes > 0L) return
-        thread(name = "OmniAssetInit", isDaemon = true) {
-            try {
-                val files = context.assets.list("antidpi_bundle") ?: emptyArray()
-                var sum = 0L
-                for (f in files) {
-                    context.assets.open("antidpi_bundle/$f").use { inp ->
-                        sum += inp.available().toLong()
-                    }
-                }
-                if (sum > 0L) loadedBundleBytes = sum
-            } catch (_: Exception) {
-            }
-        }
     }
 
     fun closeActiveSockets() {
@@ -2143,8 +2090,6 @@ object BrowsecLocalProxyServer {
         if (resetSessionTraffic) {
             st.resetTrafficCounters()
         } else {
-            st.recordTx(640L)
-            st.recordRx(1_840L)
             st.updateSpeedSample(isActiveServer = true)
         }
         st.lastRxTimestampMs.set(System.currentTimeMillis())
@@ -2164,7 +2109,7 @@ object BrowsecLocalProxyServer {
                     }
                 )
                 if (ip.isNotBlank()) {
-                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(14, 140)
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 }
             } catch (_: Exception) {
             }
@@ -2262,7 +2207,7 @@ object BrowsecLocalProxyServer {
             activeCountryName = "${node.flag} ${node.countryRu} (${node.serverName} • $modeSuffix)",
             remoteServerIpPort = "${node.remoteIp}:${node.remotePort}",
             pingMs = st.pingMs,
-            loadedAssetPackMb = (loadedBundleBytes / (1024L * 1024L)).toInt().coerceAtLeast(54),
+            loadedAssetPackMb = 0,
             browsecTunnelModeActive = tunnelActive,
             currentStrategyLabel = st.currentStrategy.shortRu,
             autoHealStatusNote = lastAutoHealEventRu
@@ -2302,65 +2247,22 @@ object BrowsecLocalProxyServer {
 
     private fun startAppsHeartbeatIfNeeded() {
         if (!heartbeatRunning.compareAndSet(false, true)) return
-        thread(name = "Apps22ServersHeartbeat", isDaemon = true) {
-            var rrIdx = 0
+        thread(name = "AppsActiveProfileCheck", isDaemon = true) {
+            var tick = 0
             while (running.get()) {
                 try {
                     val tunnelActive = useBrowsecTunnel && BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused
                     if (tunnelActive) {
                         val st = activeServerState()
-                        val node = st.node
-                        st.recordTx(380L)
-                        st.requestsCount.incrementAndGet()
-                        val t0 = System.currentTimeMillis()
-                        try {
-                            val conn = (URL("https://connectivitycheck.gstatic.com/generate_204")
-                                .openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
-                                connectTimeout = 2000
-                                readTimeout = 2000
-                                requestMethod = "HEAD"
-                                setRequestProperty("X-Forwarded-For", node.remoteIp)
-                            }
-                            if (conn.responseCode in 200..399) {
-                                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(12, 140)
-                                st.recordRx(1_420L)
-                            }
-                            conn.disconnect()
-                        } catch (_: Exception) {
-                            try {
-                                val tTcp = System.currentTimeMillis()
-                                Socket().use { s ->
-                                    BrowsecVpnService.protectSocket(s)
-                                    s.connect(InetSocketAddress("142.250.185.174", 443), 1200)
-                                }
-                                st.pingMs = (System.currentTimeMillis() - tTcp).toInt().coerceIn(12, 140)
-                            } catch (_: Exception) {
-                                st.pingMs = (st.pingMs + Random.nextInt(-3, 4)).coerceIn(15, 90)
-                            }
-                            st.recordRx(890L)
-                        }
                         st.updateSpeedSample(isActiveServer = true)
-
-                        for (pkg in BrowsecVpnService.routedPackages) {
-                            appProfiles[pkg]?.let { prof ->
-                                prof.rxBytes.addAndGet(720L)
-                                prof.txBytes.addAndGet(240L)
-                                prof.updateSpeed()
-                            }
+                        for (prof in appProfiles.values) {
+                            prof.updateSpeed()
                         }
-
-                        val allStates = getAllServerStates()
-                        if (allStates.isNotEmpty()) {
-                            val standbySt = allStates[rrIdx % allStates.size]
-                            rrIdx++
-                            if (!standbySt.node.code.equals(BrowsecVpnService.activeCountry, ignoreCase = true)) {
-                                standbySt.recordTx(210L)
-                                standbySt.recordRx(640L)
-                                standbySt.pingMs = (st.pingMs + ((rrIdx % 7) - 3) * 2).coerceIn(13, 120)
-                                standbySt.updateSpeedSample(isActiveServer = false)
-                            }
+                        if (tick % 10 == 0) {
+                            VpnProfileProber.measureActiveLink(st)
                         }
                     }
+                    tick++
                     Thread.sleep(1500L)
                 } catch (_: Exception) {
                 }
@@ -2442,7 +2344,7 @@ object BrowsecLocalProxyServer {
                 sock.sendBufferSize = 256 * 1024
                 sock.soTimeout = 30_000
                 sock.connect(InetSocketAddress(ip, port), 2600)
-                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceIn(9, 155)
+                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 FastMultiDnsResolver.rememberWorkingIp(host, ip)
                 return sock
             } catch (e: Exception) {

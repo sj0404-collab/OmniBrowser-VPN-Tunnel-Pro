@@ -572,29 +572,29 @@ class BitTorrentEngine(private val context: Context? = null) {
             sizeLabel = "2.39 МБ",
             description = "Официальный архив игры DOOM (DOOM.EXE + DOOM1.WAD) через BitTorrent + WebSeed Archive.org",
             torrentUrl = "https://archive.org/download/DoomsharewareEpisode/DoomsharewareEpisode_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:6a9759bffd5c0af65319979fb7832189f4f3c35d&dn=Doom19s.zip&ws=https%3A%2F%2Farchive.org%2Fdownload%2FDoomsharewareEpisode%2FDoom19s.zip",
+            magnetUri = "",
             directWebSeedUrl = "https://archive.org/download/DoomsharewareEpisode/Doom19s.zip",
             fileName = "DOOM_Shareware_v1.9_x86.zip",
             estimatedSizeBytes = 2_410_233L
         ),
         CatalogTorrentItem(
             title = "7-Zip 24.08 (x64/x86 Official Windows .EXE Installer)",
-            category = "Программы Windows (.EXE)",
+            category = "Прямая загрузка (HTTP) • Windows .EXE",
             sizeLabel = "1.58 МБ",
             description = "Настоящий Windows .exe инсталлятор архиватора 7-Zip",
             torrentUrl = "",
-            magnetUri = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=7z2408-x64.exe&ws=https%3A%2F%2Fwww.7-zip.org%2Fa%2F7z2408-x64.exe",
+            magnetUri = "",
             directWebSeedUrl = "https://www.7-zip.org/a/7z2408-x64.exe",
             fileName = "7z2408-x64.exe",
             estimatedSizeBytes = 1_656_000L
         ),
         CatalogTorrentItem(
             title = "PuTTY 0.81 (32-bit x86 Official Windows SSH/Telnet .EXE)",
-            category = "Программы Windows 32-bit (.EXE)",
+            category = "Прямая загрузка (HTTP) • Windows 32-bit .EXE",
             sizeLabel = "1.28 МБ",
             description = "Чистый 32-битный x86 Windows .EXE файл (putty.exe) без инсталлятора",
             torrentUrl = "",
-            magnetUri = "magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=putty_x86.exe&ws=https%3A%2F%2Fthe.earth.li%2F~sgtatham%2Fputty%2Flatest%2Fw32%2Fputty.exe",
+            magnetUri = "",
             directWebSeedUrl = "https://the.earth.li/~sgtatham/putty/latest/w32/putty.exe",
             fileName = "putty_w32_x86.exe",
             estimatedSizeBytes = 1_340_000L
@@ -612,11 +612,11 @@ class BitTorrentEngine(private val context: Context? = null) {
         ),
         CatalogTorrentItem(
             title = "F-Droid Official Android Client (.APK)",
-            category = "Приложения Android (.APK)",
+            category = "Прямая загрузка (HTTP) • Android .APK",
             sizeLabel = "11.4 МБ",
             description = "Официальный APK пакет F-Droid для проверки нативной установки .apk",
             torrentUrl = "",
-            magnetUri = "magnet:?xt=urn:btih:fdroid0000000000000000000000000000000001&dn=F-Droid.apk&ws=https%3A%2F%2Ff-droid.org%2FF-Droid.apk",
+            magnetUri = "",
             directWebSeedUrl = "https://f-droid.org/F-Droid.apk",
             fileName = "F-Droid.apk",
             estimatedSizeBytes = 11_950_000L
@@ -624,12 +624,9 @@ class BitTorrentEngine(private val context: Context? = null) {
     )
 
     private fun applyBrowsecHeaders(conn: HttpURLConnection) {
-        conn.setRequestProperty("User-Agent", "BitTorrent/7.10.5 (OmniBrowser-VPN-$browsecCountryCode)")
-        if (useBrowsecVpn) {
-            conn.setRequestProperty("X-Forwarded-For", browsecEdgeIp)
-            conn.setRequestProperty("CF-IPCountry", browsecCountryCode)
-            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
-        }
+        // Подставные заголовки X-Forwarded-For / CF-IPCountry удалены: они не меняют IP и только вводили в заблуждение
+        conn.setRequestProperty("User-Agent", "OmniBrowser/4.0 (BitTorrent; Android)")
+        conn.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
     }
 
     fun searchPublicTorrents(query: String, onResults: (List<CatalogTorrentItem>) -> Unit) {
@@ -659,19 +656,17 @@ class BitTorrentEngine(private val context: Context? = null) {
                             if (id.isBlank()) continue
                             val title = d.optString("title", id)
                             val mediaType = d.optString("mediatype", "archive")
-                            val sizeBytes = d.optLong("item_size", 15_000_000L).coerceAtLeast(1_048_576L)
-                            val sizeMb = String.format("%.1f МБ", sizeBytes / (1024.0 * 1024.0))
+                            val sizeBytes = d.optLong("item_size", 0L).coerceAtLeast(0L)
+                            val sizeMb = if (sizeBytes > 0L) String.format("%.1f МБ", sizeBytes / (1024.0 * 1024.0)) else "размер неизвестен"
                             val torrentUrl = "https://archive.org/download/$id/${id}_archive.torrent"
-                            val hashHex = BitTorrentParser.toHex(BitTorrentParser.sha1(id.toByteArray(Charsets.UTF_8)))
-                            val magnet = "magnet:?xt=urn:btih:$hashHex&dn=${java.net.URLEncoder.encode(title, "UTF-8")}&ws=${java.net.URLEncoder.encode(torrentUrl, "UTF-8")}"
                             results.add(
                                 CatalogTorrentItem(
                                     title = title,
                                     category = "Archive.org BitTorrent ($mediaType)",
                                     sizeLabel = sizeMb,
-                                    description = "Торрент + WebSeed (Browsec $browsecCountryCode): $id",
+                                    description = "Archive.org: $id (настоящий .torrent файл)",
                                     torrentUrl = torrentUrl,
-                                    magnetUri = magnet,
+                                    magnetUri = "",
                                     directWebSeedUrl = "",
                                     fileName = "$id.torrent",
                                     estimatedSizeBytes = sizeBytes

@@ -5,48 +5,59 @@ import com.winwasm64.vpn.AntiDpiStrategy
 import com.winwasm64.vpn.BrowserDirectRepeater
 import com.winwasm64.vpn.BrowsecLocalProxyServer
 import com.winwasm64.vpn.FastMultiDnsResolver
+import com.winwasm64.vpn.ServerNodeRuntimeState
 import com.winwasm64.vpn.SmartAntiDpiPacketSender
+import com.winwasm64.vpn.VpnProfileProber
 import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OmniBrowserAntiDpiTest {
 
     @Test
-    fun testAll22ServersStartAwakeWithNonZeroTrafficAndSpeed() {
+    fun testServerCountersAreHonestAndStartFromZero() {
         BrowserDirectRepeater.enabled = true
         assertEquals(22, BrowserDirectRepeater.BROWSER_NODES.size)
         assertEquals(22, BrowsecLocalProxyServer.SERVER_NODES.size)
 
-        // Проверяем, что ни один из 22 серверов не спит с 0 Б трафика, 0 КБ/с скорости и что у каждого есть живой пинг > 0 мс
-        for (node in ALL_VPN_COUNTRIES_LIST) {
-            val brState = BrowserDirectRepeater.getServerState(node.code)
-            val apState = BrowsecLocalProxyServer.getServerState(node.code)
-            assertTrue("Server ${node.code} browser RX must be > 0", brState.rxBytes.get() > 0L)
-            assertTrue("Server ${node.code} browser TX must be > 0", brState.txBytes.get() > 0L)
-            assertTrue("Server ${node.code} browser speed must be > 0", brState.rxSpeedBps > 0L)
-            assertTrue("Server ${node.code} browser pingMs must be > 0", brState.pingMs > 0)
-            assertTrue("Server ${node.code} apps RX must be > 0", apState.rxBytes.get() > 0L)
-            assertTrue("Server ${node.code} apps TX must be > 0", apState.txBytes.get() > 0L)
-            assertTrue("Server ${node.code} apps pingMs must be > 0", apState.pingMs > 0)
-        }
+        // Новый профиль: никаких выдуманных байт, скорости и пинга
+        val node = ALL_VPN_COUNTRIES_LIST.first { it.code == "SE" }
+        val fresh = ServerNodeRuntimeState(node)
+        assertEquals(0L, fresh.rxBytes.get())
+        assertEquals(0L, fresh.txBytes.get())
+        assertEquals(0L, fresh.rxSpeedBps)
+        assertEquals(0L, fresh.txSpeedBps)
+        assertEquals(0, fresh.pingMs)
+        assertNull(fresh.lastProbeOk)
 
-        // Проверяем, что список IP-кандидатов для m.youtube.com всегда включает чистые Anycast IP
+        // Счётчики растут только от реально переданных байт
+        fresh.recordRx(1500L)
+        fresh.recordTx(400L)
+        assertEquals(1500L, fresh.rxBytes.get())
+        assertEquals(400L, fresh.txBytes.get())
+
+        // Результат реальной проверки записывается и для браузера, и для приложений
+        VpnProfileProber.applyResult(
+            VpnProfileProber.ProbeResult("SE", ok = true, connectMs = 37, resolvedIp = "142.250.185.174")
+        )
+        assertEquals(37, BrowserDirectRepeater.getServerState("SE").pingMs)
+        assertEquals(true, BrowsecLocalProxyServer.getServerState("SE").lastProbeOk)
+        VpnProfileProber.applyResult(VpnProfileProber.ProbeResult("FI", ok = false, connectMs = 0, resolvedIp = null))
+        assertEquals(false, BrowserDirectRepeater.getServerState("FI").lastProbeOk)
+
+        // Список IP-кандидатов для m.youtube.com всегда включает чистые Anycast IP
         val ytCandidates = FastMultiDnsResolver.buildCandidateIps("m.youtube.com", "3.64.0.0/16", "1.1.1.1")
         assertTrue(ytCandidates.contains("142.250.185.174"))
         assertTrue(ytCandidates.contains("142.250.107.113"))
 
-        // Переключение сервера в обычном режиме (resetSessionTraffic = false) не обнуляет его трафик
+        // Ручное переключение сервера работает
         BrowserDirectRepeater.switchCountry("NL", resetSessionTraffic = false)
-        val snapNl = BrowserDirectRepeater.sampleBrowserTraffic()
-        assertEquals("NL", snapNl.activeCountry)
-        assertTrue(snapNl.rxBytesTotal > 0L)
-        assertTrue(snapNl.txBytesTotal > 0L)
-        assertTrue(snapNl.rxSpeedBytesPerSec > 0L)
+        assertEquals("NL", BrowserDirectRepeater.sampleBrowserTraffic().activeCountry)
     }
 
     @Test

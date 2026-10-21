@@ -21,11 +21,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Generate 50MB+ Offline Anti-DPI & AdBlock Asset Bundle
-        run: |
-          python3 scripts/generate_omni_assets.py
-
-      - name: Run Unit Tests & Assemble Signed Release APK (Unified Keystore)
+      - name: Run Unit Tests & Assemble Signed Release APK (R8 + Unified Keystore)
         run: |
           chmod +x gradlew
           ./gradlew testDebugUnitTest assembleRelease --stacktrace
@@ -33,11 +29,13 @@ jobs:
       - name: Prepare Signed APK Artifact
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-VPN-Tunnel-Pro-v3.9.0-arm64-release.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.0-arm64-release.apk
           ls -lh dist/
+          echo "APK size (bytes): $(stat -c %s dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.0-arm64-release.apk)"
+          unzip -l dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.0-arm64-release.apk | sort -k1 -n -r | head -n 15
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OmniBrowser-VPN-Tunnel-Pro-v3.9.0-arm64-release
-          path: dist/OmniBrowser-VPN-Tunnel-Pro-v3.9.0-arm64-release.apk
+          name: OmniBrowser-VPN-Tunnel-Pro-v4.0.0-arm64-release
+          path: dist/OmniBrowser-VPN-Tunnel-Pro-v4.0.0-arm64-release.apk

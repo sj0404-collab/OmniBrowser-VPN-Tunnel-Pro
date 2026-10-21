@@ -13,17 +13,21 @@ android {
         minSdk = 24
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
-        versionCode = 3900 + ciRunNumber
-        versionName = "3.9.0"
+        versionCode = 4000 + ciRunNumber
+        versionName = "4.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
-    }
 
-    androidResources {
-        noCompress += listOf("pak", "bin", "db", "wav", "dat")
+        // Ресурсы библиотек только на русском и английском (остальные ~80 языков вырезаются из APK)
+        resourceConfigurations += listOf("ru", "en")
+
+        // Только ARM-устройства (телефоны/планшеты). x86/x86_64 нужны лишь эмуляторам ПК
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     signingConfigs {
@@ -52,11 +56,25 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
         release {
-            isMinifyEnabled = false
+            // R8: удаление неиспользуемого кода и ресурсов (classes.dex 19 МБ -> ~2 МБ)
+            isMinifyEnabled = true
+            isShrinkResources = true
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
+            )
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += listOf(
+                "/META-INF/{AL2.0,LGPL2.1}",
+                "/META-INF/*.version",
+                "/META-INF/*.kotlin_module",
+                "DebugProbesKt.bin",
+                "kotlin/**"
             )
         }
     }
@@ -86,9 +104,7 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-    implementation(libs.okhttp)
     implementation(libs.androidx.webkit)
     testImplementation(libs.junit)
 }
