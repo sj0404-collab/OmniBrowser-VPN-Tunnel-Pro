@@ -2520,6 +2520,7 @@ class BrowsecVpnService : VpnService() {
     private var perAppVpnInterface: ParcelFileDescriptor? = null
     private val notificationTickerRunning = AtomicBoolean(false)
     private val tunLoopRunning = AtomicBoolean(false)
+    private val tunExecutor = Executors.newCachedThreadPool()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         currentInstance = this
@@ -2712,7 +2713,7 @@ class BrowsecVpnService : VpnService() {
                                 val dnsPayloadLen = n - (ihl + 8)
                                 if (dnsPayloadLen > 12) {
                                     val dnsQuery = buf.copyOfRange(ihl + 8, n)
-                                    executor.execute {
+                                    tunExecutor.execute {
                                         forwardTunDnsQuery(buf.copyOf(ihl + 8), ihl, dnsQuery, out, st)
                                     }
                                 }
