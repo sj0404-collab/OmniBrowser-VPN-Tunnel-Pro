@@ -73,6 +73,7 @@
       case 'portMsg': { var pt = ports[m.pid]; if (pt) pt._recv(m.msg); return; }
       case 'portDisc': { var pd = ports[m.pid]; if (pd) pd._disc(m.e); return; }
       case 'event': deliverEvent(m); return;
+      case 'auth': deliverAuth(m); return;
     }
   }
 
@@ -123,6 +124,38 @@
     var parts = String(m.name).split('.'), target = ctx.api;
     for (var i = 0; i < parts.length && target; i++) target = target[parts[i]];
     if (target && target._fire) _apply(target._fire, target, m.args || []);
+  }
+
+  /* Запрос логина/пароля прокси (webRequest.onAuthRequired, blocking/asyncBlocking). */
+  function deliverAuth(m) {
+    var ctx = contexts[m.ext];
+    var ev = ctx && ctx.api && ctx.api.webRequest && ctx.api.webRequest.onAuthRequired;
+    var ls = ev ? ev._ls.slice() : [];
+    if (!ls.length) { fire(m.ext, 'authResult', { rid: m.rid, none: true }); return; }
+    var answered = false, left = ls.length;
+    function answer(resp) {
+      if (answered) return;
+      var c = resp && resp.authCredentials;
+      if (c && c.username != null) {
+        answered = true;
+        fire(m.ext, 'authResult', { rid: m.rid, creds: { u: String(c.username), p: String(c.password == null ? '' : c.password) } });
+        return;
+      }
+      if ((resp && resp.cancel) || --left <= 0) {
+        answered = true;
+        fire(m.ext, 'authResult', { rid: m.rid, none: true });
+      }
+    }
+    for (var i = 0; i < ls.length; i++) {
+      (function (f) {
+        var used = false;
+        function cb(r) { if (used) return; used = true; answer(r); }
+        var r;
+        try { r = _apply(f, null, [m.details, cb]); } catch (e) { _err(e); cb(null); return; }
+        if (r && typeof r.then === 'function') r.then(cb, function () { cb(null); });
+        else if (r !== undefined) cb(r);
+      })(ls[i]);
+    }
   }
 
   function makeEvent() {
@@ -723,6 +756,68 @@
     };
     var commands = { getAll: function (cb) { return done([], cb); }, onCommand: makeEvent() };
 
+    var proxyError = makeEvent();
+    var proxy = {
+      settings: {
+        get: function (d, cb) { if (typeof d === 'function') { cb = d; d = null; } return inv('proxy.get', d || {}, cb); },
+        set: function (d, cb) { return inv('proxy.set', d || {}, cb, noValue); },
+        clear: function (d, cb) { if (typeof d === 'function') { cb = d; d = null; } return inv('proxy.clear', d || {}, cb, noValue); },
+        onChange: makeEvent()
+      },
+      onProxyError: proxyError,
+      onError: proxyError,
+      Scope: { REGULAR: 'regular', REGULAR_ONLY: 'regular_only', INCOGNITO_PERSISTENT: 'incognito_persistent', INCOGNITO_SESSION_ONLY: 'incognito_session_only' },
+      Mode: { DIRECT: 'direct', AUTO_DETECT: 'auto_detect', PAC_SCRIPT: 'pac_script', FIXED_SERVERS: 'fixed_servers', SYSTEM: 'system' }
+    };
+
+    function localSetting(def) {
+      var value = def, mine = false, ev = makeEvent();
+      function state() { return { value: value, levelOfControl: mine ? 'controlled_by_this_extension' : 'controllable_by_this_extension' }; }
+      return {
+        get: function (d, cb) { if (typeof d === 'function') cb = d; return done(state(), cb); },
+        set: function (d, cb) { if (d && ('value' in d)) value = d.value; mine = true; ev._fire(state()); return done(undefined, cb); },
+        clear: function (d, cb) { if (typeof d === 'function') cb = d; value = def; mine = false; ev._fire(state()); return done(undefined, cb); },
+        onChange: ev
+      };
+    }
+    var privacy = {
+      network: {
+        networkPredictionEnabled: localSetting(true), webRTCIPHandlingPolicy: localSetting('default'),
+        webRTCMultipleRoutesEnabled: localSetting(true), webRTCNonProxiedUdpEnabled: localSetting(true)
+      },
+      services: {
+        alternateErrorPagesEnabled: localSetting(true), autofillEnabled: localSetting(true), autofillAddressEnabled: localSetting(true),
+        autofillCreditCardEnabled: localSetting(true), passwordSavingEnabled: localSetting(true), safeBrowsingEnabled: localSetting(true),
+        safeBrowsingExtendedReportingEnabled: localSetting(false), searchSuggestEnabled: localSetting(true),
+        spellingServiceEnabled: localSetting(false), translationServiceEnabled: localSetting(true)
+      },
+      websites: {
+        thirdPartyCookiesAllowed: localSetting(true), hyperlinkAuditingEnabled: localSetting(true), referrersEnabled: localSetting(true),
+        doNotTrackEnabled: localSetting(false), protectedContentEnabled: localSetting(true), topicsEnabled: localSetting(false),
+        fledgeEnabled: localSetting(false), adMeasurementEnabled: localSetting(false), relatedWebsiteSetsEnabled: localSetting(false)
+      },
+      IPHandlingPolicy: {
+        DEFAULT: 'default', DEFAULT_PUBLIC_AND_PRIVATE_INTERFACES: 'default_public_and_private_interfaces',
+        DEFAULT_PUBLIC_INTERFACE_ONLY: 'default_public_interface_only', DISABLE_NON_PROXIED_UDP: 'disable_non_proxied_udp'
+      }
+    };
+
+    function bdRemover(types) { return function (o, cb) { return inv('browsingData.remove', { options: o || {}, types: types }, cb, noValue); }; }
+    var browsingData = {
+      remove: function (o, t, cb) { return inv('browsingData.remove', { options: o || {}, types: t || {} }, cb, noValue); },
+      removeAppcache: bdRemover({ appcache: true }), removeCache: bdRemover({ cache: true }), removeCacheStorage: bdRemover({ cacheStorage: true }),
+      removeCookies: bdRemover({ cookies: true }), removeDownloads: bdRemover({ downloads: true }), removeFileSystems: bdRemover({ fileSystems: true }),
+      removeFormData: bdRemover({ formData: true }), removeHistory: bdRemover({ history: true }), removeIndexedDB: bdRemover({ indexedDB: true }),
+      removeLocalStorage: bdRemover({ localStorage: true }), removePasswords: bdRemover({ passwords: true }), removePluginData: bdRemover({ pluginData: true }),
+      removeServiceWorkers: bdRemover({ serviceWorkers: true }), removeWebSQL: bdRemover({ webSQL: true }),
+      settings: function (cb) {
+        return done({ options: { since: 0 }, dataToRemove: {}, dataRemovalPermitted: { appcache: true, cache: true, cacheStorage: true, cookies: true,
+          downloads: true, fileSystems: true, formData: true, history: true, indexedDB: true, localStorage: true, passwords: true,
+          pluginData: true, serviceWorkers: true, webSQL: true } }, cb);
+      }
+    };
+
+    if (isPage) { api.proxy = proxy; api.privacy = privacy; api.browsingData = browsingData; }
     api.tabs = tabs; api.windows = windows; api.action = action; api.scripting = scripting;
     api.declarativeNetRequest = dnr; api.alarms = alarms; api.permissions = permissions;
     api.contextMenus = contextMenus; api.menus = contextMenus; api.notifications = notifications;
@@ -733,15 +828,28 @@
       api.browserAction = action;
       api.pageAction = action;
     }
-    return wrapUnknown(api);
+    return wrapUnknown(api, allPerms, manifest);
   }
 
-  function wrapUnknown(api) {
+  /* Как в Chrome: API без разрешения в манифесте отсутствует (undefined), иначе обёртки расширений ломаются. */
+  function wrapUnknown(api, perms, manifest) {
+    function permitted(k) {
+      if (k === 'devtools') return !!manifest.devtools_page;
+      for (var i = 0; i < perms.length; i++) {
+        var p = String(perms[i]);
+        if (p === k || p.indexOf(k + '.') === 0) return true;
+      }
+      return false;
+    }
     return new Proxy(api, {
       get: function (t, k) {
         if (k in t) return t[k];
-        if (typeof k === 'string' && KNOWN_NOOP[k]) { t[k] = deepNoop(); return t[k]; }
+        if (typeof k === 'string' && KNOWN_NOOP[k] && permitted(k)) { t[k] = deepNoop(); return t[k]; }
         return undefined;
+      },
+      has: function (t, k) {
+        if (k in t) return true;
+        return typeof k === 'string' && !!KNOWN_NOOP[k] && permitted(k);
       }
     });
   }

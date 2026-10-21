@@ -18,6 +18,8 @@ import com.winwasm64.extensions.ExtTab
 import com.winwasm64.extensions.ExtensionRuntime
 import com.winwasm64.extensions.ExtensionStore
 import com.winwasm64.extensions.ExtensionTabHost
+import com.winwasm64.extensions.ExtensionProxy
+import com.winwasm64.extensions.StoreBridge
 import com.winwasm64.ui.browser.*
 import com.winwasm64.ui.theme.Omni
 import android.Manifest
@@ -711,6 +713,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
+    fun uaFor(url: String?): String? = if (desktopMode || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
+
     fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
         val target = normalizeInputToUrl(rawInput)
         if (target.startsWith("magnet:", ignoreCase = true) || target.endsWith(".torrent", ignoreCase = true)) {
@@ -737,6 +741,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
+        wv.settings.userAgentString = uaFor(target)
         val extraHeaders = buildMap {
             put("X-Forwarded-For", nodeInfo.remoteIp)
             put("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
@@ -1114,6 +1119,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         nativeAppsManager.openUrlInNativeApp(nextUrl)
                         return true
                     }
+                    if (view != null && request.isForMainFrame) {
+                        val wantDesktop = uaFor(nextUrl) != null
+                        val isDesktop = view.settings.userAgentString == ExtensionStore.DESKTOP_UA
+                        if (wantDesktop != isDesktop) {
+                            view.settings.userAgentString = uaFor(nextUrl)
+                            view.loadUrl(nextUrl)
+                            return true
+                        }
+                    }
                     return false
                 }
 
@@ -1175,6 +1189,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (view != null) {
                         injectActiveExtensions(view)
                         if (!tab.isIncognito) ExtensionRuntime.injectFallback(view)
+                        if (!tab.isIncognito) StoreBridge.injectFallback(view, url)
                     }
                     if (!tab.isIncognito) ExtensionRuntime.onTabUpdated(extTabOf(tab), "complete", false, false)
                     persistBrowserSettings()
@@ -1191,7 +1206,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         val failingUrl = request.url?.toString() ?: tab.url
                         // 1. Как в v3.6.0: мгновенно загружаем страницу через десинхронизированный сокет Репитера №1
                         // (с перебором чистых Anycast IP), чтобы экран net::ERR_CONNECTION_CLOSED никогда не оставался!
-                        if (browserVpnEnabled && tab.autoRetryCount < 4 && view != null) {
+                        if (browserVpnEnabled && !ExtensionProxy.isActive && tab.autoRetryCount < 4 && view != null) {
                             tab.autoRetryCount++
                             tab.lastErrorText = null
                             val ua = view.settings.userAgentString
@@ -1240,6 +1255,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         if (!tab.isIncognito) {
             ExtensionRuntime.attachTab(wv, tab.numericId)
             ExtensionRuntime.onTabCreated(extTabOf(tab))
+            StoreBridge.attach(wv)
         }
         navigateTab(tab, tab.url)
         return wv
@@ -1344,11 +1360,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             val child = webViewContainer.getChildAt(i)
             child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
         }
-        current.webView?.settings?.userAgentString = if (desktopMode) {
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        } else {
-            null
-        }
+        current.webView?.settings?.userAgentString = uaFor(current.url)
     }
 
     var torrentStatuses by remember { mutableStateOf(torrentEngine.getAllStatuses()) }
@@ -1459,7 +1471,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             isLoading = activeTab.isLoading,
                             progress = activeTab.loadingProgress,
                             isIncognito = activeTab.isIncognito,
-                            vpnOn = browserVpnEnabled,
+                            vpnOn = browserVpnEnabled || ExtensionProxy.ownerName != null,
                             tabsCount = tabs.size,
                             extensionsBadge = extBadge,
                             onSubmit = { input -> navigateTab(activeTab, input) },
@@ -1605,7 +1617,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         SheetItem(
                             OmniIcons.Shield,
                             "VPN браузера",
-                            subtitle = if (browserVpnEnabled) "Включён · $browserVpnCountry" else "Выключен",
+                            subtitle = ExtensionProxy.ownerName?.let { "Через расширение «$it»" } ?: (if (browserVpnEnabled) "Включён · $browserVpnCountry" else "Выключен"),
                             tint = if (browserVpnEnabled) Omni.Success else Omni.TextDim,
                             onClick = {
                                 showMenuSheet = false
@@ -1622,7 +1634,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         })
                         SheetSwitchItem(OmniIcons.Desktop, "Версия для ПК", checked = desktopMode, onCheckedChange = { v ->
                             desktopMode = v
-                            activeTab.webView?.settings?.userAgentString = if (v) ExtensionStore.DESKTOP_UA else null
+                            activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url)
                             activeTab.webView?.reload()
                             persistBrowserSettings()
                         })
@@ -1704,6 +1716,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         ) {
                             when (activeExtensionPopup) {
                                 "browsec" -> {
+                                    ExtensionProxy.ownerName?.let { owner ->
+                                        Column(
+                                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Omni.AccentContainer).padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text("Трафиком браузера сейчас управляет расширение «$owner»", color = Omni.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                            Text("Пока оно включено, сайты открываются через его серверы. Встроенный обход DPI используется только для сайтов, которые расширение пускает напрямую.", color = Omni.TextDim, fontSize = 12.sp)
+                                            TextButton(onClick = { ExtensionProxy.release(null) }) { Text("Отключить прокси расширения", color = Omni.Accent) }
+                                        }
+                                    }
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -2061,7 +2083,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     }
                                     SettingSwitchRow("Версия для ПК", "Открывать сайты как на компьютере", desktopMode) { v ->
                                         desktopMode = v
-                                        activeTab.webView?.settings?.userAgentString = if (v) ExtensionStore.DESKTOP_UA else null
+                                        activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url)
                                         activeTab.webView?.reload()
                                         persistBrowserSettings()
                                     }

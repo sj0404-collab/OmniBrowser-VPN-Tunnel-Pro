@@ -15,6 +15,7 @@ import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -186,6 +187,13 @@ object ExtensionRuntime {
         if (initialized) return
         app = context.applicationContext
         ExtensionStore.init(app)
+        ExtensionProxy.init(app)
+        ExtensionProxy.authRequester = { owner, details, cb -> requestProxyAuth(owner, details, cb) }
+        ExtensionProxy.errorReporter = { owner, error, details ->
+            val payload = eventJson(owner, "proxy.onProxyError", JSONArray().put(JSONObject().put("fatal", false).put("error", error).put("details", details)))
+            for (sink in pageSinksOf(owner, null)) sink.send(payload)
+        }
+        ExtensionProxy.changeListener = { broadcastProxyChange() }
         messagingSupported = WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
         documentStartSupported = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
         coreTemplate = try {
@@ -313,12 +321,14 @@ object ExtensionRuntime {
     }
 
     fun setEnabled(id: String, enabled: Boolean) {
+        if (!enabled) ExtensionProxy.release(id)
         ExtensionStore.setEnabled(id, enabled)
         if (!enabled) dropExtensionEndpoints(id)
         refreshAll()
     }
 
     fun uninstall(id: String) {
+        ExtensionProxy.release(id)
         backgrounds.remove(id)?.let { releaseHost(it) }
         offscreens.remove(id)?.let { releaseHost(it) }
         dropExtensionEndpoints(id)
@@ -994,6 +1004,98 @@ object ExtensionRuntime {
         null
     }
 
+    // =====================================================================
+    // Прокси расширений: пароль (webRequest.onAuthRequired), события, browsingData
+    // =====================================================================
+
+    private val authWaiters = HashMap<Int, (JSONObject?) -> Unit>()
+    private var authSeq = 0
+
+    /** Спросить логин/пароль прокси у расширения-владельца (и у других с webRequestAuthProvider). Главный поток. */
+    private fun requestProxyAuth(owner: String, details: JSONObject, cb: (Pair<String, String>?) -> Unit) {
+        val ids = ArrayList<String>()
+        ids.add(owner)
+        for (e in ExtensionStore.enabledExtensions()) {
+            if (e.id != owner && e.manifest.permissions.contains("webRequestAuthProvider")) ids.add(e.id)
+        }
+        val targets = ids.flatMap { id -> pageSinksOf(id, null).map { id to it } }
+        if (targets.isEmpty()) {
+            cb(null)
+            return
+        }
+        val rid = ++authSeq
+        var left = targets.size
+        var finished = false
+        authWaiters[rid] = { res ->
+            if (!finished) {
+                if (res != null && res.has("u")) {
+                    finished = true
+                    authWaiters.remove(rid)
+                    cb(res.optString("u") to res.optString("p"))
+                } else if (--left <= 0) {
+                    finished = true
+                    authWaiters.remove(rid)
+                    cb(null)
+                }
+            }
+        }
+        for ((id, sink) in targets) {
+            sink.send(JSONObject().put("op", "auth").put("ext", id).put("rid", rid).put("details", details).toString())
+        }
+        main.postDelayed({
+            if (!finished) {
+                finished = true
+                authWaiters.remove(rid)
+                cb(null)
+            }
+        }, 15_000)
+    }
+
+    private fun broadcastProxyChange() {
+        for (e in ExtensionStore.enabledExtensions()) {
+            val payload = eventJson(e.id, "proxy.settings.onChange", JSONArray().put(ExtensionProxy.settingFor(e.id)))
+            for (sink in pageSinksOf(e.id, null)) sink.send(payload)
+        }
+        stateVersion++
+    }
+
+    private fun removeBrowsingData(a: JSONObject) {
+        val types = a.optJSONObject("types") ?: return
+        val originsArr = a.optJSONObject("options")?.optJSONArray("origins")
+        val origins = ArrayList<String>()
+        if (originsArr != null) for (i in 0 until originsArr.length()) {
+            val o = originsArr.optString(i)
+            if (o.startsWith("http")) origins.add(o)
+        }
+        try {
+            if (types.optBoolean("cookies")) {
+                val cm = CookieManager.getInstance()
+                if (origins.isEmpty()) {
+                    cm.removeAllCookies(null)
+                } else {
+                    for (o in origins) {
+                        cm.getCookie(o)?.split(';')?.forEach { c ->
+                            val name = c.substringBefore('=').trim()
+                            if (name.isNotEmpty()) cm.setCookie(o, "$name=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                        }
+                    }
+                }
+                cm.flush()
+            }
+            if (types.optBoolean("localStorage") || types.optBoolean("indexedDB") || types.optBoolean("webSQL") || types.optBoolean("fileSystems")) {
+                val ws = WebStorage.getInstance()
+                if (origins.isEmpty()) ws.deleteAllData() else for (o in origins) ws.deleteOrigin(o)
+            }
+            if ((types.optBoolean("cache") || types.optBoolean("appcache")) && origins.isEmpty()) {
+                val host = tabHost
+                val first = host?.tabs()?.firstOrNull()
+                if (host != null && first != null) host.webViewOf(first.id)?.clearCache(true)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "browsingData.remove", e)
+        }
+    }
+
     fun tabJson(t: ExtTab): JSONObject = JSONObject()
         .put("id", t.id).put("index", t.index).put("windowId", 1).put("openerTabId", JSONObject.NULL)
         .put("url", t.url).put("title", t.title).put("active", t.active).put("highlighted", t.active)
@@ -1275,6 +1377,21 @@ object ExtensionRuntime {
                 }
             }
             "reload" -> reloadExtension(ext)
+            "proxy.get" -> replyOk(ep, cid, ExtensionProxy.settingFor(ext))
+            "proxy.set" -> if (ep.kind == "cs") replyError(ep, cid, "chrome.proxy недоступен в контент-скриптах") else {
+                val value = a.optJSONObject("value") ?: JSONObject()
+                val name = ExtensionStore.get(ext)?.manifest?.name ?: ext
+                ExtensionProxy.set(ext, name, value) { err -> if (err == null) replyOk(ep, cid, null) else replyError(ep, cid, err) }
+            }
+            "proxy.clear" -> if (ep.kind == "cs") replyError(ep, cid, "chrome.proxy недоступен в контент-скриптах") else {
+                ExtensionProxy.release(ext)
+                replyOk(ep, cid, null)
+            }
+            "authResult" -> if (ep.kind != "cs") authWaiters[a.optInt("rid")]?.invoke(a.optJSONObject("creds"))
+            "browsingData.remove" -> if (ep.kind == "cs") replyError(ep, cid, "chrome.browsingData недоступен в контент-скриптах") else {
+                removeBrowsingData(a)
+                replyOk(ep, cid, null)
+            }
             else -> if (cid > 0) replyError(ep, cid, "Метод $op не поддерживается")
         }
     }
@@ -1660,7 +1777,7 @@ object ExtensionRuntime {
                 var hops = 0
                 lateinit var conn: HttpURLConnection
                 while (true) {
-                    conn = current.openConnection() as HttpURLConnection
+                    conn = (ExtensionProxy.javaProxy()?.let { current.openConnection(it) } ?: current.openConnection()) as HttpURLConnection
                     conn.instanceFollowRedirects = false
                     conn.requestMethod = method
                     conn.connectTimeout = 20_000

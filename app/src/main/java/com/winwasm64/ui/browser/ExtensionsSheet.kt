@@ -59,6 +59,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.winwasm64.extensions.CatalogExtension
 import com.winwasm64.extensions.ChromeWebStore
+import com.winwasm64.extensions.ExtensionProxy
 import com.winwasm64.extensions.ExtensionRuntime
 import com.winwasm64.extensions.ExtensionStore
 import com.winwasm64.extensions.InstalledExtension
@@ -236,7 +237,7 @@ fun ExtensionsSheetContent(
                     keyboardActions = KeyboardActions(onDone = { install(input) }),
                     modifier = Modifier.fillMaxWidth()
                 )
-                if (input.isEmpty()) Text("Ссылка или ID расширения", color = Omni.TextFaint, fontSize = 14.sp)
+                if (input.isEmpty()) Text("Ссылка или ID", color = Omni.TextFaint, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.width(8.dp))
             Button(
@@ -246,9 +247,33 @@ fun ExtensionsSheetContent(
                 modifier = Modifier.height(44.dp)
             ) { Text("Установить") }
         }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
-            SmallAction(OmniIcons.Globe, "Открыть Chrome Web Store") { onOpenUrl("https://chromewebstore.google.com/category/extensions") }
-            SmallAction(OmniIcons.Download, "Из файла .crx / .zip", Omni.TextDim) { onPickFile() }
+        Spacer(Modifier.height(4.dp))
+        SheetItem(
+            OmniIcons.Globe,
+            "Открыть Chrome Web Store",
+            subtitle = "На странице расширения нажмите «Установить в OmniBrowser»",
+            tint = Omni.Accent,
+            onClick = { onOpenUrl("https://chromewebstore.google.com/category/extensions") }
+        )
+        SheetItem(OmniIcons.Download, "Установить из файла", subtitle = "Пакет .crx или .zip", onClick = onPickFile)
+        ExtensionProxy.ownerName?.let { owner ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Omni.AccentContainer)
+                    .padding(start = 14.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(OmniIcons.Shield, null, tint = Omni.Success, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Прокси расширения активен", color = Omni.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text("Трафик браузера идёт через «$owner»", color = Omni.TextDim, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+                SmallAction(OmniIcons.Close, "Отключить", Omni.TextDim) { ExtensionProxy.release(null) }
+            }
         }
         message?.let { (isError, text) ->
             Text(text, color = if (isError) Omni.Danger else Omni.Success, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))

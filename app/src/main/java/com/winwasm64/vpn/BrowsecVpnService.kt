@@ -860,6 +860,14 @@ object BrowserDirectRepeater {
     @Volatile
     private var appliedProxyKey: String = ""
 
+    /** Прокси, которым управляет расширение браузера (chrome.proxy). Пока задан — WebView идёт через него. */
+    @Volatile
+    var externalProxyOverride: (((() -> Unit)?) -> Unit)? = null
+
+    fun resetAppliedProxyKey() {
+        appliedProxyKey = ""
+    }
+
     @Volatile
     var enabled: Boolean = true
 
@@ -1006,6 +1014,10 @@ object BrowserDirectRepeater {
     }
 
     fun ensureDirectBrowserMode(onReady: (() -> Unit)? = null) {
+        externalProxyOverride?.let { override ->
+            override(onReady)
+            return
+        }
         val port = ensureServerRunning()
         val desiredKey = if (enabled) "ON:$port" else "OFF"
         if (appliedProxyKey == desiredKey) {

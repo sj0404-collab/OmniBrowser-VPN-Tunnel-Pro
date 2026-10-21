@@ -91,23 +91,24 @@ fun OmniIconButton(
     iconSize: Dp = 22.dp,
     badge: String? = null
 ) {
-    Box(
-        modifier = modifier
-            .size(size)
-            .clip(CircleShape)
-            .clickable(enabled = enabled, onClick = onClick),
-        contentAlignment = Alignment.Center
-    ) {
+    Box(modifier = modifier.size(size), contentAlignment = Alignment.Center) {
+        Box(
+            Modifier
+                .matchParentSize()
+                .clip(CircleShape)
+                .clickable(enabled = enabled, onClick = onClick)
+        )
         Icon(icon, contentDescription, tint = if (enabled) tint else Omni.TextFaint, modifier = Modifier.size(iconSize))
         if (!badge.isNullOrEmpty()) {
             Box(
                 Modifier
                     .align(Alignment.TopEnd)
-                    .padding(top = 3.dp, end = 1.dp)
-                    .background(Omni.Accent, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 4.dp)
+                    .padding(top = 5.dp, end = 3.dp)
+                    .background(Omni.Accent, CircleShape)
+                    .padding(horizontal = 4.dp, vertical = 0.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text(badge.take(4), fontSize = 9.sp, color = Color.White, maxLines = 1, fontWeight = FontWeight.Bold)
+                Text(badge.take(3), fontSize = 9.sp, lineHeight = 12.sp, color = Color.White, maxLines = 1, fontWeight = FontWeight.Bold)
             }
         }
     }
