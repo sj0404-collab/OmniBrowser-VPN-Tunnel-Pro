@@ -22,16 +22,23 @@ class OmniBrowserAntiDpiTest {
         assertEquals(22, BrowserDirectRepeater.BROWSER_NODES.size)
         assertEquals(22, BrowsecLocalProxyServer.SERVER_NODES.size)
 
-        // Проверяем, что ни один из 22 серверов не спит с 0 Б трафика и 0 КБ/с скорости
+        // Проверяем, что ни один из 22 серверов не спит с 0 Б трафика, 0 КБ/с скорости и что у каждого есть живой пинг > 0 мс
         for (node in ALL_VPN_COUNTRIES_LIST) {
             val brState = BrowserDirectRepeater.getServerState(node.code)
             val apState = BrowsecLocalProxyServer.getServerState(node.code)
             assertTrue("Server ${node.code} browser RX must be > 0", brState.rxBytes.get() > 0L)
             assertTrue("Server ${node.code} browser TX must be > 0", brState.txBytes.get() > 0L)
             assertTrue("Server ${node.code} browser speed must be > 0", brState.rxSpeedBps > 0L)
+            assertTrue("Server ${node.code} browser pingMs must be > 0", brState.pingMs > 0)
             assertTrue("Server ${node.code} apps RX must be > 0", apState.rxBytes.get() > 0L)
             assertTrue("Server ${node.code} apps TX must be > 0", apState.txBytes.get() > 0L)
+            assertTrue("Server ${node.code} apps pingMs must be > 0", apState.pingMs > 0)
         }
+
+        // Проверяем, что список IP-кандидатов для m.youtube.com всегда включает чистые Anycast IP
+        val ytCandidates = FastMultiDnsResolver.buildCandidateIps("m.youtube.com", "3.64.0.0/16", "1.1.1.1")
+        assertTrue(ytCandidates.contains("142.250.185.174"))
+        assertTrue(ytCandidates.contains("142.250.107.113"))
 
         // Переключение сервера в обычном режиме (resetSessionTraffic = false) не обнуляет его трафик
         BrowserDirectRepeater.switchCountry("NL", resetSessionTraffic = false)

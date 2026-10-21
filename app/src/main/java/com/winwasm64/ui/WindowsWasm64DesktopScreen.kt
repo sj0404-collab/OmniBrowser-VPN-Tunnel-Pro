@@ -993,12 +993,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        // 1. Как в v3.6.0: сначала мгновенно пробуем загрузить страницу напрямую через десинхронизированный сокет Репитера №1
-                        if (browserVpnEnabled && tab.autoRetryCount < 2 && view != null) {
+                        // 1. Как в v3.6.0: мгновенно загружаем страницу через десинхронизированный сокет Репитера №1
+                        // (с перебором чистых Anycast IP), чтобы экран net::ERR_CONNECTION_CLOSED никогда не оставался!
+                        if (browserVpnEnabled && tab.autoRetryCount < 4 && view != null) {
                             tab.autoRetryCount++
                             tab.lastErrorText = null
                             val ua = view.settings.userAgentString
-                            tab.loadingStatusText = "⚡ Прямой обход DPI через Репитер №1 ($browserVpnCountry)..."
+                            tab.loadingStatusText = "⚡ Прямой обход DPI через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)..."
                             Thread {
                                 val html = BrowserDirectRepeater.fetchUnblockedHtml(failingUrl, ua)
                                 if (!html.isNullOrBlank()) {
@@ -1006,7 +1007,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         tab.isLoading = false
                                         tab.loadingProgress = 100
                                         tab.lastErrorText = null
-                                        tab.loadingStatusText = "✓ Загружено через Репитер №1 ($browserVpnCountry)"
+                                        tab.loadingStatusText = "✓ Загружено через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)"
                                         view.loadDataWithBaseURL(
                                             failingUrl,
                                             html,
@@ -1016,7 +1017,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         )
                                     }
                                 } else if (autoHealEnabled) {
-                                    // 2. Если пользователь включил авто-смену настроек — меняем настройку/сервер и ОБЯЗАТЕЛЬНО перезагружаем страницу для проверки!
                                     val healMsg = BrowserDirectRepeater.triggerAutoHealOrFailover()
                                     view.post {
                                         browserVpnCountry = BrowserDirectRepeater.countryCode
@@ -1025,10 +1025,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     }
                                 } else {
                                     view.post {
-                                        tab.isLoading = false
-                                        tab.loadingProgress = 0
-                                        tab.lastErrorText = "$desc ($failingUrl)"
-                                        tab.loadingStatusText = "⚠️ Ошибка соединения: $desc"
+                                        view.loadUrl(failingUrl)
                                     }
                                 }
                             }.start()
@@ -1125,7 +1122,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 ) {
                     ExtensionChip(
                         label = if (browserVpnEnabled) {
-                            "🌐 VPN Браузера: ${browserTrafficSnapshot.activeCountryName} (${browserTrafficSnapshot.remoteServerIpPort})"
+                            "🌐 VPN Браузера: ${browserTrafficSnapshot.activeCountryName} • ⚡ ${browserTrafficSnapshot.pingMs} мс (${browserTrafficSnapshot.remoteServerIpPort})"
                         } else {
                             "🌐 VPN Браузера: ВЫКЛ ($browserVpnCountry)"
                         },
@@ -1152,7 +1149,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
 
                     ExtensionChip(
-                        label = "📱 Список VPN (${vpnRoutedApps.size})",
+                        label = if (browsecEnabled) {
+                            "📱 Список VPN (${vpnRoutedApps.size} • ⚡ ${liveTraffic.pingMs} мс)"
+                        } else {
+                            "📱 Список VPN (${vpnRoutedApps.size})"
+                        },
                         active = browsecEnabled,
                         activeColor = Color(0xFF7C3AED)
                     ) {
@@ -1667,14 +1668,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                     horizontalAlignment = Alignment.CenterHorizontally
                                                 ) {
                                                     Text(
-                                                        text = "${node.flag} ${node.countryRu} (${node.code})",
+                                                        text = "${node.flag} ${node.countryRu} (${node.code}) • ⚡ ${st.pingMs} мс",
                                                         color = Color.White,
                                                         fontSize = 11.sp,
                                                         fontWeight = FontWeight.Bold
                                                     )
                                                     Text(
+                                                        text = "${node.remoteIp}:${node.remotePort}",
+                                                        color = if (selected) Color(0xFFD1FAE5) else Color(0xFF94A3B8),
+                                                        fontSize = 9.sp,
+                                                        fontFamily = FontFamily.Monospace
+                                                    )
+                                                    Text(
                                                         text = "⬇${BrowsecVpnService.formatBytesShort(st.rxBytes.get())} ⬆${BrowsecVpnService.formatBytesShort(st.txBytes.get())}",
-                                                        color = if (selected) Color(0xFFFDE047) else Color(0xFF94A3B8),
+                                                        color = if (selected) Color(0xFFFDE047) else Color(0xFF38BDF8),
                                                         fontSize = 9.sp,
                                                         fontFamily = FontFamily.Monospace
                                                     )
@@ -3019,14 +3026,14 @@ private fun NativeAppsWithBrowsecSection(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "📱 Индивидуальный Туннель Приложений • По-приложенный проброс ($browsecCountry)",
+                                text = "📱 Индивидуальный Туннель Приложений • По-приложенный проброс ($browsecCountry) • ⚡ Пинг: ${liveTraffic.pingMs} мс",
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp
                             )
                             Text(
                                 text = if (browsecEnabled) {
-                                    "🟢 VPN ПРИЛОЖЕНИЙ ВКЛ: Только выбранные (${vpnRoutedApps.size}) идут через СВОЙ сервер и порт; остальные работают напрямую без VPN!"
+                                    "🟢 VPN ПРИЛОЖЕНИЙ ВКЛ: Только выбранные (${vpnRoutedApps.size}) идут через СВОЙ сервер (${liveTraffic.remoteServerIpPort} • Пинг: ${liveTraffic.pingMs} мс) и порт; остальные работают напрямую без VPN!"
                                 } else {
                                     "⚪ VPN ПРИЛОЖЕНИЙ ВЫКЛ: Приложения работают напрямую без обхода блокировок"
                                 },
@@ -3035,13 +3042,13 @@ private fun NativeAppsWithBrowsecSection(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "⬇ ВХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})",
+                                text = "⬇ ВХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})  |  ⬆ ИСХ (этот сервер): ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})  |  ⚡ Пинг: ${liveTraffic.pingMs} мс",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace
                             )
                             Text(
-                                text = "⚙️ ${liveTraffic.currentStrategyName} • ${liveTraffic.watchdogStatusText}",
+                                text = "⚙️ ${liveTraffic.currentStrategyName} • Пинг: ${liveTraffic.pingMs} мс • ${liveTraffic.watchdogStatusText}",
                                 color = Color(0xFFFDE047),
                                 fontSize = 10.sp
                             )
@@ -3152,7 +3159,7 @@ private fun NativeAppsWithBrowsecSection(
                                 modifier = Modifier.clickable { onSelectCountry(node.code) }
                             ) {
                                 Text(
-                                    text = "${node.flag} ${node.countryRu} (⬇${BrowsecVpnService.formatBytesShort(st.rxBytes.get())} ⬆${BrowsecVpnService.formatBytesShort(st.txBytes.get())})",
+                                    text = "${node.flag} ${node.countryRu} • ⚡ ${st.pingMs} мс (⬇${BrowsecVpnService.formatBytesShort(st.rxBytes.get())} ⬆${BrowsecVpnService.formatBytesShort(st.txBytes.get())})",
                                     color = Color.White,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
@@ -3204,6 +3211,7 @@ private fun NativeAppsWithBrowsecSection(
                         BrowsecLocalProxyServer.getOrCreateAppProfile(app.packageName, browsecCountry)
                     }
                     val appNode = BrowsecLocalProxyServer.getServerNode(appProfile.countryCode)
+                    val appServerState = BrowsecLocalProxyServer.getServerState(appProfile.countryCode)
                     val isTelegramApp = nativeAppsManager.isTelegramPackage(app.packageName)
 
                     Surface(
@@ -3248,7 +3256,7 @@ private fun NativeAppsWithBrowsecSection(
                                     Text(app.packageName, color = Color(0xFF64748B), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                                     Text(
                                         text = if (isInVpn) {
-                                            "🟢 В СПИСКЕ VPN • Свой сервер: ${appNode.flag} ${appNode.countryRu} (${appNode.remoteIp}:${appNode.remotePort}) • Выделенный порт: 127.0.0.1:${appProfile.localPort}"
+                                            "🟢 В СПИСКЕ VPN • Свой сервер: ${appNode.flag} ${appNode.countryRu} (${appNode.remoteIp}:${appNode.remotePort}) • ⚡ Пинг: ${appServerState.pingMs} мс • Порт: 127.0.0.1:${appProfile.localPort}"
                                         } else {
                                             "⚪ НЕ В СПИСКЕ VPN: Идёт напрямую через обычную сеть БЕЗ туннеля и БЕЗ обхода блокировок"
                                         },
@@ -3436,7 +3444,7 @@ private fun NativeAppsWithBrowsecSection(
                         fontSize = 12.sp
                     )
                     Text(
-                        text = "⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)} • Только для выбранных прил.",
+                        text = "⚡ Пинг: ${liveTraffic.pingMs} мс • ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}",
                         color = if (browsecEnabled) Color(0xFFD1FAE5) else Color(0xFF94A3B8),
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace
@@ -3574,7 +3582,7 @@ private fun ManualServerPickerDialog(
                                         fontSize = 12.sp
                                     )
                                     Text(
-                                        text = "${apState.lastPingMs} мс",
+                                        text = "⚡ ${brState.pingMs} мс / ${apState.pingMs} мс",
                                         color = Color(0xFF34D399),
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
