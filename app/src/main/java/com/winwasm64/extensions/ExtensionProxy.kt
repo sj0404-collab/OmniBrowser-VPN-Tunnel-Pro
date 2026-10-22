@@ -536,32 +536,62 @@ function alert(){}
     private fun ensureServer() {
         if (server?.isClosed == false) return
         try {
-            val ss = ServerSocket()
-            ss.reuseAddress = true
-            ss.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 128)
+            // v4.1.1: порт стабилен на всё время жизни процесса — перезапуск слушателя не меняет настройку WebView,
+            // иначе соединения, идущие на старый порт, получали отказ (= ERR_PROXY_CONNECTION_FAILED)
+            var ss: ServerSocket? = null
+            if (port > 0) {
+                try {
+                    val t = ServerSocket()
+                    t.reuseAddress = true
+                    t.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 512)
+                    ss = t
+                } catch (_: Exception) {
+                }
+            }
+            if (ss == null) {
+                val t = ServerSocket()
+                t.reuseAddress = true
+                t.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 512)
+                ss = t
+            }
             server = ss
             port = ss.localPort
-            pool.execute { acceptLoop(ss) }
+            val acceptor = Thread({ acceptLoop(ss) }, "omni-extproxy-accept").apply { isDaemon = true }
+            acceptor.start()
             startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "не удалось запустить локальный прокси", e)
+            com.winwasm64.vpn.VpnLog.e("Браузер", "локальный прокси расширения не запустился: ${e.message ?: e.javaClass.simpleName}")
         }
     }
+
+    @Volatile
+    private var lastAcceptErrorLog = 0L
 
     private fun acceptLoop(ss: ServerSocket) {
         var errors = 0
         while (!ss.isClosed) {
             val s = try {
                 ss.accept()
-            } catch (_: Exception) {
+            } catch (e: Throwable) {
                 if (ss.isClosed) break
                 // Временная ошибка (например, кончились дескрипторы при Shorts) — НЕ выходим, иначе прокси «умирает»
                 errors++
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastAcceptErrorLog > 30_000L) {
+                    lastAcceptErrorLog = now
+                    com.winwasm64.vpn.VpnLog.w("Браузер", "локальный прокси: accept() не удался (${e.message ?: e.javaClass.simpleName}) — повторяю")
+                }
                 try { Thread.sleep(if (errors > 50) 200L else 10L) } catch (_: InterruptedException) {}
                 continue
             }
             errors = 0
-            pool.execute { handle(s) }
+            try {
+                pool.execute { handle(s) }
+            } catch (e: Throwable) {
+                // Не хватило потоков/памяти — обрабатываем без пула, но слушатель не умирает
+                try { Thread({ handle(s) }, "omni-extproxy-handle").apply { isDaemon = true }.start() } catch (_: Throwable) { closeQuietly(s) }
+            }
         }
     }
 
@@ -569,7 +599,7 @@ function alert(){}
         if (p <= 0) return false
         return try {
             Socket().use {
-                it.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 500)
+                it.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 1_500)
                 true
             }
         } catch (_: Exception) {
@@ -577,23 +607,46 @@ function alert(){}
         }
     }
 
-    /** Перезапускает локальный прокси расширения на новом порту и заново подключает к нему WebView. */
+    /**
+     * Проверяет локальный прокси расширения и перезапускает слушатель (на том же порту), только если он
+     * действительно не принимает соединения; затем заново применяет настройку WebView.
+     */
     fun repairNow(onReady: (() -> Unit)? = null) {
         if (control == null) {
             main.post { onReady?.invoke() }
             return
         }
-        try { server?.close() } catch (_: Exception) {}
-        server = null
-        ensureServer()
+        val alive = server?.isClosed == false && probe(port)
+        if (!alive) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "локальный прокси расширения не принимает соединения (порт $port) — перезапуск слушателя")
+            try { server?.close() } catch (_: Exception) {}
+            server = null
+            ensureServer()
+        }
         appliedKey = ""
         main.post { applyOverride(onReady) }
     }
 
+    /** Строка диагностики для журнала VPN: порт, жив ли слушатель, сколько открыто дескрипторов и потоков. */
+    fun diagnose(): String {
+        val fds = try { java.io.File("/proc/self/fd").list()?.size ?: -1 } catch (_: Exception) { -1 }
+        val alive = server?.isClosed == false
+        val reach = probe(port)
+        return "порт $port, слушатель ${if (alive) "открыт" else "закрыт"}, приём ${if (reach) "ок" else "НЕТ"}, дескрипторов $fds, потоков ${Thread.activeCount()}"
+    }
+
+    @Volatile
+    private var probeFails = 0
+
     /** true — прокси жив (или не используется); false — пришлось перезапустить. */
     fun ensureHealthy(): Boolean {
         if (control == null) return true
-        if (probe(port)) return true
+        if (probe(port)) {
+            probeFails = 0
+            return true
+        }
+        if (++probeFails < 2) return true // одна неудачная проверка под нагрузкой — не повод рвать соединения
+        probeFails = 0
         repairNow(null)
         return false
     }
@@ -695,9 +748,14 @@ function alert(){}
                     respond(client, 502, "Proxy Error")
                     return
                 }
-                val out = client.getOutputStream()
-                out.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
-                out.flush()
+                try {
+                    val out = client.getOutputStream()
+                    out.write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
+                    out.flush()
+                } catch (e: Exception) {
+                    closeQuietly(up.first)
+                    throw e
+                }
                 pipe(client, inp, up.first, up.second)
             } else {
                 val u = try {
@@ -843,13 +901,18 @@ function alert(){}
         raw.soTimeout = if (up.host == "127.0.0.1") 15_000 else 5_000
         raw.tcpNoDelay = true
         if (up.type != "HTTPS") return raw
-        val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, up.host, up.port, true) as SSLSocket
-        ssl.startHandshake()
-        if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(up.host, ssl.session)) {
-            closeQuietly(ssl)
-            throw SSLPeerUnverifiedException("Сертификат прокси не соответствует ${up.host}")
+        try {
+            val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, up.host, up.port, true) as SSLSocket
+            ssl.startHandshake()
+            if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(up.host, ssl.session)) {
+                closeQuietly(ssl)
+                throw SSLPeerUnverifiedException("Сертификат прокси не соответствует ${up.host}")
+            }
+            return ssl
+        } catch (e: Exception) {
+            closeQuietly(raw) // v4.1.1: зависшее TLS-рукопожатие раньше оставляло дескриптор открытым
+            throw e
         }
-        return ssl
     }
 
     private fun statusCode(head: ByteArray): Int {
@@ -871,6 +934,7 @@ function alert(){}
         while (true) {
             val used = creds[up.key]
             val s = openToProxy(up)
+            try {
             val sb = StringBuilder()
                 .append("CONNECT ").append(host).append(':').append(port).append(" HTTP/1.1\r\n")
                 .append("Host: ").append(host).append(':').append(port).append("\r\n")
@@ -899,6 +963,13 @@ function alert(){}
                 continue
             }
             throw ProxyRefusedException(up, code)
+            } catch (e: Exception) {
+                // v4.1.1: главная утечка 4.0.x–4.1.0 — при «Read timed out» сокет к прокси не закрывался; десятки таких за
+                // минуту YouTube исчерпывали дескрипторы, accept() локального прокси падал, WebView получал
+                // ERR_PROXY_CONNECTION_FAILED
+                closeQuietly(s)
+                throw e
+            }
         }
     }
 
@@ -966,8 +1037,9 @@ function alert(){}
 
     private fun viaSocks5(up: Upstream, host: String, port: Int): Pair<Socket, InputStream> {
         val s = Socket()
-        s.connect(InetSocketAddress(up.host, up.port), 15_000)
-        s.soTimeout = 25_000
+        try {
+        s.connect(InetSocketAddress(up.host, up.port), 4_000)
+        s.soTimeout = 5_000
         val out = s.getOutputStream()
         val inp = s.getInputStream()
         out.write(byteArrayOf(5, 1, 0))
@@ -999,6 +1071,10 @@ function alert(){}
         readExactly(inp, addrLen + 2)
         s.soTimeout = 0
         return s to inp
+        } catch (e: Exception) {
+            closeQuietly(s)
+            throw e
+        }
     }
 
     private fun readExactly(inp: InputStream, n: Int): ByteArray {
@@ -1034,6 +1110,7 @@ function alert(){}
         val port = if (u.port > 0) u.port else 80
         for (up in route) {
             if (up.type != "DIRECT" && isDown(up)) continue
+            var opened: Socket? = null
             try {
                 val target: Socket
                 val tin: InputStream
@@ -1063,6 +1140,7 @@ function alert(){}
                         payload = rewriteHead(head, false, u, creds[up.key])
                     }
                 }
+                opened = target
                 target.tcpNoDelay = true
                 target.getOutputStream().write(payload)
                 target.getOutputStream().flush()
@@ -1070,6 +1148,7 @@ function alert(){}
                 pipe(client, cin, target, tin)
                 return
             } catch (e: Exception) {
+                closeQuietly(opened)
                 if (up.type != "DIRECT") {
                     markDown(up, e)
                     reportError(up, e)

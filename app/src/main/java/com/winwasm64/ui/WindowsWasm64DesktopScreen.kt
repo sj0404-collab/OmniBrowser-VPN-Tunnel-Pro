@@ -1215,6 +1215,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             tab.loadingStatusText = "Перезапуск локального прокси и повтор загрузки…"
                             Thread {
                                 if (ExtensionProxy.isActive) {
+                                    // v4.1.1: в журнал — почему WebView не достучался до локального прокси
+                                    com.winwasm64.vpn.VpnLog.w("Браузер", "ERR_PROXY_CONNECTION_FAILED (${Uri.parse(failingUrl).host}): ${ExtensionProxy.diagnose()}")
                                     ExtensionProxy.repairNow { view.postDelayed({ view.loadUrl(failingUrl) }, 300) }
                                 } else {
                                     BrowserDirectRepeater.healthCheckAndRepair(force = true)
