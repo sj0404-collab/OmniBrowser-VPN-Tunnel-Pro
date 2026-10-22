@@ -204,6 +204,7 @@ object ExtensionProxy {
         ownerName = name
         pacCache.clear()
         if (c.pacText != null) loadPac(c.pacText) else pacReady = true
+        refreshAutoTunnel(c.pacText)
         ensureServer()
         BrowserDirectRepeater.externalProxyOverride = { onReady -> applyOverride(onReady) }
         applyOverride(null)
@@ -640,9 +641,12 @@ function alert(){}
                 val route = pacLookup(url, hp.first) ?: listOf(DIRECT)
                 var up = openTunnel(route, hp.first, hp.second, url)
                 if (up == null && route.any { it.type != "DIRECT" }) {
-                    // v4.0.3: прокси расширения не отвечает — открываем через встроенный обход DPI, а не ошибкой
-                    up = try { direct(hp.first, hp.second, url) } catch (_: Exception) { null }
-                    if (up != null) noteFallback(hp.first)
+                    // v4.0.7: сначала автотуннель через рабочие бесплатные серверы Browsec (настоящая смена IP), потом обход DPI
+                    up = autoTunnel(hp.first, hp.second, url)
+                    if (up == null) {
+                        up = try { direct(hp.first, hp.second, url) } catch (_: Exception) { null }
+                        if (up != null) noteFallback(hp.first)
+                    }
                 }
                 if (up == null) {
                     com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
@@ -1093,6 +1097,116 @@ function alert(){}
         val p = if (up.type == "SOCKS5") viaSocks5(up, "www.gstatic.com", 443) else viaHttpProxy(up, "www.gstatic.com", 443, "https://www.gstatic.com/")
         closeQuietly(p.first)
         return true
+    }
+
+    // v4.0.7: автотуннель — бесплатные серверы Browsec (LV/LT/DE…) из PAC расширения; если выбранный расширением сервер
+    // (например, Греция) не отвечает, сайт идёт через самый быстрый рабочий из них, а не через обход DPI
+    private val FREE_BROWSEC = setOf("lv", "lt", "de", "nl", "uk", "sg", "us")
+    private val FALLBACK_TUNNEL = listOf(
+        "lv193.staticvaultcdn.org:443", "lv197.rapidstaticserve.cc:443", "lv117.staticvaultcdn.org:443",
+        "lt40.staticvaultcdn.org:443", "lt36.staticvaultcdn.org:443", "lt44.staticvaultcdn.xyz:443",
+        "de57.rapidstaticserve.cc:443", "de62.staticvaultcdn.xyz:443", "de67.staticvaultcdn.org:443"
+    )
+    @Volatile
+    private var tunnelServers: List<Upstream> = emptyList()
+    private val tunnelPing = ConcurrentHashMap<String, Long>()
+    private val tunnelDownUntil = ConcurrentHashMap<String, Long>()
+    private val tunnelLoggedAt = ConcurrentHashMap<String, Long>()
+    @Volatile
+    private var tunnelPingAt = 0L
+    @Volatile
+    var lastAutoTunnel: String? = null
+        private set
+    @Volatile
+    private var lastAutoTunnelAt = 0L
+
+    /** Был ли автотуннель за последние 2 минуты (для карточки статуса). */
+    fun autoTunnelRecent(): Boolean = SystemClock.elapsedRealtime() - lastAutoTunnelAt < 120_000L
+
+    private fun refreshAutoTunnel(pac: String?) {
+        val found = ArrayList<Upstream>()
+        try {
+            if (pac != null) {
+                val marker = "const countries="
+                val i = pac.indexOf(marker)
+                val j = if (i >= 0) pac.indexOf(";const globalReturn", i) else -1
+                if (i >= 0 && j > i) {
+                    val o = JSONObject(pac.substring(i + marker.length, j))
+                    val keys = o.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (k.lowercase() !in FREE_BROWSEC) continue
+                        val v = o.opt(k)
+                        val txt = when (v) {
+                            is String -> v
+                            is org.json.JSONArray -> (0 until v.length()).joinToString(";") { idx -> v.optString(idx) }
+                            else -> ""
+                        }
+                        for (part in txt.split(';')) {
+                            val t = part.trim().split(Regex("\\s+"))
+                            if (t.size != 2) continue
+                            val https = t[0].equals("HTTPS", true)
+                            if (!https && !t[0].equals("PROXY", true)) continue
+                            val hp = splitHostPort(t[1], if (https) 443 else 80) ?: continue
+                            found.add(Upstream(if (https) "HTTPS" else "HTTP", hp.first, hp.second))
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        if (found.isEmpty()) {
+            for (srv in FALLBACK_TUNNEL) splitHostPort(srv, 443)?.let { found.add(Upstream("HTTPS", it.first, it.second)) }
+        }
+        tunnelServers = found.distinctBy { it.key }
+        tunnelPingAt = SystemClock.elapsedRealtime()
+        pool.execute { pingTunnelServers() }
+    }
+
+    private fun pingTunnelServers() {
+        for (up in tunnelServers.take(24)) {
+            val sock = Socket()
+            try {
+                val t0 = SystemClock.elapsedRealtime()
+                sock.connect(InetSocketAddress(up.host, up.port), 3000)
+                tunnelPing[up.key] = SystemClock.elapsedRealtime() - t0
+            } catch (_: Exception) {
+                tunnelPing[up.key] = Long.MAX_VALUE
+            } finally {
+                closeQuietly(sock)
+            }
+        }
+    }
+
+    private fun autoTunnel(host: String, port: Int, url: String): Pair<Socket, InputStream>? {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val now = SystemClock.elapsedRealtime()
+        if (now - tunnelPingAt > 600_000L) {
+            tunnelPingAt = now
+            pool.execute { pingTunnelServers() }
+        }
+        val list = tunnelServers
+            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
+            .sortedBy { tunnelPing[it.key] ?: 5_000L }
+        var tries = 0
+        for (up in list) {
+            if (tries++ >= 3) break
+            try {
+                val r = viaHttpProxy(up, host, port, url)
+                val t = SystemClock.elapsedRealtime()
+                lastAutoTunnel = up.key
+                lastAutoTunnelAt = t
+                if (t - (tunnelLoggedAt[host] ?: 0L) > 60_000L) {
+                    tunnelLoggedAt[host] = t
+                    com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → автотуннель через Browsec ${up.key}")
+                }
+                return r
+            } catch (e: Exception) {
+                tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                com.winwasm64.vpn.VpnLog.w("Браузер", "автотуннель: ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName})")
+            }
+        }
+        return null
     }
 
     private fun reportError(up: Upstream, e: Exception) {
