@@ -32,6 +32,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         )
     }
 
+    /** v4.0.4: краткий вид по умолчанию (без поясняющего абзаца). */
+    var compact: Boolean = true
     private val tvBrowser = TextView(context)
     private val tvApps = TextView(context)
     private val tvHint = TextView(context)
@@ -120,7 +122,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     fun refresh() {
         tvBrowser.text = try {
             when {
-                ExtensionProxy.isActive -> "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}». Если прокси не отвечает — сайт откроется через встроенный обход DPI (видно в журнале)."
+                ExtensionProxy.isActive && ExtensionProxy.isExtensionProxyDown() -> "🌐 Браузер: прокси расширения «${ExtensionProxy.ownerName ?: "?"}» сейчас не отвечает — сайты идут через встроенный обход DPI."
+                ExtensionProxy.isActive -> "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»."
                 BrowserDirectRepeater.enabled -> "🌐 Браузер: VPN включён — обход DPI, профиль ${BrowserDirectRepeater.sampleBrowserTraffic().activeCountry}. IP не меняется."
                 else -> "🌐 Браузер: напрямую (VPN браузера выключен)."
             }
@@ -136,6 +139,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
                 (if (BrowsecVpnService.transparentActive) "." else " (режим прокси).")
         }
         tvApps.setTextColor(if (BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && routed.isEmpty()) 0xFFFDD663.toInt() else 0xFFECECEC.toInt())
+        tvHint.visibility = if (compact) GONE else VISIBLE
         tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
         val missing = missingPopular()
         btnAdd.visibility = if (missing.isEmpty()) GONE else VISIBLE

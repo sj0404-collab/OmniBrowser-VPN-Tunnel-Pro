@@ -1344,6 +1344,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
             override fun closePopup(extId: String) {
                 if (extPopupFor == extId) extPopupFor = null
+                com.winwasm64.extensions.ExtensionPageActivity.closeFor(extId)
             }
             override fun toast(text: String) {
                 Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
@@ -3176,6 +3177,7 @@ private fun NativeAppsWithBrowsecSection(
     val context = LocalContext.current
     var selectedCategory by remember { mutableStateOf("Все") }
     var appSearchQuery by remember { mutableStateOf("") }
+    var showVpnDetails by remember { mutableStateOf(false) } // v4.0.4: краткий вид по умолчанию
     var selectedFileForOpen by remember { mutableStateOf<File?>(downloadedFiles.firstOrNull()) }
 
     val categories = listOf(
@@ -3223,6 +3225,12 @@ private fun NativeAppsWithBrowsecSection(
                 .padding(10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 84.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                item(key = "vpn_header") {
             Surface(
                 color = Omni.Surface,
                 shape = RoundedCornerShape(12.dp),
@@ -3260,6 +3268,7 @@ private fun NativeAppsWithBrowsecSection(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
+                            if (showVpnDetails) {
                             Text(
                                 text = "⬇ ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})   ⬆ ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})   соединений: ${TransparentTunEngine.activeSessionCount()}",
                                 color = Omni.Accent,
@@ -3271,27 +3280,37 @@ private fun NativeAppsWithBrowsecSection(
                                 color = Omni.Warning,
                                 fontSize = 10.sp
                             )
+                            }
                         }
                         OutlinedButton(
-                            onClick = onRefreshApps,
+                            onClick = { showVpnDetails = !showVpnDetails },
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                             modifier = Modifier.height(32.dp)
                         ) {
-                            Text("Обновить", fontSize = 11.sp, color = Color.White)
+                            Text(if (showVpnDetails) "Кратко ▴" else "Подробнее ▾", fontSize = 11.sp, color = Color.White)
                         }
                     }
 
                     // v4.0.3: что сейчас включено + журнал VPN
                     androidx.compose.ui.viewinterop.AndroidView(
                         factory = { ctx -> com.winwasm64.vpn.VpnStatusView(ctx) { pkgs -> pkgs.forEach { p -> if (!com.winwasm64.vpn.BrowsecVpnService.routedPackages.contains(p)) onToggleAppInVpn(p) } } },
+                        update = { v -> v.compact = !showVpnDetails; v.refresh() },
                         modifier = Modifier.fillMaxWidth()
                     )
+                    if (showVpnDetails) {
                     // Панель выбора сервера, синхронизации обоих VPN и авто-смены настроек с возвратом прошлого в исходное
                     Row(
                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        OutlinedButton(
+                            onClick = onRefreshApps,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.height(34.dp)
+                        ) {
+                            Text("Обновить список", fontSize = 11.sp, color = Color.White)
+                        }
                         Button(
                             onClick = { onOpenServerPicker("apps") },
                             colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
@@ -3392,6 +3411,7 @@ private fun NativeAppsWithBrowsecSection(
                             }
                         }
                     }
+                    }
 
                     CompactDarkTextField(
                         value = appSearchQuery,
@@ -3423,13 +3443,9 @@ private fun NativeAppsWithBrowsecSection(
                     }
                 }
             }
-
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 84.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+                }
                 items(filteredApps, key = { it.packageName }) { app ->
+                    var itemExpanded by remember(app.packageName) { mutableStateOf(false) }
                     val isInVpn = vpnRoutedApps.contains(app.packageName)
                     val appProfile = remember(app.packageName, appServerMapVersion, refreshTick) {
                         BrowsecLocalProxyServer.getOrCreateAppProfile(app.packageName, browsecCountry)
@@ -3444,9 +3460,10 @@ private fun NativeAppsWithBrowsecSection(
                         border = androidx.compose.foundation.BorderStroke(
                             1.dp,
                             if (isInVpn) Omni.Accent else Omni.Outline
-                        )
+                        ),
+                        modifier = Modifier.fillMaxWidth().clickable { itemExpanded = !itemExpanded }
                     ) {
-                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Column(modifier = Modifier.padding(if (itemExpanded) 10.dp else 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -3472,13 +3489,20 @@ private fun NativeAppsWithBrowsecSection(
 
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        "${app.appName} (НАТИВНОЕ АПК)",
+                                        app.appName,
                                         color = Color.White,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 13.sp
                                     )
-                                    Text(app.packageName, color = Omni.TextFaint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                                    Text(
+                                    if (!itemExpanded) {
+                                        Text(
+                                            text = if (isInVpn) "🟢 через VPN · ${appNode.code}" else "⚪ напрямую",
+                                            color = if (isInVpn) Omni.Success else Omni.TextDim,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                    if (itemExpanded) Text(app.packageName, color = Omni.TextFaint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                    if (itemExpanded) Text(
                                         text = if (isInVpn) {
                                             "🟢 В СПИСКЕ VPN • Свой сервер: ${appNode.flag} ${appNode.countryRu} (${appNode.remoteIp}:${appNode.remotePort}) • ⚡ Пинг: ${appServerState.pingMs} мс • Порт: 127.0.0.1:${appProfile.localPort}"
                                         } else {
@@ -3488,7 +3512,7 @@ private fun NativeAppsWithBrowsecSection(
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Bold
                                     )
-                                    if (isInVpn) {
+                                    if (isInVpn && itemExpanded) {
                                         Text(
                                             text = "Трафик этого приложения: ⬇ ВХ: ${BrowsecVpnService.formatSpeedShort(appProfile.rxSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.rxBytes.get())})  |  ⬆ ИСХ: ${BrowsecVpnService.formatSpeedShort(appProfile.txSpeedBps)} (${BrowsecVpnService.formatBytesShort(appProfile.txBytes.get())})",
                                             color = Omni.Accent,
@@ -3497,9 +3521,19 @@ private fun NativeAppsWithBrowsecSection(
                                         )
                                     }
                                 }
+                                if (!itemExpanded) {
+                                    OutlinedButton(
+                                        onClick = { onToggleAppInVpn(app.packageName) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Text(if (isInVpn) "✓ VPN" else "+ VPN", fontSize = 12.sp, color = Color.White)
+                                    }
+                                }
                             }
 
                             // Индивидуальный выбор сервера специально для ЭТОГО приложения
+                            if (itemExpanded) {
                             Row(
                                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -3627,6 +3661,7 @@ private fun NativeAppsWithBrowsecSection(
                                     }
                                 }
                             }
+                            }
                         }
                     }
                 }
@@ -3652,7 +3687,7 @@ private fun NativeAppsWithBrowsecSection(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(text = if (browsecEnabled) "🛡️" else "⏻", fontSize = 13.sp)
+                Text(text = if (browsecEnabled) "🛡️" else "○", fontSize = 13.sp)
                 Text(
                     text = if (browsecEnabled) {
                         "$browsecCountry · ${vpnRoutedApps.size} · ⬇${BrowsecVpnService.formatSpeedShort(liveTraffic.rxSpeedBytesPerSec)} ⬆${BrowsecVpnService.formatSpeedShort(liveTraffic.txSpeedBytesPerSec)}"

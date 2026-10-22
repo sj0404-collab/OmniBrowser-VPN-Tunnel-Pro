@@ -171,6 +171,7 @@ object ExtensionProxy {
     /** Снять управление прокси (если extId == null — у любого расширения). */
     fun release(extId: String?) {
         val c = control ?: return
+        downUntil.clear()
         if (extId != null && c.extId != extId) return
         control = null
         ownerName = null
@@ -667,6 +668,7 @@ function alert(){}
 
     private fun openTunnel(route: List<Upstream>, host: String, port: Int, url: String): Pair<Socket, InputStream>? {
         for (up in route) {
+            if (up.type != "DIRECT" && isDown(up)) continue // v4.0.4: сервер прокси не отвечает — сразу дальше
             try {
                 return when (up.type) {
                     "DIRECT" -> direct(host, port, url)
@@ -674,7 +676,10 @@ function alert(){}
                     else -> viaHttpProxy(up, host, port, url)
                 }
             } catch (e: Exception) {
-                if (up.type != "DIRECT") reportError(up, e)
+                if (up.type != "DIRECT") {
+                    markDown(up)
+                    reportError(up, e)
+                }
             }
         }
         return null
@@ -693,8 +698,8 @@ function alert(){}
 
     private fun openToProxy(up: Upstream): Socket {
         val raw = Socket()
-        raw.connect(InetSocketAddress(up.host, up.port), 15_000)
-        raw.soTimeout = 25_000
+        raw.connect(InetSocketAddress(up.host, up.port), 6_000)
+        raw.soTimeout = 8_000 // v4.0.4: зависший прокси расширения — отказ за секунды, а не 25 с
         raw.tcpNoDelay = true
         if (up.type != "HTTPS") return raw
         val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, up.host, up.port, true) as SSLSocket
@@ -875,6 +880,7 @@ function alert(){}
         val host = u.host
         val port = if (u.port > 0) u.port else 80
         for (up in route) {
+            if (up.type != "DIRECT" && isDown(up)) continue
             try {
                 val target: Socket
                 val tin: InputStream
@@ -910,7 +916,10 @@ function alert(){}
                 pipe(client, cin, target, tin)
                 return
             } catch (e: Exception) {
-                if (up.type != "DIRECT") reportError(up, e)
+                if (up.type != "DIRECT") {
+                    markDown(up)
+                    reportError(up, e)
+                }
             }
         }
         if (route.any { it.type != "DIRECT" }) {
@@ -967,6 +976,47 @@ function alert(){}
                 }
             }
         }
+    }
+
+    // v4.0.4: «предохранитель» — не ответивший сервер прокси расширения пропускаем 3 мин и дальше, пока фоновая проверка не пройдёт
+    private val downUntil = ConcurrentHashMap<String, Long>()
+    private val probing = ConcurrentHashMap<String, Boolean>()
+
+    private fun isDown(up: Upstream): Boolean {
+        val until = downUntil[up.key] ?: return false
+        if (SystemClock.elapsedRealtime() < until) return true
+        if (probing.putIfAbsent(up.key, true) == null) {
+            pool.execute {
+                val ok = try {
+                    probeUpstream(up)
+                } catch (_: Exception) {
+                    false
+                }
+                if (ok) {
+                    downUntil.remove(up.key)
+                    com.winwasm64.vpn.VpnLog.ok("Браузер", "прокси расширения ${up.key} снова отвечает")
+                } else {
+                    downUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                }
+                probing.remove(up.key)
+            }
+        }
+        return true
+    }
+
+    private fun markDown(up: Upstream) {
+        if (downUntil.put(up.key, SystemClock.elapsedRealtime() + 180_000L) == null) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} не отвечает — браузер идёт через встроенный обход DPI (проверю снова через 3 мин)")
+        }
+    }
+
+    /** Есть ли сейчас «упавший» сервер прокси расширения (для карточки статуса). */
+    fun isExtensionProxyDown(): Boolean = control != null && downUntil.isNotEmpty()
+
+    private fun probeUpstream(up: Upstream): Boolean {
+        val p = if (up.type == "SOCKS5") viaSocks5(up, "www.gstatic.com", 443) else viaHttpProxy(up, "www.gstatic.com", 443, "https://www.gstatic.com/")
+        closeQuietly(p.first)
+        return true
     }
 
     private fun reportError(up: Upstream, e: Exception) {
