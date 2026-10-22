@@ -260,8 +260,17 @@ object ExtensionProxy {
         changeListener?.invoke()
     }
 
+    /** Порт, на который направлен WebView: единый слушатель репитера (он же обслуживает режим без расширения). */
+    fun webViewPort(): Int {
+        val rp = try { BrowserDirectRepeater.ensureServerRunning() } catch (_: Exception) { -1 }
+        return if (rp > 0) rp else port
+    }
+
     private fun applyOverride(onReady: (() -> Unit)?) {
-        val p = port
+        // v4.1.3: WebView всегда ходит в один и тот же локальный порт (репитер, 8877) — и с расширением, и без него.
+        // Репитер передаёт CONNECT сюда, пока прокси расширения активен. Смена режима больше не меняет настройку
+        // прокси WebView и не рвёт его соединения.
+        val p = webViewPort()
         if (p <= 0 || !WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
             onReady?.invoke()
             return
@@ -272,7 +281,11 @@ object ExtensionProxy {
             return
         }
         try {
-            val cfg = ProxyConfig.Builder().addProxyRule("127.0.0.1:$p").build()
+            val cfg = ProxyConfig.Builder()
+                .addProxyRule("127.0.0.1:$p")
+                .addBypassRule("localhost")
+                .addBypassRule("127.0.0.1")
+                .build()
             appliedKey = key
             ProxyController.getInstance().setProxyOverride(cfg, { r -> r.run() }, { onReady?.invoke() })
         } catch (e: Exception) {
@@ -623,6 +636,12 @@ function alert(){}
             server = null
             ensureServer()
         }
+        // v4.1.3: WebView ходит через слушатель репитера — проверяем и его
+        val rp = BrowserDirectRepeater.ensureServerRunning()
+        if (rp <= 0 || !probe(rp)) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "слушатель репитера (порт $rp) не принимает соединения — перезапуск")
+            try { BrowserDirectRepeater.restartListener() } catch (_: Exception) {}
+        }
         appliedKey = ""
         main.post { applyOverride(onReady) }
     }
@@ -632,7 +651,9 @@ function alert(){}
         val fds = try { java.io.File("/proc/self/fd").list()?.size ?: -1 } catch (_: Exception) { -1 }
         val alive = server?.isClosed == false
         val reach = probe(port)
-        return "порт $port, слушатель ${if (alive) "открыт" else "закрыт"}, приём ${if (reach) "ок" else "НЕТ"}, дескрипторов $fds, потоков ${Thread.activeCount()}"
+        val wp = webViewPort()
+        val wReach = probe(wp)
+        return "WebView → порт $wp (приём ${if (wReach) "ок" else "НЕТ"}, ключ $appliedKey); прокси расширения порт $port, слушатель ${if (alive) "открыт" else "закрыт"}, приём ${if (reach) "ок" else "НЕТ"}; дескрипторов $fds, потоков ${Thread.activeCount()}"
     }
 
     @Volatile
@@ -641,7 +662,8 @@ function alert(){}
     /** true — прокси жив (или не используется); false — пришлось перезапустить. */
     fun ensureHealthy(): Boolean {
         if (control == null) return true
-        if (probe(port)) {
+        val wp = webViewPort()
+        if (probe(port) && (wp == port || probe(wp))) {
             probeFails = 0
             return true
         }
@@ -726,6 +748,30 @@ function alert(){}
                 closeQuietly(client)
                 return
             }
+            handleRequest(client, inp, head)
+        } catch (e: Exception) {
+            closeQuietly(client)
+        }
+    }
+
+    /** Заголовок CONNECT/GET, который ставит сам прокси расширения, когда идёт через репитер напрямую (защита от петли). */
+    const val DIRECT_MARK = "X-Omni-Direct"
+
+    /**
+     * Соединение, принятое слушателем репитера (v4.1.3): заголовки уже прочитаны, тело/туннель — в [inp].
+     * Возвращается после закрытия соединения.
+     */
+    fun handleAccepted(client: Socket, inp: InputStream, head: ByteArray) {
+        try {
+            try { client.soTimeout = 30_000 } catch (_: Exception) {}
+            handleRequest(client, inp, head)
+        } catch (_: Exception) {
+            closeQuietly(client)
+        }
+    }
+
+    private fun handleRequest(client: Socket, inp: InputStream, head: ByteArray) {
+        try {
             val text = String(head, Charsets.ISO_8859_1)
             val first = text.substringBefore("\r\n").split(' ')
             if (first.size < 3) {
@@ -886,7 +932,7 @@ function alert(){}
     private fun direct(host: String, port: Int, url: String): Pair<Socket, InputStream> {
         if (BrowserDirectRepeater.enabled) {
             val rp = BrowserDirectRepeater.ensureServerRunning()
-            if (rp > 0) return viaHttpProxy(Upstream("HTTP", "127.0.0.1", rp), host, port, url)
+            if (rp > 0) return viaHttpProxy(Upstream("HTTP", "127.0.0.1", rp), host, port, url, direct = true)
         }
         val s = Socket()
         s.connect(InetSocketAddress(host, port), 15_000)
@@ -929,7 +975,7 @@ function alert(){}
     private fun basic(c: Pair<String, String>): String =
         Base64.encodeToString("${c.first}:${c.second}".toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String): Pair<Socket, InputStream> {
+    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String, direct: Boolean = false): Pair<Socket, InputStream> {
         var attempt = 0
         while (true) {
             val used = creds[up.key]
@@ -941,6 +987,7 @@ function alert(){}
                 .append("User-Agent: ").append(ExtensionStore.DESKTOP_UA).append("\r\n")
                 .append("Proxy-Connection: keep-alive\r\n")
             if (used != null) sb.append("Proxy-Authorization: Basic ").append(basic(used)).append("\r\n")
+            if (direct) sb.append(DIRECT_MARK).append(": 1\r\n")
             sb.append("\r\n")
             val out = s.getOutputStream()
             out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
@@ -1088,7 +1135,7 @@ function alert(){}
         return b
     }
 
-    private fun rewriteHead(text: String, originForm: Boolean, u: URL, auth: Pair<String, String>?): ByteArray {
+    private fun rewriteHead(text: String, originForm: Boolean, u: URL, auth: Pair<String, String>?, direct: Boolean = false): ByteArray {
         val lines = text.split("\r\n")
         val first = lines[0].split(' ')
         val target = if (originForm) u.file.ifEmpty { "/" } else first[1]
@@ -1097,10 +1144,11 @@ function alert(){}
             val l = lines[i]
             if (l.isEmpty()) continue
             val name = l.substringBefore(':').trim().lowercase()
-            if (name == "proxy-connection" || name == "proxy-authorization" || name == "connection" || name == "keep-alive") continue
+            if (name == "proxy-connection" || name == "proxy-authorization" || name == "connection" || name == "keep-alive" || name == DIRECT_MARK.lowercase()) continue
             sb.append(l).append("\r\n")
         }
         if (auth != null) sb.append("Proxy-Authorization: Basic ").append(basic(auth)).append("\r\n")
+        if (direct) sb.append(DIRECT_MARK).append(": 1\r\n")
         sb.append("Connection: close\r\n\r\n")
         return sb.toString().toByteArray(Charsets.ISO_8859_1)
     }
@@ -1120,7 +1168,7 @@ function alert(){}
                         if (BrowserDirectRepeater.enabled && BrowserDirectRepeater.ensureServerRunning() > 0) {
                             target = Socket()
                             target.connect(InetSocketAddress("127.0.0.1", BrowserDirectRepeater.activePort), 10_000)
-                            payload = rewriteHead(head, false, u, null)
+                            payload = rewriteHead(head, false, u, null, direct = true)
                         } else {
                             target = Socket()
                             target.connect(InetSocketAddress(host, port), 15_000)

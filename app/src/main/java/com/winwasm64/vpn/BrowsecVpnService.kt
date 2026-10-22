@@ -1001,18 +1001,24 @@ object BrowserDirectRepeater {
 
     /** Проверяет репитер №1; если он не принимает соединения — перезапускает и заново направляет WebView. */
     fun healthCheckAndRepair(force: Boolean = false): Boolean {
-        if (!enabled || externalProxyOverride != null) return true
+        if (!enabled && externalProxyOverride == null) return true
         if (!force && probeLocalPort(activePort)) return true
-        synchronized(this) {
-            try { serverSocket?.close() } catch (_: Exception) {}
-            serverSocket = null
-            running.set(false)
-        }
+        restartListener()
         appliedProxyKey = ""
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             try { ensureDirectBrowserMode(null) } catch (_: Exception) {}
         }
         return false
+    }
+
+    /** Перезапускает слушатель репитера (тот же порт 8877, если свободен). */
+    fun restartListener() {
+        synchronized(this) {
+            try { serverSocket?.close() } catch (_: Exception) {}
+            serverSocket = null
+            running.set(false)
+        }
+        ensureServerRunning()
     }
 
     /**
@@ -1032,7 +1038,7 @@ object BrowserDirectRepeater {
                             VpnProfileProber.measureActiveLink(activeSt)
                         }
                         // v4.0.2: каждые ~6 с проверяем, что репитер жив (иначе WebView получит ERR_PROXY_CONNECTION_FAILED)
-                        if (tick % 4 == 3 && externalProxyOverride == null && appliedProxyKey.startsWith("ON:") &&
+                        if (tick % 4 == 3 && (appliedProxyKey.startsWith("ON:") || externalProxyOverride != null) &&
                             !probeLocalPort(activePort)
                         ) {
                             healthCheckAndRepair(force = true)
@@ -1454,6 +1460,16 @@ object BrowserDirectRepeater {
             val parts = requestLine.split(" ")
             val method = parts.getOrNull(0)?.uppercase().orEmpty()
             val target = parts.getOrNull(1).orEmpty()
+
+            // v4.1.3: пока прокси расширения активен, браузерные запросы обрабатывает он (PAC расширения, его серверы,
+            // автотуннель, обход DPI) — но через этот единый слушатель. Свои «прямые» запросы он помечает заголовком.
+            if (com.winwasm64.extensions.ExtensionProxy.isActive &&
+                (method == "CONNECT" || target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true)) &&
+                lines.none { it.startsWith(com.winwasm64.extensions.ExtensionProxy.DIRECT_MARK, ignoreCase = true) }
+            ) {
+                com.winwasm64.extensions.ExtensionProxy.handleAccepted(client, inp, rawHeaderBytes)
+                return
+            }
 
             if (method == "CONNECT") {
                 val hostPort = target.split(":")
