@@ -123,7 +123,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         tvBrowser.text = try {
             when {
                 ExtensionProxy.isActive && ExtensionProxy.isExtensionProxyDown() -> "🌐 Браузер: прокси расширения «${ExtensionProxy.ownerName ?: "?"}» сейчас не отвечает — сайты идут через встроенный обход DPI."
-                ExtensionProxy.isActive -> "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»."
+                ExtensionProxy.isActive -> "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»" +
+                    (ExtensionProxy.lastWorkingUpstream?.let { " — работает (сервер $it)." } ?: ".")
                 BrowserDirectRepeater.enabled -> "🌐 Браузер: VPN включён — обход DPI, профиль ${BrowserDirectRepeater.sampleBrowserTraffic().activeCountry}. IP не меняется."
                 else -> "🌐 Браузер: напрямую (VPN браузера выключен)."
             }

@@ -672,11 +672,13 @@ function alert(){}
         for (up in route) {
             if (up.type != "DIRECT" && isDown(up)) continue // v4.0.4: сервер прокси не отвечает — сразу дальше
             try {
-                return when (up.type) {
+                val r = when (up.type) {
                     "DIRECT" -> direct(host, port, url)
                     "SOCKS5" -> viaSocks5(up, host, port)
                     else -> viaHttpProxy(up, host, port, url)
                 }
+                if (up.type != "DIRECT") noteUpstreamOk(up, host)
+                return r
             } catch (e: Exception) {
                 if (up.type != "DIRECT") {
                     markDown(up, e)
@@ -915,6 +917,7 @@ function alert(){}
                 target.tcpNoDelay = true
                 target.getOutputStream().write(payload)
                 target.getOutputStream().flush()
+                if (up.type != "DIRECT") noteUpstreamOk(up, host)
                 pipe(client, cin, target, tin)
                 return
             } catch (e: Exception) {
@@ -1043,6 +1046,29 @@ function alert(){}
         }
     }
 
+    // v4.0.6: удачные соединения через прокси расширения — сбрасывают предохранитель и видны в журнале
+    @Volatile
+    private var lastUpstreamOkAt = 0L
+    @Volatile
+    var lastWorkingUpstream: String? = null
+        private set
+    private val okLoggedAt = ConcurrentHashMap<String, Long>()
+
+    private fun noteUpstreamOk(up: Upstream, host: String) {
+        val now = SystemClock.elapsedRealtime()
+        lastUpstreamOkAt = now
+        lastWorkingUpstream = up.key
+        downUntil.remove(up.key)
+        if (ownerDown()) {
+            ownerDownUntil = 0L
+            ownerFails.clear()
+        }
+        if (now - (okLoggedAt[up.key] ?: 0L) > 300_000L) {
+            okLoggedAt[up.key] = now
+            com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → через прокси «${ownerName ?: "расширения"}» ${up.key}")
+        }
+    }
+
     private fun markDown(up: Upstream, e: Exception) {
         val now = SystemClock.elapsedRealtime()
         val reason = e.message ?: e.javaClass.simpleName
@@ -1051,7 +1077,8 @@ function alert(){}
         }
         ownerFails.addLast(now)
         while (ownerFails.isNotEmpty() && now - (ownerFails.peekFirst() ?: now) > 180_000L) ownerFails.pollFirst()
-        if (ownerFails.size >= 2 && !ownerDown()) {
+        // v4.0.6: «всё расширение не работает» — только если через него ничего не прошло 2 мин (служебные серверы Browsec не в счёт)
+        if (ownerFails.size >= 2 && !ownerDown() && now - lastUpstreamOkAt > 120_000L) {
             ownerDownUntil = now + 300_000L
             ownerProbeAt = now
             com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения «${ownerName ?: "?"}» не работает (серверы не отвечают) — 5 мин все сайты сразу идут через встроенный обход DPI, без ожидания")
@@ -1059,7 +1086,8 @@ function alert(){}
     }
 
     /** Есть ли сейчас «упавший» сервер прокси расширения (для карточки статуса). */
-    fun isExtensionProxyDown(): Boolean = control != null && (ownerDown() || downUntil.isNotEmpty())
+    fun isExtensionProxyDown(): Boolean = control != null &&
+        (ownerDown() || (downUntil.isNotEmpty() && SystemClock.elapsedRealtime() - lastUpstreamOkAt > 120_000L))
 
     private fun probeUpstream(up: Upstream): Boolean {
         val p = if (up.type == "SOCKS5") viaSocks5(up, "www.gstatic.com", 443) else viaHttpProxy(up, "www.gstatic.com", 443, "https://www.gstatic.com/")
