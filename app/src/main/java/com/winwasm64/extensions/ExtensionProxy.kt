@@ -37,6 +37,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLPeerUnverifiedException
@@ -107,6 +109,53 @@ object ExtensionProxy {
 
     fun init(context: Context) {
         appContext = context.applicationContext
+        loadPersisted()
+    }
+
+    // v4.1.1: учётные данные Browsec и список его серверов переживают отключение прокси расширения и перезапуск —
+    // туннель приложений и DoH через туннель работают независимо от того, управляет ли расширение прокси браузера
+    private const val PREFS = "omni_ext_proxy_v41"
+
+    @Volatile
+    private var sharedCreds: Pair<String, String>? = null
+
+    private fun prefs() = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private fun loadPersisted() {
+        try {
+            val p = prefs()
+            val u = p.getString("shared_user", null)
+            val pw = p.getString("shared_pass", null)
+            if (!u.isNullOrEmpty() && pw != null) sharedCreds = u to pw
+            val list = p.getString("tunnel_servers", null)
+            if (!list.isNullOrBlank()) {
+                val arr = JSONArray(list)
+                val found = ArrayList<Upstream>()
+                for (i in 0 until arr.length()) {
+                    val hp = splitHostPort(arr.optString(i), 443) ?: continue
+                    found.add(Upstream("HTTPS", hp.first, hp.second))
+                }
+                if (found.isNotEmpty()) tunnelServers = found
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun rememberSharedCreds(c: Pair<String, String>) {
+        sharedCreds = c
+        try {
+            prefs().edit().putString("shared_user", c.first).putString("shared_pass", c.second).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun persistTunnelServers(list: List<Upstream>) {
+        try {
+            val arr = JSONArray()
+            for (u in list.take(40)) arr.put(u.key)
+            prefs().edit().putString("tunnel_servers", arr.toString()).apply()
+        } catch (_: Exception) {
+        }
     }
 
     // =====================================================================
@@ -178,7 +227,7 @@ object ExtensionProxy {
         control = null
         ownerName = null
         pacCache.clear()
-        creds.clear()
+        // creds не очищаем: туннель приложений продолжает работать через серверы Browsec
         pacReady = false
         BrowserDirectRepeater.externalProxyOverride = null
         BrowserDirectRepeater.resetAppliedProxyKey()
@@ -639,15 +688,8 @@ function alert(){}
                 }
                 val url = (if (hp.second == 80) "http://" else "https://") + hp.first + "/"
                 val route = pacLookup(url, hp.first) ?: listOf(DIRECT)
-                var up = openTunnel(route, hp.first, hp.second, url)
-                if (up == null && route.any { it.type != "DIRECT" }) {
-                    // v4.0.7: сначала автотуннель через рабочие бесплатные серверы Browsec (настоящая смена IP), потом обход DPI
-                    up = autoTunnel(hp.first, hp.second, url)
-                    if (up == null) {
-                        up = try { direct(hp.first, hp.second, url) } catch (_: Exception) { null }
-                        if (up != null) noteFallback(hp.first)
-                    }
-                }
+                // v4.1.1: ступенчатая гонка вместо последовательного перебора — ответ на CONNECT всегда укладывается в ~8 с
+                val up = raceConnect(route, hp.first, hp.second, url)
                 if (up == null) {
                     com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
                     respond(client, 502, "Proxy Error")
@@ -672,25 +714,115 @@ function alert(){}
         }
     }
 
-    private fun openTunnel(route: List<Upstream>, host: String, port: Int, url: String): Pair<Socket, InputStream>? {
-        for (up in route) {
-            if (up.type != "DIRECT" && isDown(up)) continue // v4.0.4: сервер прокси не отвечает — сразу дальше
-            try {
-                val r = when (up.type) {
-                    "DIRECT" -> direct(host, port, url)
-                    "SOCKS5" -> viaSocks5(up, host, port)
-                    else -> viaHttpProxy(up, host, port, url)
-                }
-                if (up.type != "DIRECT") noteUpstreamOk(up, host)
-                return r
-            } catch (e: Exception) {
-                if (up.type != "DIRECT") {
-                    markDown(up, e)
-                    reportError(up, e)
+    private class RaceResult(val sock: Pair<Socket, InputStream>?, val kind: Int, val up: Upstream?)
+
+    /**
+     * Ступенчатая гонка маршрутов (v4.1.1). WebView ждёт ответ на CONNECT около 10 с, поэтому:
+     *  t=0      — до двух серверов расширения из PAC параллельно (пропуская «упавшие»);
+     *  t=2.5 с  — (или сразу, когда все они отвалились/пропущены) два лучших сервера автотуннеля Browsec;
+     *  t=5 с    — (или сразу) встроенный обход DPI;
+     *  t=8.5 с  — общий предел.
+     * Первый успешный маршрут побеждает, остальные закрываются по завершении. Выбранный расширением сервер
+     * получает фору, но зависший сервер больше не блокирует страницу.
+     */
+    private fun raceConnect(route: List<Upstream>, host: String, port: Int, url: String): Pair<Socket, InputStream>? {
+        val proxies = route.filter { it.type != "DIRECT" }
+        val hasDirectInRoute = route.any { it.type == "DIRECT" }
+        if (proxies.isEmpty()) {
+            return try { direct(host, port, url) } catch (_: Exception) { null }
+        }
+        val results = LinkedBlockingQueue<RaceResult>()
+        val won = AtomicBoolean(false)
+        val pending = AtomicInteger(0)
+        fun launch(kind: Int, up: Upstream?, block: () -> Pair<Socket, InputStream>) {
+            pending.incrementAndGet()
+            pool.execute {
+                var r: Pair<Socket, InputStream>? = null
+                try {
+                    r = block()
+                } catch (e: Exception) {
+                    if (kind == 0 && up != null) {
+                        markDown(up, e)
+                        reportError(up, e)
+                    } else if (kind == 1 && up != null) {
+                        if (e !is ProxyRefusedException || e.code == 407) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                        com.winwasm64.vpn.VpnLog.w("Браузер", "автотуннель: ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName})")
+                    }
+                } finally {
+                    results.add(RaceResult(r, kind, up)) // сначала результат, потом счётчик — чтобы pending==0 означало «всё в очереди»
+                    pending.decrementAndGet()
+                    if (r != null && won.get()) closeQuietly(r.first) // гонка уже выиграна/завершена — лишний сокет закрываем
                 }
             }
         }
-        return null
+
+        val t0 = SystemClock.elapsedRealtime()
+        val deadline = t0 + 8_500L
+        // ступень 0: серверы расширения
+        val live = proxies.filter { !isDown(it) }.take(2)
+        for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
+        val stage1At = if (live.isEmpty()) t0 else t0 + 2_500L
+        var stage2At = if (live.isEmpty()) t0 + 2_500L else t0 + 5_000L
+        var autoStarted = false
+        var directStarted = false
+        while (true) {
+            val now = SystemClock.elapsedRealtime()
+            if (!autoStarted && (now >= stage1At || pending.get() == 0)) {
+                autoStarted = true
+                for (p in autoTunnelCandidates(2)) launch(1, p) { viaHttpProxy(p, host, port, url) }
+                if (pending.get() == 0) stage2At = now
+            }
+            if (!directStarted && autoStarted && (now >= stage2At || pending.get() == 0)) {
+                directStarted = true
+                launch(2, null) { direct(host, port, url) }
+            }
+            if (now >= deadline || (directStarted && pending.get() == 0 && results.isEmpty())) {
+                won.set(true)
+                drainAndClose(results)
+                return null
+            }
+            val nextTick = minOf(deadline, if (!autoStarted) stage1At else if (!directStarted) stage2At else deadline)
+            val r = results.poll(maxOf(20L, nextTick - now), TimeUnit.MILLISECONDS) ?: continue
+            val sock = r.sock ?: continue
+            won.set(true)
+            drainAndClose(results)
+            when (r.kind) {
+                0 -> noteUpstreamOk(r.up!!, host)
+                1 -> noteAutoTunnel(r.up!!, host)
+                else -> if (!hasDirectInRoute) noteFallback(host)
+            }
+            return sock
+        }
+    }
+
+    private fun drainAndClose(q: LinkedBlockingQueue<RaceResult>) {
+        while (true) {
+            val x = q.poll() ?: return
+            x.sock?.let { closeQuietly(it.first) }
+        }
+    }
+
+    private fun autoTunnelCandidates(n: Int): List<Upstream> {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val now = SystemClock.elapsedRealtime()
+        if (now - tunnelPingAt > 600_000L) {
+            tunnelPingAt = now
+            pool.execute { pingTunnelServers() }
+        }
+        return tunnelServers
+            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
+            .sortedBy { tunnelPing[it.key] ?: 5_000L }
+            .take(n)
+    }
+
+    private fun noteAutoTunnel(up: Upstream, host: String) {
+        val t = SystemClock.elapsedRealtime()
+        lastAutoTunnel = up.key
+        lastAutoTunnelAt = t
+        if (t - (tunnelLoggedAt[host] ?: 0L) > 60_000L) {
+            tunnelLoggedAt[host] = t
+            com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → автотуннель через Browsec ${up.key}")
+        }
     }
 
     private fun direct(host: String, port: Int, url: String): Pair<Socket, InputStream> {
@@ -706,8 +838,9 @@ function alert(){}
 
     private fun openToProxy(up: Upstream): Socket {
         val raw = Socket()
-        raw.connect(InetSocketAddress(up.host, up.port), 6_000)
-        raw.soTimeout = 8_000 // v4.0.4: зависший прокси расширения — отказ за секунды, а не 25 с
+        raw.connect(InetSocketAddress(up.host, up.port), 4_000)
+        // v4.1.1: WebView ждёт ответ на CONNECT ~10 с — зависший сервер должен отвалиться раньше; локальному репитеру даём больше
+        raw.soTimeout = if (up.host == "127.0.0.1") 15_000 else 5_000
         raw.tcpNoDelay = true
         if (up.type != "HTTPS") return raw
         val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, up.host, up.port, true) as SSLSocket
@@ -765,14 +898,23 @@ function alert(){}
                 credentialsFor(up, realmOf(head), url, used) ?: throw IOException("Прокси ${up.key} требует логин и пароль")
                 continue
             }
-            throw IOException("Прокси ${up.key} ответил HTTP $code")
+            throw ProxyRefusedException(up, code)
         }
     }
+
+    /** Прокси ответил, но отказал (403/405 на порт и т.п.) — сервер жив, «вниз» его не отправляем. */
+    class ProxyRefusedException(up: Upstream, val code: Int) : IOException("Прокси ${up.key} ответил HTTP $code")
 
     /** Один запрос пароля на прокси одновременно: остальные соединения ждут его результата. */
     private fun credentialsFor(up: Upstream, realm: String, url: String, failed: Pair<String, String>?): Pair<String, String>? {
         val current = creds[up.key]
         if (current != null && current != failed) return current
+        // Browsec использует одни учётные данные на все свои серверы — пробуем известные, не дёргая расширение
+        val shared = sharedCreds
+        if (shared != null && shared != failed && shared != current) {
+            creds[up.key] = shared
+            return shared
+        }
         val mine = CountDownLatch(1)
         val other = authInFlight.putIfAbsent(up.key, mine)
         if (other != null) {
@@ -781,7 +923,10 @@ function alert(){}
         }
         try {
             val c = askCredentials(up, realm, url)
-            if (c != null) creds[up.key] = c
+            if (c != null) {
+                creds[up.key] = c
+                rememberSharedCreds(c)
+            }
             return c
         } finally {
             authInFlight.remove(up.key)
@@ -1074,6 +1219,7 @@ function alert(){}
     }
 
     private fun markDown(up: Upstream, e: Exception) {
+        if (e is ProxyRefusedException && e.code != 407) return // сервер отвечает — просто отказал этому запросу
         val now = SystemClock.elapsedRealtime()
         val reason = e.message ?: e.javaClass.simpleName
         if (downUntil.put(up.key, now + 180_000L) == null) {
@@ -1159,6 +1305,7 @@ function alert(){}
             for (srv in FALLBACK_TUNNEL) splitHostPort(srv, 443)?.let { found.add(Upstream("HTTPS", it.first, it.second)) }
         }
         tunnelServers = found.distinctBy { it.key }
+        persistTunnelServers(tunnelServers)
         tunnelPingAt = SystemClock.elapsedRealtime()
         pool.execute { pingTunnelServers() }
     }
@@ -1178,41 +1325,10 @@ function alert(){}
         }
     }
 
-    private fun autoTunnel(host: String, port: Int, url: String): Pair<Socket, InputStream>? {
-        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
-        val now = SystemClock.elapsedRealtime()
-        if (now - tunnelPingAt > 600_000L) {
-            tunnelPingAt = now
-            pool.execute { pingTunnelServers() }
-        }
-        val list = tunnelServers
-            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
-            .sortedBy { tunnelPing[it.key] ?: 5_000L }
-        var tries = 0
-        for (up in list) {
-            if (tries++ >= 3) break
-            try {
-                val r = viaHttpProxy(up, host, port, url)
-                val t = SystemClock.elapsedRealtime()
-                lastAutoTunnel = up.key
-                lastAutoTunnelAt = t
-                if (t - (tunnelLoggedAt[host] ?: 0L) > 60_000L) {
-                    tunnelLoggedAt[host] = t
-                    com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → автотуннель через Browsec ${up.key}")
-                }
-                return r
-            } catch (e: Exception) {
-                tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
-                com.winwasm64.vpn.VpnLog.w("Браузер", "автотуннель: ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName})")
-            }
-        }
-        return null
-    }
-
     // v4.1.0: туннель Browsec для приложений из списка VPN (настоящая смена IP, как у браузера с расширением)
 
     /** Есть ли чем туннелировать приложения: расширение с прокси включено или уже известны его учётные данные. */
-    fun appTunnelAvailable(): Boolean = control != null || creds.isNotEmpty()
+    fun appTunnelAvailable(): Boolean = control != null || sharedCreds != null || creds.isNotEmpty()
 
     private val appTunnelLoggedAt = ConcurrentHashMap<String, Long>()
 
@@ -1233,7 +1349,7 @@ function alert(){}
             .sortedWith(compareBy<Upstream>({ if (pref != null && it.host.startsWith(pref)) 0 else 1 }, { tunnelPing[it.key] ?: 5_000L }))
         var tries = 0
         for (up in list) {
-            if (tries++ >= 3) break
+            if (tries++ >= 2) break
             try {
                 val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
                 lastAutoTunnel = up.key
@@ -1244,12 +1360,63 @@ function alert(){}
                     com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key}")
                 }
                 return Triple(r.first, r.second, up.key)
+            } catch (e: ProxyRefusedException) {
+                if (e.code == 407) {
+                    tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
+                    com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не принял учётные данные — включите расширение Browsec в браузере, чтобы обновить их")
+                } else {
+                    // Порт/адрес не разрешён этим прокси — остальные серверы ответят так же, идём напрямую
+                    return null
+                }
             } catch (e: Exception) {
                 tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
                 com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — следующий")
             }
         }
         return null
+    }
+
+    // v4.1.1: DNS приложений через туннель Browsec (DoH к dns.google внутри CONNECT) — ответы провайдера отравлены
+    private val tunnelDnsCache = ConcurrentHashMap<String, Pair<String, Long>>()
+
+    fun resolveViaTunnel(name: String, ecsSubnet: String?): String? {
+        val now = SystemClock.elapsedRealtime()
+        tunnelDnsCache[name]?.let { if (it.second > now) return it.first else tunnelDnsCache.remove(name) }
+        if (!appTunnelAvailable()) return null
+        val t = openAppTunnel("dns.google", 443, null) ?: return null
+        var ssl: SSLSocket? = null
+        try {
+            t.first.soTimeout = 5_000
+            ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(t.first, "dns.google", 443, true) as SSLSocket
+            ssl.startHandshake()
+            val path = "/resolve?name=" + java.net.URLEncoder.encode(name, "UTF-8") + "&type=A" +
+                (if (!ecsSubnet.isNullOrBlank()) "&edns_client_subnet=" + java.net.URLEncoder.encode(ecsSubnet, "UTF-8") else "")
+            ssl.outputStream.write(("GET $path HTTP/1.1\r\nHost: dns.google\r\nAccept: application/dns-json\r\nConnection: close\r\n\r\n").toByteArray(Charsets.ISO_8859_1))
+            ssl.outputStream.flush()
+            val all = ssl.inputStream.readBytes()
+            val text = String(all, Charsets.UTF_8)
+            val body = text.substringAfter("\r\n\r\n", "")
+            val json = JSONObject(body.substring(body.indexOf('{').coerceAtLeast(0)))
+            val answers = json.optJSONArray("Answer") ?: return null
+            var ttl = 60L
+            for (i in 0 until answers.length()) {
+                val a = answers.getJSONObject(i)
+                if (a.optInt("type") == 1) {
+                    val ip = a.optString("data").trim()
+                    if (ip.count { it == '.' } == 3) {
+                        ttl = a.optLong("TTL", 60L).coerceIn(30L, 600L)
+                        tunnelDnsCache[name] = ip to (now + ttl * 1000L)
+                        return ip
+                    }
+                }
+            }
+            return null
+        } catch (_: Exception) {
+            return null
+        } finally {
+            closeQuietly(ssl)
+            closeQuietly(t.first)
+        }
     }
 
     private fun reportError(up: Upstream, e: Exception) {

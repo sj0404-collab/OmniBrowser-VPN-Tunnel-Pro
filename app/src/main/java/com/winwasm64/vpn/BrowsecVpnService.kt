@@ -2497,9 +2497,8 @@ object BrowsecLocalProxyServer {
             // 2. Маршрут: туннель Browsec (настоящая смена IP, как у браузера) → иначе напрямую с обходом DPI
             var upIn: InputStream? = null
             var up: Socket? = null
-            if (!isDnsIp && BrowsecVpnService.appsViaBrowsecTunnel && (origPort == 443 || origPort == 80 || origPort == 8443) &&
-                com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()
-            ) {
+            // v4.1.1: любой TCP-порт (Telegram ходит на 5222 и по IP без SNI); если прокси откажет в порте — напрямую
+            if (!isDnsIp && BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
                 val t0 = System.currentTimeMillis()
                 val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
                 if (r != null) {
@@ -3487,7 +3486,10 @@ class BrowsecVpnService : VpnService() {
                         return
                     }
                     DnsPackets.TYPE_A -> {
-                        val ip = FastMultiDnsResolver.resolveFast(
+                        // v4.1.1: сначала DoH через туннель Browsec (провайдер подменяет и UDP-DNS, и прямые DoH), потом обычный резолвер
+                        val viaTunnel = if (BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable())
+                            com.winwasm64.extensions.ExtensionProxy.resolveViaTunnel(q.name, st.node.ecsSubnet) else null
+                        val ip = viaTunnel ?: FastMultiDnsResolver.resolveFast(
                             host = q.name,
                             ecsSubnet = st.node.ecsSubnet,
                             dohServer = st.currentDoh,
