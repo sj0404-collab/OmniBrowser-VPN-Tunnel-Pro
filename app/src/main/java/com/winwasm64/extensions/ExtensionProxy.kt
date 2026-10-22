@@ -635,8 +635,14 @@ function alert(){}
                 }
                 val url = (if (hp.second == 80) "http://" else "https://") + hp.first + "/"
                 val route = pacLookup(url, hp.first) ?: listOf(DIRECT)
-                val up = openTunnel(route, hp.first, hp.second, url)
+                var up = openTunnel(route, hp.first, hp.second, url)
+                if (up == null && route.any { it.type != "DIRECT" }) {
+                    // v4.0.3: прокси расширения не отвечает — открываем через встроенный обход DPI, а не ошибкой
+                    up = try { direct(hp.first, hp.second, url) } catch (_: Exception) { null }
+                    if (up != null) noteFallback(hp.first)
+                }
                 if (up == null) {
+                    com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
                     respond(client, 502, "Proxy Error")
                     return
                 }
@@ -907,6 +913,12 @@ function alert(){}
                 if (up.type != "DIRECT") reportError(up, e)
             }
         }
+        if (route.any { it.type != "DIRECT" }) {
+            noteFallback(host)
+            forwardHttp(client, cin, head, u, listOf(DIRECT))
+            return
+        }
+        com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть $host:$port")
         respond(client, 502, "Proxy Error")
     }
 
@@ -939,6 +951,24 @@ function alert(){}
         }
     }
 
+    @Volatile
+    private var lastFallbackToast = 0L
+
+    private fun noteFallback(host: String) {
+        val owner = ownerName ?: "расширения"
+        com.winwasm64.vpn.VpnLog.w("Браузер", "прокси «$owner» не отвечает → $host открыт через встроенный обход DPI")
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastFallbackToast > 60_000L) {
+            lastFallbackToast = now
+            main.post {
+                try {
+                    android.widget.Toast.makeText(appContext, "Прокси «$owner» не отвечает — сайты открываются через встроенный обход DPI", android.widget.Toast.LENGTH_LONG).show()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
     private fun reportError(up: Upstream, e: Exception) {
         val owner = control?.extId ?: return
         val now = SystemClock.elapsedRealtime()
@@ -946,6 +976,7 @@ function alert(){}
         if (now - last < 10_000) return
         lastErrorAt[up.key] = now
         Log.w(TAG, "прокси ${up.key}: ${e.message}")
-        main.post { errorReporter?.invoke(owner, "net::ERR_PROXY_CONNECTION_FAILED", "${up.key}: ${e.message ?: e.javaClass.simpleName}") }
+        // v4.0.3: без красной плашки — сайт и так откроется через встроенный обход DPI; причина — в журнале VPN
+        com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения «${ownerName ?: owner}» ${up.key}: ${e.message ?: e.javaClass.simpleName}")
     }
 }

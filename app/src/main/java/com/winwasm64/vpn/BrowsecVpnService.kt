@@ -2462,6 +2462,9 @@ object BrowsecLocalProxyServer {
         st.requestsCount.incrementAndGet()
         profile?.activeSockets?.incrementAndGet()
         profile?.requests?.incrementAndGet()
+        val logStart = System.currentTimeMillis()
+        var logHost = remoteAddr.hostAddress ?: ""
+        var logErr: String? = null
         var upstream: Socket? = null
         try {
             client.tcpNoDelay = true
@@ -2490,6 +2493,7 @@ object BrowsecLocalProxyServer {
                 if (n < 0) return
                 if (n > 0) {
                     TlsSni.extract(first, n)?.let { host = it }
+                    logHost = host
                     pin.unread(first, 0, n)
                 }
             }
@@ -2505,7 +2509,8 @@ object BrowsecLocalProxyServer {
             pipeServerToClientV38(upIn, out, st, profile, true)
             try { client.shutdownOutput() } catch (_: Exception) {}
             t1.join(2000)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logErr = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
         } finally {
             openClientSockets.remove(client)
             st.activeConnections.decrementAndGet()
@@ -2513,6 +2518,7 @@ object BrowsecLocalProxyServer {
             try { upstream?.close() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
             sess.closing = true
+            VpnLog.conn(profile?.packageName, logHost, origPort, profile?.countryCode ?: BrowsecVpnService.activeCountry, System.currentTimeMillis() - logStart, logErr)
         }
     }
 
@@ -3213,6 +3219,7 @@ class BrowsecVpnService : VpnService() {
         super.onCreate()
         activeInstance = this
         appContext = applicationContext
+        VpnLog.init(this)
         createNotificationChannel()
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
         BrowsecLocalProxyServer.ensureRunning()
@@ -3220,6 +3227,7 @@ class BrowsecVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        VpnLog.i("Сервис", "команда: " + (intent?.action?.substringAfterLast('.') ?: "запуск") + (intent?.getStringExtra(EXTRA_COUNTRY)?.let { " ($it)" } ?: ""))
         when (intent?.action) {
             ACTION_DISCONNECT -> {
                 isRunning = false
@@ -3350,6 +3358,7 @@ class BrowsecVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
+                    VpnLog.w("Туннель", "VPN приложений включён, но список пуст — ни одно приложение не идёт через VPN")
                     return
                 }
             } else {
@@ -3361,6 +3370,8 @@ class BrowsecVpnService : VpnService() {
 
             val pfd = builder.establish()
             perAppVpnInterface = pfd
+            if (pfd == null) VpnLog.e("Туннель", "Android не создал VPN-интерфейс (нет разрешения VPN или включено другое VPN-приложение)")
+            else VpnLog.ok("Туннель", "VPN приложений поднят, профиль $activeCountry: " + VpnLog.appList(routedPackages) + (if (wantTransparent) " · прозрачный режим" else " · режим прокси"))
             if (pfd == null) {
                 tunnelEstablished = false
                 transparentActive = false
@@ -3390,6 +3401,8 @@ class BrowsecVpnService : VpnService() {
             if (wantTransparent) {
                 thread(name = "OmniTunSelfTest", isDaemon = true) {
                     val ok = engine.selfTest()
+                    if (ok) VpnLog.ok("Туннель", "самопроверка прозрачного туннеля пройдена")
+                    else VpnLog.w("Туннель", "устройство не пропускает прозрачный туннель → переключаюсь на режим прокси")
                     if (!ok && tunEngine === engine && isRunning && !isPaused) {
                         // Устройство не пропускает NAT через TUN — откат на системный прокси, чтобы ничего не сломать
                         transparentUnsupported = true

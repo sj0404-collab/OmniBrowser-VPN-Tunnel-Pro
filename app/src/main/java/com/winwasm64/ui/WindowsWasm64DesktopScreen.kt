@@ -3281,6 +3281,11 @@ private fun NativeAppsWithBrowsecSection(
                         }
                     }
 
+                    // v4.0.3: что сейчас включено + журнал VPN
+                    androidx.compose.ui.viewinterop.AndroidView(
+                        factory = { ctx -> com.winwasm64.vpn.VpnStatusView(ctx) { pkgs -> pkgs.forEach { p -> if (!com.winwasm64.vpn.BrowsecVpnService.routedPackages.contains(p)) onToggleAppInVpn(p) } } },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     // Панель выбора сервера, синхронизации обоих VPN и авто-смены настроек с возвратом прошлого в исходное
                     Row(
                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),

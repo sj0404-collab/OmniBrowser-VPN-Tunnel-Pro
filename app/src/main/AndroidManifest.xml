@@ -71,6 +71,11 @@
                 <data android:scheme="magnet" />
             </intent-filter>
         </activity>
+        <activity
+            android:name="com.winwasm64.vpn.VpnLogActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
     </application>
 
 </manifest>
