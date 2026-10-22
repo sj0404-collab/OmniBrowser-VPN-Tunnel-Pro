@@ -157,6 +157,7 @@ class BrowserTabModel(
     var canGoForward by mutableStateOf(false)
     var autoRetryCount by mutableIntStateOf(0)
     var proxyRepairCount by mutableIntStateOf(0)
+    @Volatile var mediaPlaying: Boolean = false // v4.2.0: во вкладке играет видео/аудио
     var webView: WebView? = null
     val numericId: Int = BrowserSessionVault.nextNumericId()
 }
@@ -1272,6 +1273,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
         }
         tab.webView = wv
+        // v4.2.0: учёт воспроизведения + фоновое видео (страница не видит, что скрыта)
+        try {
+            wv.addJavascriptInterface(OmniMediaBridge(tab), "OmniMedia")
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(wv, MediaState.DOCUMENT_START_SCRIPT, setOf("*"))
+            }
+        } catch (_: Exception) {
+        }
         webViewContainer.addView(wv)
         if (!tab.isIncognito) {
             ExtensionRuntime.attachTab(wv, tab.numericId)
@@ -1374,14 +1383,37 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
+    // v4.2.0: вкладка с играющим видео остаётся «видимой» для WebView (уводится за экран), а не GONE — иначе
+    // Chromium ставит воспроизведение на паузу при переключении вкладок
+    fun applyTabVisibility(container: ViewGroup, current: BrowserTabModel) {
+        val playing = tabs.filter { it !== current && it.mediaPlaying }.mapNotNull { it.webView }.toSet()
+        val off = (container.width.takeIf { it > 0 } ?: 4000) * 3f
+        for (i in 0 until container.childCount) {
+            val child = container.getChildAt(i)
+            when {
+                child == current.webView -> { child.visibility = View.VISIBLE; child.translationX = 0f }
+                child in playing -> { child.visibility = View.VISIBLE; child.translationX = off }
+                else -> { child.visibility = View.GONE; child.translationX = 0f }
+            }
+        }
+    }
+
+    // v4.2.0: «картинка в картинке» — раскладка «только видео» внутри страницы и параметры авто-входа (Android 12+)
+    LaunchedEffect(MediaState.inPip) {
+        val wv = tabs.getOrNull(activeTabIndex)?.webView ?: return@LaunchedEffect
+        try { wv.evaluateJavascript(MediaState.pipLayoutScript(MediaState.inPip), null) } catch (_: Exception) {}
+    }
+    LaunchedEffect(MediaState.activeMediaPlaying) {
+        (context as? com.winwasm64.MainActivity)?.updatePipParams(MediaState.activeMediaPlaying)
+    }
+
     LaunchedEffect(activeTabIndex, tabs.size, desktopMode) {
         val current = tabs.getOrNull(activeTabIndex) ?: return@LaunchedEffect
         ensureTabWebView(current)
         if (!current.isIncognito) ExtensionRuntime.onTabActivated(current.numericId)
-        for (i in 0 until webViewContainer.childCount) {
-            val child = webViewContainer.getChildAt(i)
-            child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
-        }
+        MediaState.activeTabId = current.id
+        MediaState.activeMediaPlaying = current.mediaPlaying
+        applyTabVisibility(webViewContainer, current)
         current.webView?.settings?.userAgentString = uaFor(current.url)
     }
 
@@ -1454,6 +1486,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         modifier = Modifier.fillMaxSize(),
         color = Omni.Bg
     ) {
+        if (MediaState.inPip) {
+            // v4.2.0: в окне «картинка в картинке» — только страница (видео растянуто на всё окно скриптом)
+            val pipView: View = fullscreenCustomView ?: webViewContainer
+            AndroidView(
+                factory = { ctx ->
+                    FrameLayout(ctx).apply { setBackgroundColor(android.graphics.Color.BLACK) }
+                },
+                update = { holder ->
+                    if (holder.childCount != 1 || holder.getChildAt(0) !== pipView) {
+                        holder.removeAllViews()
+                        (pipView.parent as? ViewGroup)?.removeView(pipView)
+                        holder.addView(pipView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else
         Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
 
             if (currentSection == 0) {
@@ -1622,6 +1671,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         SheetItem(OmniIcons.Search, "Найти на странице", onClick = {
                             showMenuSheet = false
                             findBarVisible = true
+                        })
+                        SheetItem(OmniIcons.Share, "Видео в окне (картинка в картинке)", onClick = {
+                            showMenuSheet = false
+                            val ok = (context as? com.winwasm64.MainActivity)?.enterPipNow() ?: false
+                            if (!ok) Toast.makeText(context, "Картинка в картинке недоступна на этом устройстве", Toast.LENGTH_SHORT).show()
                         })
                         SheetItem(OmniIcons.Share, "Поделиться", onClick = {
                             showMenuSheet = false
@@ -2328,16 +2382,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 AndroidView(
                     factory = {
                         ensureTabWebView(activeTab)
+                        (webViewContainer.parent as? ViewGroup)?.removeView(webViewContainer)
                         webViewContainer
                     },
                     update = { container ->
                         val current = tabs.getOrNull(activeTabIndex)
                         if (current != null) {
                             ensureTabWebView(current)
-                            for (i in 0 until container.childCount) {
-                                val child = container.getChildAt(i)
-                                child.visibility = if (child == current.webView) View.VISIBLE else View.GONE
-                            }
+                            applyTabVisibility(container, current)
                         }
                     },
                     modifier = Modifier.fillMaxSize()

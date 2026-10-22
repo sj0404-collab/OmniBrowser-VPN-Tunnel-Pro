@@ -569,8 +569,9 @@ function alert(){}
             }
             server = ss
             port = ss.localPort
-            val acceptor = Thread({ acceptLoop(ss) }, "omni-extproxy-accept").apply { isDaemon = true }
-            acceptor.start()
+            val t = Thread({ acceptLoop(ss) }, "omni-extproxy-accept").apply { isDaemon = true }
+            acceptor = t
+            t.start()
             startWatchdog()
         } catch (e: Exception) {
             Log.e(TAG, "не удалось запустить локальный прокси", e)
@@ -608,17 +609,26 @@ function alert(){}
         }
     }
 
-    private fun probe(p: Int): Boolean {
-        if (p <= 0) return false
+    private fun probe(p: Int): Boolean = probeReason(p) == null
+
+    /** null — порт принимает соединения; иначе причина отказа (для журнала). */
+    private fun probeReason(p: Int): String? {
+        if (p <= 0) return "порт не задан"
         return try {
             Socket().use {
-                it.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 1_500)
-                true
+                it.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), p), 3_000)
+                null
             }
-        } catch (_: Exception) {
-            false
+        } catch (e: Exception) {
+            e.message ?: e.javaClass.simpleName
         }
     }
+
+    @Volatile
+    private var acceptor: Thread? = null
+
+    /** Слушатель прокси расширения жив: сокет открыт и поток accept() работает. */
+    private fun listenerAlive(): Boolean = server?.isClosed == false && acceptor?.isAlive == true
 
     /**
      * Проверяет локальный прокси расширения и перезапускает слушатель (на том же порту), только если он
@@ -629,18 +639,22 @@ function alert(){}
             main.post { onReady?.invoke() }
             return
         }
-        val alive = server?.isClosed == false && probe(port)
-        if (!alive) {
-            com.winwasm64.vpn.VpnLog.w("Браузер", "локальный прокси расширения не принимает соединения (порт $port) — перезапуск слушателя")
+        // v4.2.0: слушатель перезапускаем только если он действительно мёртв (сокет закрыт или поток accept() умер).
+        // Неудачная пробная проверка при живом слушателе — лишь запись в журнал: перезапуск рвал бы все соединения браузера.
+        if (!listenerAlive()) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "слушатель прокси расширения (порт $port) остановился — перезапуск")
             try { server?.close() } catch (_: Exception) {}
             server = null
             ensureServer()
+        } else {
+            probeReason(port)?.let { com.winwasm64.vpn.VpnLog.w("Браузер", "проверка порта $port прокси расширения не прошла ($it), слушатель жив — не трогаем") }
         }
-        // v4.1.3: WebView ходит через слушатель репитера — проверяем и его
         val rp = BrowserDirectRepeater.ensureServerRunning()
-        if (rp <= 0 || !probe(rp)) {
-            com.winwasm64.vpn.VpnLog.w("Браузер", "слушатель репитера (порт $rp) не принимает соединения — перезапуск")
+        if (!BrowserDirectRepeater.listenerAlive()) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "слушатель репитера (порт $rp) остановился — перезапуск")
             try { BrowserDirectRepeater.restartListener() } catch (_: Exception) {}
+        } else {
+            probeReason(rp)?.let { com.winwasm64.vpn.VpnLog.w("Браузер", "проверка порта $rp репитера не прошла ($it), слушатель жив — не трогаем") }
         }
         appliedKey = ""
         main.post { applyOverride(onReady) }
@@ -662,12 +676,11 @@ function alert(){}
     /** true — прокси жив (или не используется); false — пришлось перезапустить. */
     fun ensureHealthy(): Boolean {
         if (control == null) return true
-        val wp = webViewPort()
-        if (probe(port) && (wp == port || probe(wp))) {
+        if (listenerAlive() && BrowserDirectRepeater.listenerAlive()) {
             probeFails = 0
             return true
         }
-        if (++probeFails < 2) return true // одна неудачная проверка под нагрузкой — не повод рвать соединения
+        if (++probeFails < 2) return true
         probeFails = 0
         repairNow(null)
         return false
@@ -1437,6 +1450,27 @@ function alert(){}
         pool.execute { pingTunnelServers() }
     }
 
+    /** Страны серверов Browsec, доступных для туннеля приложений, с лучшим пингом (мс); Long.MAX_VALUE — не отвечает. */
+    fun tunnelCountries(): Map<String, Long> {
+        val m = LinkedHashMap<String, Long>()
+        for (up in tunnelServers) {
+            val cc = up.host.takeWhile { it.isLetter() }.take(2).lowercase()
+            if (cc.length < 2) continue
+            val p = tunnelPing[up.key] ?: continue
+            val cur = m[cc]
+            if (cur == null || p < cur) m[cc] = p
+        }
+        return m
+    }
+
+    private fun logTunnelCountries() {
+        val m = tunnelCountries()
+        if (m.isEmpty()) return
+        val ok = m.filter { it.value != Long.MAX_VALUE }.entries.sortedBy { it.value }.joinToString(", ") { "${it.key.uppercase()} ${it.value} мс" }
+        val bad = m.filter { it.value == Long.MAX_VALUE }.keys.joinToString(", ") { it.uppercase() }
+        com.winwasm64.vpn.VpnLog.i("Прил", "страны Browsec для приложений: " + ok.ifEmpty { "нет отвечающих" } + (if (bad.isNotEmpty()) " · не отвечают: $bad" else ""))
+    }
+
     private fun pingTunnelServers() {
         for (up in tunnelServers.take(24)) {
             val sock = Socket()
@@ -1450,6 +1484,7 @@ function alert(){}
                 closeQuietly(sock)
             }
         }
+        logTunnelCountries()
     }
 
     // v4.1.0: туннель Browsec для приложений из списка VPN (настоящая смена IP, как у браузера с расширением)

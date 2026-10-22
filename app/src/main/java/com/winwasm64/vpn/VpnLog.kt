@@ -38,7 +38,8 @@ object VpnLog {
     /** Соединение приложения через VPN: куда, через какой профиль, сколько заняло, ошибка. */
     fun conn(pkg: String?, host: String, port: Int, profile: String, ms: Long, err: String?) {
         val who = label(pkg)
-        if (err == null) add("📱", "Прил", "$who → $host:$port · профиль $profile · $ms мс")
+        val dur = if (ms >= 1000) String.format(java.util.Locale.US, "%.1f с", ms / 1000.0) else "$ms мс"
+        if (err == null) add("📱", "Прил", "$who → $host:$port · профиль $profile · длилось $dur")
         else add("❌", "Прил", "$who → $host:$port · профиль $profile · ошибка: $err")
     }
 

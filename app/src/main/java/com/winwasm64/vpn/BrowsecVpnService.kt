@@ -965,14 +965,19 @@ object BrowserDirectRepeater {
                 serverSocket = ss
                 activePort = ss.localPort
                 running.set(true)
-                thread(name = "BrowserRepeater1-$activePort", isDaemon = true) {
+                acceptThread = thread(name = "BrowserRepeater1-$activePort", isDaemon = true) {
                     while (running.get() && !ss.isClosed) {
                         try {
                             val client = ss.accept()
                             openClientSockets.add(client)
-                            executor.execute { handleBrowserClient(client) }
-                        } catch (_: Exception) {
+                            try {
+                                executor.execute { handleBrowserClient(client) }
+                            } catch (_: Throwable) {
+                                try { client.close() } catch (_: Exception) {}
+                            }
+                        } catch (_: Throwable) {
                             if (!running.get() || ss.isClosed) break
+                            try { Thread.sleep(20) } catch (_: InterruptedException) {}
                         }
                     }
                 }
@@ -1011,6 +1016,12 @@ object BrowserDirectRepeater {
         return false
     }
 
+    @Volatile
+    private var acceptThread: Thread? = null
+
+    /** Слушатель репитера жив: сокет открыт и поток accept() работает. */
+    fun listenerAlive(): Boolean = serverSocket?.isClosed == false && acceptThread?.isAlive == true
+
     /** Перезапускает слушатель репитера (тот же порт 8877, если свободен). */
     fun restartListener() {
         synchronized(this) {
@@ -1039,7 +1050,7 @@ object BrowserDirectRepeater {
                         }
                         // v4.0.2: каждые ~6 с проверяем, что репитер жив (иначе WebView получит ERR_PROXY_CONNECTION_FAILED)
                         if (tick % 4 == 3 && (appliedProxyKey.startsWith("ON:") || externalProxyOverride != null) &&
-                            !probeLocalPort(activePort)
+                            !listenerAlive()
                         ) {
                             healthCheckAndRepair(force = true)
                         }
@@ -2605,6 +2616,20 @@ object BrowsecLocalProxyServer {
             }
         )
         var lastErr: Exception? = null
+        // v4.2.0: прокси приложений 127.0.0.1:89xx (Telegram с настроенным прокси) тоже идёт через туннель Browsec,
+        // как и прозрачный туннель — иначе Telegram с прокси «Соединение…» на сети, где его IP режут
+        if (BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
+            try {
+                val t0 = System.currentTimeMillis()
+                val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, port, appProfile?.countryCode ?: BrowsecVpnService.activeCountry)
+                if (r != null) {
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+                    return TunneledSocket(r.first, r.second)
+                }
+            } catch (e: Exception) {
+                lastErr = e
+            }
+        }
         for (ip in candidates) {
             try {
                 val t0 = System.currentTimeMillis()
@@ -2625,6 +2650,27 @@ object BrowsecLocalProxyServer {
         }
         st.consecutiveFailures.incrementAndGet()
         throw (lastErr ?: java.io.IOException("Failed to connect to $host:$port"))
+    }
+
+    /** Сокет внутри CONNECT-туннеля Browsec: входной поток уже обёрнут буфером, поэтому отдаём его вместо сырого. */
+    private class TunneledSocket(private val inner: Socket, private val input: InputStream) : Socket() {
+        override fun getInputStream(): InputStream = input
+        override fun getOutputStream(): java.io.OutputStream = inner.getOutputStream()
+        override fun close() = inner.close()
+        override fun isClosed(): Boolean = inner.isClosed
+        override fun isConnected(): Boolean = inner.isConnected
+        override fun setSoTimeout(timeout: Int) { inner.soTimeout = timeout }
+        override fun getSoTimeout(): Int = inner.soTimeout
+        override fun shutdownOutput() = inner.shutdownOutput()
+        override fun shutdownInput() = inner.shutdownInput()
+        override fun setTcpNoDelay(on: Boolean) { inner.tcpNoDelay = on }
+        override fun setKeepAlive(on: Boolean) { inner.keepAlive = on }
+        override fun getInetAddress(): InetAddress? = inner.inetAddress
+        override fun getPort(): Int = inner.port
+        override fun setReceiveBufferSize(size: Int) { try { inner.receiveBufferSize = size } catch (_: Exception) {} }
+        override fun setSendBufferSize(size: Int) { try { inner.sendBufferSize = size } catch (_: Exception) {} }
+        override fun getLocalPort(): Int = inner.localPort
+        override fun getRemoteSocketAddress(): java.net.SocketAddress? = inner.remoteSocketAddress
     }
 
     private fun handleClient(
