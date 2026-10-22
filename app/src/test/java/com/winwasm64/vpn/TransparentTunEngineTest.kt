@@ -47,11 +47,54 @@ class TransparentTunEngineTest {
     }
 
     @Test
-    fun natKeySeparatesDestinations() {
-        val k1 = TransparentTunEngine.key(youtubeIp, 40001)
-        val k2 = TransparentTunEngine.key(youtubeIp + 1, 40001)
-        val k3 = TransparentTunEngine.key(youtubeIp, 40002)
-        assertTrue(k1 != k2 && k1 != k3 && k2 != k3)
+    fun tcpFlowKeySeparatesDestinations() {
+        val k1 = TunTcpStack.key(youtubeIp, 443, 40001)
+        val k2 = TunTcpStack.key(youtubeIp + 1, 443, 40001)
+        val k3 = TunTcpStack.key(youtubeIp, 443, 40002)
+        val k4 = TunTcpStack.key(youtubeIp, 80, 40001)
+        assertTrue(setOf(k1, k2, k3, k4).size == 4)
+    }
+
+    @Test
+    fun tcpSegmentWithOptionsAndPayloadIsValid() {
+        val payload = "GET / HTTP/1.1\r\n\r\n".toByteArray()
+        val p = TunPackets.buildTcpSegmentV4(
+            youtubeIp, 443, TunPackets.TUN_IP, 40001, 100, 200, TunPackets.ACK or 0x08, 1000,
+            TunPackets.tcpSynAckOptions(1460, 2), payload, 0, payload.size
+        )
+        assertEquals(20 + 28 + payload.size, p.size)
+        assertTrue(TunPackets.ipv4ChecksumOk(p, 20))
+        assertTrue(TunPackets.l4ChecksumOk(p, 20, p.size, 6))
+        assertEquals(7, (p[32].toInt() and 0xFF) ushr 4)
+        val (mss, ws) = TunPackets.parseTcpSynOptions(p, 20, p.size)
+        assertEquals(1460, mss)
+        assertEquals(2, ws)
+        assertEquals(String(payload), String(p, 48, payload.size))
+    }
+
+    @Test
+    fun dnsResponseBuilder() {
+        // запрос A m.youtube.com
+        val name = "m.youtube.com"
+        val out = ByteArrayOutputStream()
+        out.write(byteArrayOf(0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0))
+        for (label in name.split('.')) { out.write(label.length); out.write(label.toByteArray()) }
+        out.write(0); out.write(byteArrayOf(0, 1, 0, 1))
+        val q = out.toByteArray()
+        val parsed = DnsPackets.parseQuestion(q, q.size)
+        assertNotNull(parsed)
+        assertEquals(name, parsed!!.name)
+        assertEquals(DnsPackets.TYPE_A, parsed.type)
+        val r = DnsPackets.buildResponse(q, parsed, listOf("142.250.74.46"))
+        assertEquals(q.size + 16, r.size)
+        assertEquals(0x12, r[0].toInt() and 0xFF)
+        assertEquals(0x81, r[2].toInt() and 0xFF)
+        assertEquals(1, r[7].toInt())
+        assertEquals(142, r[r.size - 4].toInt() and 0xFF)
+        assertEquals(46, r[r.size - 1].toInt() and 0xFF)
+        val empty = DnsPackets.buildResponse(q, parsed, emptyList())
+        assertEquals(q.size, empty.size)
+        assertEquals(0, empty[7].toInt())
     }
 
     @Test

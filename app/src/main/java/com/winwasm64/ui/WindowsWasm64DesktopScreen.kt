@@ -3257,6 +3257,7 @@ private fun NativeAppsWithBrowsecSection(
                                     !browsecEnabled -> "Выключен: приложения работают напрямую, без обхода"
                                     vpnRoutedApps.isEmpty() -> "Включён, но список пуст — добавьте приложение кнопкой «+ Добавить в VPN»"
                                     !BrowsecVpnService.tunnelEstablished -> "⚠ Туннель не поднят (нет разрешения VPN или его занял другой VPN) — выключите и включите VPN списка"
+                                    BrowsecVpnService.transparentActive && BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable() -> "Включён: ${vpnRoutedApps.size} прил. целиком идут через туннель (TCP через серверы Browsec, QUIC → TCP), остальные — напрямую"
                                     BrowsecVpnService.transparentActive -> "Включён: ${vpnRoutedApps.size} прил. целиком идут через туннель (TCP с обходом DPI, QUIC → TCP), остальные — напрямую"
                                     else -> "Включён (режим прокси): ${vpnRoutedApps.size} прил. через системный прокси; что игнорирует прокси — идёт напрямую"
                                 },

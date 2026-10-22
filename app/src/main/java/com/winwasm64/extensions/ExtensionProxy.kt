@@ -1209,6 +1209,49 @@ function alert(){}
         return null
     }
 
+    // v4.1.0: туннель Browsec для приложений из списка VPN (настоящая смена IP, как у браузера с расширением)
+
+    /** Есть ли чем туннелировать приложения: расширение с прокси включено или уже известны его учётные данные. */
+    fun appTunnelAvailable(): Boolean = control != null || creds.isNotEmpty()
+
+    private val appTunnelLoggedAt = ConcurrentHashMap<String, Long>()
+
+    /**
+     * CONNECT host:port через рабочий сервер Browsec; предпочитаем серверы страны профиля приложения ([preferCountry], например "LT"),
+     * затем — по пингу. Возвращает (сокет, поток чтения, имя сервера) или null, если ни один сервер не ответил.
+     */
+    fun openAppTunnel(host: String, port: Int, preferCountry: String?): Triple<Socket, InputStream, String>? {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val now = SystemClock.elapsedRealtime()
+        if (now - tunnelPingAt > 600_000L) {
+            tunnelPingAt = now
+            pool.execute { pingTunnelServers() }
+        }
+        val pref = preferCountry?.lowercase()?.take(2)
+        val list = tunnelServers
+            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
+            .sortedWith(compareBy<Upstream>({ if (pref != null && it.host.startsWith(pref)) 0 else 1 }, { tunnelPing[it.key] ?: 5_000L }))
+        var tries = 0
+        for (up in list) {
+            if (tries++ >= 3) break
+            try {
+                val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
+                lastAutoTunnel = up.key
+                lastAutoTunnelAt = SystemClock.elapsedRealtime()
+                val t = lastAutoTunnelAt
+                if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
+                    appTunnelLoggedAt[up.key] = t
+                    com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key}")
+                }
+                return Triple(r.first, r.second, up.key)
+            } catch (e: Exception) {
+                tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — следующий")
+            }
+        }
+        return null
+    }
+
     private fun reportError(up: Upstream, e: Exception) {
         val owner = control?.extId ?: return
         val now = SystemClock.elapsedRealtime()

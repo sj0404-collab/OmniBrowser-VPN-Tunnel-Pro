@@ -2442,21 +2442,23 @@ object BrowsecLocalProxyServer {
     }
 
     private fun handleTransparentClient(client: Socket) {
-        val remoteAddr = client.inetAddress
-        val appPort = client.port
-        val sess = TransparentTunEngine.lookupSession(remoteAddr, appPort)
+        // v4.1.0: соединение приходит loopback-сокетом из userspace TCP-стека; исходный адрес — по его локальному порту
+        val sess = TransparentTunEngine.lookupSession(client.port)
         if (sess == null) {
             openClientSockets.remove(client)
             try { client.close() } catch (_: Exception) {}
             return
         }
+        val remoteAddr = TunPackets.ipToInet(sess.remoteIp)
+        val appPort = sess.appPort
         val origPort = sess.remotePort
         val profile = sess.profilePackage?.let { getOrCreateAppProfile(it) }
             ?: profileForConnection(
                 InetSocketAddress(TunPackets.ipToInet(TunPackets.TUN_IP), appPort),
                 InetSocketAddress(remoteAddr, origPort)
             )?.also { sess.profilePackage = it.packageName }
-        val st = getServerState(profile?.countryCode ?: BrowsecVpnService.activeCountry)
+        val countryCode = profile?.countryCode ?: BrowsecVpnService.activeCountry
+        val st = getServerState(countryCode)
         val allowBypass = useBrowsecTunnel && BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && antiDpiSplitEnabled
         st.activeConnections.incrementAndGet()
         st.requestsCount.incrementAndGet()
@@ -2466,24 +2468,17 @@ object BrowsecLocalProxyServer {
         var logHost = remoteAddr.hostAddress ?: ""
         var logErr: String? = null
         var upstream: Socket? = null
+        var viaTunnel: String? = null
         try {
             client.tcpNoDelay = true
-            val target = if (TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP) {
+            val isDnsIp = TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP
+            val target = if (isDnsIp) {
                 InetSocketAddress(InetAddress.getByName("1.1.1.1"), 53)
             } else {
                 InetSocketAddress(remoteAddr, origPort)
             }
-            val up = Socket()
-            BrowsecVpnService.protectSocket(up)
-            up.tcpNoDelay = true
-            up.keepAlive = true
-            up.receiveBufferSize = 512 * 1024
-            val t0 = System.currentTimeMillis()
-            up.connect(target, 6000)
-            st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
-            up.soTimeout = 10 * 60_000
-            upstream = up
 
+            // 1. Первые байты от приложения — имя сайта из TLS ClientHello (нужно и для обхода DPI, и для CONNECT через Browsec)
             val pin = PushbackInputStream(client.getInputStream(), 32 * 1024)
             var host = remoteAddr.hostAddress ?: ""
             if (origPort == 443 || origPort == 853 || origPort == 8443) {
@@ -2498,15 +2493,47 @@ object BrowsecLocalProxyServer {
                 }
             }
             client.soTimeout = 10 * 60_000
-            val shouldBypass = allowBypass && !host.endsWith(".gvt1.com") && !host.endsWith(".gvt2.com")
-            val upIn = up.getInputStream()
-            val upOut = up.getOutputStream()
+
+            // 2. Маршрут: туннель Browsec (настоящая смена IP, как у браузера) → иначе напрямую с обходом DPI
+            var upIn: InputStream? = null
+            var up: Socket? = null
+            if (!isDnsIp && BrowsecVpnService.appsViaBrowsecTunnel && (origPort == 443 || origPort == 80 || origPort == 8443) &&
+                com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()
+            ) {
+                val t0 = System.currentTimeMillis()
+                val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                if (r != null) {
+                    up = r.first
+                    upIn = r.second
+                    viaTunnel = r.third
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+                }
+            }
+            if (up == null) {
+                val s = Socket()
+                BrowsecVpnService.protectSocket(s)
+                s.tcpNoDelay = true
+                s.keepAlive = true
+                s.receiveBufferSize = 512 * 1024
+                val t0 = System.currentTimeMillis()
+                s.connect(target, 6000)
+                st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+                s.soTimeout = 10 * 60_000
+                up = s
+                upIn = s.getInputStream()
+            }
+            val upSock: Socket = up ?: throw java.io.IOException("нет исходящего соединения")
+            val upStream: InputStream = upIn ?: upSock.getInputStream()
+            upstream = upSock
+            // Через туннель Browsec соединение уже внутри TLS к прокси — резать ClientHello не нужно
+            val shouldBypass = viaTunnel == null && allowBypass && !host.endsWith(".gvt1.com") && !host.endsWith(".gvt2.com")
+            val upOut = upSock.getOutputStream()
             val out = client.getOutputStream()
             val t1 = thread(name = "TunC2S-$origPort", isDaemon = true) {
                 pipeClientToServerV38(pin, upOut, host, origPort, st, profile, shouldBypass)
-                try { up.shutdownOutput() } catch (_: Exception) {}
+                try { upSock.shutdownOutput() } catch (_: Exception) {}
             }
-            pipeServerToClientV38(upIn, out, st, profile, true)
+            pipeServerToClientV38(upStream, out, st, profile, true)
             try { client.shutdownOutput() } catch (_: Exception) {}
             t1.join(2000)
         } catch (e: Exception) {
@@ -2517,8 +2544,7 @@ object BrowsecLocalProxyServer {
             profile?.activeSockets?.decrementAndGet()
             try { upstream?.close() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
-            sess.closing = true
-            VpnLog.conn(profile?.packageName, logHost, origPort, profile?.countryCode ?: BrowsecVpnService.activeCountry, System.currentTimeMillis() - logStart, logErr)
+            VpnLog.conn(profile?.packageName, logHost, origPort, viaTunnel?.let { "Browsec $it" } ?: countryCode, System.currentTimeMillis() - logStart, logErr)
         }
     }
 
@@ -3074,9 +3100,24 @@ class BrowsecVpnService : VpnService() {
         @Volatile
         var transparentActive: Boolean = false
 
-        /** Самопроверка NAT не прошла на этом устройстве — работаем через системный прокси. */
+        /** Прозрачный обработчик не поднялся (нет свободного порта) — работаем через системный прокси. */
         @Volatile
         var transparentUnsupported: Boolean = false
+
+        /**
+         * v4.1.0: приложения из списка идут через серверы Browsec (настоящая смена IP, как у браузера с расширением),
+         * если расширение Browsec установлено и включено; иначе — напрямую с обходом DPI.
+         */
+        @Volatile
+        var appsViaBrowsecTunnel: Boolean = true
+
+        const val PREF_APPS_VIA_BROWSEC = "apps_via_browsec_tunnel"
+
+        fun setAppsViaBrowsecTunnel(context: Context, on: Boolean) {
+            appsViaBrowsecTunnel = on
+            context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).edit().putBoolean(PREF_APPS_VIA_BROWSEC, on).apply()
+            VpnLog.i("Сервис", if (on) "приложения из списка идут через серверы Browsec (если расширение включено)" else "приложения из списка идут напрямую с обходом DPI")
+        }
 
         val routedPackages = CopyOnWriteArraySet<String>().apply {
             add("com.google.android.youtube")
@@ -3212,7 +3253,6 @@ class BrowsecVpnService : VpnService() {
 
     private var perAppVpnInterface: ParcelFileDescriptor? = null
     private val notificationTickerRunning = AtomicBoolean(false)
-    private val tunLoopRunning = AtomicBoolean(false)
     private val tunExecutor = Executors.newCachedThreadPool()
 
     override fun onCreate() {
@@ -3220,6 +3260,7 @@ class BrowsecVpnService : VpnService() {
         activeInstance = this
         appContext = applicationContext
         VpnLog.init(this)
+        appsViaBrowsecTunnel = getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean(PREF_APPS_VIA_BROWSEC, true)
         createNotificationChannel()
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
         BrowsecLocalProxyServer.ensureRunning()
@@ -3284,6 +3325,7 @@ class BrowsecVpnService : VpnService() {
                 }
                 isRunning = true
                 isPaused = false
+                transparentUnsupported = false // v4.1.0: каждое включение снова пробует прозрачный режим
                 BrowsecLocalProxyServer.useBrowsecTunnel = true
                 BrowsecLocalProxyServer.ensureRunning()
                 BrowsecLocalProxyServer.onServerCountrySwitched(activeCountry, resetSessionTraffic = false)
@@ -3400,11 +3442,12 @@ class BrowsecVpnService : VpnService() {
             transparentActive = wantTransparent
             if (wantTransparent) {
                 thread(name = "OmniTunSelfTest", isDaemon = true) {
+                    // v4.1.0: userspace TCP-стек не зависит от маршрутизации ядра — проверяем только, что обработчик принимает соединения
                     val ok = engine.selfTest()
-                    if (ok) VpnLog.ok("Туннель", "самопроверка прозрачного туннеля пройдена")
-                    else VpnLog.w("Туннель", "устройство не пропускает прозрачный туннель → переключаюсь на режим прокси")
-                    if (!ok && tunEngine === engine && isRunning && !isPaused) {
-                        // Устройство не пропускает NAT через TUN — откат на системный прокси, чтобы ничего не сломать
+                    if (ok) VpnLog.ok("Туннель", "прозрачный туннель готов: TCP приложений → userspace-стек → обработчик :$transparentPort" +
+                        (if (appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) " → серверы Browsec" else " → обход DPI"))
+                    else if (tunEngine === engine && isRunning && !isPaused) {
+                        VpnLog.w("Туннель", "обработчик :$transparentPort не принимает соединения → режим прокси")
                         transparentUnsupported = true
                         transparentActive = false
                         rebuildPerAppVpnInterface()
@@ -3412,47 +3455,9 @@ class BrowsecVpnService : VpnService() {
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             tunnelEstablished = perAppVpnInterface != null
-        }
-    }
-
-    private fun startTunDnsForwarderLoop() {
-        val pfd = perAppVpnInterface ?: return
-        if (!tunLoopRunning.compareAndSet(false, true)) return
-        thread(name = "OmniTunDnsLoop", isDaemon = true) {
-            val inp = ParcelFileDescriptor.AutoCloseInputStream(pfd)
-            val out = ParcelFileDescriptor.AutoCloseOutputStream(pfd)
-            val buf = ByteArray(4096)
-            try {
-                while (isRunning && !isPaused && perAppVpnInterface != null) {
-                    val n = inp.read(buf)
-                    if (n <= 0) break
-                    val st = BrowsecLocalProxyServer.activeServerState()
-                    st.recordTx(n.toLong())
-
-                    val ver = (buf[0].toInt() ushr 4) and 0x0F
-                    if (ver == 4 && n >= 28) {
-                        val ihl = (buf[0].toInt() and 0x0F) * 4
-                        val proto = buf[9].toInt() and 0xFF
-                        if (proto == 17 && n > ihl + 8) {
-                            val dstPort = ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
-                            if (dstPort == 53) {
-                                val dnsPayloadLen = n - (ihl + 8)
-                                if (dnsPayloadLen > 12) {
-                                    val dnsQuery = buf.copyOfRange(ihl + 8, n)
-                                    tunExecutor.execute {
-                                        forwardTunDnsQuery(buf.copyOf(ihl + 8), ihl, dnsQuery, out, st)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                tunLoopRunning.set(false)
-            }
+            VpnLog.e("Туннель", "ошибка подъёма VPN-интерфейса: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
@@ -3463,6 +3468,41 @@ class BrowsecVpnService : VpnService() {
         tunOut: OutputStream,
         st: ServerNodeRuntimeState
     ) {
+        val appPort = ((ipUdpHeader[ihl].toInt() and 0xFF) shl 8) or (ipUdpHeader[ihl + 1].toInt() and 0xFF)
+        fun reply(payload: ByteArray) {
+            val pkt = TunPackets.buildUdpV4(TunPackets.DNS_IP, 53, TunPackets.TUN_IP, appPort, payload, 0, payload.size)
+            synchronized(tunOut) {
+                tunOut.write(pkt, 0, pkt.size)
+                tunOut.flush()
+            }
+            st.recordRx(pkt.size.toLong())
+        }
+        try {
+            // v4.1.0: A-запросы — через DoH-резолвер сервиса (нельзя доверять ответам провайдера), AAAA/HTTPS — пусто (IPv4 через туннель)
+            val q = DnsPackets.parseQuestion(dnsQuery, dnsQuery.size)
+            if (q != null && q.clazz == 1 && q.name.isNotBlank()) {
+                when (q.type) {
+                    DnsPackets.TYPE_AAAA, DnsPackets.TYPE_HTTPS -> {
+                        reply(DnsPackets.buildResponse(dnsQuery, q, emptyList()))
+                        return
+                    }
+                    DnsPackets.TYPE_A -> {
+                        val ip = FastMultiDnsResolver.resolveFast(
+                            host = q.name,
+                            ecsSubnet = st.node.ecsSubnet,
+                            dohServer = st.currentDoh,
+                            onTraffic = { tx, rx -> st.recordTx(tx); st.recordRx(rx) }
+                        )
+                        if (FastMultiDnsResolver.isIpv4Literal(ip)) {
+                            reply(DnsPackets.buildResponse(dnsQuery, q, listOf(ip)))
+                            return
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        // Прочие типы (или резолвер не ответил): обычный UDP-форвард на DNS профиля
         var udp: DatagramSocket? = null
         try {
             udp = DatagramSocket()
@@ -3475,46 +3515,7 @@ class BrowsecVpnService : VpnService() {
             udp.receive(respPkt)
             val dnsRespLen = respPkt.length
             if (dnsRespLen <= 0) return
-
-            val totalLen = ihl + 8 + dnsRespLen
-            val reply = ByteArray(totalLen)
-            System.arraycopy(ipUdpHeader, 0, reply, 0, ihl)
-            reply[2] = ((totalLen shr 8) and 0xFF).toByte()
-            reply[3] = (totalLen and 0xFF).toByte()
-            for (i in 0 until 4) {
-                reply[12 + i] = ipUdpHeader[16 + i]
-                reply[16 + i] = ipUdpHeader[12 + i]
-            }
-            reply[10] = 0
-            reply[11] = 0
-            var sum = 0
-            for (i in 0 until ihl step 2) {
-                val word = ((reply[i].toInt() and 0xFF) shl 8) or (reply[i + 1].toInt() and 0xFF)
-                sum += word
-            }
-            while ((sum ushr 16) != 0) {
-                sum = (sum and 0xFFFF) + (sum ushr 16)
-            }
-            val csum = sum.inv() and 0xFFFF
-            reply[10] = ((csum shr 8) and 0xFF).toByte()
-            reply[11] = (csum and 0xFF).toByte()
-
-            reply[ihl] = ipUdpHeader[ihl + 2]
-            reply[ihl + 1] = ipUdpHeader[ihl + 3]
-            reply[ihl + 2] = ipUdpHeader[ihl]
-            reply[ihl + 3] = ipUdpHeader[ihl + 1]
-            val udpLen = 8 + dnsRespLen
-            reply[ihl + 4] = ((udpLen shr 8) and 0xFF).toByte()
-            reply[ihl + 5] = (udpLen and 0xFF).toByte()
-            reply[ihl + 6] = 0
-            reply[ihl + 7] = 0
-
-            System.arraycopy(respBuf, 0, reply, ihl + 8, dnsRespLen)
-            synchronized(tunOut) {
-                tunOut.write(reply)
-                tunOut.flush()
-            }
-            st.recordRx(reply.size.toLong())
+            reply(respBuf.copyOf(dnsRespLen))
         } catch (_: Exception) {
         } finally {
             try { udp?.close() } catch (_: Exception) {}

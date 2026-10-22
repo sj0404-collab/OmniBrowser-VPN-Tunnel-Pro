@@ -38,6 +38,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     private val tvApps = TextView(context)
     private val tvHint = TextView(context)
     private val btnAdd = TextView(context)
+    private val btnTunnel = TextView(context)
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -104,6 +105,18 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             refresh()
         })
         addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        // v4.1.0: приложения через серверы Browsec (настоящая смена IP) или напрямую с обходом DPI
+        pill(btnTunnel, "") {
+            val on = !BrowsecVpnService.appsViaBrowsecTunnel
+            BrowsecVpnService.setAppsViaBrowsecTunnel(context, on)
+            Toast.makeText(
+                context,
+                if (on) "Приложения пойдут через серверы Browsec (нужно включённое расширение Browsec в браузере)" else "Приложения пойдут напрямую с обходом DPI",
+                Toast.LENGTH_SHORT
+            ).show()
+            refresh()
+        }
+        addView(btnTunnel, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
         refresh()
     }
 
@@ -138,11 +151,19 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             BrowsecVpnService.isPaused -> "📱 Приложения: VPN на паузе — все приложения идут напрямую."
             routed.isEmpty() -> "📱 Приложения: VPN включён, но список пуст — ни одно приложение не идёт через VPN. Добавьте приложения (кнопка ниже или «+ Добавить в VPN»)."
             else -> "📱 Приложения через VPN (${routed.size}): ${VpnLog.appList(routed)}. Остальные — напрямую" +
-                (if (BrowsecVpnService.transparentActive) "." else " (режим прокси).")
+                when {
+                    !BrowsecVpnService.transparentActive -> " (режим прокси — что игнорирует прокси, идёт напрямую)."
+                    BrowsecVpnService.appsViaBrowsecTunnel && ExtensionProxy.appTunnelAvailable() ->
+                        ". Весь их TCP — через серверы Browsec" + (ExtensionProxy.lastAutoTunnel?.let { " ($it)" } ?: "") + ", QUIC → TCP."
+                    BrowsecVpnService.appsViaBrowsecTunnel -> ". Пока через обход DPI: включите расширение Browsec в браузере — и приложения пойдут через его серверы."
+                    else -> ". Весь их TCP — через обход DPI, QUIC → TCP."
+                }
         }
+        btnTunnel.text = if (BrowsecVpnService.appsViaBrowsecTunnel) "🌍 Приложения через серверы Browsec: ВКЛ" else "🌍 Приложения через серверы Browsec: ВЫКЛ (обход DPI)"
+        btnTunnel.alpha = if (BrowsecVpnService.appsViaBrowsecTunnel && !ExtensionProxy.appTunnelAvailable()) 0.7f else 1f
         tvApps.setTextColor(if (BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && routed.isEmpty()) 0xFFFDD663.toInt() else 0xFFECECEC.toInt())
         tvHint.visibility = if (compact) GONE else VISIBLE
-        tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
+        tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Настоящую смену IP дают серверы Browsec: для браузера — через расширение, для приложений — кнопкой ниже. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
         val missing = missingPopular()
         btnAdd.visibility = if (missing.isEmpty()) GONE else VISIBLE
         btnAdd.text = "+ " + missing.map { it.second }.distinct().take(3).joinToString(", ")
