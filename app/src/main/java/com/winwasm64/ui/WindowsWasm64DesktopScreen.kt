@@ -1344,6 +1344,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
             override fun closePopup(extId: String) {
                 if (extPopupFor == extId) extPopupFor = null
+                com.winwasm64.extensions.ExtensionPageActivity.closeFor(extId)
             }
             override fun toast(text: String) {
                 Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
@@ -3281,6 +3282,11 @@ private fun NativeAppsWithBrowsecSection(
                         }
                     }
 
+                    // v4.1: настоящий VPN Browsec — страны с пингом и скоростью до подключения, живой трафик, плавающая кнопка
+                    androidx.compose.ui.viewinterop.AndroidView(
+                        factory = { ctx -> com.winwasm64.vpn.BrowsecPanelView(ctx, false, null, true) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     // Панель выбора сервера, синхронизации обоих VPN и авто-смены настроек с возвратом прошлого в исходное
                     Row(
                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
@@ -3293,7 +3299,7 @@ private fun NativeAppsWithBrowsecSection(
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
-                            Text("Выбрать сервер самостоятельно (22 страны)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("Профили обхода DPI (без смены IP)", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
 
                         Button(

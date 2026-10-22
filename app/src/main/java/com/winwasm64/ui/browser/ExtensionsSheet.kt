@@ -321,59 +321,12 @@ fun ExtensionsSheetContent(
     }
 }
 
-/** Окно расширения (popup) или его страница настроек — отдельный WebView в диалоге. */
+/** Окно расширения (popup) или страница настроек — отдельная страница на весь экран (как в Lemur/Kiwi). */
 @Composable
 fun ExtensionPageDialog(extId: String, options: Boolean, onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val ext = remember(extId) { ExtensionStore.get(extId) }
-    val host = remember(extId, options) {
-        if (options) ExtensionRuntime.createOptionsHost(context, extId) else ExtensionRuntime.createPopupHost(context, extId)
-    }
-    DisposableEffect(host) {
-        onDispose {
-            host?.let {
-                (it.webView.parent as? ViewGroup)?.removeView(it.webView)
-                ExtensionRuntime.releaseHost(it)
-            }
-        }
-    }
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(
-            shape = RoundedCornerShape(18.dp),
-            color = Omni.Surface,
-            modifier = Modifier.fillMaxWidth(0.95f).fillMaxHeight(if (options) 0.9f else 0.72f)
-        ) {
-            Column {
-                Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        (ext?.manifest?.name ?: extId) + if (options) " — настройки" else "",
-                        color = Omni.Text,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    OmniIconButton(OmniIcons.Close, "Закрыть", onDismiss)
-                }
-                HorizontalDivider(thickness = 0.5.dp, color = Omni.Outline)
-                if (host == null) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text(
-                            if (options) "У расширения нет страницы настроек" else "У расширения нет всплывающего окна",
-                            color = Omni.TextDim
-                        )
-                    }
-                } else {
-                    AndroidView(
-                        factory = {
-                            (host.webView.parent as? ViewGroup)?.removeView(host.webView)
-                            host.webView
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-            }
-        }
+    androidx.compose.runtime.LaunchedEffect(extId, options) {
+        com.winwasm64.extensions.ExtensionPageActivity.start(context, extId, options)
+        onDismiss()
     }
 }

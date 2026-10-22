@@ -78,6 +78,28 @@ object ExtensionProxy {
 
     val isActive: Boolean get() = control != null
 
+    /** v4.1: свой Browsec (страны с API Browsec) — маршрут браузера через BrowsecNative поверх прокси расширений. */
+    const val NATIVE_ID = "omni.browsec.native"
+    private val NATIVE_UP = Upstream("BROWSEC", "browsec", 0)
+    @Volatile
+    private var savedExtControl: Pair<Control, String>? = null
+    val isInitialized: Boolean get() = ::appContext.isInitialized
+
+    fun activateNative(name: String, bypass: List<String>) {
+        val cur = control
+        if (cur != null && cur.extId != NATIVE_ID) savedExtControl = cur to (ownerName ?: "")
+        activate(Control(NATIVE_ID, JSONObject().put("mode", "fixed_servers"), null, FixedRules(NATIVE_UP, null, null, null, bypass)), name)
+    }
+
+    /** Выключили Browsec — возвращаем прокси расширения, если оно было. */
+    fun deactivateNative() {
+        if (control?.extId != NATIVE_ID) return
+        release(NATIVE_ID)
+        val saved = savedExtControl
+        savedExtControl = null
+        if (saved != null) activate(saved.first, saved.second)
+    }
+
     @Volatile
     var port: Int = 0
         private set
@@ -170,6 +192,8 @@ object ExtensionProxy {
 
     /** Снять управление прокси (если extId == null — у любого расширения). */
     fun release(extId: String?) {
+        if (extId != null && extId != NATIVE_ID && savedExtControl?.first?.extId == extId) savedExtControl = null
+        if (extId == null && control?.extId == NATIVE_ID) return
         val c = control ?: return
         if (extId != null && c.extId != extId) return
         control = null
@@ -195,6 +219,10 @@ object ExtensionProxy {
     }
 
     private fun activate(c: Control, name: String) {
+        if (control?.extId == NATIVE_ID && c.extId != NATIVE_ID) {
+            savedExtControl = c to name // пока включён наш Browsec, прокси расширения ждёт
+            return
+        }
         val previous = control
         if (previous == null || previous.extId != c.extId) creds.clear()
         control = c
@@ -664,6 +692,7 @@ function alert(){}
             try {
                 return when (up.type) {
                     "DIRECT" -> direct(host, port, url)
+                    "BROWSEC" -> com.winwasm64.vpn.BrowsecNative.openTunnel(host, port)
                     "SOCKS5" -> viaSocks5(up, host, port)
                     else -> viaHttpProxy(up, host, port, url)
                 }
@@ -892,6 +921,12 @@ function alert(){}
                         tin = t.second
                         payload = rewriteHead(head, true, u, null)
                     }
+                    "BROWSEC" -> {
+                        val t = com.winwasm64.vpn.BrowsecNative.openTunnel(host, port)
+                        target = t.first
+                        tin = t.second
+                        payload = rewriteHead(head, true, u, null)
+                    }
                     else -> {
                         target = openToProxy(up)
                         tin = target.getInputStream()
@@ -921,12 +956,12 @@ function alert(){}
             closeQuietly(a)
             closeQuietly(b)
         }
-        copy(aIn, b.getOutputStream())
+        copy(aIn, b.getOutputStream(), bIn is com.winwasm64.vpn.BrowsecNative.CountingInput)
         closeQuietly(a)
         closeQuietly(b)
     }
 
-    private fun copy(i: InputStream, o: OutputStream) {
+    private fun copy(i: InputStream, o: OutputStream, countUp: Boolean = false) {
         val buf = ByteArray(32 * 1024)
         try {
             while (true) {
@@ -934,6 +969,7 @@ function alert(){}
                 if (n < 0) break
                 o.write(buf, 0, n)
                 o.flush()
+                if (countUp) com.winwasm64.vpn.BrowsecNative.addUp(n)
             }
         } catch (_: Exception) {
         }
@@ -941,6 +977,7 @@ function alert(){}
 
     private fun reportError(up: Upstream, e: Exception) {
         val owner = control?.extId ?: return
+        if (owner == NATIVE_ID) return
         val now = SystemClock.elapsedRealtime()
         val last = lastErrorAt[up.key] ?: 0L
         if (now - last < 10_000) return

@@ -330,7 +330,7 @@ data class TrafficSnapshot(
     val systemVpnActive: Boolean,
     val isPaused: Boolean,
     val activeCountry: String,
-    val activeCountryName: String = "Литва (Vilnius LT-Baltic #1)",
+    val activeCountryName: String = "Обход DPI №1 (без смены IP)",
     val remoteServerIpPort: String = "185.150.189.201:443",
     val pingMs: Int = 18,
     val loadedAssetPackMb: Int = 0,
@@ -345,28 +345,28 @@ data class TrafficSnapshot(
  * Полный список из 22 стран (Литва, Латвия, Эстония, Польша, Германия, Нидерланды, Финляндия и др.)
  */
 val ALL_VPN_COUNTRIES_LIST: List<VpnServerNodeInfo> = listOf(
-    VpnServerNodeInfo("LT", "🇱🇹", "Литва", "Vilnius LT-Baltic #1", "185.150.189.201", 443, "185.150.189.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("LV", "🇱🇻", "Латвия", "Riga LV-Baltic #1", "91.198.156.42", 443, "91.198.156.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("EE", "🇪🇪", "Эстония", "Tallinn EE-Baltic #1", "185.197.105.78", 443, "185.197.105.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("PL", "🇵🇱", "Польша", "Warsaw PL-Central #1", "185.238.72.19", 443, "185.238.72.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("DE", "🇩🇪", "Германия", "Frankfurt DE-Core #1", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("NL", "🇳🇱", "Нидерланды", "Amsterdam NL-Core #2", "94.142.241.111", 443, "94.142.241.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("FI", "🇫🇮", "Финляндия", "Helsinki FI-Nordic #1", "95.216.195.133", 443, "95.216.195.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("SE", "🇸🇪", "Швеция", "Stockholm SE-Nordic #1", "185.213.155.94", 443, "185.213.155.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("FR", "🇫🇷", "Франция", "Paris FR-West #1", "51.158.108.44", 443, "51.158.108.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("UK", "🇬🇧", "Британия", "London UK-Docklands #2", "51.89.153.210", 443, "51.89.153.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("CH", "🇨🇭", "Швейцария", "Zurich CH-Alpine #1", "185.156.175.34", 443, "185.156.175.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("ES", "🇪🇸", "Испания", "Madrid ES-South #1", "185.253.162.55", 443, "185.253.162.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("IT", "🇮🇹", "Италия", "Milan IT-South #1", "185.216.34.81", 443, "185.216.34.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("CZ", "🇨🇿", "Чехия", "Prague CZ-Central #1", "185.101.215.63", 443, "185.101.215.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("RO", "🇷🇴", "Румыния", "Bucharest RO-East #1", "89.40.181.120", 443, "89.40.181.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("UA", "🇺🇦", "Украина", "Kyiv UA-East #1", "185.65.244.18", 443, "185.65.244.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("US", "🇺🇸", "США", "New York US-East #4", "104.244.72.115", 443, "104.244.72.0/24", "https://8.8.8.8/resolve"),
-    VpnServerNodeInfo("CA", "🇨🇦", "Канада", "Toronto CA-North #1", "158.69.211.48", 443, "158.69.211.0/24", "https://8.8.8.8/resolve"),
-    VpnServerNodeInfo("TR", "🇹🇷", "Турция", "Istanbul TR-Bridge #1", "185.125.33.92", 443, "185.125.33.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("KZ", "🇰🇿", "Казахстан", "Almaty KZ-Steppe #1", "91.215.136.44", 443, "91.215.136.0/24", "https://1.1.1.1/dns-query"),
-    VpnServerNodeInfo("JP", "🇯🇵", "Япония", "Tokyo JP-Pacific #1", "45.76.211.108", 443, "45.76.211.0/24", "https://8.8.8.8/resolve"),
-    VpnServerNodeInfo("SG", "🇸🇬", "Сингапур", "Singapore SG-Asia #3", "139.99.61.88", 443, "139.99.61.0/24", "https://8.8.8.8/resolve")
+    VpnServerNodeInfo("LT", "🛡", "Обход DPI №1", "без смены IP", "185.150.189.201", 443, "185.150.189.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("LV", "🛡", "Обход DPI №2", "без смены IP", "91.198.156.42", 443, "91.198.156.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("EE", "🛡", "Обход DPI №3", "без смены IP", "185.197.105.78", 443, "185.197.105.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("PL", "🛡", "Обход DPI №4", "без смены IP", "185.238.72.19", 443, "185.238.72.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("DE", "🛡", "Обход DPI №5", "без смены IP", "185.220.101.45", 443, "185.220.101.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("NL", "🛡", "Обход DPI №6", "без смены IP", "94.142.241.111", 443, "94.142.241.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("FI", "🛡", "Обход DPI №7", "без смены IP", "95.216.195.133", 443, "95.216.195.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("SE", "🛡", "Обход DPI №8", "без смены IP", "185.213.155.94", 443, "185.213.155.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("FR", "🛡", "Обход DPI №9", "без смены IP", "51.158.108.44", 443, "51.158.108.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("UK", "🛡", "Обход DPI №10", "без смены IP", "51.89.153.210", 443, "51.89.153.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("CH", "🛡", "Обход DPI №11", "без смены IP", "185.156.175.34", 443, "185.156.175.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("ES", "🛡", "Обход DPI №12", "без смены IP", "185.253.162.55", 443, "185.253.162.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("IT", "🛡", "Обход DPI №13", "без смены IP", "185.216.34.81", 443, "185.216.34.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("CZ", "🛡", "Обход DPI №14", "без смены IP", "185.101.215.63", 443, "185.101.215.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("RO", "🛡", "Обход DPI №15", "без смены IP", "89.40.181.120", 443, "89.40.181.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("UA", "🛡", "Обход DPI №16", "без смены IP", "185.65.244.18", 443, "185.65.244.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("US", "🛡", "Обход DPI №17", "без смены IP", "104.244.72.115", 443, "104.244.72.0/24", "https://8.8.8.8/resolve"),
+    VpnServerNodeInfo("CA", "🛡", "Обход DPI №18", "без смены IP", "158.69.211.48", 443, "158.69.211.0/24", "https://8.8.8.8/resolve"),
+    VpnServerNodeInfo("TR", "🛡", "Обход DPI №19", "без смены IP", "185.125.33.92", 443, "185.125.33.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("KZ", "🛡", "Обход DPI №20", "без смены IP", "91.215.136.44", 443, "91.215.136.0/24", "https://1.1.1.1/dns-query"),
+    VpnServerNodeInfo("JP", "🛡", "Обход DPI №21", "без смены IP", "45.76.211.108", 443, "45.76.211.0/24", "https://8.8.8.8/resolve"),
+    VpnServerNodeInfo("SG", "🛡", "Обход DPI №22", "без смены IP", "139.99.61.88", 443, "139.99.61.0/24", "https://8.8.8.8/resolve")
 )
 
 /**
@@ -2441,6 +2441,54 @@ object BrowsecLocalProxyServer {
         }
     }
 
+    /** v4.1: приложения из белого списка — через сервер Browsec выбранной страны (как Browsec в Lemur: настоящая смена IP). */
+    private fun browsecTunnelPipe(client: Socket, remoteAddr: InetAddress, origPort: Int, st: ServerNodeRuntimeState, profile: AppTunnelProfile?) {
+        val pin = PushbackInputStream(client.getInputStream(), 32 * 1024)
+        var host = remoteAddr.hostAddress ?: ""
+        client.soTimeout = 1500
+        val first = ByteArray(32 * 1024)
+        val n = try { pin.read(first) } catch (_: SocketTimeoutException) { 0 }
+        if (n < 0) return
+        if (n > 0) {
+            val name = if (origPort == 80 || origPort == 8080) httpHostOf(first, n) else TlsSni.extract(first, n)
+            if (!name.isNullOrBlank()) host = name
+            pin.unread(first, 0, n)
+        }
+        client.soTimeout = 10 * 60_000
+        val t0 = System.currentTimeMillis()
+        val viaBrowsec = BrowsecNative.shouldTunnel(host)
+        val pair: Pair<Socket, InputStream> = if (viaBrowsec) {
+            BrowsecNative.openTunnel(host, origPort)
+        } else {
+            val s = Socket()
+            BrowsecVpnService.protectSocket(s)
+            s.tcpNoDelay = true
+            s.connect(InetSocketAddress(remoteAddr, origPort), 6000)
+            s to s.getInputStream()
+        }
+        st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+        val up = pair.first
+        try {
+            val upOut: OutputStream = if (viaBrowsec) BrowsecNative.CountingOutput(up.getOutputStream()) else up.getOutputStream()
+            val out = client.getOutputStream()
+            val t1 = thread(name = "BsecC2S-$origPort", isDaemon = true) {
+                pipeClientToServerV38(pin, upOut, host, origPort, st, profile, false)
+                try { up.shutdownOutput() } catch (_: Exception) {}
+            }
+            pipeServerToClientV38(pair.second, out, st, profile, true)
+            try { client.shutdownOutput() } catch (_: Exception) {}
+            t1.join(2000)
+        } finally {
+            try { up.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun httpHostOf(b: ByteArray, n: Int): String? {
+        val text = String(b, 0, minOf(n, 4096), Charsets.ISO_8859_1)
+        val m = Regex("(?im)^host:\\s*([^\\r\\n:]+)").find(text) ?: return null
+        return m.groupValues[1].trim()
+    }
+
     private fun handleTransparentClient(client: Socket) {
         val remoteAddr = client.inetAddress
         val appPort = client.port
@@ -2465,6 +2513,11 @@ object BrowsecLocalProxyServer {
         var upstream: Socket? = null
         try {
             client.tcpNoDelay = true
+            // v4.1: Browsec — приложения из белого списка идут через сервер выбранной страны
+            if (BrowsecNative.enabled && TunPackets.inetToIp(remoteAddr) != TunPackets.DNS_IP) {
+                browsecTunnelPipe(client, remoteAddr, origPort, st, profile)
+                return
+            }
             val target = if (TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP) {
                 InetSocketAddress(InetAddress.getByName("1.1.1.1"), 53)
             } else {
@@ -3213,6 +3266,9 @@ class BrowsecVpnService : VpnService() {
         super.onCreate()
         activeInstance = this
         appContext = applicationContext
+        BrowsecNative.init(this)
+        BrowsecNative.socketProtector = { sock -> protectSocket(sock) }
+        try { FloatingVpnBubble.syncWithState(this) } catch (_: Exception) {}
         createNotificationChannel()
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
         BrowsecLocalProxyServer.ensureRunning()
@@ -3560,9 +3616,8 @@ class BrowsecVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val pickServerIntent = Intent(this, MainActivity::class.java).apply {
-            action = ACTION_OPEN_SERVER_PICKER
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        val pickServerIntent = Intent(this, QuickCountryActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
         val pickServerPi = PendingIntent.getActivity(
             this, 1, pickServerIntent,
@@ -3585,13 +3640,21 @@ class BrowsecVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val title = if (isPaused) {
+        val titleDpi = if (isPaused) {
             "⏸ VPN Приложений: ПАУЗА | Браузер: ${bNode.flag} ${bNode.code} (${bSnap.pingMs} мс)"
         } else {
             "🌐 ${bNode.flag}${bNode.code} ⚡${bSnap.pingMs}мс ⬇${formatSpeedRu(bSnap.rxSpeedBytesPerSec)} ⬆${formatSpeedRu(bSnap.txSpeedBytesPerSec)} | 📱 ${aNode.flag}${aNode.code} ⚡${aSnap.pingMs}мс ⬇${formatSpeedRu(aSnap.rxSpeedBytesPerSec)} ⬆${formatSpeedRu(aSnap.txSpeedBytesPerSec)}"
         }
 
-        val shortLine = "Браузер(${bNode.code} • ${bSnap.pingMs}мс): ⬇${formatBytesRu(bSnap.rxBytesTotal)} ⬆${formatBytesRu(bSnap.txBytesTotal)} • Прил.(${aNode.code} • ${aSnap.pingMs}мс): ⬇${formatBytesRu(aSnap.rxBytesTotal)} ⬆${formatBytesRu(aSnap.txBytesTotal)}"
+        val shortLineDpi = "Браузер(${bNode.code} • ${bSnap.pingMs}мс): ⬇${formatBytesRu(bSnap.rxBytesTotal)} ⬆${formatBytesRu(bSnap.txBytesTotal)} • Прил.(${aNode.code} • ${aSnap.pingMs}мс): ⬇${formatBytesRu(aSnap.rxBytesTotal)} ⬆${formatBytesRu(aSnap.txBytesTotal)}"
+
+        val bsc = BrowsecNative.activeCountry()
+        val title = if (BrowsecNative.enabled && bsc != null) {
+            "🌍 Browsec ${bsc.flag} ${bsc.nameRu} ⬇${BrowsecNative.formatRate(BrowsecNative.rateDown)} ⬆${BrowsecNative.formatRate(BrowsecNative.rateUp)}"
+        } else titleDpi
+        val shortLine = if (BrowsecNative.enabled && bsc != null) {
+            "Всего ⬇${BrowsecNative.formatBytes(BrowsecNative.bytesDown.get())} ⬆${BrowsecNative.formatBytes(BrowsecNative.bytesUp.get())} • через VPN: браузер и приложения из списка (${routedPackages.size})"
+        } else shortLineDpi
 
         val perAppSummary = buildString {
             appendLine("1️⃣ БРАУЗЕР VPN (${bNode.flag} ${bNode.countryRu} • 127.0.0.1:${bSnap.proxyPort} • Пинг: ${bSnap.pingMs} мс • ${bSnap.currentStrategyLabel}):")
@@ -3624,7 +3687,7 @@ class BrowsecVpnService : VpnService() {
             .setContentIntent(contentPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(android.R.drawable.ic_menu_mylocation, "🎯 Выбрать сервер", pickServerPi)
+            .addAction(android.R.drawable.ic_menu_mylocation, "🌍 Страна", pickServerPi)
             .addAction(android.R.drawable.ic_popup_sync, "🔗 Синхр. оба VPN", syncPi)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "⏹ Выкл", stopPi)
 

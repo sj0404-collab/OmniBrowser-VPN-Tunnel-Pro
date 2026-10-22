@@ -188,6 +188,9 @@ object ExtensionRuntime {
         app = context.applicationContext
         ExtensionStore.init(app)
         ExtensionProxy.init(app)
+        com.winwasm64.vpn.BrowsecNative.init(app)
+        com.winwasm64.vpn.BrowsecNative.applyBrowserRoute()
+        try { com.winwasm64.vpn.FloatingVpnBubble.syncWithState(app) } catch (_: Exception) {}
         ExtensionProxy.authRequester = { owner, details, cb -> requestProxyAuth(owner, details, cb) }
         ExtensionProxy.errorReporter = { owner, error, details ->
             val payload = eventJson(owner, "proxy.onProxyError", JSONArray().put(JSONObject().put("fatal", false).put("error", error).put("details", details)))
