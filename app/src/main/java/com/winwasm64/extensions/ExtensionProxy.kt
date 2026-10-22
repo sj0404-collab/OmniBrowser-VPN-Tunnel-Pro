@@ -172,6 +172,8 @@ object ExtensionProxy {
     fun release(extId: String?) {
         val c = control ?: return
         downUntil.clear()
+        ownerDownUntil = 0L
+        ownerFails.clear()
         if (extId != null && c.extId != extId) return
         control = null
         ownerName = null
@@ -677,7 +679,7 @@ function alert(){}
                 }
             } catch (e: Exception) {
                 if (up.type != "DIRECT") {
-                    markDown(up)
+                    markDown(up, e)
                     reportError(up, e)
                 }
             }
@@ -917,7 +919,7 @@ function alert(){}
                 return
             } catch (e: Exception) {
                 if (up.type != "DIRECT") {
-                    markDown(up)
+                    markDown(up, e)
                     reportError(up, e)
                 }
             }
@@ -963,10 +965,15 @@ function alert(){}
     @Volatile
     private var lastFallbackToast = 0L
 
+    private val fallbackLoggedAt = ConcurrentHashMap<String, Long>()
+
     private fun noteFallback(host: String) {
         val owner = ownerName ?: "расширения"
-        com.winwasm64.vpn.VpnLog.w("Браузер", "прокси «$owner» не отвечает → $host открыт через встроенный обход DPI")
         val now = SystemClock.elapsedRealtime()
+        if (now - (fallbackLoggedAt[host] ?: 0L) > 60_000L) {
+            fallbackLoggedAt[host] = now
+            com.winwasm64.vpn.VpnLog.i("Браузер", "$host открыт через встроенный обход DPI (прокси «$owner» не отвечает)")
+        }
         if (now - lastFallbackToast > 60_000L) {
             lastFallbackToast = now
             main.post {
@@ -983,6 +990,10 @@ function alert(){}
     private val probing = ConcurrentHashMap<String, Boolean>()
 
     private fun isDown(up: Upstream): Boolean {
+        if (ownerDown()) {
+            maybeProbeOwner(up)
+            return true
+        }
         val until = downUntil[up.key] ?: return false
         if (SystemClock.elapsedRealtime() < until) return true
         if (probing.putIfAbsent(up.key, true) == null) {
@@ -1004,14 +1015,51 @@ function alert(){}
         return true
     }
 
-    private fun markDown(up: Upstream) {
-        if (downUntil.put(up.key, SystemClock.elapsedRealtime() + 180_000L) == null) {
-            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} не отвечает — браузер идёт через встроенный обход DPI (проверю снова через 3 мин)")
+    // v4.0.5: предохранитель на всё расширение — Browsec из РФ перебирает серверы, и каждый новый ждали бы по 8 с
+    private val ownerFails = java.util.concurrent.ConcurrentLinkedDeque<Long>()
+    @Volatile
+    private var ownerDownUntil = 0L
+    @Volatile
+    private var ownerProbeAt = 0L
+
+    private fun ownerDown(): Boolean = SystemClock.elapsedRealtime() < ownerDownUntil
+
+    private fun maybeProbeOwner(up: Upstream) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - ownerProbeAt < 60_000L) return
+        ownerProbeAt = now
+        pool.execute {
+            val ok = try {
+                probeUpstream(up)
+            } catch (_: Exception) {
+                false
+            }
+            if (ok) {
+                ownerDownUntil = 0L
+                ownerFails.clear()
+                downUntil.remove(up.key)
+                com.winwasm64.vpn.VpnLog.ok("Браузер", "прокси расширения «${ownerName ?: "?"}» снова отвечает (${up.key})")
+            }
+        }
+    }
+
+    private fun markDown(up: Upstream, e: Exception) {
+        val now = SystemClock.elapsedRealtime()
+        val reason = e.message ?: e.javaClass.simpleName
+        if (downUntil.put(up.key, now + 180_000L) == null) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} не отвечает ($reason) — сайт идёт через встроенный обход DPI")
+        }
+        ownerFails.addLast(now)
+        while (ownerFails.isNotEmpty() && now - (ownerFails.peekFirst() ?: now) > 180_000L) ownerFails.pollFirst()
+        if (ownerFails.size >= 2 && !ownerDown()) {
+            ownerDownUntil = now + 300_000L
+            ownerProbeAt = now
+            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения «${ownerName ?: "?"}» не работает (серверы не отвечают) — 5 мин все сайты сразу идут через встроенный обход DPI, без ожидания")
         }
     }
 
     /** Есть ли сейчас «упавший» сервер прокси расширения (для карточки статуса). */
-    fun isExtensionProxyDown(): Boolean = control != null && downUntil.isNotEmpty()
+    fun isExtensionProxyDown(): Boolean = control != null && (ownerDown() || downUntil.isNotEmpty())
 
     private fun probeUpstream(up: Upstream): Boolean {
         val p = if (up.type == "SOCKS5") viaSocks5(up, "www.gstatic.com", 443) else viaHttpProxy(up, "www.gstatic.com", 443, "https://www.gstatic.com/")
@@ -1027,6 +1075,5 @@ function alert(){}
         lastErrorAt[up.key] = now
         Log.w(TAG, "прокси ${up.key}: ${e.message}")
         // v4.0.3: без красной плашки — сайт и так откроется через встроенный обход DPI; причина — в журнале VPN
-        com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения «${ownerName ?: owner}» ${up.key}: ${e.message ?: e.javaClass.simpleName}")
     }
 }
