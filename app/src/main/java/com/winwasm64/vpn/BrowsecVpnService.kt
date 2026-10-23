@@ -3318,6 +3318,7 @@ class BrowsecVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        com.winwasm64.CrashCatcher.install(this)
         activeInstance = this
         appContext = applicationContext
         VpnLog.init(this)

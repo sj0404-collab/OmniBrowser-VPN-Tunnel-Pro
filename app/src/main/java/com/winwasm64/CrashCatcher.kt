@@ -27,15 +27,26 @@ object CrashCatcher {
             }
         } catch (_: Exception) {}
         val prev = Thread.getDefaultUncaughtExceptionHandler()
+        val mainThread = android.os.Looper.getMainLooper().thread
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
-            try {
+            val text = try {
                 val sw = StringWriter()
                 PrintWriter(sw).use { pw ->
                     pw.println("${java.util.Date()} поток ${t.name}")
                     e.printStackTrace(pw)
                 }
-                file.writeText(sw.toString())
-            } catch (_: Exception) {}
+                sw.toString()
+            } catch (_: Exception) { e.toString() }
+            if (t !== mainThread && e !is OutOfMemoryError) {
+                // v4.2.8: ошибка в фоновом (сетевом) потоке — пишем в журнал, поток умирает, приложение продолжает работать
+                try {
+                    com.winwasm64.vpn.VpnLog.w("Сбой", "ошибка в фоновом потоке ${t.name} (приложение продолжает работу):\n" +
+                        text.lines().filter { it.isNotBlank() }.take(6).joinToString("\n"))
+                    File(app.filesDir, "crash_bg_last.txt").writeText(text)
+                } catch (_: Exception) {}
+                return@setDefaultUncaughtExceptionHandler
+            }
+            try { file.writeText(text) } catch (_: Exception) {}
             prev?.uncaughtException(t, e)
         }
     }

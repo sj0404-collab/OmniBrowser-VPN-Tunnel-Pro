@@ -89,7 +89,12 @@ object ExtensionProxy {
     var changeListener: (() -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
-    private val pool = Executors.newCachedThreadPool { r -> Thread(r, "omni-extproxy").apply { isDaemon = true } }
+    private val pool = Executors.newCachedThreadPool { r ->
+        Thread(r, "omni-extproxy").apply {
+            isDaemon = true
+            setUncaughtExceptionHandler { _, e -> Log.w(TAG, "фоновая ошибка", e) } // v4.2.8: ошибка в потоке не должна ронять приложение
+        }
+    }
     private var server: ServerSocket? = null
     private var appliedKey = ""
     private lateinit var appContext: Context
@@ -1301,12 +1306,13 @@ function alert(){}
             b.soTimeout = 300_000
         } catch (_: Exception) {
         }
+        // v4.2.8: getOutputStream() на уже закрытом сокете бросал SocketException вне try — ронял весь процесс
         pool.execute {
-            copy(bIn, a.getOutputStream())
+            try { copy(bIn, a.getOutputStream()) } catch (_: Exception) {}
             closeQuietly(a)
             closeQuietly(b)
         }
-        copy(aIn, b.getOutputStream())
+        try { copy(aIn, b.getOutputStream()) } catch (_: Exception) {}
         closeQuietly(a)
         closeQuietly(b)
     }
@@ -1593,7 +1599,8 @@ function alert(){}
             tunnelPingAt = now
             pool.execute { pingTunnelServers() }
         }
-        if (now - tunnelMeasuredAt > 300_000L && tunnelPing.isNotEmpty()) {
+        val goodMeasured = tunnelConnectMs.count { it.value < 3_000L && (tunnelDownUntil[it.key] ?: 0L) < now }
+        if (now - tunnelMeasuredAt > (if (goodMeasured < 3) 90_000L else 300_000L) && tunnelPing.isNotEmpty()) {
             tunnelMeasuredAt = now
             pool.execute { measureTunnelServers() }
         }
@@ -1774,7 +1781,8 @@ function alert(){}
 
     /** Чем меньше — тем лучше: задержка CONNECT плюс штраф за медленную отдачу (ниже 400 КБ/с). */
     private fun scoreOf(up: Upstream): Long {
-        val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3 + 300)
+        // неизмеренный сервер — хуже любого измеренного рабочего (в час пик половина серверов отвечает 503)
+        val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3 + 1_500)
         val rate = tunnelRateKb[up.key]
         val penalty = if (rate == null) 0L else ((400.0 - rate).coerceAtLeast(0.0) * 5).toLong()
         return connect + penalty
@@ -1818,7 +1826,7 @@ function alert(){}
         val cands = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
             .sortedBy { tunnelPing[it.key] ?: 5_000L }
-            .take(10)
+            .take(16)
         if (cands.isEmpty()) return
         val latch = CountDownLatch(cands.size)
         for (up in cands) {
@@ -1829,7 +1837,10 @@ function alert(){}
                     closeQuietly(r.first)
                     noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
                 } catch (e: ProxyRefusedException) {
-                    if (e.code == 407) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
+                    if (e.code == 407 || e.code in 500..599) {
+                        tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
+                        tunnelConnectMs[up.key] = 9_000L
+                    }
                 } catch (_: Exception) {
                     tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
                     tunnelConnectMs[up.key] = 9_000L
