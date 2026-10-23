@@ -80,6 +80,92 @@ object MediaState {
     };
     ['play','playing','pause','ended','emptied','abort'].forEach(function(ev){ document.addEventListener(ev, function(){ setTimeout(report, 80); }, true); });
     setInterval(report, 3000);
+    // v4.2.13: сколько видео реально играло и сколько трафика съела страница (ресурсы через PerformanceObserver;
+    // для googlevideo, где размер скрыт политикой Timing-Allow-Origin, берём Content-Length из fetch/XHR)
+    var S = window.__omniStats = { playedMs: 0, firstPlayAt: 0, lastPlayAt: 0, bytes: 0, media: 0, n: 0, lastCt: -1 };
+    var clByUrl = {};
+    var isMedia = function(u){ return u.indexOf('googlevideo.com') >= 0 || u.indexOf('videoplayback') >= 0 || u.indexOf('.m3u8') >= 0 || u.indexOf('.ts?') >= 0 || u.indexOf('.mp4') >= 0 || u.indexOf('.m4s') >= 0 || u.indexOf('.webm') >= 0; };
+    var addBytes = function(u, b){ if (!(b > 0)) return; S.bytes += b; S.n++; if (isMedia(u)) S.media += b; };
+    try {
+      var po = new PerformanceObserver(function(list){
+        try {
+          var es = list.getEntries();
+          for (var i = 0; i < es.length; i++) {
+            var e = es[i]; var b = e.transferSize || e.encodedBodySize || 0;
+            if (!b) { b = clByUrl[e.name] || 0; }
+            delete clByUrl[e.name];
+            addBytes(e.name, b);
+          }
+        } catch (x) {}
+      });
+      po.observe({ type: 'resource', buffered: true });
+    } catch (e) {}
+    try {
+      var of = window.fetch;
+      if (of) window.fetch = function(input, init){
+        var u = (typeof input === 'string') ? input : (input && input.url) || '';
+        return of.apply(this, arguments).then(function(res){
+          try { var cl = parseInt(res.headers.get('content-length') || '0', 10); if (cl > 0 && u) clByUrl[u] = cl; } catch (x) {}
+          return res;
+        });
+      };
+    } catch (e) {}
+    try {
+      var oo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(m, u){
+        try { var self = this; self.__omniUrl = String(u); self.addEventListener('loadend', function(){ try { var cl = parseInt(self.getResponseHeader('content-length') || '0', 10); if (cl > 0) clByUrl[self.__omniUrl] = cl; } catch (x) {} }); } catch (x) {}
+        return oo.apply(this, arguments);
+      };
+    } catch (e) {}
+    document.addEventListener('timeupdate', function(e){
+      try {
+        var v = e.target; if (!v || (v.tagName !== 'VIDEO' && v.tagName !== 'AUDIO') || v.paused) return;
+        var ct = v.currentTime; var d = ct - S.lastCt;
+        if (S.lastCt >= 0 && d > 0 && d < 2) S.playedMs += d * 1000;
+        S.lastCt = ct;
+        if (!S.firstPlayAt) S.firstPlayAt = Date.now();
+        S.lastPlayAt = Date.now();
+      } catch (x) {}
+    }, true);
+    document.addEventListener('seeking', function(){ S.lastCt = -1; }, true);
+    window.__omniStatsJson = function(){
+      return JSON.stringify({ played: Math.round(S.playedMs), wall: S.firstPlayAt ? (Date.now() - S.firstPlayAt) : 0, bytes: Math.round(S.bytes), media: Math.round(S.media), n: S.n });
+    };
+    var statsAt = function(){ return { t: Date.now(), played: S.playedMs, bytes: S.bytes, media: S.media }; };
+    var lastStop = statsAt();
+    document.addEventListener('pause', function(e){
+      try {
+        var v = e.target; if (!v || (v.tagName !== 'VIDEO' && v.tagName !== 'AUDIO')) return;
+        setTimeout(function(){
+          try {
+            var now = statsAt(); var seg = { played: now.played - lastStop.played, bytes: now.bytes - lastStop.bytes, media: now.media - lastStop.media, wall: now.t - lastStop.t };
+            lastStop = now;
+            if (seg.played < 1000) return;
+            if (window.OmniMedia && OmniMedia.stats) OmniMedia.stats(JSON.stringify({ kind: 'stop', seg: seg, total: { played: S.playedMs, wall: S.firstPlayAt ? (Date.now() - S.firstPlayAt) : 0, bytes: S.bytes, media: S.media } }));
+          } catch (x) {}
+        }, 400);
+      } catch (x) {}
+    }, true);
+    document.addEventListener('playing', function(){ try { if (lastStop.played < S.playedMs - 1000) return; lastStop = statsAt(); } catch (x) {} }, true);
+    var pipMark = null;
+    window.__omniPipMark = function(){ pipMark = statsAt(); };
+    window.__omniPipReport = function(){
+      try {
+        if (!pipMark) return; var now = statsAt();
+        if (window.OmniMedia && OmniMedia.stats) OmniMedia.stats(JSON.stringify({ kind: 'pip', seg: { played: now.played - pipMark.played, bytes: now.bytes - pipMark.bytes, media: now.media - pipMark.media, wall: now.t - pipMark.t }, total: { played: S.playedMs, wall: S.firstPlayAt ? (Date.now() - S.firstPlayAt) : 0, bytes: S.bytes, media: S.media } }));
+        pipMark = null;
+      } catch (x) {}
+    };
+    // каждые 5 минут непрерывной игры — промежуточная сводка
+    var lastPeriodic = statsAt();
+    setInterval(function(){
+      try {
+        if (Date.now() - S.lastPlayAt > 4000) { lastPeriodic = statsAt(); return; }
+        var now = statsAt(); if (now.t - lastPeriodic.t < 300000) return;
+        if (window.OmniMedia && OmniMedia.stats) OmniMedia.stats(JSON.stringify({ kind: 'period', seg: { played: now.played - lastPeriodic.played, bytes: now.bytes - lastPeriodic.bytes, media: now.media - lastPeriodic.media, wall: now.t - lastPeriodic.t }, total: { played: S.playedMs, wall: Date.now() - S.firstPlayAt, bytes: S.bytes, media: S.media } }));
+        lastPeriodic = now;
+      } catch (x) {}
+    }, 10000);
     // v4.2.10: причина пауз в PiP — сам плеер YouTube: в его конфиге есть флаги html5_picture_in_picture_blocking_*
     // (onresize/ontimeupdate/standard_api/document_fullscreen) — плеер распознаёт маленькое окно PiP и ставит паузу
     // на каждом timeupdate. Как в Brave: переписываем флаги в ytcfg до создания плеера.
@@ -268,6 +354,37 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
     @JavascriptInterface
     fun trace(msg: String) {
         com.winwasm64.vpn.VpnLog.i("Видео", "«${tab.title.take(40)}»: " + msg.take(600))
+    }
+
+    /** v4.2.13: сводка «сколько играло и сколько трафика»: {kind: stop|pip|period, seg:{played,wall,bytes,media}, total:{…}}. */
+    @JavascriptInterface
+    fun stats(json: String) {
+        try {
+            val o = org.json.JSONObject(json)
+            val kind = o.optString("kind")
+            val seg = o.getJSONObject("seg")
+            val tot = o.getJSONObject("total")
+            fun dur(ms: Long): String {
+                val s = ms / 1000
+                return when {
+                    s >= 3600 -> "${s / 3600} ч ${(s % 3600) / 60} мин"
+                    s >= 60 -> "${s / 60} мин ${s % 60} с"
+                    else -> "$s с"
+                }
+            }
+            fun mb(b: Long): String = if (b >= 1_048_576) String.format(java.util.Locale.US, "%.1f МБ", b / 1_048_576.0) else "${b / 1024} КБ"
+            val sp = seg.optLong("played"); val sw = seg.optLong("wall"); val sb = seg.optLong("bytes"); val sm = seg.optLong("media")
+            val rate = if (sw > 1000) " ≈${sb * 1000 / sw / 1024} КБ/с" else ""
+            val head = when (kind) {
+                "pip" -> "PiP закрыт: в окне PiP играло ${dur(sp)} из ${dur(sw)}"
+                "period" -> "играет уже ${dur(tot.optLong("played"))}; за последние ${dur(sw)}"
+                else -> "остановлено: играло ${dur(sp)} подряд" + (if (sw > sp + 15_000) " (с паузами/буферизацией за ${dur(sw)})" else "")
+            }
+            val traffic = if (sm > 0) "трафик видео ${mb(sm)}, всего ${mb(sb)}$rate" else "трафик ${mb(sb)}$rate"
+            val total = "всего с открытия: играло ${dur(tot.optLong("played"))}, трафик ${mb(tot.optLong("bytes"))}"
+            com.winwasm64.vpn.VpnLog.i("Видео", "«${tab.title.take(40)}» — $head, $traffic · $total")
+        } catch (_: Exception) {
+        }
     }
 
     @JavascriptInterface

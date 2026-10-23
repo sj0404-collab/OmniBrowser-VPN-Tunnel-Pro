@@ -3135,6 +3135,41 @@ class BrowsecVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.winwasm64.vpn.ACTION_CONNECT"
         const val ACTION_DISCONNECT = "com.winwasm64.vpn.ACTION_DISCONNECT"
+
+        // v4.2.13: сводка сеанса VPN приложений — сколько работал и сколько трафика съело каждое приложение
+        @Volatile private var sessionStartedAt = 0L
+        @Volatile private var sessionBase: Map<String, Pair<Long, Long>> = emptyMap()
+
+        private fun durRu(ms: Long): String {
+            val s = ms / 1000
+            return when {
+                s >= 3600 -> "${s / 3600} ч ${(s % 3600) / 60} мин"
+                s >= 60 -> "${s / 60} мин ${s % 60} с"
+                else -> "$s с"
+            }
+        }
+
+        fun logSessionSummary() {
+            val start = sessionStartedAt
+            if (start == 0L) return
+            sessionStartedAt = 0L
+            val dur = System.currentTimeMillis() - start
+            var rxAll = 0L; var txAll = 0L
+            val parts = ArrayList<String>()
+            try {
+                for (p in BrowsecLocalProxyServer.getAllAppProfiles()) {
+                    val base = sessionBase[p.packageName] ?: (0L to 0L)
+                    val rx = (p.rxBytes.get() - base.first).coerceAtLeast(0L)
+                    val tx = (p.txBytes.get() - base.second).coerceAtLeast(0L)
+                    rxAll += rx; txAll += tx
+                    if (rx + tx > 0) parts.add("${VpnLog.label(p.packageName)} ↓${formatBytesRu(rx)} ↑${formatBytesRu(tx)}")
+                }
+            } catch (_: Exception) {}
+            VpnLog.i("Туннель", "VPN приложений работал ${durRu(dur)} · трафик ↓${formatBytesRu(rxAll)} ↑${formatBytesRu(txAll)}" +
+                (if (parts.isNotEmpty()) " · " + parts.joinToString(", ") else " · приложения трафик не передавали") +
+                (if (dur > 60_000L) " · средняя ↓${formatBytesRu(rxAll * 1000 / dur)}/с" else ""))
+        }
+
         const val ACTION_PAUSE = "com.winwasm64.vpn.ACTION_PAUSE"
         const val ACTION_RESUME = "com.winwasm64.vpn.ACTION_RESUME"
         const val ACTION_SWITCH_COUNTRY = "com.winwasm64.vpn.ACTION_SWITCH_COUNTRY"
@@ -3355,6 +3390,7 @@ class BrowsecVpnService : VpnService() {
         VpnLog.i("Сервис", "команда: " + (intent?.action?.substringAfterLast('.') ?: "запуск") + (intent?.getStringExtra(EXTRA_COUNTRY)?.let { " ($it)" } ?: ""))
         when (intent?.action) {
             ACTION_DISCONNECT -> {
+                logSessionSummary()
                 isRunning = false
                 isPaused = false
                 BrowsecLocalProxyServer.useBrowsecTunnel = false
@@ -3498,6 +3534,11 @@ class BrowsecVpnService : VpnService() {
             perAppVpnInterface = pfd
             if (pfd == null) VpnLog.e("Туннель", "Android не создал VPN-интерфейс (нет разрешения VPN или включено другое VPN-приложение)")
             else VpnLog.ok("Туннель", "VPN приложений поднят, профиль $activeCountry: " + VpnLog.appList(routedPackages) + (if (wantTransparent) " · прозрачный режим" else " · режим прокси"))
+            if (pfd != null && sessionStartedAt == 0L) {
+                // v4.2.13: точка отсчёта сеанса — время работы и трафик по приложениям покажем при отключении
+                sessionStartedAt = System.currentTimeMillis()
+                sessionBase = BrowsecLocalProxyServer.getAllAppProfiles().associate { it.packageName to (it.rxBytes.get() to it.txBytes.get()) }
+            }
             if (pfd == null) {
                 tunnelEstablished = false
                 transparentActive = false

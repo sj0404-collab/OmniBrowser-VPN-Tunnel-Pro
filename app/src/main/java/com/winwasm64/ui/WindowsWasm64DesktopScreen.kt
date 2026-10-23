@@ -1443,9 +1443,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     child.visibility = if (child === wv) View.VISIBLE else View.GONE
                 }
                 wv.bringToFront()
-                wv.evaluateJavascript("(function(){ try { if (window.__omniFixYtFlags) window.__omniFixYtFlags(); } catch (e) {} })();", null)
+                wv.evaluateJavascript("(function(){ try { if (window.__omniFixYtFlags) window.__omniFixYtFlags(); if (window.__omniPipMark) window.__omniPipMark(); } catch (e) {} })();", null)
             } else {
                 applyTabVisibility(webViewContainer, tab)
+                wv.evaluateJavascript("(function(){ try { if (window.__omniPipReport) window.__omniPipReport(); } catch (e) {} })();", null)
             }
         } catch (_: Exception) {}
         if (MediaState.inPip) {
