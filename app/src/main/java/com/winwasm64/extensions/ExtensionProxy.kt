@@ -1931,12 +1931,28 @@ function alert(){}
      * Порядок серверов: лучший по измеренному качеству; страна профиля приложения или страна расширения — только если её
      * лучший сервер не хуже общего лучшего более чем в полтора раза («быстрее» важнее, чем «первый попавшийся»).
      */
+    @Volatile private var lastResortLoggedAt = 0L
+
     private fun rankTunnelServers(preferCountry: String?, now: Long, dest: String? = null, useCountry: Boolean = true): List<Upstream> {
         val pref = if (useCountry) preferCountry?.lowercase()?.take(2) else null
         val extPref = if (useCountry) extensionCountry() else null
-        val alive = tunnelServers
+        var alive = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
             .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 4 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
+        if (alive.isEmpty() && tunnelServers.isNotEmpty()) {
+            // v4.2.17: в час пик весь пул за несколько секунд получает 503/таймауты и уходит в паузу на 60–180 с —
+            // раньше приложения на это время оставались вообще без серверов (1881 отказ AyuGram за 45 с).
+            // Запасной вариант: берём серверы, чья пауза кончается раньше всех (503 = живой, но перегруженный), и пробуем всё равно.
+            alive = tunnelServers
+                .filter { tunnelPing[it.key] != Long.MAX_VALUE || tunnelConnectMs.containsKey(it.key) }
+                .sortedBy { (tunnelDownUntil[it.key] ?: 0L) }
+                .take(6)
+            if (alive.isEmpty()) alive = tunnelServers.take(6)
+            if (now - lastResortLoggedAt > 60_000L) {
+                lastResortLoggedAt = now
+                VpnLog.w("Прил", "все серверы Browsec в паузе после 503/таймаутов — пробуем ${alive.take(4).joinToString(", ") { it.host.substringBefore('.') }} всё равно, чтобы приложения не остались без туннеля")
+            }
+        }
         if (alive.isEmpty()) return alive
         val byScore = alive.sortedBy { scoreFor(dest, it) }
         val best = scoreFor(dest, byScore.first())

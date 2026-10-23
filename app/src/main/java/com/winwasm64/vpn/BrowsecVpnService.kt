@@ -2638,7 +2638,16 @@ object BrowsecLocalProxyServer {
             // v4.1.1: любой TCP-порт (Telegram ходит на 5222 и по IP без SNI); если прокси откажет в порте — напрямую
             if (!isDnsIp && BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
                 val t0 = System.currentTimeMillis()
-                val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                var r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                // v4.2.17: мгновенный null = кандидатов не было вовсе (пул в паузе). Не отказываем сразу — ждём до 4,5 с,
+                // пока сервер освободится; Telegram такую задержку переживает, а мгновенный отказ повторяет 40 раз в секунду
+                var waits = 0
+                while (r == null && waits < 3 && System.currentTimeMillis() - t0 < 1_000L + waits * 1_600L &&
+                    !com.winwasm64.extensions.ExtensionProxy.isDeadDest(host, origPort)) {
+                    waits++
+                    try { Thread.sleep(1_500) } catch (_: InterruptedException) { break }
+                    r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                }
                 if (r != null) {
                     up = r.first
                     upIn = r.second
@@ -2652,9 +2661,12 @@ object BrowsecLocalProxyServer {
                 val dk = "${target.address?.hostAddress ?: host}:$origPort"
                 val failedAgo = System.currentTimeMillis() - (directFailAt[dk] ?: 0L)
                 if (com.winwasm64.extensions.ExtensionProxy.isDeadDest(host, origPort) && failedAgo < 1_800_000L) {
+                    try { Thread.sleep(1_200) } catch (_: InterruptedException) {}
                     throw java.io.IOException("адресат недоступен и через серверы Browsec, и напрямую — отказ сразу")
                 }
                 if (failedAgo < 300_000L) {
+                    // v4.2.17: пауза перед отказом — иначе приложение повторяет попытку мгновенно и журнал/процессор тонут в отказах
+                    try { Thread.sleep(1_200) } catch (_: InterruptedException) {}
                     val who = VpnLog.label(profile?.packageName)
                     if (System.currentTimeMillis() - (directSkipLoggedAt[dk] ?: 0L) > 120_000L) {
                         directSkipLoggedAt[dk] = System.currentTimeMillis()
@@ -3551,7 +3563,11 @@ class BrowsecVpnService : VpnService() {
             ACTION_SYNC_VPNS -> {
                 synchronizeBothVpns(fromBrowserToApps = true)
                 if (isRunning && !isPaused) {
-                    rebuildPerAppVpnInterface()
+                    if (perAppVpnInterface != null && builtConfigKey == currentConfigKey()) {
+                        VpnLog.i("Туннель", "синхронизация: список и страна не изменились — туннель не пересоздаём")
+                    } else {
+                        rebuildPerAppVpnInterface()
+                    }
                 }
                 updateNotificationShade()
                 return START_STICKY

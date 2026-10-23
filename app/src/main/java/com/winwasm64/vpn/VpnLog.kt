@@ -36,11 +36,25 @@ object VpnLog {
     fun e(tag: String, msg: String) = add("❌", tag, msg)
 
     /** Соединение приложения через VPN: куда, через какой профиль, сколько заняло, ошибка. */
+    private class Rep(var firstAt: Long, var count: Int)
+    private val repeats = java.util.concurrent.ConcurrentHashMap<String, Rep>()
+
     fun conn(pkg: String?, host: String, port: Int, profile: String, ms: Long, err: String?) {
         val who = label(pkg)
         val dur = if (ms >= 1000) String.format(java.util.Locale.US, "%.1f с", ms / 1000.0) else "$ms мс"
-        if (err == null) add("📱", "Прил", "$who → $host:$port · профиль $profile · длилось $dur")
-        else add("❌", "Прил", "$who → $host:$port · профиль $profile · ошибка: $err")
+        if (err == null) { add("📱", "Прил", "$who → $host:$port · профиль $profile · длилось $dur"); return }
+        // v4.2.17: одинаковые ошибки одного приложения к одному адресату — не чаще раза в 15 с, остальные считаем
+        val key = "$who|$host:$port|${err.substringBefore(" (")}"
+        val now = System.currentTimeMillis()
+        val rep = repeats[key]
+        if (rep != null && now - rep.firstAt < 15_000L) {
+            rep.count++
+            return
+        }
+        val suffix = if (rep != null && rep.count > 1) " (повторялось ×${rep.count} за ${(now - rep.firstAt) / 1000} с)" else ""
+        repeats[key] = Rep(now, 1)
+        if (repeats.size > 400) repeats.entries.removeIf { now - it.value.firstAt > 60_000L }
+        add("❌", "Прил", "$who → $host:$port · профиль $profile · ошибка: $err$suffix")
     }
 
     fun label(pkg: String?): String {
