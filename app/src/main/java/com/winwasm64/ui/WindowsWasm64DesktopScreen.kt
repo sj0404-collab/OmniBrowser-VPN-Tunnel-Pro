@@ -714,6 +714,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         if (js.isNotBlank()) {
             wv.evaluateJavascript(js, null)
         }
+        // v4.2.1: учёт воспроизведения — и там, где WebView не поддерживает скрипты «до загрузки» (старые версии)
+        try { wv.evaluateJavascript(MediaState.DOCUMENT_START_SCRIPT, null) } catch (_: Exception) {}
     }
 
     fun uaFor(url: String?): String? = if (desktopMode || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
@@ -1386,16 +1388,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     // v4.2.0: вкладка с играющим видео остаётся «видимой» для WebView (уводится за экран), а не GONE — иначе
     // Chromium ставит воспроизведение на паузу при переключении вкладок
     fun applyTabVisibility(container: ViewGroup, current: BrowserTabModel) {
-        val playing = tabs.filter { it !== current && it.mediaPlaying }.mapNotNull { it.webView }.toSet()
-        val off = (container.width.takeIf { it > 0 } ?: 4000) * 3f
+        // v4.2.1: видеосайты держим «видимыми» всегда — даже если страница ещё не сообщила о воспроизведении
+        val playing = tabs.filter { it !== current && (it.mediaPlaying || MediaState.isMediaSite(it.url)) }.mapNotNull { it.webView }.toSet()
+        // Играющая вкладка остаётся на месте и видимой — просто под активной (по z-порядку); так движок не считает её
+        // скрытой ни по видимости, ни по положению на экране
         for (i in 0 until container.childCount) {
             val child = container.getChildAt(i)
-            when {
-                child == current.webView -> { child.visibility = View.VISIBLE; child.translationX = 0f }
-                child in playing -> { child.visibility = View.VISIBLE; child.translationX = off }
-                else -> { child.visibility = View.GONE; child.translationX = 0f }
-            }
+            child.translationX = 0f
+            child.visibility = if (child == current.webView || child in playing) View.VISIBLE else View.GONE
         }
+        current.webView?.let { if (it.parent === container) it.bringToFront() }
     }
 
     // v4.2.0: «картинка в картинке» — раскладка «только видео» внутри страницы и параметры авто-входа (Android 12+)

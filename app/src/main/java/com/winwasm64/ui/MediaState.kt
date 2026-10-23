@@ -18,6 +18,17 @@ object MediaState {
     @Volatile
     var activeTabId: String? = null
 
+    private val mediaHosts = listOf(
+        "youtube.com", "youtu.be", "youtube-nocookie.com", "twitch.tv", "rutube.ru", "vk.com", "vkvideo.ru", "ok.ru",
+        "dzen.ru", "kinopoisk.ru", "soundcloud.com", "music.yandex", "vimeo.com", "dailymotion.com", "kick.com", "tiktok.com"
+    )
+
+    /** Сайт с видео/музыкой: его вкладку не скрываем от движка при переключении, чтобы воспроизведение не прерывалось. */
+    fun isMediaSite(url: String?): Boolean {
+        val host = try { android.net.Uri.parse(url ?: return false).host?.lowercase() ?: return false } catch (_: Exception) { return false }
+        return mediaHosts.any { host == it || host.endsWith(".$it") || host.startsWith(it) }
+    }
+
     /** Скрипт, который выполняется до скриптов страницы: учёт воспроизведения + страница не узнаёт, что скрыта. */
     const val DOCUMENT_START_SCRIPT = """
 (function(){

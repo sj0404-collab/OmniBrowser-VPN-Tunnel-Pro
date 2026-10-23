@@ -1506,16 +1506,30 @@ function alert(){}
             pool.execute { pingTunnelServers() }
         }
         val pref = preferCountry?.lowercase()?.take(2)
+        val extPref = extensionCountry()
+        // v4.2.1: порядок — страна профиля приложения → страна, выбранная в расширении Browsec → недавно работавшие → по пингу;
+        // сервер, на котором уже «висят» ≥2 попытки без недавних успехов, пропускаем (не ждём его таймаут толпой)
         val list = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
-            .sortedWith(compareBy<Upstream>({ if (pref != null && it.host.startsWith(pref)) 0 else 1 }, { tunnelPing[it.key] ?: 5_000L }))
+            .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 2 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
+            .sortedWith(
+                compareBy<Upstream>(
+                    { if (pref != null && it.host.startsWith(pref)) 0 else 1 },
+                    { if (extPref != null && it.host.startsWith(extPref)) 0 else 1 },
+                    { if (now - (tunnelLastOk[it.key] ?: 0L) < 120_000L) 0 else 1 },
+                    { tunnelPing[it.key] ?: 5_000L }
+                )
+            )
         var tries = 0
         for (up in list) {
             if (tries++ >= 2) break
+            val inFlight = tunnelInFlight.getOrPut(up.key) { AtomicInteger() }
+            inFlight.incrementAndGet()
             try {
                 val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
                 lastAutoTunnel = up.key
                 lastAutoTunnelAt = SystemClock.elapsedRealtime()
+                tunnelLastOk[up.key] = lastAutoTunnelAt
                 val t = lastAutoTunnelAt
                 if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
                     appTunnelLoggedAt[up.key] = t
@@ -1531,11 +1545,36 @@ function alert(){}
                     return null
                 }
             } catch (e: Exception) {
-                tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
-                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — следующий")
+                val t = SystemClock.elapsedRealtime()
+                tunnelDownUntil[up.key] = t + 180_000L
+                if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                    appTunnelFailLoggedAt[up.key] = t
+                    com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
+                }
+            } finally {
+                inFlight.decrementAndGet()
             }
         }
         return null
+    }
+
+    private val tunnelInFlight = ConcurrentHashMap<String, AtomicInteger>()
+    private val tunnelLastOk = ConcurrentHashMap<String, Long>()
+    private val appTunnelFailLoggedAt = ConcurrentHashMap<String, Long>()
+
+    @Volatile private var extCountryCache: Pair<String?, Long> = null to 0L
+
+    /** Страна, выбранная пользователем в расширении Browsec (по первому серверу его PAC-маршрута); null — неизвестно. */
+    private fun extensionCountry(): String? {
+        val now = SystemClock.elapsedRealtime()
+        val c = extCountryCache
+        if (now - c.second < 60_000L) return c.first
+        val cc = try {
+            if (control == null) null else pacLookup("https://www.youtube.com/", "www.youtube.com")
+                ?.firstOrNull { it.type != "DIRECT" }?.host?.takeWhile { ch -> ch.isLetter() }?.take(2)?.lowercase()?.takeIf { it.length == 2 }
+        } catch (_: Exception) { null }
+        extCountryCache = cc to now
+        return cc
     }
 
     // v4.1.1: DNS приложений через туннель Browsec (DoH к dns.google внутри CONNECT) — ответы провайдера отравлены
