@@ -1455,6 +1455,26 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         MediaState.activeMediaPlaying = current.mediaPlaying
         applyTabVisibility(webViewContainer, current)
         current.webView?.settings?.userAgentString = uaFor(current.url)
+        // v4.2.9: активная вкладка держит аудиофокус (системные «pause» игнорирует), остальные — нет
+        val playingBg = tabs.filter { it !== current && it.mediaPlaying }.map { "«${it.title.take(30)}»" }
+        com.winwasm64.vpn.VpnLog.i("Видео", "переключение на вкладку «${current.title.take(40)}»" +
+            (if (current.mediaPlaying) " (в ней играет видео)" else "") + (if (playingBg.isNotEmpty()) "; в фоне играет: ${playingBg.joinToString()}" else ""))
+        for (t in tabs) {
+            try { t.webView?.evaluateJavascript(MediaState.holdFocusScript(t === current), null) } catch (_: Exception) {}
+        }
+    }
+    // v4.2.9: когда во вкладке началось воспроизведение — остальные играющие вкладки ставим на паузу явно (JS),
+    // иначе Chromium гоняет аудиофокус между двумя плеерами и оба дёргаются раз в секунду
+    DisposableEffect(Unit) {
+        MediaState.onTabStartedPlaying = { id ->
+            for (t in tabs) {
+                if (t.id != id && t.mediaPlaying) {
+                    com.winwasm64.vpn.VpnLog.i("Видео", "«${t.title.take(40)}» ставим на паузу: началось воспроизведение в другой вкладке")
+                    try { t.webView?.evaluateJavascript(MediaState.mediaControlScript("pause"), null) } catch (_: Exception) {}
+                }
+            }
+        }
+        onDispose { MediaState.onTabStartedPlaying = null }
     }
 
     var torrentStatuses by remember { mutableStateOf(torrentEngine.getAllStatuses()) }

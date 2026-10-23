@@ -80,22 +80,50 @@ object MediaState {
     };
     ['play','playing','pause','ended','emptied','abort'].forEach(function(ev){ document.addEventListener(ev, function(){ setTimeout(report, 80); }, true); });
     setInterval(report, 3000);
-    // v4.2.7: кто ставит паузу в окне PiP — запоминаем стек вызова pause() (если паузу поставил движок, стека не будет)
+    // v4.2.9: причина пауз найдена — Chromium при потере аудиофокуса (второй плеер в другой вкладке / другое приложение)
+    // шлёт странице действие mediaSession «pause», YouTube вызывает pauseVideo(); две вкладки качают фокус друг у друга
+    // раз в секунду. Для вкладки, которую смотрит пользователь (активная или в PiP), такое «системное» pause игнорируем.
+    try {
+      var ms = navigator.mediaSession;
+      if (ms && ms.setActionHandler) {
+        var origSet = ms.setActionHandler.bind(ms);
+        ms.setActionHandler = function(action, handler){
+          if (action === 'pause' && typeof handler === 'function') {
+            var wrapped = function(){
+              window.__omniLastMsPause = Date.now();
+              if (window.__omniInPip || window.__omniHoldFocus) {
+                var n = (window.__omniMsIgnored || 0) + 1; window.__omniMsIgnored = n;
+                if ((n <= 3 || n % 20 === 0) && window.OmniMedia && OmniMedia.trace) OmniMedia.trace('системная команда «пауза» (аудиофокус отобрал другой плеер) проигнорирована, №' + n);
+                return;
+              }
+              return handler.apply(this, arguments);
+            };
+            return origSet(action, wrapped);
+          }
+          return origSet(action, handler);
+        };
+      }
+    } catch (e) {}
+    // кто ставит паузу — запоминаем стек вызова pause() (если паузу поставил движок, стека не будет)
     try {
       var origPause = HTMLMediaElement.prototype.pause;
       HTMLMediaElement.prototype.pause = function(){
-        try { if (window.__omniInPip) window.__omniLastPause = { t: Date.now(), stack: (new Error().stack || '').split('\n').slice(1, 6).join(' | ') }; } catch (e) {}
+        try { window.__omniLastPause = { t: Date.now(), stack: (new Error().stack || '').split('\n').slice(1, 4).join(' | ') }; } catch (e) {}
         return origPause.apply(this, arguments);
       };
     } catch (e) {}
+    var lastPauseLog = 0;
     document.addEventListener('pause', function(e){
       try {
-        var v = e.target; if (!window.__omniInPip || !v || v.tagName !== 'VIDEO' || v.ended) return;
-        if (Date.now() - (window.__omniUserPauseAt || 0) < 5000) return; // пауза по кнопке пользователя — не трогаем
+        var v = e.target; if (!v || v.tagName !== 'VIDEO' || v.ended) return;
+        var user = Date.now() - (window.__omniUserPauseAt || 0) < 5000;
+        var lp = window.__omniLastPause; var viaJs = lp && Date.now() - lp.t < 300;
+        var viaMs = Date.now() - (window.__omniLastMsPause || 0) < 300;
+        var who = user ? 'кнопка пользователя' : viaMs ? 'системная команда mediaSession (аудиофокус)' : viaJs ? ('скрипт сайта: ' + lp.stack) : 'движок/система (не через JS)';
+        if (Date.now() - lastPauseLog > 1500 && window.OmniMedia && OmniMedia.trace) { lastPauseLog = Date.now(); OmniMedia.trace('пауза' + (window.__omniInPip ? ' в PiP' : '') + ' @' + Math.round(v.currentTime) + 'с — ' + who); }
+        if (user || !window.__omniInPip) return;
         var n = window.__omniResumeCount || 0;
-        var lp = window.__omniLastPause; var who = (lp && Date.now() - lp.t < 300) ? lp.stack : 'движок/система (не через JS)';
-        if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('пауза в PiP #' + (n + 1) + ': ' + who);
-        if (n >= 6) return;
+        if (n >= 30) return;
         window.__omniResumeCount = n + 1;
         setTimeout(function(){ try { if (window.__omniInPip && v.paused && !v.ended) { var p = v.play(); if (p && p.catch) p.catch(function(){}); } } catch (x) {} }, 250);
       } catch (x) {}
@@ -110,6 +138,13 @@ object MediaState {
   } catch (e) {}
 })();
 """
+
+    /** Вкладка, которую смотрит пользователь: системные «pause» по аудиофокусу игнорируются. */
+    fun holdFocusScript(on: Boolean): String = "(function(){ window.__omniHoldFocus = $on; })();"
+
+    /** Вызывается, когда во вкладке [tabId] началось воспроизведение — остальные вкладки надо поставить на паузу явно. */
+    @Volatile
+    var onTabStartedPlaying: ((String) -> Unit)? = null
 
     /** Диагностика окна PiP для журнала: размер вьюпорта, видео и его положение. */
     const val PIP_DIAG_SCRIPT = """
@@ -183,14 +218,23 @@ object MediaState {
 class OmniMediaBridge(private val tab: BrowserTabModel) {
     @JavascriptInterface
     fun trace(msg: String) {
-        com.winwasm64.vpn.VpnLog.i("PiP", msg.take(600))
+        com.winwasm64.vpn.VpnLog.i("Видео", "«${tab.title.take(40)}»: " + msg.take(600))
     }
 
     @JavascriptInterface
     fun state(playing: Boolean) {
+        val was = tab.mediaPlaying
         tab.mediaPlaying = playing
+        if (was != playing) {
+            com.winwasm64.vpn.VpnLog.i("Видео", "«${tab.title.take(40)}» — " + (if (playing) "играет" else "остановлено") +
+                (if (tab.id == MediaState.activeTabId) " (активная вкладка" + (if (MediaState.inPip) ", PiP)" else ")") else " (фоновая вкладка)"))
+        }
         if (tab.id == MediaState.activeTabId) {
             Handler(Looper.getMainLooper()).post { MediaState.activeMediaPlaying = playing }
+        }
+        if (playing && !was) {
+            val h = MediaState.onTabStartedPlaying
+            if (h != null) Handler(Looper.getMainLooper()).post { h(tab.id) }
         }
     }
 }
