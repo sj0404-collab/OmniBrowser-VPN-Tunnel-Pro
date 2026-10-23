@@ -3665,6 +3665,31 @@ private fun NativeAppsWithBrowsecSection(
                                             fontSize = 10.sp,
                                             fontFamily = FontFamily.Monospace
                                         )
+                                        // v4.2.14: точные замеры — время активности, соединения, задержка, сервер, итог за всё время
+                                        val nowMs = System.currentTimeMillis()
+                                        val sess = BrowsecVpnService.sessionStartedAt
+                                        val sessTxt = if (sess > 0L && BrowsecVpnService.isRunning) "в VPN ${com.winwasm64.vpn.AppTrafficStore.fmtDur(nowMs - sess)}" else "VPN выключен"
+                                        val okN = appProfile.connOk.get(); val badN = appProfile.connFail.get()
+                                        val lastAct = appProfile.lastActivityAt
+                                        Text(
+                                            text = "Сеанс: $sessTxt · активно ${com.winwasm64.vpn.AppTrafficStore.fmtDur(appProfile.activeMs.get())}" +
+                                                (if (lastAct > 0L) " · последняя активность ${com.winwasm64.vpn.AppTrafficStore.fmtDur(nowMs - lastAct)} назад" else " · трафика ещё не было") +
+                                                " · соединений $okN" + (if (badN > 0) " (ошибок $badN)" else "") +
+                                                (if (appProfile.avgConnectMs() > 0) " · подключение ср. ${appProfile.avgConnectMs()} мс" else "") +
+                                                (appProfile.lastServer?.let { " · сервер ${it.substringBefore('.')}" } ?: ""),
+                                            color = Omni.TextDim,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                        Text(
+                                            text = "За всё время: ↓${BrowsecVpnService.formatBytesShort(appProfile.allTimeRx + (appProfile.rxBytes.get() - appProfile.flushedRx))} ↑${BrowsecVpnService.formatBytesShort(appProfile.allTimeTx + (appProfile.txBytes.get() - appProfile.flushedTx))}" +
+                                                " · активно ${com.winwasm64.vpn.AppTrafficStore.fmtDur(appProfile.allTimeActiveMs + (appProfile.activeMs.get() - appProfile.flushedActiveMs))}" +
+                                                " · соединений ${appProfile.allTimeConns + (appProfile.connOk.get() - appProfile.flushedConns)}" +
+                                                (appProfile.lastError?.let { if (nowMs - appProfile.lastErrorAt < 600_000L) " · последняя ошибка: ${it.take(60)}" else "" } ?: ""),
+                                            color = Omni.TextFaint,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
                                     }
                                 }
                                 if (!itemExpanded) {

@@ -277,6 +277,39 @@ class AppTunnelProfile(
     val activeSockets = AtomicInteger(0)
     val requests = AtomicLong(0L)
 
+    // v4.2.14: точные замеры по приложению — время активности (когда реально шёл трафик), соединения, задержка, сервер
+    @Volatile var firstActivityAt = 0L
+    @Volatile var lastActivityAt = 0L
+    val activeMs = AtomicLong(0L)
+    val connOk = AtomicLong(0L)
+    val connFail = AtomicLong(0L)
+    val connMsSum = AtomicLong(0L)
+    val tunnelConns = AtomicLong(0L)
+    @Volatile var lastServer: String? = null
+    @Volatile var lastError: String? = null
+    @Volatile var lastErrorAt = 0L
+    @Volatile var activityReportedAt = 0L
+    @Volatile var activityStartRef: Triple<Long, Long, Long> = Triple(0L, 0L, 0L)
+    @Volatile var connRef = 0L
+    @Volatile var connFailRef = 0L
+    // накопленное «за всё время» (из настроек) и ещё не записанные дельты
+    @Volatile var allTimeRx = 0L
+    @Volatile var allTimeTx = 0L
+    @Volatile var allTimeActiveMs = 0L
+    @Volatile var allTimeConns = 0L
+    @Volatile var flushedRx = 0L
+    @Volatile var flushedTx = 0L
+    @Volatile var flushedActiveMs = 0L
+    @Volatile var flushedConns = 0L
+
+    fun noteConn(ok: Boolean, connectMs: Long, server: String?, err: String?) {
+        if (ok) { connOk.incrementAndGet(); if (connectMs > 0) connMsSum.addAndGet(connectMs) } else { connFail.incrementAndGet(); lastError = err; lastErrorAt = System.currentTimeMillis() }
+        if (server != null) { lastServer = server; tunnelConns.incrementAndGet() }
+    }
+
+    /** Средняя задержка установления соединения, мс. */
+    fun avgConnectMs(): Long { val n = connOk.get(); return if (n > 0) connMsSum.get() / n else 0L }
+
     @Volatile
     var rxSpeedBps: Long = 0L
 
@@ -306,6 +339,12 @@ class AppTunnelProfile(
             val tBps = ((curTx - lastSampleTx).coerceAtLeast(0L) * 1000L) / elapsed
             rxSpeedBps = rBps
             txSpeedBps = tBps
+            if (curRx != lastSampleRx || curTx != lastSampleTx) {
+                // v4.2.14: трафик шёл — засчитываем интервал как активность (не больше 3 с за выборку)
+                activeMs.addAndGet(elapsed.coerceAtMost(3_000L))
+                if (firstActivityAt == 0L) firstActivityAt = now
+                lastActivityAt = now
+            }
             lastSampleRx = curRx
             lastSampleTx = curTx
             lastSampleMs = now
@@ -2008,6 +2047,67 @@ object BrowserDirectRepeater {
  * РЕПИТЕР №2: ЛОКАЛЬНЫЙ СЕРВЕР С ИНДИВИДУАЛЬНЫМ ПРОБРОСОМ ДЛЯ КАЖДОГО ПРИЛОЖЕНИЯ
  * ============================================================================
  */
+/** v4.2.14: трафик и время активности приложений «за всё время» — переживают перезапуск. */
+object AppTrafficStore {
+    private const val PREFS = "omni_app_traffic"
+    private fun prefs() = BrowsecVpnService.appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun load(p: AppTunnelProfile) {
+        val sp = prefs() ?: return
+        p.allTimeRx = sp.getLong(p.packageName + ".rx", 0L)
+        p.allTimeTx = sp.getLong(p.packageName + ".tx", 0L)
+        p.allTimeActiveMs = sp.getLong(p.packageName + ".active", 0L)
+        p.allTimeConns = sp.getLong(p.packageName + ".conns", 0L)
+    }
+
+    fun flush(list: Collection<AppTunnelProfile>) {
+        val sp = prefs() ?: return
+        val ed = sp.edit()
+        var dirty = false
+        for (p in list) {
+            val rx = p.rxBytes.get(); val tx = p.txBytes.get(); val act = p.activeMs.get(); val cn = p.connOk.get()
+            val dRx = (rx - p.flushedRx).coerceAtLeast(0L); val dTx = (tx - p.flushedTx).coerceAtLeast(0L)
+            val dAct = (act - p.flushedActiveMs).coerceAtLeast(0L); val dCn = (cn - p.flushedConns).coerceAtLeast(0L)
+            if (dRx == 0L && dTx == 0L && dAct == 0L && dCn == 0L) continue
+            p.allTimeRx += dRx; p.allTimeTx += dTx; p.allTimeActiveMs += dAct; p.allTimeConns += dCn
+            p.flushedRx = rx; p.flushedTx = tx; p.flushedActiveMs = act; p.flushedConns = cn
+            ed.putLong(p.packageName + ".rx", p.allTimeRx).putLong(p.packageName + ".tx", p.allTimeTx)
+                .putLong(p.packageName + ".active", p.allTimeActiveMs).putLong(p.packageName + ".conns", p.allTimeConns)
+            dirty = true
+        }
+        if (dirty) ed.apply()
+    }
+
+    /** Приложение помолчало 2 минуты после активности — записываем в журнал, сколько оно работало и сколько съело. */
+    fun reportIdle(list: Collection<AppTunnelProfile>) {
+        val now = System.currentTimeMillis()
+        for (p in list) {
+            if (p.lastActivityAt == 0L || now - p.lastActivityAt < 120_000L || p.activityReportedAt >= p.lastActivityAt) continue
+            p.activityReportedAt = now
+            val startRef = p.activityStartRef
+            val rx = p.rxBytes.get() - startRef.first; val tx = p.txBytes.get() - startRef.second
+            val act = p.activeMs.get() - startRef.third
+            if (act < 10_000L && rx + tx < 200 * 1024) { p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get()); continue }
+            val ok = p.connOk.get() - p.connRef; val bad = p.connFail.get() - p.connFailRef
+            VpnLog.i("Прил", "${VpnLog.label(p.packageName)}: период активности завершён — активно ${fmtDur(act)}, ↓${BrowsecVpnService.formatBytesRu(rx)} ↑${BrowsecVpnService.formatBytesRu(tx)}" +
+                (if (act > 1000) " (ср. ↓${BrowsecVpnService.formatBytesRu(rx * 1000 / act)}/с)" else "") +
+                " · соединений $ok" + (if (bad > 0) ", ошибок $bad" else "") + (p.lastServer?.let { " · сервер $it" } ?: "") +
+                " · всего за всё время: ↓${BrowsecVpnService.formatBytesRu(p.allTimeRx + (p.rxBytes.get() - p.flushedRx))}, активно ${fmtDur(p.allTimeActiveMs + (p.activeMs.get() - p.flushedActiveMs))}")
+            p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get())
+            p.connRef = p.connOk.get(); p.connFailRef = p.connFail.get()
+        }
+    }
+
+    fun fmtDur(ms: Long): String {
+        val s = ms / 1000
+        return when {
+            s >= 3600 -> "${s / 3600} ч ${(s % 3600) / 60} мин"
+            s >= 60 -> "${s / 60} мин ${s % 60} с"
+            else -> "$s с"
+        }
+    }
+}
+
 object BrowsecLocalProxyServer {
     private val running = AtomicBoolean(false)
     private val heartbeatRunning = AtomicBoolean(false)
@@ -2112,6 +2212,7 @@ object BrowsecLocalProxyServer {
         var boundPort = nextAppPort.getAndIncrement()
         if (boundPort > 8980) boundPort = 8901
         val profile = AppTunnelProfile(packageName, assignedCountry, boundPort)
+        AppTrafficStore.load(profile)
         appProfiles[packageName] = profile
         ensureAppDedicatedListener(profile)
         return profile
@@ -2353,6 +2454,8 @@ object BrowsecLocalProxyServer {
                         for (prof in appProfiles.values) {
                             prof.updateSpeed()
                         }
+                        if (tick % 20 == 0) AppTrafficStore.flush(appProfiles.values)
+                        AppTrafficStore.reportIdle(appProfiles.values)
                         if (tick % 10 == 0) {
                             VpnProfileProber.measureActiveLink(st)
                         }
@@ -2589,6 +2692,7 @@ object BrowsecLocalProxyServer {
             try { upstream?.close() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
             VpnLog.conn(profile?.packageName, logHost, origPort, viaTunnel?.let { "Browsec $it" } ?: countryCode, System.currentTimeMillis() - logStart, logErr)
+            profile?.noteConn(logErr == null, st.pingMs.toLong(), viaTunnel, logErr)
         }
     }
 
@@ -3137,7 +3241,8 @@ class BrowsecVpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.winwasm64.vpn.ACTION_DISCONNECT"
 
         // v4.2.13: сводка сеанса VPN приложений — сколько работал и сколько трафика съело каждое приложение
-        @Volatile private var sessionStartedAt = 0L
+        @Volatile var sessionStartedAt = 0L
+            private set
         @Volatile private var sessionBase: Map<String, Pair<Long, Long>> = emptyMap()
 
         private fun durRu(ms: Long): String {
@@ -3162,8 +3267,9 @@ class BrowsecVpnService : VpnService() {
                     val rx = (p.rxBytes.get() - base.first).coerceAtLeast(0L)
                     val tx = (p.txBytes.get() - base.second).coerceAtLeast(0L)
                     rxAll += rx; txAll += tx
-                    if (rx + tx > 0) parts.add("${VpnLog.label(p.packageName)} ↓${formatBytesRu(rx)} ↑${formatBytesRu(tx)}")
+                    if (rx + tx > 0) parts.add("${VpnLog.label(p.packageName)} ↓${formatBytesRu(rx)} ↑${formatBytesRu(tx)}, активно ${durRu(p.activeMs.get())}, соединений ${p.connOk.get()}" + (if (p.connFail.get() > 0) " (ошибок ${p.connFail.get()})" else "") + (if (p.avgConnectMs() > 0) ", подключение ср. ${p.avgConnectMs()} мс" else ""))
                 }
+                AppTrafficStore.flush(BrowsecLocalProxyServer.getAllAppProfiles())
             } catch (_: Exception) {}
             VpnLog.i("Туннель", "VPN приложений работал ${durRu(dur)} · трафик ↓${formatBytesRu(rxAll)} ↑${formatBytesRu(txAll)}" +
                 (if (parts.isNotEmpty()) " · " + parts.joinToString(", ") else " · приложения трафик не передавали") +
