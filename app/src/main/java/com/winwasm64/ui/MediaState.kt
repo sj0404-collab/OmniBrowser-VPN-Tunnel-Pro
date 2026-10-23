@@ -22,8 +22,13 @@ object MediaState {
     @Volatile
     var controlHandler: ((String) -> Unit)? = null
 
+    /** Когда пользователь последний раз нажимал кнопку в окне PiP (автовозобновление в это время не вмешивается). */
+    @Volatile
+    var lastUserControlAt = 0L
+
     fun control(cmd: String) {
         val h = controlHandler ?: return
+        lastUserControlAt = android.os.SystemClock.elapsedRealtime()
         Handler(Looper.getMainLooper()).post { h(cmd) }
     }
 
@@ -37,11 +42,14 @@ object MediaState {
     for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended) { v = vs[i]; break; } }
     if (!v) { vs.sort(function(a, b){ return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight); }); v = vs[0]; }
     var play = function(){ try { var p = v.play(); if (p && p.catch) p.catch(function(){}); } catch (e) {} };
-    if (cmd === 'play') play();
-    else if (cmd === 'pause') v.pause();
-    else if (cmd === 'toggle') { if (v.paused) play(); else v.pause(); }
+    var want = null;
+    if (cmd === 'play') { play(); want = 'play'; }
+    else if (cmd === 'pause') { v.pause(); want = 'pause'; }
+    else if (cmd === 'toggle') { if (v.paused) { play(); want = 'play'; } else { v.pause(); want = 'pause'; } }
     else if (cmd === 'back') v.currentTime = Math.max(0, v.currentTime - 10);
     else if (cmd === 'fwd') { var d = isFinite(v.duration) ? v.duration : 1e12; v.currentTime = Math.min(d, v.currentTime + 10); }
+    // сайт может «откатить» команду своим состоянием плеера — повторяем её дважды
+    if (want) { [400, 1200].forEach(function(ms){ setTimeout(function(){ try { if (want === 'play' && v.paused && !v.ended) play(); else if (want === 'pause' && !v.paused) v.pause(); } catch (e) {} }, ms); }); }
   } catch (e) {}
 })('$cmd');
 """
@@ -66,7 +74,7 @@ object MediaState {
     var report = function(){
       try {
         var vs = document.querySelectorAll('video,audio'); var p = false;
-        for (var i = 0; i < vs.length; i++) { var v = vs[i]; if (!v.paused && !v.ended && v.readyState > 2) { p = true; break; } }
+        for (var i = 0; i < vs.length; i++) { var v = vs[i]; if (!v.paused && !v.ended) { p = true; break; } }
         if (p !== last) { last = p; if (window.OmniMedia) OmniMedia.state(p); }
       } catch (e) {}
     };
@@ -104,13 +112,23 @@ object MediaState {
 (function(on){
   try {
     var id = '__omniPipStyle'; var s = document.getElementById(id);
+    var clearMarks = function(){
+      var all = document.querySelectorAll('[data-omni-pip],[data-omni-pip-anc]');
+      for (var k = 0; k < all.length; k++) { all[k].removeAttribute('data-omni-pip'); all[k].removeAttribute('data-omni-pip-anc'); }
+    };
     var pick = function(){
       try {
         var vs = Array.prototype.slice.call(document.querySelectorAll('video')); if (!vs.length) return;
         var best = null;
         for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended && vs[i].readyState > 1) { best = vs[i]; break; } }
         if (!best) { vs.sort(function(a, b){ var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect(); return (rb.width * rb.height) - (ra.width * ra.height); }); best = vs[0]; }
-        for (var j = 0; j < vs.length; j++) { if (vs[j] === best) vs[j].setAttribute('data-omni-pip', '1'); else vs[j].removeAttribute('data-omni-pip'); }
+        if (best.getAttribute('data-omni-pip') === '1') return;
+        clearMarks();
+        best.setAttribute('data-omni-pip', '1');
+        // v4.2.5: помечаем всю цепочку предков — только они остаются видимыми (всё остальное: панели, подложки, оверлеи плеера — скрыто),
+        // а их transform/filter/contain снимаются, иначе position:fixed считается не от окна, а от контейнера плеера
+        var p = best.parentElement;
+        while (p) { p.setAttribute('data-omni-pip-anc', '1'); p = p.parentElement; }
       } catch (e) {}
     };
     if (on) {
@@ -121,14 +139,18 @@ object MediaState {
       if (!window.__omniPipTimer) window.__omniPipTimer = setInterval(pick, 2000);
       if (!s) {
         s = document.createElement('style'); s.id = id;
-        // v4.2.4: растягиваем только ОДНО видео (играющее/самое крупное): скрытые превью-видео страницы раньше ложились сверху чёрным
-        s.textContent = 'video[data-omni-pip="1"]{position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;z-index:2147483647!important;object-fit:contain!important;background:#000!important;transform:none!important;opacity:1!important;visibility:visible!important} html,body{overflow:hidden!important;background:#000!important}';
+        s.textContent =
+          'html,body{overflow:hidden!important;background:#000!important;margin:0!important;padding:0!important}' +
+          'body *{visibility:hidden!important}' +
+          '[data-omni-pip-anc]{visibility:visible!important;transform:none!important;filter:none!important;perspective:none!important;contain:none!important;clip-path:none!important;backdrop-filter:none!important;will-change:auto!important;background:transparent!important;box-shadow:none!important;border:0!important;outline:0!important}' +
+          '[data-omni-pip-anc]::before,[data-omni-pip-anc]::after{display:none!important}' +
+          'video[data-omni-pip="1"]{visibility:visible!important;position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;z-index:2147483647!important;object-fit:contain!important;background:#000!important;transform:none!important;opacity:1!important;filter:none!important;clip-path:none!important}';
         document.documentElement.appendChild(s);
       }
     } else {
       if (s) s.remove();
       if (window.__omniPipTimer) { clearInterval(window.__omniPipTimer); window.__omniPipTimer = null; }
-      var all = document.querySelectorAll('video[data-omni-pip]'); for (var k = 0; k < all.length; k++) all[k].removeAttribute('data-omni-pip');
+      clearMarks();
     }
   } catch (e) {}
 })($on);

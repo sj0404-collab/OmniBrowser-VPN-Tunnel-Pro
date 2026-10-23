@@ -74,8 +74,9 @@ class MainActivity : ComponentActivity() {
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
     private fun pipActions(playing: Boolean): List<RemoteAction> {
-        val toggle = if (playing) pipAction(2, R.drawable.ic_pip_pause, "Пауза", "pause")
-        else pipAction(2, R.drawable.ic_pip_play, "Воспроизвести", "play")
+        // v4.2.5: кнопка действует по фактическому состоянию видео в момент нажатия (значок может чуть отставать)
+        val toggle = if (playing) pipAction(2, R.drawable.ic_pip_pause, "Пауза", "toggle")
+        else pipAction(2, R.drawable.ic_pip_play, "Воспроизвести", "toggle")
         val all = listOf(
             pipAction(1, R.drawable.ic_pip_rewind, "Назад 10 с", "back"),
             toggle,

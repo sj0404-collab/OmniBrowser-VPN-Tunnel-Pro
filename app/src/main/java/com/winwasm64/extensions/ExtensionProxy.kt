@@ -902,26 +902,31 @@ function alert(){}
         }
 
         val t0 = SystemClock.elapsedRealtime()
-        val deadline = t0 + 8_500L
+        val deadline = t0 + 9_500L
         // ступень 0: серверы расширения
         val live = proxies.filter { !isDown(it) }.take(2)
         for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
-        val stage1At = if (live.isEmpty()) t0 else t0 + 2_500L
-        var stage2At = if (live.isEmpty()) t0 + 2_500L else t0 + 5_000L
+        val stage1At = if (live.isEmpty()) t0 else t0 + 1_500L
+        var stage2At = if (live.isEmpty()) t0 + 3_000L else t0 + 5_000L
         var autoStarted = false
         var directStarted = false
+        // v4.2.5: если DNS провайдера подменяет адреса (все заблокированные сайты «резолвятся» в один IP фильтра), прямой путь
+        // соединяется мгновенно и выигрывал гонку — а дальше страница ломалась. Для таких сайтов прямой путь не используем вовсе.
+        val poisonedF = pool.submit<Boolean> { try { dnsSuspect(host) } catch (_: Exception) { false } }
+        fun poisonedNow(): Boolean = poisonedF.isDone && (try { poisonedF.get() } catch (_: Exception) { false })
         while (true) {
+            val poisoned = poisonedNow()
             val now = SystemClock.elapsedRealtime()
             if (!autoStarted && (now >= stage1At || pending.get() == 0)) {
                 autoStarted = true
-                for (p in autoTunnelCandidates(2)) launch(1, p) { viaHttpProxy(p, host, port, url) }
+                for (p in autoTunnelCandidates(3, host)) launch(1, p) { viaHttpProxy(p, host, port, url) }
                 if (pending.get() == 0) stage2At = now
             }
-            if (!directStarted && autoStarted && (now >= stage2At || pending.get() == 0)) {
+            if (!directStarted && autoStarted && !poisoned && (now >= stage2At || pending.get() == 0)) {
                 directStarted = true
                 launch(2, null) { direct(host, port, url) }
             }
-            if (now >= deadline || (directStarted && pending.get() == 0 && results.isEmpty())) {
+            if (now >= deadline || (pending.get() == 0 && results.isEmpty() && (directStarted || poisoned))) {
                 won.set(true)
                 drainAndClose(results)
                 return null
@@ -947,17 +952,42 @@ function alert(){}
         }
     }
 
-    private fun autoTunnelCandidates(n: Int): List<Upstream> {
+    private fun autoTunnelCandidates(n: Int, host: String? = null): List<Upstream> {
         if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
         val now = SystemClock.elapsedRealtime()
         if (now - tunnelPingAt > 600_000L) {
             tunnelPingAt = now
             pool.execute { pingTunnelServers() }
         }
-        return tunnelServers
-            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
-            .sortedBy { tunnelPing[it.key] ?: 5_000L }
-            .take(n)
+        // v4.2.5: те же измеренные серверы, что и для приложений (CONNECT-задержка/скорость), а не просто TCP-пинг
+        return rankTunnelServers(null, now, host?.let { destKey(it) }).take(n)
+    }
+
+    // ---- v4.2.5: подмена DNS провайдером ----
+    private val poisonIps: MutableSet<String> = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()).apply { add("194.221.250.50") }
+    private val ipSites = ConcurrentHashMap<String, MutableSet<String>>()
+    private val poisonLogged = ConcurrentHashMap<String, Boolean>()
+
+    /** Похоже ли, что системный DNS отдаёт для [host] адрес фильтра: известный IP подмены или один IP у ≥3 разных сайтов из PAC-маршрута. */
+    private fun dnsSuspect(host: String): Boolean {
+        if (host.all { it.isDigit() || it == '.' }) return poisonIps.contains(host)
+        val ips = try { InetAddress.getAllByName(host).mapNotNull { it.hostAddress } } catch (_: Exception) { return false }
+        val site = destKey(host)
+        var suspect = false
+        for (ip in ips) {
+            if (ip.startsWith("10.") || ip.startsWith("192.168.") || ip.startsWith("127.") || ip.contains(':')) continue
+            if (poisonIps.contains(ip)) { suspect = true; continue }
+            val set = ipSites.getOrPut(ip) { java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>()) }
+            set.add(site)
+            if (set.size >= 3) {
+                poisonIps.add(ip)
+                suspect = true
+            }
+        }
+        if (suspect && poisonLogged.putIfAbsent(site, true) == null) {
+            com.winwasm64.vpn.VpnLog.w("Браузер", "DNS провайдера подменяет адрес $host → ${ips.joinToString()} (фильтр); прямой путь к нему отключён — только через Browsec")
+        }
+        return suspect
     }
 
     private fun noteAutoTunnel(up: Upstream, host: String) {
@@ -1391,7 +1421,7 @@ function alert(){}
         val now = SystemClock.elapsedRealtime()
         val reason = e.message ?: e.javaClass.simpleName
         if (downUntil.put(up.key, now + 180_000L) == null) {
-            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} не отвечает ($reason) — сайт идёт через встроенный обход DPI")
+            com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} не отвечает ($reason) — 3 мин идём через другие серверы Browsec")
         }
         ownerFails.addLast(now)
         while (ownerFails.isNotEmpty() && now - (ownerFails.peekFirst() ?: now) > 180_000L) ownerFails.pollFirst()
@@ -1540,58 +1570,123 @@ function alert(){}
             tunnelMeasuredAt = now
             pool.execute { measureTunnelServers() }
         }
-        val list = rankTunnelServers(preferCountry, now)
-        var tries = 0
-        for (up in list) {
-            if (tries++ >= 2) break
+        val dest = destKey(host)
+        val list = rankTunnelServers(preferCountry, now, dest).take(3)
+        if (list.isEmpty()) return null
+
+        // v4.2.5: «хеджирование» — если сервер не ответил на CONNECT за 4 с, параллельно пробуем следующий; побеждает первый ответ.
+        // Сервер запоминает задержку до конкретного адресата (Telegram DC и т.п.), и в следующий раз к нему идёт лучший для него сервер.
+        class Res(val up: Upstream, val sock: Pair<Socket, InputStream>?, val err: Exception?)
+        val results = LinkedBlockingQueue<Res>()
+        val won = AtomicBoolean(false)
+        var next = 0
+        var pendingN = 0
+        fun launch(up: Upstream) {
+            pendingN++
             val inFlight = tunnelInFlight.getOrPut(up.key) { AtomicInteger() }
             inFlight.incrementAndGet()
-            try {
+            pool.execute {
+                var r: Pair<Socket, InputStream>? = null
+                var err: Exception? = null
                 val t0 = SystemClock.elapsedRealtime()
-                // v4.2.4: серверу даём 9 с на CONNECT — он сам сначала соединяется с адресатом (Telegram DC и т.п.), это не его «смерть»
-                val r0 = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000)
-                noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
-                val r = r0.first to (CountingInputStream(r0.second, up.key) as InputStream)
-                lastAutoTunnel = up.key
-                lastAutoTunnelAt = SystemClock.elapsedRealtime()
-                tunnelLastOk[up.key] = lastAutoTunnelAt
-                val t = lastAutoTunnelAt
-                if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
-                    appTunnelLoggedAt[up.key] = t
-                    com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
+                try {
+                    r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000)
+                    val ms = SystemClock.elapsedRealtime() - t0
+                    noteConnectMs(up.key, ms)
+                    noteDestMs(up.key, dest, ms)
+                    tunnelLastOk[up.key] = SystemClock.elapsedRealtime()
+                } catch (e: Exception) {
+                    err = e
+                    handleAppTunnelError(up, e, host, port, dest)
+                } finally {
+                    inFlight.decrementAndGet()
+                    if (r != null && won.get()) { closeQuietly(r.first); r = null }
+                    results.add(Res(up, r, err))
                 }
-                return Triple(r.first, r.second, up.key)
-            } catch (e: ProxyRefusedException) {
-                if (e.code == 407) {
-                    tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
-                    com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не принял учётные данные — включите расширение Browsec в браузере, чтобы обновить их")
-                } else {
-                    // Порт/адрес не разрешён этим прокси — остальные серверы ответят так же, идём напрямую
-                    return null
-                }
-            } catch (e: Exception) {
-                val t = SystemClock.elapsedRealtime()
-                val readTimeout = e is java.net.SocketTimeoutException && (e.message ?: "").contains("Read timed out")
-                if (readTimeout && tunnelServerAlive(up)) {
-                    // v4.2.4: сервер жив (CONNECT к Google проходит) — это адресат не ответил ему вовремя; сервер «вниз» не отправляем,
-                    // иначе за минуту все серверы по очереди «умирают» из‑за одного медленного Telegram DC
-                    noteConnectMs(up.key, 4_000L)
-                    if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
-                        appTunnelFailLoggedAt[up.key] = t
-                        com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не достучался до $host:$port за 9 с (сам сервер отвечает) — пробуем другой")
-                    }
-                } else {
-                    tunnelDownUntil[up.key] = t + 180_000L
-                    if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
-                        appTunnelFailLoggedAt[up.key] = t
-                        com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
-                    }
-                }
-            } finally {
-                inFlight.decrementAndGet()
             }
         }
+        launch(list[next++])
+        val t0 = SystemClock.elapsedRealtime()
+        val deadline = t0 + 12_000L
+        var hedgeAt = t0 + 4_000L
+        while (pendingN > 0) {
+            val now2 = SystemClock.elapsedRealtime()
+            if (now2 >= deadline) break
+            val r = results.poll(maxOf(20L, minOf(hedgeAt, deadline) - now2), TimeUnit.MILLISECONDS)
+            if (r == null) {
+                if (SystemClock.elapsedRealtime() >= hedgeAt) {
+                    if (next < list.size) launch(list[next++])
+                    hedgeAt = SystemClock.elapsedRealtime() + 4_000L
+                }
+                continue
+            }
+            pendingN--
+            if (r.sock != null) {
+                if (won.compareAndSet(false, true)) {
+                    while (true) { val late = results.poll() ?: break; late.sock?.let { closeQuietly(it.first) } }
+                    val up = r.up
+                    lastAutoTunnel = up.key
+                    lastAutoTunnelAt = SystemClock.elapsedRealtime()
+                    val t = lastAutoTunnelAt
+                    if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
+                        appTunnelLoggedAt[up.key] = t
+                        com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
+                    }
+                    return Triple(r.sock.first, CountingInputStream(r.sock.second, up.key), up.key)
+                } else {
+                    closeQuietly(r.sock.first)
+                }
+            } else {
+                val e = r.err
+                if (e is ProxyRefusedException && e.code != 407) { won.set(true); return null } // адресат/порт запрещён — идём напрямую
+                if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 4_000L }
+            }
+        }
+        won.set(true)
         return null
+    }
+
+    private fun handleAppTunnelError(up: Upstream, e: Exception, host: String, port: Int, dest: String) {
+        val t = SystemClock.elapsedRealtime()
+        if (e is ProxyRefusedException) {
+            if (e.code == 407) {
+                tunnelDownUntil[up.key] = t + 60_000L
+                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не принял учётные данные — включите расширение Browsec в браузере, чтобы обновить их")
+            }
+            return
+        }
+        val readTimeout = e is java.net.SocketTimeoutException && (e.message ?: "").contains("Read timed out")
+        if (readTimeout && tunnelServerAlive(up)) {
+            // сервер жив (CONNECT к Google проходит) — это адресат не ответил ему вовремя; запоминаем, что к этому адресату через него медленно
+            noteDestMs(up.key, dest, 9_000L)
+            noteConnectMs(up.key, 3_000L)
+            if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                appTunnelFailLoggedAt[up.key] = t
+                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не достучался до $host:$port за 9 с (сам сервер отвечает) — к этому адресату пойдём через другой")
+            }
+        } else {
+            tunnelDownUntil[up.key] = t + 180_000L
+            if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                appTunnelFailLoggedAt[up.key] = t
+                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
+            }
+        }
+    }
+
+    // ---- v4.2.5: память «сервер → адресат»: Telegram DC, Google и т.п. доступны с разных серверов Browsec по-разному ----
+    private val tunnelDestMs = ConcurrentHashMap<String, Long>()
+
+    private fun destKey(host: String): String {
+        val isIp = host.isNotEmpty() && host.all { it.isDigit() || it == '.' }
+        if (isIp) return host.split('.').take(3).joinToString(".")
+        val parts = host.lowercase().split('.')
+        return if (parts.size >= 3 && parts[parts.size - 2].length <= 3) parts.takeLast(3).joinToString(".") else parts.takeLast(2).joinToString(".")
+    }
+
+    private fun noteDestMs(server: String, dest: String, ms: Long) {
+        val k = "$server|$dest"
+        val prev = tunnelDestMs[k]
+        tunnelDestMs[k] = if (prev == null) ms else (prev * 0.5 + ms * 0.5).toLong()
     }
 
     private val tunnelProbeAt = ConcurrentHashMap<String, Long>()
@@ -1637,6 +1732,13 @@ function alert(){}
         tunnelRateKb[key] = if (prev == null) kbPerSec else prev * 0.7 + kbPerSec * 0.3
     }
 
+    /** Оценка с учётом адресата: если известна задержка именно до него через этот сервер — она важнее общей. */
+    private fun scoreFor(dest: String?, up: Upstream): Long {
+        val base = scoreOf(up)
+        val d = if (dest != null) tunnelDestMs["${up.key}|$dest"] else null
+        return if (d == null) base else maxOf(d, 50L) + (base - (tunnelConnectMs[up.key] ?: 0L)).coerceAtLeast(0L)
+    }
+
     /** Чем меньше — тем лучше: задержка CONNECT плюс штраф за медленную отдачу (ниже 400 КБ/с). */
     private fun scoreOf(up: Upstream): Long {
         val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3 + 300)
@@ -1649,23 +1751,23 @@ function alert(){}
      * Порядок серверов: лучший по измеренному качеству; страна профиля приложения или страна расширения — только если её
      * лучший сервер не хуже общего лучшего более чем в полтора раза («быстрее» важнее, чем «первый попавшийся»).
      */
-    private fun rankTunnelServers(preferCountry: String?, now: Long): List<Upstream> {
+    private fun rankTunnelServers(preferCountry: String?, now: Long, dest: String? = null): List<Upstream> {
         val pref = preferCountry?.lowercase()?.take(2)
         val extPref = extensionCountry()
         val alive = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
             .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 4 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
         if (alive.isEmpty()) return alive
-        val byScore = alive.sortedBy { scoreOf(it) }
-        val best = scoreOf(byScore.first())
+        val byScore = alive.sortedBy { scoreFor(dest, it) }
+        val best = scoreFor(dest, byScore.first())
         val limit = (best * 1.5).toLong() + 200
         fun cc(u: Upstream) = u.host.takeWhile { it.isLetter() }.take(2).lowercase()
         var head = byScore.filter { (pref != null && cc(it) == pref) || (extPref != null && cc(it) == extPref) }
-            .filter { scoreOf(it) <= limit }
+            .filter { scoreFor(dest, it) <= limit }
         if (head.isEmpty()) {
             // держимся текущего сервера, пока другой не лучше его хотя бы на 30 % (иначе прыгаем между lt9/lt40/de73 без пользы)
             val cur = alive.firstOrNull { it.key == lastAutoTunnel }
-            if (cur != null && scoreOf(cur) <= (best * 1.3).toLong() + 100) head = listOf(cur)
+            if (cur != null && scoreFor(dest, cur) <= (best * 1.3).toLong() + 100) head = listOf(cur)
         }
         return (head + byScore).distinctBy { it.key }
     }

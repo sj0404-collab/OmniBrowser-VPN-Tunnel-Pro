@@ -1424,7 +1424,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     wv.requestLayout()
                     wv.invalidate()
                     wv.evaluateJavascript(MediaState.pipLayoutScript(true), null)
-                    if (wasPlaying && !tab.mediaPlaying) wv.evaluateJavascript(MediaState.mediaControlScript("play"), null)
+                    val userTouched = android.os.SystemClock.elapsedRealtime() - MediaState.lastUserControlAt < 5_000L
+                    if (wasPlaying && !tab.mediaPlaying && !userTouched) wv.evaluateJavascript(MediaState.mediaControlScript("play"), null)
                 } catch (_: Exception) {}
             }
             try {
@@ -2288,8 +2289,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }
                                         Button(onClick = {
                                             activeTab.webView?.clearCache(true)
-                                            CookieManager.getInstance().removeAllCookies(null)
-                                            CookieManager.getInstance().flush()
+                                            // v4.2.5: cookies сервисов расширений (вход в Browsec) сохраняем — иначе после очистки расширение «слетало»
+                                            val cm = CookieManager.getInstance()
+                                            val keepUrls = listOf("https://browsec.com", "https://api.browsec.com", "https://www.browsec.com", "https://app.browsec.com")
+                                            val kept = keepUrls.associateWith { cm.getCookie(it) }.filterValues { !it.isNullOrBlank() }
+                                            cm.removeAllCookies {
+                                                for ((u, c) in kept) c!!.split(';').forEach { kv ->
+                                                    val t = kv.trim(); if (t.contains('=')) cm.setCookie(u, "$t; Max-Age=31536000; Path=/; Secure")
+                                                }
+                                                cm.flush()
+                                            }
                                             Toast.makeText(context, "🗑 Кэш и Cookies очищены!", Toast.LENGTH_SHORT).show()
                                         }, colors = ButtonDefaults.buttonColors(containerColor = Omni.DangerContainer)) {
                                             Text("Очистить Кэш и Cookies", fontSize = 11.sp, color = Color.White)
