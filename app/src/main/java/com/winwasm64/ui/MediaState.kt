@@ -18,6 +18,34 @@ object MediaState {
     @Volatile
     var activeTabId: String? = null
 
+    /** v4.2.3: обработчик команд кнопок окна PiP (play/pause/back/fwd); ставится экраном браузера. */
+    @Volatile
+    var controlHandler: ((String) -> Unit)? = null
+
+    fun control(cmd: String) {
+        val h = controlHandler ?: return
+        Handler(Looper.getMainLooper()).post { h(cmd) }
+    }
+
+    /** Управление видео на странице из окна PiP: пуск/пауза/перемотка ±10 с — для самого крупного или играющего элемента. */
+    fun mediaControlScript(cmd: String): String = """
+(function(cmd){
+  try {
+    var vs = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
+    if (!vs.length) return;
+    var v = null;
+    for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended) { v = vs[i]; break; } }
+    if (!v) { vs.sort(function(a, b){ return (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight); }); v = vs[0]; }
+    var play = function(){ try { var p = v.play(); if (p && p.catch) p.catch(function(){}); } catch (e) {} };
+    if (cmd === 'play') play();
+    else if (cmd === 'pause') v.pause();
+    else if (cmd === 'toggle') { if (v.paused) play(); else v.pause(); }
+    else if (cmd === 'back') v.currentTime = Math.max(0, v.currentTime - 10);
+    else if (cmd === 'fwd') { var d = isFinite(v.duration) ? v.duration : 1e12; v.currentTime = Math.min(d, v.currentTime + 10); }
+  } catch (e) {}
+})('$cmd');
+"""
+
     private val mediaHosts = listOf(
         "youtube.com", "youtu.be", "youtube-nocookie.com", "twitch.tv", "rutube.ru", "vk.com", "vkvideo.ru", "ok.ru",
         "dzen.ru", "kinopoisk.ru", "soundcloud.com", "music.yandex", "vimeo.com", "dailymotion.com", "kick.com", "tiktok.com"

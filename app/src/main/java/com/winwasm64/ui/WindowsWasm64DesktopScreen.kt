@@ -1402,11 +1402,29 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     // v4.2.0: «картинка в картинке» — раскладка «только видео» внутри страницы и параметры авто-входа (Android 12+)
     LaunchedEffect(MediaState.inPip) {
-        val wv = tabs.getOrNull(activeTabIndex)?.webView ?: return@LaunchedEffect
+        val tab = tabs.getOrNull(activeTabIndex) ?: return@LaunchedEffect
+        val wv = tab.webView ?: return@LaunchedEffect
+        val wasPlaying = tab.mediaPlaying
         try { wv.evaluateJavascript(MediaState.pipLayoutScript(MediaState.inPip), null) } catch (_: Exception) {}
+        if (MediaState.inPip && wasPlaying) {
+            // v4.2.3: если при входе в PiP движок/сайт поставил видео на паузу — возобновляем
+            for (d in listOf(400L, 1200L)) {
+                delay(d)
+                if (!MediaState.inPip) break
+                if (!tab.mediaPlaying) try { wv.evaluateJavascript(MediaState.mediaControlScript("play"), null) } catch (_: Exception) {}
+            }
+        }
     }
     LaunchedEffect(MediaState.activeMediaPlaying) {
         (context as? com.winwasm64.MainActivity)?.updatePipParams(MediaState.activeMediaPlaying)
+    }
+    // v4.2.3: кнопки окна PiP управляют видео активной вкладки
+    DisposableEffect(Unit) {
+        MediaState.controlHandler = { cmd ->
+            val wv = tabs.getOrNull(activeTabIndex)?.webView
+            try { wv?.evaluateJavascript(MediaState.mediaControlScript(cmd), null) } catch (_: Exception) {}
+        }
+        onDispose { MediaState.controlHandler = null }
     }
 
     LaunchedEffect(activeTabIndex, tabs.size, desktopMode) {
@@ -1488,26 +1506,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         modifier = Modifier.fillMaxSize(),
         color = Omni.Bg
     ) {
-        if (MediaState.inPip) {
-            // v4.2.0: в окне «картинка в картинке» — только страница (видео растянуто на всё окно скриптом)
-            val pipView: View = fullscreenCustomView ?: webViewContainer
-            AndroidView(
-                factory = { ctx ->
-                    FrameLayout(ctx).apply { setBackgroundColor(android.graphics.Color.BLACK) }
-                },
-                update = { holder ->
-                    if (holder.childCount != 1 || holder.getChildAt(0) !== pipView) {
-                        holder.removeAllViews()
-                        (pipView.parent as? ViewGroup)?.removeView(pipView)
-                        holder.addView(pipView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-        } else
-        Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+        // v4.2.3: в окне «картинка в картинке» WebView НЕ переносится в другой контейнер (перенос = «скрытие» для движка,
+        // и видео вставало на паузу); просто прячем панели, а контейнер страницы занимает всё окно
+        val inPip = MediaState.inPip
+        Column(modifier = if (inPip) Modifier.fillMaxSize() else Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
 
-            if (currentSection == 0) {
+            if (currentSection == 0 && !inPip) {
                 // 1. Верхняя панель: VPN · адрес · вкладки · расширения · меню
                 if (fullscreenCustomView == null) {
                     if (findBarVisible) {
@@ -2360,7 +2364,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         },
                         modifier = Modifier.fillMaxSize()
                     )
-                    Button(
+                    if (!inPip) Button(
                         onClick = {
                             fullscreenCustomView = null
                             fullscreenCallback?.onCustomViewHidden()
@@ -2375,7 +2379,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             Box(
-                modifier = if (currentSection == 0 && fullscreenCustomView == null) {
+                modifier = if ((currentSection == 0 || inPip) && fullscreenCustomView == null) {
                     Modifier.weight(1f).fillMaxWidth()
                 } else {
                     Modifier.size(0.dp)
@@ -2399,7 +2403,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== SECTION 1: TORRENT CLIENT + BROWSEC VPN + MEMORY ACCESS =====================
-            if (currentSection == 1) {
+            if (currentSection == 1 && !inPip) {
                 TorrentClientSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     torrentEngine = torrentEngine,
@@ -2431,7 +2435,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
-            if (currentSection == 2) {
+            if (currentSection == 2 && !inPip) {
                 HistoryAndDownloadsSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     historyList = historyList,
@@ -2451,7 +2455,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== SECTION 3: NATIVE APPS + BROWSEC VPN LAUNCHER =====================
-            if (currentSection == 3) {
+            if (currentSection == 3 && !inPip) {
                 NativeAppsWithBrowsecSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     nativeAppsManager = nativeAppsManager,
@@ -2651,7 +2655,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== НИЖНЯЯ НАВИГАЦИЯ =====================
-            if (fullscreenCustomView == null) {
+            if (fullscreenCustomView == null && !inPip) {
                 OmniBottomBar(
                     selected = currentSection,
                     items = listOf(

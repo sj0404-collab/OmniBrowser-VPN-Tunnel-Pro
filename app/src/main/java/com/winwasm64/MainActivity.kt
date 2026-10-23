@@ -1,7 +1,13 @@
 package com.winwasm64
 
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.drawable.Icon
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
@@ -9,6 +15,7 @@ import android.os.Bundle
 import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.ContextCompat
 import com.winwasm64.ui.MediaState
 import com.winwasm64.ui.WindowsWasm64DesktopScreen
 import com.winwasm64.ui.theme.OmniTheme
@@ -18,6 +25,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleIncomingIntent(intent)
+        registerPipReceiver()
         val initialUri = intent?.dataString
         setContent {
             OmniTheme {
@@ -44,13 +52,57 @@ class MainActivity : ComponentActivity() {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
 
-    private fun pipParams(autoEnter: Boolean): PictureInPictureParams {
+    private fun pipParams(playing: Boolean): PictureInPictureParams {
         val b = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            b.setActions(pipActions(playing))
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            b.setAutoEnterEnabled(autoEnter)
+            b.setAutoEnterEnabled(playing)
             b.setSeamlessResizeEnabled(true)
         }
         return b.build()
+    }
+
+    // v4.2.3: кнопки в окне PiP — «−10 с», «пауза/пуск», «+10 с» (как у нативных видеоплееров)
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
+    private fun pipAction(code: Int, icon: Int, title: String, cmd: String): RemoteAction {
+        val intent = Intent(ACTION_PIP_CONTROL).setPackage(packageName).putExtra(EXTRA_PIP_CMD, cmd)
+        val pi = PendingIntent.getBroadcast(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        return RemoteAction(Icon.createWithResource(this, icon), title, title, pi)
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
+    private fun pipActions(playing: Boolean): List<RemoteAction> {
+        val toggle = if (playing) pipAction(2, R.drawable.ic_pip_pause, "Пауза", "pause")
+        else pipAction(2, R.drawable.ic_pip_play, "Воспроизвести", "play")
+        val all = listOf(
+            pipAction(1, R.drawable.ic_pip_rewind, "Назад 10 с", "back"),
+            toggle,
+            pipAction(3, R.drawable.ic_pip_forward, "Вперёд 10 с", "fwd")
+        )
+        val max = try { maxNumPictureInPictureActions } catch (_: Exception) { 3 }
+        return if (max >= 3) all else listOf(toggle)
+    }
+
+    private val pipReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_PIP_CONTROL) return
+            val cmd = intent.getStringExtra(EXTRA_PIP_CMD) ?: return
+            MediaState.control(cmd)
+        }
+    }
+
+    private fun registerPipReceiver() {
+        if (!pipSupported()) return
+        try {
+            ContextCompat.registerReceiver(this, pipReceiver, IntentFilter(ACTION_PIP_CONTROL), ContextCompat.RECEIVER_NOT_EXPORTED)
+        } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        try { unregisterReceiver(pipReceiver) } catch (_: Exception) {}
+        super.onDestroy()
     }
 
     /** Вызывается экраном, когда меняется состояние воспроизведения в активной вкладке. */
@@ -74,5 +126,11 @@ class MainActivity : ComponentActivity() {
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         MediaState.inPip = isInPictureInPictureMode
+        if (isInPictureInPictureMode) updatePipParams(MediaState.activeMediaPlaying)
+    }
+
+    companion object {
+        const val ACTION_PIP_CONTROL = "com.winwasm64.PIP_CONTROL"
+        const val EXTRA_PIP_CMD = "cmd"
     }
 }
