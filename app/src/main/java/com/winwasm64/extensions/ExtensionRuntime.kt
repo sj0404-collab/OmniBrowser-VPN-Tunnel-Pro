@@ -205,6 +205,47 @@ object ExtensionRuntime {
         rebuildScripts(delayMs = 0)
         rebuildDnr(delayMs = 300)
         main.postDelayed({ syncBackgrounds() }, 800)
+        installBundledExtensions()
+    }
+
+    // =====================================================================
+    // v4.2.6: встроенные расширения (assets/bundled_ext/<id>.crx + <id>.version) — Browsec ставится сразу, без магазина
+    // =====================================================================
+
+    private fun bundledPrefs() = app.getSharedPreferences("omni_bundled_ext", Context.MODE_PRIVATE)
+
+    private fun versionNewer(a: String, b: String): Boolean {
+        val x = a.split('.').map { it.toIntOrNull() ?: 0 }
+        val y = b.split('.').map { it.toIntOrNull() ?: 0 }
+        for (i in 0 until maxOf(x.size, y.size)) {
+            val d = (x.getOrNull(i) ?: 0) - (y.getOrNull(i) ?: 0)
+            if (d != 0) return d > 0
+        }
+        return false
+    }
+
+    private fun installBundledExtensions() {
+        io.execute {
+            val names = try { app.assets.list("bundled_ext")?.toList() ?: emptyList() } catch (_: Exception) { emptyList() }
+            for (n in names) {
+                if (!n.endsWith(".crx")) continue
+                val id = n.removeSuffix(".crx")
+                try {
+                    val bundledVersion = try { app.assets.open("bundled_ext/$id.version").bufferedReader().use { it.readText().trim() } } catch (_: Exception) { "0" }
+                    val installed = ExtensionStore.get(id)
+                    if (installed != null && !versionNewer(bundledVersion, installed.manifest.version)) continue // уже стоит такая же или новее
+                    if (installed == null && bundledPrefs().getBoolean("declined_$id", false)) continue // пользователь сам удалил — не навязываем
+                    if (installed != null && installed.source == "store") continue // обновляется из магазина — не трогаем
+                    val bytes = app.assets.open("bundled_ext/$n").use { it.readBytes() }
+                    val ext = ExtensionStore.installBytes(bytes, id, "bundled")
+                    main.post { refreshAll() }
+                    com.winwasm64.vpn.VpnLog.ok("Расширения", "встроенное расширение «${ext.manifest.name}» ${ext.manifest.version} ${if (installed == null) "установлено" else "обновлено"}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "bundled extension $id", e)
+                    com.winwasm64.vpn.VpnLog.w("Расширения", "встроенное расширение $id не установилось: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
     }
 
     private fun rebuildScripts(delayMs: Long = 250) {
@@ -328,6 +369,7 @@ object ExtensionRuntime {
     }
 
     fun uninstall(id: String) {
+        try { bundledPrefs().edit().putBoolean("declined_$id", true).apply() } catch (_: Exception) {}
         ExtensionProxy.release(id)
         backgrounds.remove(id)?.let { releaseHost(it) }
         offscreens.remove(id)?.let { releaseHost(it) }
