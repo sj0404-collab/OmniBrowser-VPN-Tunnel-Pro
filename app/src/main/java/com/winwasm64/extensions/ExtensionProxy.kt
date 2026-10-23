@@ -1700,8 +1700,33 @@ function alert(){}
      * CONNECT host:port через рабочий сервер Browsec; предпочитаем серверы страны профиля приложения ([preferCountry], например "LT"),
      * затем — по пингу. Возвращает (сокет, поток чтения, имя сервера) или null, если ни один сервер не ответил.
      */
+    // v4.2.15: адресат, до которого не достучались ≥2 разных сервера за 2 мин, 3 минуты не пробуем вовсе — отказ сразу,
+    // чтобы Telegram не ждал 12 с на каждом мёртвом резервном адресе, а шёл на следующий DC
+    private val deadDestServers = ConcurrentHashMap<String, MutableSet<String>>()
+    private val deadDestAt = ConcurrentHashMap<String, Long>()
+    private val deadDestUntil = ConcurrentHashMap<String, Long>()
+
+    private fun noteDeadDest(host: String, port: Int, server: String) {
+        val k = "$host:$port"
+        val now = SystemClock.elapsedRealtime()
+        if (now - (deadDestAt[k] ?: 0L) > 120_000L) deadDestServers.remove(k)
+        deadDestAt[k] = now
+        val set = deadDestServers.getOrPut(k) { java.util.Collections.synchronizedSet(HashSet()) }
+        set.add(server)
+        if (set.size >= 2 && (deadDestUntil[k] ?: 0L) < now) {
+            deadDestUntil[k] = now + 180_000L
+            com.winwasm64.vpn.VpnLog.w("Прил", "адресат $k недоступен через ${set.size} сервера Browsec — 3 мин отказываем сразу, приложение пойдёт на другой адрес")
+        }
+    }
+
+    /** Адресат недавно признан недоступным через туннель (см. [noteDeadDest]). */
+    fun isDeadDest(host: String, port: Int): Boolean = (deadDestUntil["$host:$port"] ?: 0L) > SystemClock.elapsedRealtime()
+
+    fun noteDestAlive(host: String, port: Int) { val k = "$host:$port"; deadDestUntil.remove(k); deadDestServers.remove(k) }
+
     fun openAppTunnel(host: String, port: Int, preferCountry: String?): Triple<Socket, InputStream, String>? {
         if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        if (isDeadDest(host, port)) return null
         val now = SystemClock.elapsedRealtime()
         if (now - tunnelPingAt > 600_000L) {
             tunnelPingAt = now
@@ -1738,6 +1763,7 @@ function alert(){}
                     val ms = SystemClock.elapsedRealtime() - t0
                     noteConnectMs(up.key, ms)
                     noteDestMs(up.key, dest, ms)
+                    noteDestAlive(host, port)
                     tunnelLastOk[up.key] = SystemClock.elapsedRealtime()
                 } catch (e: Exception) {
                     err = e
@@ -1809,8 +1835,10 @@ function alert(){}
         val readTimeout = e is java.net.SocketTimeoutException && (e.message ?: "").contains("Read timed out")
         if (readTimeout && tunnelServerAlive(up)) {
             // сервер жив (CONNECT к Google проходит) — это адресат не ответил ему вовремя; запоминаем, что к этому адресату через него медленно
+            // v4.2.15: штрафуем только пару «сервер → адресат»; общий рейтинг сервера не трогаем (раньше мёртвый адрес
+            // Telegram 91.105.192.100 за несколько попыток «утапливал» лучший lv115, и приложения уходили на медленный de83)
             noteDestMs(up.key, dest, 9_000L)
-            noteConnectMs(up.key, 3_000L)
+            noteDeadDest(host, port, up.key)
             if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
                 appTunnelFailLoggedAt[up.key] = t
                 com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не достучался до $host:$port за 9 с (сам сервер отвечает) — к этому адресату пойдём через другой")

@@ -3690,6 +3690,14 @@ private fun NativeAppsWithBrowsecSection(
                                             fontSize = 10.sp,
                                             fontFamily = FontFamily.Monospace
                                         )
+                                        TextButton(
+                                            onClick = {
+                                                com.winwasm64.vpn.AppTrafficStore.reportNow(appProfile)
+                                                Toast.makeText(context, "Итоги по ${app.appName} записаны в журнал VPN", Toast.LENGTH_SHORT).show()
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(28.dp)
+                                        ) { Text("📊 Итоги сейчас → в журнал", fontSize = 11.sp) }
                                     }
                                 }
                                 if (!itemExpanded) {

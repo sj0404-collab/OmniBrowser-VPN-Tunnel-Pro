@@ -2083,18 +2083,26 @@ object AppTrafficStore {
         val now = System.currentTimeMillis()
         for (p in list) {
             if (p.lastActivityAt == 0L || now - p.lastActivityAt < 120_000L || p.activityReportedAt >= p.lastActivityAt) continue
+            report(p, now, force = false)
+        }
+    }
+
+    /** Итоги по приложению прямо сейчас (кнопка в карточке). */
+    fun reportNow(p: AppTunnelProfile) = report(p, System.currentTimeMillis(), force = true)
+
+    private fun report(p: AppTunnelProfile, now: Long, force: Boolean) {
+        run {
             p.activityReportedAt = now
             val startRef = p.activityStartRef
             val rx = p.rxBytes.get() - startRef.first; val tx = p.txBytes.get() - startRef.second
             val act = p.activeMs.get() - startRef.third
-            if (act < 10_000L && rx + tx < 200 * 1024) { p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get()); continue }
+            if (!force && act < 10_000L && rx + tx < 200 * 1024) { p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get()); return }
             val ok = p.connOk.get() - p.connRef; val bad = p.connFail.get() - p.connFailRef
-            VpnLog.i("Прил", "${VpnLog.label(p.packageName)}: период активности завершён — активно ${fmtDur(act)}, ↓${BrowsecVpnService.formatBytesRu(rx)} ↑${BrowsecVpnService.formatBytesRu(tx)}" +
+            VpnLog.i("Прил", "${VpnLog.label(p.packageName)}: " + (if (force) "итоги сейчас" else "период активности завершён") + " — активно ${fmtDur(act)}, ↓${BrowsecVpnService.formatBytesRu(rx)} ↑${BrowsecVpnService.formatBytesRu(tx)}" +
                 (if (act > 1000) " (ср. ↓${BrowsecVpnService.formatBytesRu(rx * 1000 / act)}/с)" else "") +
                 " · соединений $ok" + (if (bad > 0) ", ошибок $bad" else "") + (p.lastServer?.let { " · сервер $it" } ?: "") +
                 " · всего за всё время: ↓${BrowsecVpnService.formatBytesRu(p.allTimeRx + (p.rxBytes.get() - p.flushedRx))}, активно ${fmtDur(p.allTimeActiveMs + (p.activeMs.get() - p.flushedActiveMs))}")
-            p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get())
-            p.connRef = p.connOk.get(); p.connFailRef = p.connFail.get()
+            if (!force) { p.activityStartRef = Triple(p.rxBytes.get(), p.txBytes.get(), p.activeMs.get()); p.connRef = p.connOk.get(); p.connFailRef = p.connFail.get() }
         }
     }
 
@@ -2643,6 +2651,9 @@ object BrowsecLocalProxyServer {
                 // ещё 6 с, а сразу отказываем: так Telegram быстрее повторит попытку, и она снова пойдёт через туннель
                 val dk = "${target.address?.hostAddress ?: host}:$origPort"
                 val failedAgo = System.currentTimeMillis() - (directFailAt[dk] ?: 0L)
+                if (com.winwasm64.extensions.ExtensionProxy.isDeadDest(host, origPort) && failedAgo < 1_800_000L) {
+                    throw java.io.IOException("адресат недоступен и через серверы Browsec, и напрямую — отказ сразу")
+                }
                 if (failedAgo < 300_000L) {
                     val who = VpnLog.label(profile?.packageName)
                     if (System.currentTimeMillis() - (directSkipLoggedAt[dk] ?: 0L) > 120_000L) {
@@ -3584,6 +3595,10 @@ class BrowsecVpnService : VpnService() {
 
     @Synchronized
     private fun rebuildPerAppVpnInterface() {
+        if (perAppVpnInterface != null) {
+            // v4.2.15: Android не меняет список приложений у живого VPN — интерфейс пересоздаётся, соединения приложений закрываются
+            VpnLog.i("Туннель", "список приложений/страна изменены — туннель пересоздаётся, текущие соединения приложений закроются и переустановятся сами")
+        }
         closeVpnInterface()
         if (!isRunning || isPaused) return
         try {
