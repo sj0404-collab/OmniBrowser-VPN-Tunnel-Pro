@@ -756,11 +756,34 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 put("Sec-GPC", "1")
             }
         }
-        BrowserDirectRepeater.ensureDirectBrowserMode {
-            wv.post {
-                wv.loadUrl(target, extraHeaders)
+        // v4.2.10: при старте приложения расширение-прокси (Browsec) поднимается ~1–3 с; первая страница раньше
+        // уходила напрямую (без VPN) и «расширение включалось» только после обновления. Ждём его готовности (до 6 с).
+        val waitExt = com.winwasm64.extensions.ExtensionProxy.control == null && !target.startsWith("about:") && !target.startsWith("file:") &&
+            android.os.SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime() < 25_000L &&
+            try { com.winwasm64.extensions.ExtensionStore.enabledExtensions().any { "proxy" in it.manifest.permissions } } catch (_: Exception) { false }
+        val doLoad = {
+            BrowserDirectRepeater.ensureDirectBrowserMode {
+                wv.post {
+                    wv.loadUrl(target, extraHeaders)
+                }
             }
         }
+        if (waitExt) {
+            tab.loadingStatusText = "⏳ Запуск расширения VPN…"
+            val startedWait = android.os.SystemClock.elapsedRealtime()
+            lateinit var tick: Runnable
+            tick = Runnable {
+                val waited = android.os.SystemClock.elapsedRealtime() - startedWait
+                if (com.winwasm64.extensions.ExtensionProxy.control != null) {
+                    com.winwasm64.vpn.VpnLog.i("Браузер", "расширение-прокси готово через $waited мс — открываем первую страницу через него")
+                    doLoad()
+                } else if (waited >= 6_000L) {
+                    com.winwasm64.vpn.VpnLog.w("Браузер", "расширение-прокси не поднялось за $waited мс — открываем страницу без него (обновится маршрут — обновите страницу)")
+                    doLoad()
+                } else wv.postDelayed(tick, 150)
+            }
+            wv.post(tick)
+        } else doLoad()
     }
 
     /**
@@ -1412,6 +1435,19 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             fullscreenCustomView = null
         }
         try { wv.evaluateJavascript(MediaState.pipLayoutScript(MediaState.inPip), null) } catch (_: Exception) {}
+        // v4.2.10: в окне PiP — только один WebView (текущая вкладка); остальные скрываем, при выходе возвращаем как было
+        try {
+            if (MediaState.inPip) {
+                for (i in 0 until webViewContainer.childCount) {
+                    val child = webViewContainer.getChildAt(i)
+                    child.visibility = if (child === wv) View.VISIBLE else View.GONE
+                }
+                wv.bringToFront()
+                wv.evaluateJavascript("(function(){ try { if (window.__omniFixYtFlags) window.__omniFixYtFlags(); } catch (e) {} })();", null)
+            } else {
+                applyTabVisibility(webViewContainer, tab)
+            }
+        } catch (_: Exception) {}
         if (MediaState.inPip) {
             // v4.2.4: после смены размера окна принудительно перекладываем WebView и повторяем раскладку «только видео»;
             // если при входе в PiP движок/сайт поставил видео на паузу — возобновляем

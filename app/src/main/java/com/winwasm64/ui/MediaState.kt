@@ -80,6 +80,55 @@ object MediaState {
     };
     ['play','playing','pause','ended','emptied','abort'].forEach(function(ev){ document.addEventListener(ev, function(){ setTimeout(report, 80); }, true); });
     setInterval(report, 3000);
+    // v4.2.10: причина пауз в PiP — сам плеер YouTube: в его конфиге есть флаги html5_picture_in_picture_blocking_*
+    // (onresize/ontimeupdate/standard_api/document_fullscreen) — плеер распознаёт маленькое окно PiP и ставит паузу
+    // на каждом timeupdate. Как в Brave: переписываем флаги в ytcfg до создания плеера.
+    var hn = location.hostname || '';
+    if (hn === 'youtube.com' || hn.slice(-12) === '.youtube.com' || hn.slice(-21) === '.youtube-nocookie.com') {
+      var flagRe = new RegExp('html5_picture_in_picture_(blocking|logging)_([a-z_]+)=true', 'g');
+      var fixFlags = function(){
+        try {
+          var cfg = window.ytcfg; if (!cfg || !cfg.get) return;
+          var confs = cfg.get('WEB_PLAYER_CONTEXT_CONFIGS'); if (!confs) return;
+          var n = 0;
+          for (var k in confs) {
+            var c = confs[k]; if (!c || typeof c.serializedExperimentFlags !== 'string') continue;
+            var f = c.serializedExperimentFlags.replace(flagRe, function(m, a, b){ return 'html5_picture_in_picture_' + a + '_' + b + '=false'; });
+            if (f !== c.serializedExperimentFlags) { c.serializedExperimentFlags = f; n++; }
+          }
+          if (n && !window.__omniPipFlagsFixed) { window.__omniPipFlagsFixed = true; if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('YouTube: отключены флаги блокировки PiP в конфиге плеера (' + n + ')'); }
+        } catch (e) {}
+      };
+      var hookSet = function(){
+        try {
+          var cfg = window.ytcfg; if (!cfg || !cfg.set || cfg.__omniHooked) return;
+          cfg.__omniHooked = true; var os = cfg.set;
+          cfg.set = function(){ var r = os.apply(this, arguments); fixFlags(); return r; };
+        } catch (e) {}
+      };
+      fixFlags(); hookSet();
+      document.addEventListener('load', function(e){ try { if (e.target && e.target.tagName === 'SCRIPT') { hookSet(); fixFlags(); } } catch (x) {} }, true);
+      var t0 = Date.now(); var iv = setInterval(function(){ hookSet(); fixFlags(); if (Date.now() - t0 > 20000) clearInterval(iv); }, 250);
+      document.addEventListener('DOMContentLoaded', function(){ hookSet(); fixFlags(); });
+      window.__omniFixYtFlags = fixFlags;
+    }
+    // v4.2.10: с января 2026 YouTube останавливает видео у не-Premium, если страница «не видна» (проверяет
+    // document.visibilityState, а не только событие). Для вкладки, которую смотрит пользователь (активная / PiP),
+    // страница всегда «видима»: как в Brave и mozilla/video-bg-play.
+    try {
+      var held = function(){ return !!(window.__omniInPip || window.__omniHoldFocus); };
+      var vsDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+      var hdDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+      if (vsDesc && vsDesc.get) Object.defineProperty(document, 'visibilityState', { configurable: true, get: function(){ return held() ? 'visible' : vsDesc.get.call(document); } });
+      if (hdDesc && hdDesc.get) Object.defineProperty(document, 'hidden', { configurable: true, get: function(){ return held() ? false : hdDesc.get.call(document); } });
+      var origHasFocus = document.hasFocus;
+      document.hasFocus = function(){ return held() ? true : origHasFocus.call(document); };
+      var swallow = function(e){ if (held()) { e.stopImmediatePropagation(); if (e.type === 'visibilitychange' && window.OmniMedia && OmniMedia.trace) OmniMedia.trace('событие visibilitychange скрыто от страницы (вкладка удерживается)'); } };
+      window.addEventListener('visibilitychange', swallow, true);
+      document.addEventListener('visibilitychange', swallow, true);
+      window.addEventListener('pagehide', swallow, true);
+      window.addEventListener('blur', function(e){ if (held() && e.target === window) e.stopImmediatePropagation(); }, true);
+    } catch (e) {}
     // v4.2.9: причина пауз найдена — Chromium при потере аудиофокуса (второй плеер в другой вкладке / другое приложение)
     // шлёт странице действие mediaSession «pause», YouTube вызывает pauseVideo(); две вкладки качают фокус друг у друга
     // раз в секунду. Для вкладки, которую смотрит пользователь (активная или в PiP), такое «системное» pause игнорируем.
@@ -108,7 +157,7 @@ object MediaState {
     try {
       var origPause = HTMLMediaElement.prototype.pause;
       HTMLMediaElement.prototype.pause = function(){
-        try { window.__omniLastPause = { t: Date.now(), stack: (new Error().stack || '').split('\n').slice(1, 4).join(' | ') }; } catch (e) {}
+        try { window.__omniLastPause = { t: Date.now(), stack: (new Error().stack || '').split('\n').slice(1, 9).map(function(l){ l = l.trim(); return l.indexOf('at ') === 0 ? l.slice(3) : l; }).join(' | ') }; } catch (e) {}
         return origPause.apply(this, arguments);
       };
     } catch (e) {}
