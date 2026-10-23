@@ -382,6 +382,13 @@ function alert(){}
             }
         }
         latch.await(12, TimeUnit.SECONDS)
+        // v4.2.7: сразу же измеряем резервные серверы автотуннеля, чтобы к первому видео знать самые быстрые
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val now = SystemClock.elapsedRealtime()
+        if (now - tunnelPingAt > 600_000L) {
+            tunnelPingAt = now
+            pingTunnelServers()
+        }
     }
 
     object PacBridge {
@@ -891,7 +898,11 @@ function alert(){}
                         reportError(up, e)
                     } else if (kind == 1 && up != null) {
                         if (e !is ProxyRefusedException || e.code == 407) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
-                        com.winwasm64.vpn.VpnLog.w("Браузер", "автотуннель: ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName})")
+                        else if (e.code in 500..599) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
+                        if (SystemClock.elapsedRealtime() - (appTunnelFailLoggedAt[up.key] ?: 0L) > 30_000L) {
+                            appTunnelFailLoggedAt[up.key] = SystemClock.elapsedRealtime()
+                            com.winwasm64.vpn.VpnLog.w("Браузер", "автотуннель: ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName})")
+                        }
                     }
                 } finally {
                     results.add(RaceResult(r, kind, up)) // сначала результат, потом счётчик — чтобы pending==0 означало «всё в очереди»
@@ -960,7 +971,8 @@ function alert(){}
             pool.execute { pingTunnelServers() }
         }
         // v4.2.5: те же измеренные серверы, что и для приложений (CONNECT-задержка/скорость), а не просто TCP-пинг
-        return rankTunnelServers(null, now, host?.let { destKey(it) }).take(n)
+        // страну здесь не учитываем: это резерв, когда серверы страны из PAC уже не ответили — нужен самый быстрый
+        return rankTunnelServers(null, now, host?.let { destKey(it) }, useCountry = false).take(n)
     }
 
     // ---- v4.2.5: подмена DNS провайдером ----
@@ -1417,6 +1429,14 @@ function alert(){}
     }
 
     private fun markDown(up: Upstream, e: Exception) {
+        if (e is ProxyRefusedException && e.code in 500..599) {
+            // v4.2.7: 502/503/504 — сервер перегружен; минуту его не трогаем (раньше считался «живым» и выбирался снова и снова)
+            val now = SystemClock.elapsedRealtime()
+            if (downUntil.put(up.key, now + 60_000L) == null) {
+                com.winwasm64.vpn.VpnLog.w("Браузер", "прокси расширения ${up.key} перегружен (HTTP ${e.code}) — минуту идём через другие серверы Browsec")
+            }
+            return
+        }
         if (e is ProxyRefusedException && e.code != 407) return // сервер отвечает — просто отказал этому запросу
         val now = SystemClock.elapsedRealtime()
         val reason = e.message ?: e.javaClass.simpleName
@@ -1531,18 +1551,25 @@ function alert(){}
     }
 
     private fun pingTunnelServers() {
-        for (up in tunnelServers.take(24)) {
-            val sock = Socket()
-            try {
-                val t0 = SystemClock.elapsedRealtime()
-                sock.connect(InetSocketAddress(up.host, up.port), 3000)
-                tunnelPing[up.key] = SystemClock.elapsedRealtime() - t0
-            } catch (_: Exception) {
-                tunnelPing[up.key] = Long.MAX_VALUE
-            } finally {
-                closeQuietly(sock)
+        // v4.2.7: параллельно (раньше по очереди — до 70 с, и всё это время выбор шёл вслепую)
+        val list = tunnelServers.take(32)
+        val latch = CountDownLatch(list.size)
+        for (up in list) {
+            pool.execute {
+                val sock = Socket()
+                try {
+                    val t0 = SystemClock.elapsedRealtime()
+                    sock.connect(InetSocketAddress(up.host, up.port), 3000)
+                    tunnelPing[up.key] = SystemClock.elapsedRealtime() - t0
+                } catch (_: Exception) {
+                    tunnelPing[up.key] = Long.MAX_VALUE
+                } finally {
+                    closeQuietly(sock)
+                    latch.countDown()
+                }
             }
         }
+        latch.await(4, TimeUnit.SECONDS)
         tunnelMeasuredAt = SystemClock.elapsedRealtime()
         measureTunnelServers()
         logTunnelCountries()
@@ -1638,7 +1665,7 @@ function alert(){}
                 }
             } else {
                 val e = r.err
-                if (e is ProxyRefusedException && e.code != 407) { won.set(true); return null } // адресат/порт запрещён — идём напрямую
+                if (e is ProxyRefusedException && e.code != 407 && e.code !in 500..599) { won.set(true); return null } // адресат/порт запрещён — идём напрямую
                 if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 4_000L }
             }
         }
@@ -1652,6 +1679,12 @@ function alert(){}
             if (e.code == 407) {
                 tunnelDownUntil[up.key] = t + 60_000L
                 com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не принял учётные данные — включите расширение Browsec в браузере, чтобы обновить их")
+            } else if (e.code in 500..599) {
+                tunnelDownUntil[up.key] = t + 60_000L
+                if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                    appTunnelFailLoggedAt[up.key] = t
+                    com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} перегружен (HTTP ${e.code}) — минуту пропускаем")
+                }
             }
             return
         }
@@ -1751,9 +1784,9 @@ function alert(){}
      * Порядок серверов: лучший по измеренному качеству; страна профиля приложения или страна расширения — только если её
      * лучший сервер не хуже общего лучшего более чем в полтора раза («быстрее» важнее, чем «первый попавшийся»).
      */
-    private fun rankTunnelServers(preferCountry: String?, now: Long, dest: String? = null): List<Upstream> {
-        val pref = preferCountry?.lowercase()?.take(2)
-        val extPref = extensionCountry()
+    private fun rankTunnelServers(preferCountry: String?, now: Long, dest: String? = null, useCountry: Boolean = true): List<Upstream> {
+        val pref = if (useCountry) preferCountry?.lowercase()?.take(2) else null
+        val extPref = if (useCountry) extensionCountry() else null
         val alive = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
             .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 4 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }

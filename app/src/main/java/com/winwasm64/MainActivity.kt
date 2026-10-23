@@ -24,6 +24,7 @@ import com.winwasm64.vpn.BrowsecVpnService
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashCatcher.install(this)
         handleIncomingIntent(intent)
         registerPipReceiver()
         val initialUri = intent?.dataString

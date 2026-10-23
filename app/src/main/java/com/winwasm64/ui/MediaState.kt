@@ -44,8 +44,8 @@ object MediaState {
     var play = function(){ try { var p = v.play(); if (p && p.catch) p.catch(function(){}); } catch (e) {} };
     var want = null;
     if (cmd === 'play') { play(); want = 'play'; }
-    else if (cmd === 'pause') { v.pause(); want = 'pause'; }
-    else if (cmd === 'toggle') { if (v.paused) { play(); want = 'play'; } else { v.pause(); want = 'pause'; } }
+    else if (cmd === 'pause') { window.__omniUserPauseAt = Date.now(); v.pause(); want = 'pause'; }
+    else if (cmd === 'toggle') { if (v.paused) { play(); want = 'play'; } else { window.__omniUserPauseAt = Date.now(); v.pause(); want = 'pause'; } }
     else if (cmd === 'back') v.currentTime = Math.max(0, v.currentTime - 10);
     else if (cmd === 'fwd') { var d = isFinite(v.duration) ? v.duration : 1e12; v.currentTime = Math.min(d, v.currentTime + 10); }
     // сайт может «откатить» команду своим состоянием плеера — повторяем её дважды
@@ -80,6 +80,26 @@ object MediaState {
     };
     ['play','playing','pause','ended','emptied','abort'].forEach(function(ev){ document.addEventListener(ev, function(){ setTimeout(report, 80); }, true); });
     setInterval(report, 3000);
+    // v4.2.7: кто ставит паузу в окне PiP — запоминаем стек вызова pause() (если паузу поставил движок, стека не будет)
+    try {
+      var origPause = HTMLMediaElement.prototype.pause;
+      HTMLMediaElement.prototype.pause = function(){
+        try { if (window.__omniInPip) window.__omniLastPause = { t: Date.now(), stack: (new Error().stack || '').split('\n').slice(1, 6).join(' | ') }; } catch (e) {}
+        return origPause.apply(this, arguments);
+      };
+    } catch (e) {}
+    document.addEventListener('pause', function(e){
+      try {
+        var v = e.target; if (!window.__omniInPip || !v || v.tagName !== 'VIDEO' || v.ended) return;
+        if (Date.now() - (window.__omniUserPauseAt || 0) < 5000) return; // пауза по кнопке пользователя — не трогаем
+        var n = window.__omniResumeCount || 0;
+        var lp = window.__omniLastPause; var who = (lp && Date.now() - lp.t < 300) ? lp.stack : 'движок/система (не через JS)';
+        if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('пауза в PiP #' + (n + 1) + ': ' + who);
+        if (n >= 6) return;
+        window.__omniResumeCount = n + 1;
+        setTimeout(function(){ try { if (window.__omniInPip && v.paused && !v.ended) { var p = v.play(); if (p && p.catch) p.catch(function(){}); } } catch (x) {} }, 250);
+      } catch (x) {}
+    }, true);
     var swallow = function(e){ try { e.stopImmediatePropagation(); } catch (x) {} };
     document.addEventListener('visibilitychange', swallow, true);
     document.addEventListener('webkitvisibilitychange', swallow, true);
@@ -131,7 +151,9 @@ object MediaState {
         while (p) { p.setAttribute('data-omni-pip-anc', '1'); p = p.parentElement; }
       } catch (e) {}
     };
+    window.__omniInPip = !!on;
     if (on) {
+      window.__omniResumeCount = 0;
       try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen(); } catch (e) {}
       try { if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen(); } catch (e) {}
       try { window.scrollTo(0, 0); } catch (e) {}
@@ -159,6 +181,11 @@ object MediaState {
 
 /** Мост из страницы: OmniMedia.state(true/false). */
 class OmniMediaBridge(private val tab: BrowserTabModel) {
+    @JavascriptInterface
+    fun trace(msg: String) {
+        com.winwasm64.vpn.VpnLog.i("PiP", msg.take(600))
+    }
+
     @JavascriptInterface
     fun state(playing: Boolean) {
         tab.mediaPlaying = playing
