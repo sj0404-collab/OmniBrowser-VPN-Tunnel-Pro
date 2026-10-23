@@ -148,7 +148,11 @@ object ExtensionProxy {
             val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
             lastNetId = cm.activeNetwork?.toString()
             cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                private fun isVpn(network: android.net.Network): Boolean = try {
+                    cm.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+                } catch (_: Exception) { false }
                 override fun onAvailable(network: android.net.Network) {
+                    if (isVpn(network)) return // v4.2.12: наш собственный VPN приложений — не смена сети
                     val id = network.toString()
                     val prev = lastNetId
                     lastNetId = id
@@ -158,11 +162,13 @@ object ExtensionProxy {
                 }
                 override fun onLost(network: android.net.Network) {
                     if (network.toString() != lastNetId) return
+                    if (isVpn(network)) return
                     netLostAt = SystemClock.elapsedRealtime()
                     lastNetId = null
                     com.winwasm64.vpn.VpnLog.w("Сеть", "сеть потеряна (${describeNet(cm, network)}) — серверы Browsec не штрафуем, ждём новую сеть")
                 }
                 override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
+                    if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) return
                     val v = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                     if (v && !netValidated) onNetworkChanged("интернет в сети снова доступен (${describeNet(cm, network)})")
                     netValidated = v
@@ -1707,7 +1713,9 @@ function alert(){}
             pool.execute { measureTunnelServers() }
         }
         val dest = destKey(host)
-        val list = rankTunnelServers(preferCountry, now, dest).take(3)
+        // v4.2.12: четыре кандидата и хедж через 2,5 с (было 3 и 4 с) — Telegram сам рвёт соединение через ~8–10 с,
+        // и при перегруженных серверах Browsec в час пик мы не успевали ответить ему вовремя
+        val list = rankTunnelServers(preferCountry, now, dest).take(4)
         if (list.isEmpty()) return null
 
         // v4.2.5: «хеджирование» — если сервер не ответил на CONNECT за 4 с, параллельно пробуем следующий; побеждает первый ответ.
@@ -1744,7 +1752,7 @@ function alert(){}
         launch(list[next++])
         val t0 = SystemClock.elapsedRealtime()
         val deadline = t0 + 12_000L
-        var hedgeAt = t0 + 4_000L
+        var hedgeAt = t0 + 2_500L
         while (pendingN > 0) {
             val now2 = SystemClock.elapsedRealtime()
             if (now2 >= deadline) break
@@ -1752,7 +1760,7 @@ function alert(){}
             if (r == null) {
                 if (SystemClock.elapsedRealtime() >= hedgeAt) {
                     if (next < list.size) launch(list[next++])
-                    hedgeAt = SystemClock.elapsedRealtime() + 4_000L
+                    hedgeAt = SystemClock.elapsedRealtime() + 2_500L
                 }
                 continue
             }
@@ -1775,7 +1783,7 @@ function alert(){}
             } else {
                 val e = r.err
                 if (e is ProxyRefusedException && e.code != 407 && e.code !in 500..599) { won.set(true); return null } // адресат/порт запрещён — идём напрямую
-                if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 4_000L }
+                if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 2_500L }
             }
         }
         won.set(true)

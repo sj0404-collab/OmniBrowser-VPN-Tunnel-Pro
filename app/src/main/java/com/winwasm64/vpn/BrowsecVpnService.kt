@@ -2536,13 +2536,31 @@ object BrowsecLocalProxyServer {
                 }
             }
             if (up == null) {
+                // v4.2.12: если напрямую к этому адресату недавно не пробились (провайдер режет Telegram/Google) — не ждём
+                // ещё 6 с, а сразу отказываем: так Telegram быстрее повторит попытку, и она снова пойдёт через туннель
+                val dk = "${target.address?.hostAddress ?: host}:$origPort"
+                val failedAgo = System.currentTimeMillis() - (directFailAt[dk] ?: 0L)
+                if (failedAgo < 300_000L) {
+                    val who = VpnLog.label(profile?.packageName)
+                    if (System.currentTimeMillis() - (directSkipLoggedAt[dk] ?: 0L) > 120_000L) {
+                        directSkipLoggedAt[dk] = System.currentTimeMillis()
+                        VpnLog.w("Прил", "$who → $logHost:$origPort: серверы Browsec не ответили, а напрямую адресат был недоступен ${failedAgo / 1000} с назад — отказываем сразу, чтобы приложение быстрее повторило через туннель")
+                    }
+                    throw java.io.IOException("туннель не ответил, напрямую недоступно (проверено ${failedAgo / 1000} с назад)")
+                }
                 val s = Socket()
                 BrowsecVpnService.protectSocket(s)
                 s.tcpNoDelay = true
                 s.keepAlive = true
                 s.receiveBufferSize = 512 * 1024
                 val t0 = System.currentTimeMillis()
-                s.connect(target, 6000)
+                try {
+                    s.connect(target, 6000)
+                } catch (e: Exception) {
+                    directFailAt[dk] = System.currentTimeMillis()
+                    throw e
+                }
+                directFailAt.remove(dk)
                 st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
                 s.soTimeout = 10 * 60_000
                 up = s
@@ -3108,6 +3126,10 @@ object BrowsecLocalProxyServer {
  * СИСТЕМНЫЙ VPN-СЕРВИС (ШТОРКА С ЖИВОЙ СКОРОСТЬЮ КАЖДОГО VPN ОТДЕЛЬНО + PER-APP TUN)
  * ============================================================================
  */
+// v4.2.12: память «напрямую к адресату не пробиться» (ключ ip:port → время), чтобы не ждать 6 с на каждом повторе
+private val directFailAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+private val directSkipLoggedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
 class BrowsecVpnService : VpnService() {
 
     companion object {
