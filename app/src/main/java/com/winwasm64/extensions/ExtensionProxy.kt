@@ -1950,7 +1950,7 @@ function alert(){}
             if (alive.isEmpty()) alive = tunnelServers.take(6)
             if (now - lastResortLoggedAt > 60_000L) {
                 lastResortLoggedAt = now
-                VpnLog.w("Прил", "все серверы Browsec в паузе после 503/таймаутов — пробуем ${alive.take(4).joinToString(", ") { it.host.substringBefore('.') }} всё равно, чтобы приложения не остались без туннеля")
+                com.winwasm64.vpn.VpnLog.w("Прил", "все серверы Browsec в паузе после 503/таймаутов — пробуем ${alive.take(4).joinToString(", ") { it.host.substringBefore('.') }} всё равно, чтобы приложения не остались без туннеля")
             }
         }
         if (alive.isEmpty()) return alive
