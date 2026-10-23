@@ -1405,14 +1405,33 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         val tab = tabs.getOrNull(activeTabIndex) ?: return@LaunchedEffect
         val wv = tab.webView ?: return@LaunchedEffect
         val wasPlaying = tab.mediaPlaying
+        if (MediaState.inPip && fullscreenCustomView != null) {
+            // v4.2.4: HTML5-полный экран (отдельная поверхность) в окне PiP рисуется чёрным — возвращаем видео на страницу
+            try { fullscreenCallback?.onCustomViewHidden() } catch (_: Exception) {}
+            fullscreenCallback = null
+            fullscreenCustomView = null
+        }
         try { wv.evaluateJavascript(MediaState.pipLayoutScript(MediaState.inPip), null) } catch (_: Exception) {}
-        if (MediaState.inPip && wasPlaying) {
-            // v4.2.3: если при входе в PiP движок/сайт поставил видео на паузу — возобновляем
-            for (d in listOf(400L, 1200L)) {
-                delay(d)
+        if (MediaState.inPip) {
+            // v4.2.4: после смены размера окна принудительно перекладываем WebView и повторяем раскладку «только видео»;
+            // если при входе в PiP движок/сайт поставил видео на паузу — возобновляем
+            var elapsed = 0L
+            for (d in listOf(300L, 900L, 1800L)) {
+                delay(d - elapsed); elapsed = d
                 if (!MediaState.inPip) break
-                if (!tab.mediaPlaying) try { wv.evaluateJavascript(MediaState.mediaControlScript("play"), null) } catch (_: Exception) {}
+                try {
+                    webViewContainer.requestLayout()
+                    wv.requestLayout()
+                    wv.invalidate()
+                    wv.evaluateJavascript(MediaState.pipLayoutScript(true), null)
+                    if (wasPlaying && !tab.mediaPlaying) wv.evaluateJavascript(MediaState.mediaControlScript("play"), null)
+                } catch (_: Exception) {}
             }
+            try {
+                wv.evaluateJavascript(MediaState.PIP_DIAG_SCRIPT) { r ->
+                    com.winwasm64.vpn.VpnLog.i("PiP", "окно ${webViewContainer.width}×${webViewContainer.height} px, WebView ${wv.width}×${wv.height} px (${wv.visibility}), страница: ${r ?: "?"}")
+                }
+            } catch (_: Exception) {}
         }
     }
     LaunchedEffect(MediaState.activeMediaPlaying) {

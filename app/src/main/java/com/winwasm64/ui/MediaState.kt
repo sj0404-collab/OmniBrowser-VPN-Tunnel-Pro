@@ -83,18 +83,53 @@ object MediaState {
 })();
 """
 
+    /** Диагностика окна PiP для журнала: размер вьюпорта, видео и его положение. */
+    const val PIP_DIAG_SCRIPT = """
+(function(){
+  try {
+    var vs = document.querySelectorAll('video'); var v = null;
+    for (var i = 0; i < vs.length; i++) { if (!vs[i].paused) { v = vs[i]; break; } }
+    if (!v && vs.length) v = vs[0];
+    var r = v ? v.getBoundingClientRect() : null;
+    return JSON.stringify({ vp: innerWidth + 'x' + innerHeight, dpr: devicePixelRatio, videos: vs.length,
+      paused: v ? v.paused : null, ready: v ? v.readyState : null, size: v ? (v.videoWidth + 'x' + v.videoHeight) : null,
+      rect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
+      fs: !!(document.fullscreenElement || document.webkitFullscreenElement), vis: document.visibilityState });
+  } catch (e) { return 'error: ' + e; }
+})();
+"""
+
     /** Включает/выключает раскладку «только видео на весь экран» (для окна PiP). */
     fun pipLayoutScript(on: Boolean): String = """
 (function(on){
   try {
     var id = '__omniPipStyle'; var s = document.getElementById(id);
+    var pick = function(){
+      try {
+        var vs = Array.prototype.slice.call(document.querySelectorAll('video')); if (!vs.length) return;
+        var best = null;
+        for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended && vs[i].readyState > 1) { best = vs[i]; break; } }
+        if (!best) { vs.sort(function(a, b){ var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect(); return (rb.width * rb.height) - (ra.width * ra.height); }); best = vs[0]; }
+        for (var j = 0; j < vs.length; j++) { if (vs[j] === best) vs[j].setAttribute('data-omni-pip', '1'); else vs[j].removeAttribute('data-omni-pip'); }
+      } catch (e) {}
+    };
     if (on) {
+      try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen(); } catch (e) {}
+      try { if (document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen(); } catch (e) {}
+      try { window.scrollTo(0, 0); } catch (e) {}
+      pick();
+      if (!window.__omniPipTimer) window.__omniPipTimer = setInterval(pick, 2000);
       if (!s) {
         s = document.createElement('style'); s.id = id;
-        s.textContent = 'video{position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;z-index:2147483647!important;object-fit:contain!important;background:#000!important;transform:none!important} html,body{overflow:hidden!important;background:#000!important}';
+        // v4.2.4: растягиваем только ОДНО видео (играющее/самое крупное): скрытые превью-видео страницы раньше ложились сверху чёрным
+        s.textContent = 'video[data-omni-pip="1"]{position:fixed!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;z-index:2147483647!important;object-fit:contain!important;background:#000!important;transform:none!important;opacity:1!important;visibility:visible!important} html,body{overflow:hidden!important;background:#000!important}';
         document.documentElement.appendChild(s);
       }
-    } else if (s) { s.remove(); }
+    } else {
+      if (s) s.remove();
+      if (window.__omniPipTimer) { clearInterval(window.__omniPipTimer); window.__omniPipTimer = null; }
+      var all = document.querySelectorAll('video[data-omni-pip]'); for (var k = 0; k < all.length; k++) all[k].removeAttribute('data-omni-pip');
+    }
   } catch (e) {}
 })($on);
 """

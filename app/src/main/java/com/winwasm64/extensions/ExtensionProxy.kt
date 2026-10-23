@@ -981,11 +981,11 @@ function alert(){}
         return s to s.getInputStream()
     }
 
-    private fun openToProxy(up: Upstream): Socket {
+    private fun openToProxy(up: Upstream, readTimeoutMs: Int = 5_000): Socket {
         val raw = Socket()
         raw.connect(InetSocketAddress(up.host, up.port), 4_000)
         // v4.1.1: WebView ждёт ответ на CONNECT ~10 с — зависший сервер должен отвалиться раньше; локальному репитеру даём больше
-        raw.soTimeout = if (up.host == "127.0.0.1") 15_000 else 5_000
+        raw.soTimeout = if (up.host == "127.0.0.1") 15_000 else readTimeoutMs
         raw.tcpNoDelay = true
         if (up.type != "HTTPS") return raw
         try {
@@ -1016,11 +1016,11 @@ function alert(){}
     private fun basic(c: Pair<String, String>): String =
         Base64.encodeToString("${c.first}:${c.second}".toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String, direct: Boolean = false): Pair<Socket, InputStream> {
+    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String, direct: Boolean = false, readTimeoutMs: Int = 5_000): Pair<Socket, InputStream> {
         var attempt = 0
         while (true) {
             val used = creds[up.key]
-            val s = openToProxy(up)
+            val s = openToProxy(up, readTimeoutMs)
             try {
             val sb = StringBuilder()
                 .append("CONNECT ").append(host).append(':').append(port).append(" HTTP/1.1\r\n")
@@ -1548,7 +1548,8 @@ function alert(){}
             inFlight.incrementAndGet()
             try {
                 val t0 = SystemClock.elapsedRealtime()
-                val r0 = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
+                // v4.2.4: серверу даём 9 с на CONNECT — он сам сначала соединяется с адресатом (Telegram DC и т.п.), это не его «смерть»
+                val r0 = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000)
                 noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
                 val r = r0.first to (CountingInputStream(r0.second, up.key) as InputStream)
                 lastAutoTunnel = up.key
@@ -1570,16 +1571,50 @@ function alert(){}
                 }
             } catch (e: Exception) {
                 val t = SystemClock.elapsedRealtime()
-                tunnelDownUntil[up.key] = t + 180_000L
-                if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
-                    appTunnelFailLoggedAt[up.key] = t
-                    com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
+                val readTimeout = e is java.net.SocketTimeoutException && (e.message ?: "").contains("Read timed out")
+                if (readTimeout && tunnelServerAlive(up)) {
+                    // v4.2.4: сервер жив (CONNECT к Google проходит) — это адресат не ответил ему вовремя; сервер «вниз» не отправляем,
+                    // иначе за минуту все серверы по очереди «умирают» из‑за одного медленного Telegram DC
+                    noteConnectMs(up.key, 4_000L)
+                    if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                        appTunnelFailLoggedAt[up.key] = t
+                        com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не достучался до $host:$port за 9 с (сам сервер отвечает) — пробуем другой")
+                    }
+                } else {
+                    tunnelDownUntil[up.key] = t + 180_000L
+                    if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
+                        appTunnelFailLoggedAt[up.key] = t
+                        com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
+                    }
                 }
             } finally {
                 inFlight.decrementAndGet()
             }
         }
         return null
+    }
+
+    private val tunnelProbeAt = ConcurrentHashMap<String, Long>()
+
+    /** Жив ли сервер: недавний успех через него или быстрый CONNECT www.google.com:443 (не чаще раза в 30 с на сервер). */
+    private fun tunnelServerAlive(up: Upstream): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (now - (tunnelLastOk[up.key] ?: 0L) < 30_000L) return true
+        val lastProbe = tunnelProbeAt[up.key] ?: 0L
+        if (now - lastProbe < 30_000L) return now - (tunnelLastOk[up.key] ?: 0L) < 60_000L
+        tunnelProbeAt[up.key] = now
+        return try {
+            val t0 = SystemClock.elapsedRealtime()
+            val r = viaHttpProxy(up, "www.google.com", 443, "https://www.google.com/")
+            closeQuietly(r.first)
+            noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
+            tunnelLastOk[up.key] = SystemClock.elapsedRealtime()
+            true
+        } catch (e: ProxyRefusedException) {
+            e.code != 407
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private val tunnelInFlight = ConcurrentHashMap<String, AtomicInteger>()
@@ -1604,7 +1639,7 @@ function alert(){}
 
     /** Чем меньше — тем лучше: задержка CONNECT плюс штраф за медленную отдачу (ниже 400 КБ/с). */
     private fun scoreOf(up: Upstream): Long {
-        val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3)
+        val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3 + 300)
         val rate = tunnelRateKb[up.key]
         val penalty = if (rate == null) 0L else ((400.0 - rate).coerceAtLeast(0.0) * 5).toLong()
         return connect + penalty
@@ -1619,7 +1654,7 @@ function alert(){}
         val extPref = extensionCountry()
         val alive = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
-            .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 2 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
+            .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 4 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
         if (alive.isEmpty()) return alive
         val byScore = alive.sortedBy { scoreOf(it) }
         val best = scoreOf(byScore.first())
@@ -1636,7 +1671,14 @@ function alert(){}
     }
 
     /** Активный замер: CONNECT www.google.com:443 через 10 лучших по TCP-пингу серверов, параллельно. */
+    private val measuring = AtomicBoolean(false)
+
     private fun measureTunnelServers() {
+        if (!measuring.compareAndSet(false, true)) return
+        try { measureTunnelServersInner() } finally { measuring.set(false) }
+    }
+
+    private fun measureTunnelServersInner() {
         val now = SystemClock.elapsedRealtime()
         val cands = tunnelServers
             .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
@@ -1666,7 +1708,7 @@ function alert(){}
         if (ranked.isNotEmpty()) {
             com.winwasm64.vpn.VpnLog.i("Прил", "лучшие серверы Browsec: " + ranked.joinToString(", ") { u ->
                 val rate = tunnelRateKb[u.key]
-                u.key.substringBefore('.') + " " + (tunnelConnectMs[u.key] ?: 0L) + " мс" + (if (rate != null) " · %.0f КБ/с".format(java.util.Locale.US, rate) else "")
+                u.key.substringBefore('.') + " " + (tunnelConnectMs[u.key]?.let { "$it мс" } ?: "не измерен") + (if (rate != null) " · %.0f КБ/с".format(java.util.Locale.US, rate) else "")
             })
         }
     }
