@@ -115,6 +115,105 @@ object ExtensionProxy {
     fun init(context: Context) {
         appContext = context.applicationContext
         loadPersisted()
+        registerNetworkWatch()
+    }
+
+    // =====================================================================
+    // v4.2.11: смена сети (Wi-Fi выключили/включили, переход на мобильную) — раньше все серверы Browsec помечались
+    // «не отвечают» на 3–5 мин из-за ENETUNREACH/ECONNABORTED нашей же сети, и после возврата Wi-Fi браузер ещё долго
+    // шёл мимо туннеля. Теперь: сбои «на нашей стороне» серверы не штрафуют, а при появлении сети все пометки снимаются
+    // и серверы перемеряются сразу.
+    // =====================================================================
+    @Volatile private var noNetLoggedAt = 0L
+    @Volatile private var lastNetId: String? = null
+    @Volatile private var netLostAt = 0L
+    @Volatile private var netValidated = true
+    private var netWatchRegistered = false
+
+    private fun describeNet(cm: android.net.ConnectivityManager, n: android.net.Network?): String {
+        val caps = try { n?.let { cm.getNetworkCapabilities(it) } } catch (_: Exception) { null } ?: return "неизвестная сеть"
+        return when {
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "мобильная сеть"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            else -> "сеть"
+        }
+    }
+
+    private fun registerNetworkWatch() {
+        if (netWatchRegistered) return
+        netWatchRegistered = true
+        try {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            lastNetId = cm.activeNetwork?.toString()
+            cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    val id = network.toString()
+                    val prev = lastNetId
+                    lastNetId = id
+                    if (prev == id) return
+                    val lostAgo = if (netLostAt > 0L) SystemClock.elapsedRealtime() - netLostAt else -1L
+                    onNetworkChanged("появилась сеть: ${describeNet(cm, network)}" + (if (prev == null) "" else " (вместо прежней)") + (if (lostAgo in 0..600_000L) ", без сети были ${lostAgo / 1000} с" else ""))
+                }
+                override fun onLost(network: android.net.Network) {
+                    if (network.toString() != lastNetId) return
+                    netLostAt = SystemClock.elapsedRealtime()
+                    lastNetId = null
+                    com.winwasm64.vpn.VpnLog.w("Сеть", "сеть потеряна (${describeNet(cm, network)}) — серверы Browsec не штрафуем, ждём новую сеть")
+                }
+                override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
+                    val v = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    if (v && !netValidated) onNetworkChanged("интернет в сети снова доступен (${describeNet(cm, network)})")
+                    netValidated = v
+                }
+            })
+        } catch (e: Exception) {
+            Log.w(TAG, "network watch", e)
+        }
+    }
+
+    /** Есть ли сейчас сеть с интернетом (по данным системы). */
+    fun networkUp(): Boolean = try {
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val n = cm.activeNetwork
+        n != null && (cm.getNetworkCapabilities(n)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+    } catch (_: Exception) { true }
+
+    /** Ошибка вызвана нашей сетью (Wi-Fi выключен/переключается, нет маршрута, DNS не отвечает), а не сервером Browsec. */
+    private fun localNetFault(e: Throwable): Boolean {
+        val m = e.message ?: ""
+        val local = e is java.net.UnknownHostException || m.contains("ENETUNREACH") || m.contains("Network is unreachable") ||
+            m.contains("ECONNABORTED") || m.contains("Software caused connection abort") || m.contains("EHOSTUNREACH") ||
+            m.contains("No route to host") || m.contains("EADDRNOTAVAIL") || !networkUp()
+        if (local) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - noNetLoggedAt > 30_000L) {
+                noNetLoggedAt = now
+                com.winwasm64.vpn.VpnLog.w("Сеть", "сбой на нашей стороне (${(m.ifEmpty { e.javaClass.simpleName }).take(90)}) — серверы Browsec не помечаем недоступными; когда сеть вернётся, проверим их заново")
+            }
+        }
+        return local
+    }
+
+    /** Снимает все пометки «сервер не отвечает» и запускает новый замер. */
+    fun onNetworkChanged(reason: String) {
+        val had = downUntil.size + tunnelDownUntil.size + (if (ownerDown()) 1 else 0)
+        downUntil.clear()
+        ownerDownUntil = 0L
+        ownerFails.clear()
+        tunnelDownUntil.clear()
+        tunnelPing.clear()
+        tunnelConnectMs.entries.removeIf { it.value >= 9_000L }
+        tunnelDestMs.entries.removeIf { it.value >= 9_000L }
+        appTunnelFailLoggedAt.clear()
+        netLostAt = 0L
+        com.winwasm64.vpn.VpnLog.ok("Сеть", "$reason — снимаем пометки «не отвечает» ($had) и перемеряем серверы Browsec")
+        tunnelPingAt = SystemClock.elapsedRealtime()
+        pool.execute {
+            try { pingTunnelServers() } catch (_: Exception) {}
+            if (control != null && pacReady) try { prewarmRoute() } catch (_: Exception) {}
+        }
     }
 
     // v4.1.1: учётные данные Browsec и список его серверов переживают отключение прокси расширения и перезапуск —
@@ -380,7 +479,7 @@ function alert(){}
                     com.winwasm64.vpn.VpnLog.i("Браузер", "сервер расширения ${up.key} отвечает за ${SystemClock.elapsedRealtime() - t0} мс")
                 } catch (e: Exception) {
                     markDown(up, e)
-                    com.winwasm64.vpn.VpnLog.w("Браузер", "сервер расширения ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — пропускаем его сразу")
+                    if (!localNetFault(e)) com.winwasm64.vpn.VpnLog.w("Браузер", "сервер расширения ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — пропускаем его сразу")
                 } finally {
                     latch.countDown()
                 }
@@ -901,6 +1000,8 @@ function alert(){}
                     if (kind == 0 && up != null) {
                         markDown(up, e)
                         reportError(up, e)
+                    } else if (kind == 1 && up != null && e !is ProxyRefusedException && localNetFault(e)) {
+                        tunnelDownUntil.putIfAbsent(up.key, SystemClock.elapsedRealtime() + 8_000L) // v4.2.11: наша сеть, не сервер
                     } else if (kind == 1 && up != null) {
                         if (e !is ProxyRefusedException || e.code == 407) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
                         else if (e.code in 500..599) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
@@ -1444,6 +1545,7 @@ function alert(){}
             return
         }
         if (e is ProxyRefusedException && e.code != 407) return // сервер отвечает — просто отказал этому запросу
+        if (localNetFault(e)) { downUntil.putIfAbsent(up.key, SystemClock.elapsedRealtime() + 8_000L); return } // v4.2.11
         val now = SystemClock.elapsedRealtime()
         val reason = e.message ?: e.javaClass.simpleName
         if (downUntil.put(up.key, now + 180_000L) == null) {
@@ -1567,8 +1669,8 @@ function alert(){}
                     val t0 = SystemClock.elapsedRealtime()
                     sock.connect(InetSocketAddress(up.host, up.port), 3000)
                     tunnelPing[up.key] = SystemClock.elapsedRealtime() - t0
-                } catch (_: Exception) {
-                    tunnelPing[up.key] = Long.MAX_VALUE
+                } catch (e: Exception) {
+                    if (!localNetFault(e)) tunnelPing[up.key] = Long.MAX_VALUE // v4.2.11: без сети пинг не «провал сервера»
                 } finally {
                     closeQuietly(sock)
                     latch.countDown()
@@ -1695,6 +1797,7 @@ function alert(){}
             }
             return
         }
+        if (localNetFault(e)) { tunnelDownUntil.putIfAbsent(up.key, t + 8_000L); return } // v4.2.11
         val readTimeout = e is java.net.SocketTimeoutException && (e.message ?: "").contains("Read timed out")
         if (readTimeout && tunnelServerAlive(up)) {
             // сервер жив (CONNECT к Google проходит) — это адресат не ответил ему вовремя; запоминаем, что к этому адресату через него медленно
@@ -1841,9 +1944,13 @@ function alert(){}
                         tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
                         tunnelConnectMs[up.key] = 9_000L
                     }
-                } catch (_: Exception) {
-                    tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
-                    tunnelConnectMs[up.key] = 9_000L
+                } catch (e: Exception) {
+                    if (localNetFault(e)) {
+                        tunnelDownUntil.putIfAbsent(up.key, SystemClock.elapsedRealtime() + 8_000L)
+                    } else {
+                        tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                        tunnelConnectMs[up.key] = 9_000L
+                    }
                 } finally {
                     latch.countDown()
                 }
