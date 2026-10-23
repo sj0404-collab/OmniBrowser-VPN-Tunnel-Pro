@@ -353,7 +353,35 @@ function alert(){}
             if (gen != pacGeneration) return@evaluateJavascript
             pacReady = r != null && r.contains("ok")
             if (!pacReady) Log.w(TAG, "PAC не загружен: $r")
+            else pool.execute { prewarmRoute() } // v4.2.2: мёртвые серверы маршрута отмечаем до первой страницы
         }
+    }
+
+    /**
+     * Параллельно проверяет первые серверы PAC-маршрута (CONNECT www.google.com:443) и отмечает неотвечающие «вниз»,
+     * чтобы первая страница после включения не ждала их таймауты (чёрный плеер YouTube при первом открытии).
+     */
+    private fun prewarmRoute() {
+        val route = try { pacLookup("https://www.youtube.com/", "www.youtube.com") } catch (_: Exception) { null } ?: return
+        val ups = route.filter { it.type != "DIRECT" }.take(4)
+        val latch = CountDownLatch(ups.size)
+        for (up in ups) {
+            pool.execute {
+                try {
+                    val t0 = SystemClock.elapsedRealtime()
+                    val r = if (up.type == "SOCKS5") viaSocks5(up, "www.google.com", 443) else viaHttpProxy(up, "www.google.com", 443, "https://www.google.com/")
+                    closeQuietly(r.first)
+                    noteUpstreamOk(up, "проверка маршрута")
+                    com.winwasm64.vpn.VpnLog.i("Браузер", "сервер расширения ${up.key} отвечает за ${SystemClock.elapsedRealtime() - t0} мс")
+                } catch (e: Exception) {
+                    markDown(up, e)
+                    com.winwasm64.vpn.VpnLog.w("Браузер", "сервер расширения ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — пропускаем его сразу")
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        latch.await(12, TimeUnit.SECONDS)
     }
 
     object PacBridge {
@@ -1456,7 +1484,8 @@ function alert(){}
         for (up in tunnelServers) {
             val cc = up.host.takeWhile { it.isLetter() }.take(2).lowercase()
             if (cc.length < 2) continue
-            val p = tunnelPing[up.key] ?: continue
+            val ping = tunnelPing[up.key] ?: continue
+            val p = if (ping == Long.MAX_VALUE) ping else (tunnelConnectMs[up.key] ?: ping)
             val cur = m[cc]
             if (cur == null || p < cur) m[cc] = p
         }
@@ -1484,6 +1513,8 @@ function alert(){}
                 closeQuietly(sock)
             }
         }
+        tunnelMeasuredAt = SystemClock.elapsedRealtime()
+        measureTunnelServers()
         logTunnelCountries()
     }
 
@@ -1505,35 +1536,28 @@ function alert(){}
             tunnelPingAt = now
             pool.execute { pingTunnelServers() }
         }
-        val pref = preferCountry?.lowercase()?.take(2)
-        val extPref = extensionCountry()
-        // v4.2.1: порядок — страна профиля приложения → страна, выбранная в расширении Browsec → недавно работавшие → по пингу;
-        // сервер, на котором уже «висят» ≥2 попытки без недавних успехов, пропускаем (не ждём его таймаут толпой)
-        val list = tunnelServers
-            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
-            .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 2 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
-            .sortedWith(
-                compareBy<Upstream>(
-                    { if (pref != null && it.host.startsWith(pref)) 0 else 1 },
-                    { if (extPref != null && it.host.startsWith(extPref)) 0 else 1 },
-                    { if (now - (tunnelLastOk[it.key] ?: 0L) < 120_000L) 0 else 1 },
-                    { tunnelPing[it.key] ?: 5_000L }
-                )
-            )
+        if (now - tunnelMeasuredAt > 300_000L && tunnelPing.isNotEmpty()) {
+            tunnelMeasuredAt = now
+            pool.execute { measureTunnelServers() }
+        }
+        val list = rankTunnelServers(preferCountry, now)
         var tries = 0
         for (up in list) {
             if (tries++ >= 2) break
             val inFlight = tunnelInFlight.getOrPut(up.key) { AtomicInteger() }
             inFlight.incrementAndGet()
             try {
-                val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
+                val t0 = SystemClock.elapsedRealtime()
+                val r0 = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/")
+                noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
+                val r = r0.first to (CountingInputStream(r0.second, up.key) as InputStream)
                 lastAutoTunnel = up.key
                 lastAutoTunnelAt = SystemClock.elapsedRealtime()
                 tunnelLastOk[up.key] = lastAutoTunnelAt
                 val t = lastAutoTunnelAt
                 if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
                     appTunnelLoggedAt[up.key] = t
-                    com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key}")
+                    com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
                 }
                 return Triple(r.first, r.second, up.key)
             } catch (e: ProxyRefusedException) {
@@ -1561,6 +1585,111 @@ function alert(){}
     private val tunnelInFlight = ConcurrentHashMap<String, AtomicInteger>()
     private val tunnelLastOk = ConcurrentHashMap<String, Long>()
     private val appTunnelFailLoggedAt = ConcurrentHashMap<String, Long>()
+
+    // ---- v4.2.2: качество серверов Browsec для приложений — реальная задержка CONNECT и фактическая скорость ----
+    private val tunnelConnectMs = ConcurrentHashMap<String, Long>()   // EWMA времени установления CONNECT
+    private val tunnelRateKb = ConcurrentHashMap<String, Double>()    // EWMA скорости приёма в активные секунды, КБ/с
+    @Volatile private var tunnelMeasuredAt = 0L
+
+    private fun noteConnectMs(key: String, ms: Long) {
+        val prev = tunnelConnectMs[key]
+        tunnelConnectMs[key] = if (prev == null) ms else (prev * 0.6 + ms * 0.4).toLong()
+    }
+
+    private fun noteRate(key: String, kbPerSec: Double) {
+        if (kbPerSec < 8.0) return // пустые секунды/keep-alive не считаем
+        val prev = tunnelRateKb[key]
+        tunnelRateKb[key] = if (prev == null) kbPerSec else prev * 0.7 + kbPerSec * 0.3
+    }
+
+    /** Чем меньше — тем лучше: задержка CONNECT плюс штраф за медленную отдачу (ниже 400 КБ/с). */
+    private fun scoreOf(up: Upstream): Long {
+        val connect = tunnelConnectMs[up.key] ?: ((tunnelPing[up.key] ?: 1_500L).coerceAtMost(5_000L) * 3)
+        val rate = tunnelRateKb[up.key]
+        val penalty = if (rate == null) 0L else ((400.0 - rate).coerceAtLeast(0.0) * 5).toLong()
+        return connect + penalty
+    }
+
+    /**
+     * Порядок серверов: лучший по измеренному качеству; страна профиля приложения или страна расширения — только если её
+     * лучший сервер не хуже общего лучшего более чем в полтора раза («быстрее» важнее, чем «первый попавшийся»).
+     */
+    private fun rankTunnelServers(preferCountry: String?, now: Long): List<Upstream> {
+        val pref = preferCountry?.lowercase()?.take(2)
+        val extPref = extensionCountry()
+        val alive = tunnelServers
+            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
+            .filter { (tunnelInFlight[it.key]?.get() ?: 0) < 2 || now - (tunnelLastOk[it.key] ?: 0L) < 60_000L }
+        if (alive.isEmpty()) return alive
+        val byScore = alive.sortedBy { scoreOf(it) }
+        val best = scoreOf(byScore.first())
+        val limit = (best * 1.5).toLong() + 200
+        fun cc(u: Upstream) = u.host.takeWhile { it.isLetter() }.take(2).lowercase()
+        var head = byScore.filter { (pref != null && cc(it) == pref) || (extPref != null && cc(it) == extPref) }
+            .filter { scoreOf(it) <= limit }
+        if (head.isEmpty()) {
+            // держимся текущего сервера, пока другой не лучше его хотя бы на 30 % (иначе прыгаем между lt9/lt40/de73 без пользы)
+            val cur = alive.firstOrNull { it.key == lastAutoTunnel }
+            if (cur != null && scoreOf(cur) <= (best * 1.3).toLong() + 100) head = listOf(cur)
+        }
+        return (head + byScore).distinctBy { it.key }
+    }
+
+    /** Активный замер: CONNECT www.google.com:443 через 10 лучших по TCP-пингу серверов, параллельно. */
+    private fun measureTunnelServers() {
+        val now = SystemClock.elapsedRealtime()
+        val cands = tunnelServers
+            .filter { (tunnelDownUntil[it.key] ?: 0L) < now && tunnelPing[it.key] != Long.MAX_VALUE }
+            .sortedBy { tunnelPing[it.key] ?: 5_000L }
+            .take(10)
+        if (cands.isEmpty()) return
+        val latch = CountDownLatch(cands.size)
+        for (up in cands) {
+            pool.execute {
+                try {
+                    val t0 = SystemClock.elapsedRealtime()
+                    val r = viaHttpProxy(up, "www.google.com", 443, "https://www.google.com/")
+                    closeQuietly(r.first)
+                    noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
+                } catch (e: ProxyRefusedException) {
+                    if (e.code == 407) tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 60_000L
+                } catch (_: Exception) {
+                    tunnelDownUntil[up.key] = SystemClock.elapsedRealtime() + 180_000L
+                    tunnelConnectMs[up.key] = 9_000L
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        latch.await(15, TimeUnit.SECONDS)
+        val ranked = rankTunnelServers(null, SystemClock.elapsedRealtime()).take(5)
+        if (ranked.isNotEmpty()) {
+            com.winwasm64.vpn.VpnLog.i("Прил", "лучшие серверы Browsec: " + ranked.joinToString(", ") { u ->
+                val rate = tunnelRateKb[u.key]
+                u.key.substringBefore('.') + " " + (tunnelConnectMs[u.key] ?: 0L) + " мс" + (if (rate != null) " · %.0f КБ/с".format(java.util.Locale.US, rate) else "")
+            })
+        }
+    }
+
+    /** Считает фактическую скорость приёма через сервер (по секундам с данными). */
+    private class CountingInputStream(private val inner: InputStream, private val key: String) : InputStream() {
+        private var sec = 0L
+        private var bucket = 0L
+        private fun count(n: Int) {
+            if (n <= 0) return
+            val s = SystemClock.elapsedRealtime() / 1000
+            if (s != sec) {
+                if (sec != 0L && bucket > 0) noteRate(key, bucket / 1024.0)
+                sec = s
+                bucket = 0
+            }
+            bucket += n
+        }
+        override fun read(): Int { val b = inner.read(); if (b >= 0) count(1); return b }
+        override fun read(b: ByteArray, off: Int, len: Int): Int { val n = inner.read(b, off, len); count(n); return n }
+        override fun available(): Int = inner.available()
+        override fun close() = inner.close()
+    }
 
     @Volatile private var extCountryCache: Pair<String?, Long> = null to 0L
 
