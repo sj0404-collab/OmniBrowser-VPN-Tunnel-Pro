@@ -3566,7 +3566,13 @@ class BrowsecVpnService : VpnService() {
                 BrowsecLocalProxyServer.useBrowsecTunnel = true
                 BrowsecLocalProxyServer.ensureRunning()
                 BrowsecLocalProxyServer.onServerCountrySwitched(activeCountry, resetSessionTraffic = false)
-                rebuildPerAppVpnInterface()
+                // v4.2.16: повторный ACTION_CONNECT с тем же списком и страной (кнопка «Запустить через VPN», синхронизация)
+                // раньше пересоздавал интерфейс и рвал все соединения приложений через 5–7 с после подключения
+                if (perAppVpnInterface != null && builtConfigKey == currentConfigKey()) {
+                    VpnLog.i("Туннель", "VPN приложений уже работает с этим списком (${VpnLog.appList(routedPackages)}) — соединения не трогаем")
+                } else {
+                    rebuildPerAppVpnInterface()
+                }
                 startForeground(NOTIFICATION_ID, buildLiveNotification())
                 startLiveNotificationTicker()
                 return START_STICKY
@@ -3593,8 +3599,12 @@ class BrowsecVpnService : VpnService() {
     @Volatile
     private var tunEngine: TransparentTunEngine? = null
 
+    @Volatile private var builtConfigKey: String = ""
+    private fun currentConfigKey(): String = activeCountry + "|" + perAppMode + "|" + routedPackages.sorted().joinToString(",")
+
     @Synchronized
     private fun rebuildPerAppVpnInterface() {
+        builtConfigKey = currentConfigKey()
         if (perAppVpnInterface != null) {
             // v4.2.15: Android не меняет список приложений у живого VPN — интерфейс пересоздаётся, соединения приложений закрываются
             VpnLog.i("Туннель", "список приложений/страна изменены — туннель пересоздаётся, текущие соединения приложений закроются и переустановятся сами")
