@@ -243,15 +243,21 @@ object MediaGrabber {
         val title: String,
         val fileName: String,
         val mime: String,
-        val urls: List<String>,
+        val urls: MutableList<String>,
         val headers: Map<String, String>,
         val expectedBytes: Long = 0L,
-        val isAudio: Boolean = false
+        val isAudio: Boolean = false,
+        /** YouTube: id ролика и itag каждой ссылки — чтобы при 403 получить свежие адреса через новый сервер. */
+        val ytId: String = "",
+        val itags: List<Int> = emptyList(),
+        /** Закреплённый сервер Browsec (host:port): все соединения загрузки идут через него. Пусто — обычный прокси браузера. */
+        @Volatile var server: String = ""
     ) {
         fun toJson(): String = JSONObject().apply {
             put("mode", mode); put("title", title); put("fileName", fileName); put("mime", mime)
             put("urls", JSONArray(urls)); put("headers", JSONObject(headers as Map<*, *>))
             put("expectedBytes", expectedBytes); put("isAudio", isAudio)
+            put("ytId", ytId); put("itags", JSONArray(itags)); put("server", server)
         }.toString()
 
         companion object {
@@ -263,9 +269,13 @@ object MediaGrabber {
                 val headers = LinkedHashMap<String, String>()
                 val ho = o.optJSONObject("headers")
                 if (ho != null) for (k in ho.keys()) headers[k] = ho.getString(k)
+                val itags = ArrayList<Int>()
+                val ia = o.optJSONArray("itags") ?: JSONArray()
+                for (i in 0 until ia.length()) itags.add(ia.getInt(i))
                 DownloadJob(
                     o.getString("mode"), o.optString("title"), o.getString("fileName"), o.optString("mime", "application/octet-stream"),
-                    urls, headers, o.optLong("expectedBytes", 0L), o.optBoolean("isAudio", false)
+                    urls, headers, o.optLong("expectedBytes", 0L), o.optBoolean("isAudio", false),
+                    o.optString("ytId"), itags, o.optString("server")
                 )
             } catch (_: Exception) { null }
         }
@@ -446,7 +456,10 @@ object MediaGrabber {
     }
 
     /** Запасной путь: InnerTube-клиенты без шифрования подписи (ANDROID_VR, IOS). */
-    private fun innerTubeFormats(videoId: String, headers: Map<String, String>): Pair<List<YtFormat>, String>? {
+    /** Клиентский UA, которым получены адреса InnerTube (тем же UA их и качаем). */
+    @Volatile private var lastInnerTubeUa: String = DEFAULT_UA
+
+    private fun innerTubeFormats(videoId: String, http: TunnelHttp): Pair<List<YtFormat>, String>? {
         data class Client(val name: String, val version: String, val ua: String, val id: Int, val extra: JSONObject)
         val clients = listOf(
             Client(
@@ -475,7 +488,7 @@ object MediaGrabber {
                 h["X-YouTube-Client-Name"] = cl.id.toString()
                 h["X-YouTube-Client-Version"] = cl.version
                 h["Origin"] = "https://www.youtube.com"
-                val resp = postJson("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", h, body)
+                val resp = http.postJson("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", h, body)
                 val o = JSONObject(resp)
                 val status = o.optJSONObject("playabilityStatus")?.optString("status") ?: ""
                 val sd = o.optJSONObject("streamingData")
@@ -504,7 +517,8 @@ object MediaGrabber {
                 take(sd.optJSONArray("adaptiveFormats"), false)
                 if (list.isNotEmpty()) {
                     val title = o.optJSONObject("videoDetails")?.optString("title") ?: ""
-                    VpnLog.i(TAG, "YouTube: форматы получены через клиент ${cl.name} (${list.size})")
+                    lastInnerTubeUa = cl.ua
+                    VpnLog.i(TAG, "YouTube: форматы получены через клиент ${cl.name} (${list.size}), сервер ${http.serverKey ?: "?"}")
                     return Pair(list, title)
                 }
             } catch (e: Exception) {
@@ -512,6 +526,21 @@ object MediaGrabber {
             }
         }
         return null
+    }
+
+    /** Свежие адреса для тех же itag через новый закреплённый сервер (после 403 / падения сервера). */
+    fun ytRefresh(videoId: String, itags: List<Int>): Pair<List<String>, String>? {
+        val http = TunnelHttp()
+        val fb = innerTubeFormats(videoId, http) ?: return null
+        val server = http.serverKey ?: return null
+        val urls = ArrayList<String>()
+        for (t in itags) {
+            val f = fb.first.firstOrNull { it.itag == t } ?: run {
+                VpnLog.w(TAG, "YouTube: itag $t больше не отдаётся"); return null
+            }
+            urls.add(f.url)
+        }
+        return Pair(urls, server)
     }
 
     private fun ytOptions(yt: JSONObject, sniffed: JSONArray, baseHeaders: Map<String, String>, pageTitle: String): List<Option> {
@@ -523,13 +552,22 @@ object MediaGrabber {
         val known = formats.map { it.itag }.toHashSet()
         for (f in sniffedYtFormats(sniffed)) if (known.add(f.itag)) formats.add(f)
 
-        val haveVideo = formats.any { it.isVideo && it.h >= 360 }
-        val haveAudio = formats.any { it.isAudio }
-        if ((!haveVideo || !haveAudio) && videoId.isNotBlank() && !yt.optBoolean("live")) {
-            val fb = innerTubeFormats(videoId, baseHeaders)
-            if (fb != null) {
+        // v4.3.1: адреса из ответа плеера страницы (web) требуют PO-token и привязаны к IP того сервера, через который
+        // их получил плеер, — при скачивании через другой сервер YouTube отвечает 403. Поэтому основной путь —
+        // InnerTube-клиент через ОДИН закреплённый сервер Browsec; адреса страницы остаются запасным вариантом.
+        var server = ""
+        var itUa = ""
+        if (videoId.isNotBlank() && !yt.optBoolean("live")) {
+            val http = TunnelHttp()
+            val fb = innerTubeFormats(videoId, http)
+            if (fb != null && fb.first.isNotEmpty()) {
+                formats.clear(); known.clear()
                 for (f in fb.first) if (known.add(f.itag)) formats.add(f)
                 if (title.isBlank()) title = fb.second
+                server = http.serverKey ?: ""
+                itUa = lastInnerTubeUa
+            } else {
+                VpnLog.w(TAG, "YouTube: InnerTube не дал форматов — используем адреса страницы (возможен 403)")
             }
         }
         if (title.isBlank()) title = "YouTube $videoId"
@@ -542,9 +580,15 @@ object MediaGrabber {
         val name = safeName(title)
         // заголовки для googlevideo: UA должен совпадать с тем, кем получен адрес (web-адреса привязаны к UA/IP не строго, но Referer не нужен)
         val headers = LinkedHashMap<String, String>()
-        headers["User-Agent"] = baseHeaders["User-Agent"] ?: DEFAULT_UA
-        headers["Origin"] = "https://www.youtube.com"
-        headers["Referer"] = "https://www.youtube.com/"
+        if (server.isNotBlank()) {
+            headers["User-Agent"] = itUa
+        } else {
+            headers["User-Agent"] = baseHeaders["User-Agent"] ?: DEFAULT_UA
+            headers["Origin"] = "https://www.youtube.com"
+            headers["Referer"] = "https://www.youtube.com/"
+        }
+        fun job(mode: String, file: String, mime: String, fs: List<YtFormat>, size: Long, audio: Boolean = false) =
+            DownloadJob(mode, title, file, mime, fs.map { it.url }.toMutableList(), headers, size, audio, videoId, fs.map { it.itag }, server)
 
         val audioMp4 = formats.filter { it.isAudio && it.container == "mp4" && (it.dflt || it.lang.isBlank()) }.maxByOrNull { it.br }
             ?: formats.filter { it.isAudio && it.container == "mp4" }.maxByOrNull { it.br }
@@ -567,14 +611,14 @@ object MediaGrabber {
                     out.add(
                         Option(
                             "Видео ${h}p · MP4", "${fpsTxt}${mp4v.codec.substringBefore('.')} + AAC ${audioMp4.br / 1000} кбит/с · ${fmtSize(size).ifBlank { "размер неизвестен" }}", false,
-                            DownloadJob("merge", title, "$name [${h}p].mp4", "video/mp4", listOf(mp4v.url, audioMp4.url), headers, size)
+                            job("merge", "$name [${h}p].mp4", "video/mp4", listOf(mp4v, audioMp4), size)
                         )
                     )
                 }
                 mux != null -> out.add(
                     Option(
                         "Видео ${h}p · MP4 со звуком", "один файл, без склейки · ${fmtSize(mux.size).ifBlank { "размер неизвестен" }}", false,
-                        DownloadJob("single", title, "$name [${h}p].mp4", "video/mp4", listOf(mux.url), headers, mux.size)
+                        job("single", "$name [${h}p].mp4", "video/mp4", listOf(mux), mux.size)
                     )
                 )
                 webmv != null && audioWebm != null -> {
@@ -582,14 +626,14 @@ object MediaGrabber {
                     out.add(
                         Option(
                             "Видео ${h}p · WebM", "VP9/AV1 + Opus · ${fmtSize(size).ifBlank { "размер неизвестен" }}", false,
-                            DownloadJob("merge", title, "$name [${h}p].webm", "video/webm", listOf(webmv.url, audioWebm.url), headers, size)
+                            job("merge", "$name [${h}p].webm", "video/webm", listOf(webmv, audioWebm), size)
                         )
                     )
                 }
                 mp4v != null -> out.add(
                     Option(
                         "Видео ${h}p · MP4 без звука", "аудиодорожка недоступна · ${fmtSize(mp4v.size)}", false,
-                        DownloadJob("single", title, "$name [${h}p, без звука].mp4", "video/mp4", listOf(mp4v.url), headers, mp4v.size)
+                        job("single", "$name [${h}p, без звука].mp4", "video/mp4", listOf(mp4v), mp4v.size)
                     )
                 )
             }
@@ -600,7 +644,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Только аудио · M4A (музыка)", "AAC ${audioMp4.br / 1000} кбит/с · ${fmtSize(audioMp4.size).ifBlank { "размер неизвестен" }}" + (if (durSec > 0) " · ${fmtDur(durSec)}" else ""), true,
-                    DownloadJob("single", title, "$name.m4a", "audio/mp4", listOf(audioMp4.url), headers, audioMp4.size, isAudio = true)
+                    job("single", "$name.m4a", "audio/mp4", listOf(audioMp4), audioMp4.size, audio = true)
                 )
             )
         }
@@ -608,7 +652,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Только аудио · Opus (webm)", "Opus ${audioWebm.br / 1000} кбит/с · ${fmtSize(audioWebm.size).ifBlank { "размер неизвестен" }}", true,
-                    DownloadJob("single", title, "$name.opus.webm", "audio/webm", listOf(audioWebm.url), headers, audioWebm.size, isAudio = true)
+                    job("single", "$name.opus.webm", "audio/webm", listOf(audioWebm), audioWebm.size, audio = true)
                 )
             )
         }
@@ -619,7 +663,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Аудио · ${a.lang}", "AAC ${a.br / 1000} кбит/с · ${fmtSize(a.size)}", true,
-                    DownloadJob("single", title, "$name [${safeName(a.lang)}].m4a", "audio/mp4", listOf(a.url), headers, a.size, isAudio = true)
+                    job("single", "$name [${safeName(a.lang)}].m4a", "audio/mp4", listOf(a), a.size, audio = true)
                 )
             )
         }
@@ -692,7 +736,7 @@ object MediaGrabber {
                 out.add(
                     Option(
                         "Видео ${if (h > 0) "${h}p" else "${v.bandwidth / 1000} кбит/с"} · HLS", "${v.codecs.ifBlank { "поток m3u8" }}${if (est > 0) " · ~${fmtSize(est)}" else ""}", false,
-                        DownloadJob("hls", title, "$name [${key}].$ext", if (ext == "ts") "video/mp2t" else "video/mp4", listOf(v.url), headers, est)
+                        DownloadJob("hls", title, "$name [${key}].$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(v.url), headers, est)
                     )
                 )
                 if (out.size >= 6) break
@@ -702,7 +746,7 @@ object MediaGrabber {
                 out.add(
                     Option(
                         "Только аудио · HLS", "аудиодорожка потока (${if (audio.codecs == "audio") "AAC" else audio.codecs})", true,
-                        DownloadJob("hls", title, "$name.aac", "audio/aac", listOf(audio.url), headers, 0L, isAudio = true)
+                        DownloadJob("hls", title, "$name.aac", "audio/aac", mutableListOf(audio.url), headers, 0L, isAudio = true)
                     )
                 )
             }
@@ -710,7 +754,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Видео · HLS-поток", "сегменты m3u8 будут собраны в один файл", false,
-                    DownloadJob("hls", title, "$name.$ext", if (ext == "ts") "video/mp2t" else "video/mp4", listOf(masterUrl), headers, 0L)
+                    DownloadJob("hls", title, "$name.$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(masterUrl), headers, 0L)
                 )
             )
         }
@@ -718,7 +762,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Только аудио из потока · M4A", "скачать поток и извлечь звук", true,
-                    DownloadJob("hls_audio", title, "$name.m4a", "audio/mp4", listOf(out.last { !it.isAudio }.job.urls[0]), headers, 0L, isAudio = true)
+                    DownloadJob("hls_audio", title, "$name.m4a", "audio/mp4", mutableListOf(out.last { !it.isAudio }.job.urls[0]), headers, 0L, isAudio = true)
                 )
             )
         }
@@ -823,14 +867,14 @@ object MediaGrabber {
             out.add(
                 Option(
                     label, "$host · ${if (size > 0) fmtSize(size) else "размер неизвестен"}" + (if (durSec > 0 && fileCount == 0) " · ${fmtDur(durSec)}" else ""), isAudio,
-                    DownloadJob("single", title, if (fileCount == 0) "$name.$ext" else "$name (${fileCount + 1}).$ext", mime, listOf(u), headers, if (size > 0) size else 0L, isAudio)
+                    DownloadJob("single", title, if (fileCount == 0) "$name.$ext" else "$name (${fileCount + 1}).$ext", mime, mutableListOf(u), headers, if (size > 0) size else 0L, isAudio)
                 )
             )
             if (!isAudio && (ext == "mp4" || ext == "m4v" || ext == "mov" || ext == "webm")) {
                 out.add(
                     Option(
                         "Только аудио из видео · ${if (ext == "webm") "WebM" else "M4A"}", "скачать и извлечь звуковую дорожку", true,
-                        DownloadJob("audio_extract", title, if (ext == "webm") "$name.audio.webm" else "$name.m4a", if (ext == "webm") "audio/webm" else "audio/mp4", listOf(u), headers, if (size > 0) size else 0L, isAudio = true)
+                        DownloadJob("audio_extract", title, if (ext == "webm") "$name.audio.webm" else "$name.m4a", if (ext == "webm") "audio/webm" else "audio/mp4", mutableListOf(u), headers, if (size > 0) size else 0L, isAudio = true)
                     )
                 )
             }

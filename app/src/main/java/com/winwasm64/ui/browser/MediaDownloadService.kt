@@ -219,7 +219,7 @@ class MediaDownloadService : Service() {
             "single" -> {
                 val sink = MediaSink.create(this, job)
                 try {
-                    sink.stream.use { out -> downloadUrl(job, job.urls[0], out, job.expectedBytes, 0L, 1) }
+                    sink.stream.use { out -> downloadUrl(job, 0, out, job.expectedBytes, 0L, 1) }
                     sink.finish()
                 } catch (e: Throwable) { sink.abort(); throw e }
             }
@@ -227,8 +227,8 @@ class MediaDownloadService : Service() {
                 val tv = tmp("v", extOf(job.fileName))
                 val ta = tmp("a", if (job.fileName.endsWith(".webm")) "webm" else "m4a")
                 try {
-                    val vSize = FileOutputStream(tv).use { downloadUrl(job, job.urls[0], it, job.expectedBytes, 0L, 2) }
-                    FileOutputStream(ta).use { downloadUrl(job, job.urls[1], it, job.expectedBytes, vSize, 2) }
+                    val vSize = FileOutputStream(tv).use { downloadUrl(job, 0, it, job.expectedBytes, 0L, 2) }
+                    FileOutputStream(ta).use { downloadUrl(job, 1, it, job.expectedBytes, vSize, 2) }
                     progress(job, 0, 0, 0, "склейка видео и звука…", force = true)
                     val merged = tmp("m", extOf(job.fileName))
                     try {
@@ -240,7 +240,7 @@ class MediaDownloadService : Service() {
             "audio_extract" -> {
                 val tv = tmp("v", "src")
                 try {
-                    FileOutputStream(tv).use { downloadUrl(job, job.urls[0], it, job.expectedBytes, 0L, 1) }
+                    FileOutputStream(tv).use { downloadUrl(job, 0, it, job.expectedBytes, 0L, 1) }
                     progress(job, 0, 0, 0, "извлечение звука…", force = true)
                     val outF = tmp("x", extOf(job.fileName))
                     try {
@@ -290,43 +290,95 @@ class MediaDownloadService : Service() {
         } catch (e: Throwable) { sink.abort(); throw e }
     }
 
+    // ------------------------------------------------------------------ источники
+
+    private class Resp(val code: Int, val contentRange: String?, val contentLength: Long, val body: InputStream, val closer: () -> Unit)
+
+    private interface Fetcher {
+        fun get(url: String, headers: Map<String, String>, range: String?): Resp
+    }
+
+    /** Обычный путь: HttpURLConnection через локальный прокси браузера (маршрут по PAC/гонке, как у страницы). */
+    private object ProxyFetcher : Fetcher {
+        override fun get(url: String, headers: Map<String, String>, range: String?): Resp {
+            val c = MediaGrabber.open(url, headers)
+            if (range != null) c.setRequestProperty("Range", range)
+            val code = c.responseCode
+            val body: InputStream = try { if (code in 200..299) c.inputStream else (c.errorStream ?: ByteArrayInputStreamEmpty()) } catch (_: Exception) { ByteArrayInputStreamEmpty() }
+            return Resp(code, c.getHeaderField("Content-Range"), c.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L, body) { try { c.disconnect() } catch (_: Exception) {} }
+        }
+        private fun ByteArrayInputStreamEmpty(): InputStream = java.io.ByteArrayInputStream(ByteArray(0))
+    }
+
+    /** Закреплённый сервер Browsec (YouTube): все соединения через один IP. */
+    private class PinnedFetcher(val http: TunnelHttp) : Fetcher {
+        override fun get(url: String, headers: Map<String, String>, range: String?): Resp {
+            val r = http.request(url, headers, "GET", null, if (range != null) mapOf("Range" to range) else emptyMap())
+            return Resp(r.code, r.header("content-range"), r.header("content-length")?.toLongOrNull() ?: -1L, r.body) { r.close() }
+        }
+    }
+
+    private fun fetcherFor(job: MediaGrabber.DownloadJob): Fetcher =
+        if (job.server.isNotBlank()) PinnedFetcher(TunnelHttp(job.server)) else ProxyFetcher
+
+    /** YouTube ответил 403 или закреплённый сервер упал: новые адреса для тех же itag через другой сервер. */
+    private fun refreshYouTube(job: MediaGrabber.DownloadJob, why: String): Fetcher? {
+        if (job.ytId.isBlank() || job.itags.size != job.urls.size) return null
+        VpnLog.w(MediaGrabber.TAG, "YouTube: $why — запрашиваю свежие адреса через другой сервер")
+        val r = MediaGrabber.ytRefresh(job.ytId, job.itags) ?: return null
+        for (i in r.first.indices) job.urls[i] = r.first[i]
+        job.server = r.second
+        VpnLog.i(MediaGrabber.TAG, "YouTube: адреса обновлены, сервер ${r.second}")
+        return PinnedFetcher(TunnelHttp(r.second))
+    }
+
     /**
-     * Качает URL в поток кусками по 8 МБ (Range) с докачкой при обрыве. Возвращает число байт.
+     * Качает ссылку №[index] задания в поток кусками по 8 МБ (Range) с докачкой при обрыве. Возвращает число байт.
      * @param parts число частей задания (для процента), [already] — байты, скачанные предыдущими частями
      */
-    private fun downloadUrl(job: MediaGrabber.DownloadJob, url: String, out: OutputStream, expectedTotal: Long, already: Long, parts: Int): Long {
+    private fun downloadUrl(job: MediaGrabber.DownloadJob, index: Int, out: OutputStream, expectedTotal: Long, already: Long, parts: Int): Long {
+        var fetcher = fetcherFor(job)
         var pos = 0L
         var total = -1L
         var attempts = 0
+        var refreshes = 0
         var rangesOk = true
         val buf = ByteArray(128 * 1024)
         var lastTick = System.currentTimeMillis()
         var tickBytes = 0L
         var speed = 0L
-        val isGoogle = url.contains("googlevideo.com")
         while (true) {
             checkCancel()
+            val url = job.urls[index]
+            val isGoogle = url.contains("googlevideo.com")
             val end = if (rangesOk) pos + CHUNK - 1 else -1L
-            val c = MediaGrabber.open(url, job.headers)
-            if (rangesOk) c.setRequestProperty("Range", if (end >= 0) "bytes=$pos-$end" else "bytes=$pos-")
+            var resp: Resp? = null
             try {
-                val code = try { c.responseCode } catch (e: IOException) { throw e }
+                resp = fetcher.get(url, job.headers, if (rangesOk) (if (end >= 0) "bytes=$pos-$end" else "bytes=$pos-") else null)
+                val code = resp.code
                 when {
                     code == 206 -> {
-                        val cr = c.getHeaderField("Content-Range") ?: ""
-                        if (total < 0) total = cr.substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
+                        if (total < 0) total = (resp.contentRange ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
                     }
                     code == 200 -> {
                         if (pos > 0) throw IOException("сервер не поддерживает докачку")
                         rangesOk = false
-                        if (total < 0) total = c.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+                        if (total < 0) total = resp.contentLength
                     }
                     code == 416 -> break
-                    code == 403 && isGoogle -> throw IOException("YouTube отклонил ссылку (403) — откройте видео заново и повторите")
+                    (code == 403 || code == 410) && isGoogle -> {
+                        if (refreshes < 3) {
+                            refreshes++
+                            resp.closer(); resp = null
+                            val nf = refreshYouTube(job, "HTTP $code на ${MediaGrabber.fmtSize(pos).ifBlank { "0" }}")
+                            if (nf != null) { fetcher = nf; attempts = 0; continue }
+                        }
+                        throw IOException("YouTube отклонил ссылку (HTTP $code) даже после обновления адресов")
+                    }
                     else -> throw IOException("HTTP $code")
                 }
                 val shown = if (expectedTotal > 0) expectedTotal else if (total > 0) total * parts else 0L
-                val ins: InputStream = c.inputStream
+                val ins: InputStream = resp.body
                 var got = 0L
                 while (true) {
                     val n = ins.read(buf)
@@ -337,7 +389,7 @@ class MediaDownloadService : Service() {
                     if (now - lastTick >= 1000) {
                         speed = tickBytes * 1000 / (now - lastTick)
                         tickBytes = 0; lastTick = now
-                        progress(job, already + pos, shown, speed, if (parts > 1) "часть ${if (already > 0) 2 else 1} из $parts" else "")
+                        progress(job, already + pos, shown, speed, if (parts > 1) "часть ${index + 1} из $parts" else "")
                     }
                     if (cancelCurrent.get()) throw CancelledException()
                 }
@@ -345,21 +397,27 @@ class MediaDownloadService : Service() {
                 if (!rangesOk) break
                 if (total in 1..pos) break
                 if (got == 0L) break
-                if (end >= 0 && got < (end - (pos - got) + 1) && total < 0) break
+                if (total < 0 && got < CHUNK) break
             } catch (e: CancelledException) {
                 throw e
             } catch (e: IOException) {
                 attempts++
                 if (attempts > 5 || !rangesOk) throw e
-                VpnLog.w(MediaGrabber.TAG, "обрыв на ${MediaGrabber.fmtSize(pos)} (${e.message}) — повтор $attempts/5")
+                VpnLog.w(MediaGrabber.TAG, "обрыв на ${MediaGrabber.fmtSize(pos).ifBlank { "0" }} (${e.message}) — повтор $attempts/5")
+                // закреплённый сервер мог упасть — для YouTube переезжаем на другой вместе с новыми адресами
+                if (job.server.isNotBlank() && attempts >= 2 && refreshes < 3) {
+                    refreshes++
+                    refreshYouTube(job, e.message ?: "обрыв")?.let { fetcher = it }
+                }
                 Thread.sleep(1500L * attempts)
             } finally {
-                try { c.disconnect() } catch (_: Exception) {}
+                try { resp?.closer?.invoke() } catch (_: Exception) {}
             }
         }
         out.flush()
         return pos
     }
+
 
     // ------------------------------------------------------------------ HLS
 

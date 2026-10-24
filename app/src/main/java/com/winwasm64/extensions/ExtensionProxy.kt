@@ -1816,6 +1816,26 @@ function alert(){}
         return null
     }
 
+    /**
+     * v4.3.1: туннель к [host]:[port] через КОНКРЕТНЫЙ сервер Browsec [serverKey] (host:port).
+     * Нужен загрузчику видео: адреса googlevideo привязаны к IP, с которого получен ответ плеера, — все соединения
+     * одной загрузки должны идти через один и тот же сервер. Возвращает null, если сервер неизвестен/не ответил.
+     */
+    fun openPinnedTunnel(host: String, port: Int, serverKey: String): Pair<Socket, InputStream>? {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val up = tunnelServers.firstOrNull { it.key == serverKey } ?: return null
+        val t0 = SystemClock.elapsedRealtime()
+        return try {
+            val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 12_000)
+            noteConnectMs(up.key, SystemClock.elapsedRealtime() - t0)
+            tunnelLastOk[up.key] = SystemClock.elapsedRealtime()
+            r
+        } catch (e: Exception) {
+            handleAppTunnelError(up, e, host, port, destKey(host))
+            null
+        }
+    }
+
     private fun handleAppTunnelError(up: Upstream, e: Exception, host: String, port: Int, dest: String) {
         val t = SystemClock.elapsedRealtime()
         if (e is ProxyRefusedException) {
