@@ -946,7 +946,8 @@ function alert(){}
                 val url = (if (hp.second == 80) "http://" else "https://") + hp.first + "/"
                 val route = pacLookup(url, hp.first) ?: listOf(DIRECT)
                 // v4.1.1: ступенчатая гонка вместо последовательного перебора — ответ на CONNECT всегда укладывается в ~8 с
-                val up = raceConnect(route, hp.first, hp.second, url)
+                // v4.3.8: закреплённый за хостом сервер (загрузка видео, привязанного к IP) имеет приоритет
+                val up = pinnedConnect(hp.first, hp.second) ?: raceConnect(route, hp.first, hp.second, url)
                 if (up == null) {
                     com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
                     respond(client, 502, "Proxy Error")
@@ -1830,6 +1831,29 @@ function alert(){}
      * Нужен загрузчику видео: адреса googlevideo привязаны к IP, с которого получен ответ плеера, — все соединения
      * одной загрузки должны идти через один и тот же сервер. Возвращает null, если сервер неизвестен/не ответил.
      */
+    /** v4.3.8: хост → (сервер Browsec, срок): соединения браузера к этому хосту идут строго через указанный сервер. */
+    private val hostPins = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+    private val hostPinFailLoggedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun pinHost(host: String, serverKey: String, ttlMs: Long) {
+        hostPins[host.lowercase()] = Pair(serverKey, SystemClock.elapsedRealtime() + ttlMs)
+    }
+
+    fun unpinHost(host: String) { hostPins.remove(host.lowercase()) }
+
+    private fun pinnedConnect(host: String, port: Int): Pair<Socket, InputStream>? {
+        val pin = hostPins[host.lowercase()] ?: return null
+        val now = SystemClock.elapsedRealtime()
+        if (pin.second < now) { hostPins.remove(host.lowercase()); return null }
+        if ((tunnelDownUntil[pin.first] ?: 0L) > now) return null
+        val r = openPinnedTunnel(host, port, pin.first)
+        if (r == null && now - (hostPinFailLoggedAt[host] ?: 0L) > 30_000L) {
+            hostPinFailLoggedAt[host] = now
+            com.winwasm64.vpn.VpnLog.w("Браузер", "закреплённый сервер ${pin.first.substringBefore('.')} не открыл $host — обычный маршрут")
+        }
+        return r
+    }
+
     fun openPinnedTunnel(host: String, port: Int, serverKey: String): Pair<Socket, InputStream>? {
         if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
         val up = tunnelServers.firstOrNull { it.key == serverKey } ?: return null

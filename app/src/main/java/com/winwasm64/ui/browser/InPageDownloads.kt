@@ -98,6 +98,27 @@ object InPageDownloads {
         return w.text
     }
 
+    /** v4.3.8: InnerTube /player из страницы (см. `__omniInnerTube` в MediaGrabber.SNIFF_SCRIPT). */
+    fun innerTube(tabId: String, videoId: String, clientJson: String, clientId: Int, sts: Int, timeoutMs: Long): String? {
+        val wv = webViews[tabId]?.get() ?: return null
+        val id = UUID.randomUUID().toString()
+        val w = TextWait()
+        texts[id] = w
+        main.post {
+            try {
+                wv.evaluateJavascript("(function(){ try { if (!window.__omniInnerTube) return 'no'; window.__omniInnerTube(" + org.json.JSONObject.quote(id) + "," +
+                    org.json.JSONObject.quote(videoId) + "," + clientJson + "," + clientId + "," + sts + "); return 'ok'; } catch (e) { return 'err:' + e; } })()") { r ->
+                    if (r == null || !r.contains("ok")) { w.error = "страница не приняла запрос (${r ?: "null"})"; w.latch.countDown() }
+                }
+            } catch (e: Exception) { w.error = e.toString(); w.latch.countDown() }
+        }
+        val ok = w.latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        texts.remove(id)
+        if (!ok) { VpnLog.w(TAG, "InnerTube из страницы: нет ответа за ${timeoutMs / 1000} с"); return null }
+        if (w.text == null) VpnLog.w(TAG, "InnerTube из страницы: ${w.error}")
+        return w.text
+    }
+
     fun onText(id: String, text: String, error: String) {
         val w = texts[id] ?: return
         if (error.isBlank() && text.isNotEmpty()) w.text = text else w.error = error.ifBlank { "пусто" }
@@ -110,12 +131,12 @@ object InPageDownloads {
      * Запускает загрузку [url] страницей вкладки [tabId]; байты пишутся в [out]. Возвращает null, если вкладки уже нет.
      * @param total ожидаемый размер (0 — неизвестен)
      */
-    fun start(tabId: String, url: String, total: Long, out: OutputStream, onProgress: (Long) -> Unit): Transfer? {
+    fun start(tabId: String, url: String, total: Long, out: OutputStream, startPos: Long = 0L, onProgress: (Long) -> Unit): Transfer? {
         val wv = webViews[tabId]?.get() ?: return null
         val t = Transfer(UUID.randomUUID().toString(), tabId, out, onProgress)
         transfers[t.id] = t
         val js = "(function(){ try { if (!window.__omniDl) return 'no'; window.__omniDl(" +
-            org.json.JSONObject.quote(t.id) + "," + org.json.JSONObject.quote(url) + "," + total + "); return 'ok'; } catch (e) { return 'err:' + e; } })()"
+            org.json.JSONObject.quote(t.id) + "," + org.json.JSONObject.quote(url) + "," + total + "," + startPos + "); return 'ok'; } catch (e) { return 'err:' + e; } })()"
         main.post {
             try {
                 wv.evaluateJavascript(js) { r ->

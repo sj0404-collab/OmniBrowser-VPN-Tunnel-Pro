@@ -282,10 +282,10 @@ object MediaGrabber {
   // v4.3.6: загрузка файла самой страницей (тот же fetch, что у плеера) → байты в сервис через OmniMedia.dlChunk
   var dlActive = {};
   window.__omniDlCancel = function(id){ dlActive[id] = false; };
-  window.__omniDl = function(id, url, total){
+  window.__omniDl = function(id, url, total, start){
     dlActive[id] = true;
     var CH = 1048576;
-    var pos = 0;
+    var pos = start || 0;
     var toB64 = function(buf){
       var u8 = new Uint8Array(buf); var s = ''; var step = 0x8000;
       for (var i = 0; i < u8.length; i += step) s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
@@ -313,6 +313,40 @@ object MediaGrabber {
       }).catch(function(e){ fail(e && e.message ? e.message : e); });
     };
     step();
+  };
+  // v4.3.8: запрос к InnerTube из самой страницы (её куки, visitorData и IP) клиентами без PO-token (TVHTML5, WEB_EMBEDDED_PLAYER)
+  window.__omniInnerTube = function(id, videoId, client, cn, sts){
+    var done = function(t, e){ try { OmniMedia.textResult(id, t || '', e || ''); } catch (x) {} };
+    try {
+      var base = null;
+      try { base = JSON.parse(JSON.stringify(window.ytcfg.get('INNERTUBE_CONTEXT'))); } catch (e) {}
+      var ctx = base || {};
+      var c = ctx.client || {};
+      var nc = {};
+      ['hl', 'gl', 'visitorData', 'timeZone', 'utcOffsetMinutes', 'remoteHost'].forEach(function(k){ if (c[k] !== undefined) nc[k] = c[k]; });
+      for (var k2 in client) nc[k2] = client[k2];
+      ctx.client = nc;
+      delete ctx.clickTracking; delete ctx.adSignalsInfo; delete ctx.clientScreenNonce;
+      if (client.clientName === 'WEB_EMBEDDED_PLAYER') ctx.thirdParty = { embedUrl: 'https://www.youtube.com/' };
+      var body = { context: ctx, videoId: videoId, contentCheckOk: true, racyCheckOk: true };
+      if (sts) body.playbackContext = { contentPlaybackContext: { html5Preference: 'HTML5_PREF_WANTS', signatureTimestamp: sts } };
+      var headers = { 'Content-Type': 'application/json', 'X-Youtube-Client-Name': String(cn), 'X-Youtube-Client-Version': client.clientVersion, 'X-Origin': location.origin, 'X-Goog-AuthUser': '0' };
+      if (nc.visitorData) headers['X-Goog-Visitor-Id'] = nc.visitorData;
+      var m = document.cookie.match(/(?:^|;\s*)(?:__Secure-3PAPISID|SAPISID)=([^;]+)/);
+      var send = function(){
+        fetch(location.origin + '/youtubei/v1/player?prettyPrint=false', { method: 'POST', credentials: 'include', headers: headers, body: JSON.stringify(body) })
+          .then(function(r){ return r.text().then(function(t){ if (!r.ok) throw 'HTTP ' + r.status + ' ' + t.slice(0, 160); return t; }); })
+          .then(function(t){ done(t, ''); }).catch(function(e){ done('', String(e)); });
+      };
+      if (m && window.crypto && crypto.subtle && window.TextEncoder) {
+        var ts = Math.floor(Date.now() / 1000);
+        crypto.subtle.digest('SHA-1', new TextEncoder().encode(ts + ' ' + m[1] + ' ' + location.origin)).then(function(buf){
+          var h = Array.prototype.map.call(new Uint8Array(buf), function(b){ return ('0' + b.toString(16)).slice(-2); }).join('');
+          headers['Authorization'] = 'SAPISIDHASH ' + ts + '_' + h;
+          send();
+        }).catch(send);
+      } else send();
+    } catch (e) { done('', String(e)); }
   };
   window.__omniFetchText = function(id, url){
     fetch(url, { credentials: 'omit' }).then(function(r){ if (!r.ok) throw 'HTTP ' + r.status; return r.text(); })
@@ -346,8 +380,10 @@ object MediaGrabber {
         if (!vid) { var m = location.pathname.match(/\/(shorts|embed|live|v)\/([A-Za-z0-9_-]{6,})/); if (m) vid = m[2]; }
         if (!vid && hn === 'youtu.be') { var m2 = location.pathname.match(/^\/([A-Za-z0-9_-]{6,})/); if (m2) vid = m2[1]; }
         var fm = [];
+        var noUrl = 0;
         var push = function(muxed){ return function(f){
           try {
+            if (!f.url && !f.signatureCipher && !f.cipher) noUrl++;
             fm.push({ itag: f.itag || 0, url: f.url || '', cipher: !!(f.signatureCipher || f.cipher), sc: f.signatureCipher || f.cipher || '', mime: f.mimeType || '', q: f.qualityLabel || f.quality || '', br: f.bitrate || 0, size: parseInt(f.contentLength || '0', 10) || 0, fps: f.fps || 0, h: f.height || 0, w: f.width || 0, muxed: muxed, lang: (f.audioTrack && f.audioTrack.displayName) || '', dflt: !!(f.audioTrack && f.audioTrack.audioIsDefault) });
           } catch (e) {}
         }; };
@@ -362,6 +398,7 @@ object MediaGrabber {
           dur: parseInt((pr && pr.videoDetails && pr.videoDetails.lengthSeconds) || '0', 10) || 0,
           live: !!(pr && pr.videoDetails && pr.videoDetails.isLive),
           formats: fm,
+          noUrl: noUrl,
           hls: (pr && pr.streamingData && pr.streamingData.hlsManifestUrl) || '',
           playerJs: (function(){
             try {
@@ -658,7 +695,9 @@ object MediaGrabber {
         val itag: Int, val url: String, val mime: String, val q: String, val br: Int, val size: Long,
         val fps: Int, val h: Int, val muxed: Boolean, val lang: String, val dflt: Boolean,
         /** signatureCipher: задача подписи `s` и имя параметра `sp`; needsSolve — адрес из ответа плеера (n ещё не решён). */
-        val sig: String = "", val sp: String = "", val needsSolve: Boolean = false
+        val sig: String = "", val sp: String = "", val needsSolve: Boolean = false,
+        /** Откуда адрес: "" — ответ плеера страницы (нужен PO-token), иначе имя клиента InnerTube (TVHTML5 и т.п. — без токена). */
+        val client: String = ""
     ) {
         val isVideo get() = mime.startsWith("video/")
         val isAudio get() = mime.startsWith("audio/")
@@ -666,7 +705,7 @@ object MediaGrabber {
         val codec get() = mime.substringAfter("codecs=\"", "").substringBefore('"')
     }
 
-    private fun YtFormat.copyUrl(u: String, solved: Boolean = false) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt, sig, sp, needsSolve && !solved)
+    private fun YtFormat.copyUrl(u: String, solved: Boolean = false) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt, sig, sp, needsSolve && !solved, client)
 
     /** PO-token и уже расшифрованный параметр n из любого запроса плеера к googlevideo (одинаковы для всех форматов ролика). */
     private fun sniffedPotAndN(root: JSONObject, sniffed: JSONArray): Pair<String, String?>? {
@@ -685,6 +724,88 @@ object MediaGrabber {
             if (best.second != null) break
         }
         return best
+    }
+
+    /** v4.3.8: хосты googlevideo из адресов закрепляются в прокси браузера за сервером с тем же IP — и страница, и загрузка идут через него. */
+    fun pinHosts(urls: List<String>, server: String, ttlMs: Long = 40 * 60_000L) {
+        if (server.isBlank()) return
+        val hosts = LinkedHashSet<String>()
+        for (u in urls) try { Uri.parse(u).host?.let { if (it.endsWith("googlevideo.com")) hosts.add(it) } } catch (_: Exception) {}
+        if (hosts.isEmpty()) return
+        for (h in hosts) com.winwasm64.extensions.ExtensionProxy.pinHost(h, server, ttlMs)
+        VpnLog.i(TAG, "хосты видео (${hosts.size}) закреплены в прокси браузера за ${server.substringBefore('.')} на ${ttlMs / 60_000} мин")
+    }
+
+    /**
+     * v4.3.8: InnerTube /player из самой страницы клиентами без PO-token. Ответ приходит через `OmniMedia.textResult`.
+     * Возвращает форматы (n/подпись ещё не решены — needsSolve), помеченные именем клиента.
+     */
+    private fun innerTubeFromPage(tabId: String, videoId: String, playerJs: String): List<YtFormat> {
+        data class Client(val name: String, val version: String, val id: Int, val extra: JSONObject)
+        val clients = listOf(
+            Client("TVHTML5", "5.20260707", 7, JSONObject().put("deviceMake", "Samsung").put("deviceModel", "UKS9800").put("osName", "Tizen").put("osVersion", "2.4.0")
+                .put("userAgent", "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1")),
+            Client("WEB_EMBEDDED_PLAYER", "2.20260708.00.00", 56, JSONObject())
+        )
+        var sts = 0
+        try {
+            val ctx = InPageDownloads.appContext
+            if (ctx != null && playerJs.isNotBlank()) {
+                val src = fetchPlayerSource(tabId, playerJs, ctx)
+                if (src != null) sts = Regex("signatureTimestamp[:=](\\d+)").find(src)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            }
+        } catch (_: Exception) {}
+        for (cl in clients) {
+            try {
+                val clientObj = JSONObject().put("clientName", cl.name).put("clientVersion", cl.version)
+                for (k in cl.extra.keys()) clientObj.put(k, cl.extra.get(k))
+                val resp = InPageDownloads.innerTube(tabId, videoId, clientObj.toString(), cl.id, sts, 20_000L)
+                if (resp == null) { VpnLog.w(TAG, "InnerTube из страницы ${cl.name}: нет ответа"); continue }
+                val o = JSONObject(resp)
+                val ps = o.optJSONObject("playabilityStatus")
+                val status = ps?.optString("status") ?: ""
+                val sd = o.optJSONObject("streamingData")
+                if (sd == null || status != "OK") {
+                    VpnLog.w(TAG, "InnerTube из страницы ${cl.name}: ${status.ifBlank { "нет streamingData" }} ${ps?.optString("reason") ?: ""}".trim())
+                    continue
+                }
+                val list = ArrayList<YtFormat>()
+                fun take(arr: JSONArray?, muxed: Boolean) {
+                    if (arr == null) return
+                    for (i in 0 until arr.length()) {
+                        val f = arr.optJSONObject(i) ?: continue
+                        var url = f.optString("url")
+                        var sig = ""
+                        var sp = ""
+                        val sc = f.optString("signatureCipher").ifBlank { f.optString("cipher") }
+                        if (url.isBlank() && sc.isNotBlank()) {
+                            val q = Uri.parse("https://x/?$sc")
+                            url = q.getQueryParameter("url") ?: ""
+                            sig = q.getQueryParameter("s") ?: ""
+                            sp = q.getQueryParameter("sp") ?: "signature"
+                        }
+                        if (url.isBlank()) continue
+                        val at = f.optJSONObject("audioTrack")
+                        list.add(
+                            YtFormat(
+                                f.optInt("itag"), url, f.optString("mimeType"), f.optString("qualityLabel", f.optString("quality")),
+                                f.optInt("bitrate"), f.optString("contentLength", "0").toLongOrNull() ?: 0L, f.optInt("fps"), f.optInt("height"),
+                                muxed, at?.optString("displayName") ?: "", at?.optBoolean("audioIsDefault") ?: true,
+                                sig, sp, true, cl.name
+                            )
+                        )
+                    }
+                }
+                take(sd.optJSONArray("formats"), true)
+                take(sd.optJSONArray("adaptiveFormats"), false)
+                val ciphered = list.count { it.sig.isNotBlank() }
+                VpnLog.i(TAG, "InnerTube из страницы ${cl.name}: форматов ${list.size}" + (if (ciphered > 0) " ($ciphered с подписью)" else "") + (if (sts > 0) ", sts=$sts" else ", sts не найден"))
+                if (list.isNotEmpty()) return list
+            } catch (e: Exception) {
+                VpnLog.w(TAG, "InnerTube из страницы ${cl.name}: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
+        return emptyList()
     }
 
     private val solvedCache = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -977,28 +1098,42 @@ object MediaGrabber {
         val potN = sniffedPotAndN(root, sniffed)
         // v4.3.7: адреса из ответа плеера — «задачи» n (и подпись s), которые решает JS плеера; решаем их тем же кодом
         // (решатель yt-dlp/ejs в скрытом WebView). Скопированный из SABR-запроса n был решением ДРУГОЙ задачи → 403 (журнал 19:09).
+        val playerJs = yt.optString("playerJs")
+        val noUrl = yt.optInt("noUrl")
+        if (noUrl > 0) VpnLog.i(TAG, "YouTube: в ответе плеера страницы ${formats.size} форматов с адресом, $noUrl — только SABR (без адреса)")
+        // v4.3.8: если у плеера страницы нет раздельных дорожек с адресами (при входе в аккаунт web отдаёт только SABR + itag 18),
+        // спрашиваем InnerTube из самой страницы (её куки, visitorData, IP) клиентами TVHTML5 / WEB_EMBEDDED_PLAYER — им PO-token не нужен
+        if (videoId.isNotBlank() && tabId.isNotBlank() && !yt.optBoolean("live") && formats.none { !it.muxed && it.needsSolve }) {
+            val extra = innerTubeFromPage(tabId, videoId, playerJs)
+            if (extra.isNotEmpty()) {
+                val have = formats.map { it.itag }.toHashSet()
+                for (f in extra) if (have.add(f.itag)) formats.add(f)
+            }
+        }
         if (formats.isNotEmpty()) {
             webMode = true
-            val playerJs = yt.optString("playerJs")
             val solvedAll = try { solveFormats(tabId, playerJs, formats) } catch (e: Exception) {
                 VpnLog.w(TAG, "решатель n: ${e.message ?: e.javaClass.simpleName}"); false
             }
             val pot = potN?.first
+            val pageCount = formats.count { it.client.isBlank() }
             if (pot != null) {
-                for (i in formats.indices) formats[i] = formats[i].copyUrl(patchYtUrl(formats[i].url, pot, null))
-                VpnLog.i(TAG, "YouTube: адреса плеера страницы + решённый n + PO-token из запроса плеера (${formats.size} форматов)")
+                for (i in formats.indices) if (formats[i].client.isBlank()) formats[i] = formats[i].copyUrl(patchYtUrl(formats[i].url, pot, null))
+                VpnLog.i(TAG, "YouTube: адреса плеера страницы + решённый n + PO-token из запроса плеера ($pageCount форматов)" +
+                    (if (formats.size > pageCount) " + InnerTube из страницы (${formats.size - pageCount})" else ""))
             } else {
-                // itag 18 (360p, видео+звук) — единственный формат, который googlevideo отдаёт без PO-token
-                val keep = formats.filter { it.itag == 18 }
+                // itag 18 (360p, видео+звук) — единственный формат страницы, который googlevideo отдаёт без PO-token
+                val keep = formats.filter { it.itag == 18 || it.client.isNotBlank() }
                 formats.clear(); formats.addAll(keep)
-                lastNotice = "PO-token плеера ещё не перехвачен — пока доступно только 360p (itag 18, без токена). Запустите видео, подождите 15–20 секунд и откройте шторку снова для остальных качеств."
-                VpnLog.w(TAG, "YouTube: PO-token не перехвачен — только itag 18 (не требует токена)" + (if (keep.isEmpty()) ", но его нет в списке плеера" else ""))
+                if (keep.none { it.client.isNotBlank() }) lastNotice = "PO-token плеера ещё не перехвачен — пока доступно только 360p (itag 18, без токена). Запустите видео, подождите 15–20 секунд и откройте шторку снова для остальных качеств."
+                VpnLog.w(TAG, "YouTube: PO-token не перехвачен — от страницы только itag 18" + (if (keep.any { it.client.isNotBlank() }) ", остальные качества — от InnerTube из страницы" else ""))
             }
             if (!solvedAll) lastNotice = (lastNotice + " Не удалось решить параметр n кодом плеера — возможен 403.").trim()
             if (formats.isNotEmpty()) {
                 val boundIp = try { Uri.parse(formats[0].url).getQueryParameter("ip") ?: "" } catch (_: Exception) { "" }
                 server = findServerForIp(boundIp) ?: ""
                 if (server.isBlank()) lastNotice = (lastNotice + " Ссылки плеера привязаны к IP $boundIp, подходящий сервер Browsec не найден — загрузка пойдёт через прокси браузера.").trim()
+                else pinHosts(formats.map { it.url }, server)
             }
         }
         if (formats.isEmpty() && videoId.isNotBlank() && !yt.optBoolean("live")) {
