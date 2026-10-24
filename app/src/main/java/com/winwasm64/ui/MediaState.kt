@@ -387,6 +387,12 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
         }
     }
 
+    /** v4.3.0: страница сообщила, что на ней есть видео/аудио (элемент или медиа-запрос) — показать кнопку «Скачать». */
+    @JavascriptInterface
+    fun hasMedia(present: Boolean) {
+        Handler(Looper.getMainLooper()).post { tab.hasMedia = present }
+    }
+
     @JavascriptInterface
     fun state(playing: Boolean) {
         val was = tab.mediaPlaying

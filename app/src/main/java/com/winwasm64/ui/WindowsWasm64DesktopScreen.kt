@@ -157,9 +157,16 @@ class BrowserTabModel(
     var canGoForward by mutableStateOf(false)
     var autoRetryCount by mutableIntStateOf(0)
     var proxyRepairCount by mutableIntStateOf(0)
+    /** v4.3.0: на странице замечено видео/аудио — показываем плавающую кнопку «Скачать». */
+    var hasMedia by mutableStateOf(false)
     @Volatile var mediaPlaying: Boolean = false // v4.2.0: во вкладке играет видео/аудио
     var webView: WebView? = null
     val numericId: Int = BrowserSessionVault.nextNumericId()
+}
+
+/** v4.3.0: состояние шторки «Скачать видео»: null в options — ещё ищем. */
+class MediaGrabState(val title: String) {
+    var options by mutableStateOf<List<MediaGrabber.Option>?>(null)
 }
 
 /**
@@ -403,6 +410,28 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var longPressImageUrl by remember { mutableStateOf<String?>(null) }
     var fileChooserCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     val blobBridge = remember { BlobDownloadBridge(context.applicationContext) }
+
+    // v4.3.0: плавающая кнопка «Скачать видео» → шторка с вариантами качества / только аудио
+    var grabSheet by remember { mutableStateOf<MediaGrabState?>(null) }
+    fun openMediaGrabber(tab: BrowserTabModel) {
+        val wv = tab.webView ?: return
+        val state = MediaGrabState(tab.title)
+        grabSheet = state
+        val pageUrl = wv.url ?: tab.url
+        val ua = try { wv.settings.userAgentString } catch (_: Exception) { null }
+        val cookie = if (tab.isIncognito) null else try { CookieManager.getInstance().getCookie(pageUrl) } catch (_: Exception) { null }
+        wv.evaluateJavascript("(function(){ try { return window.__omniListMedia ? window.__omniListMedia() : '{}'; } catch (e) { return '{}'; } })()") { raw ->
+            val json = try { (org.json.JSONTokener(raw ?: "\"{}\"").nextValue() as? String) ?: "{}" } catch (_: Exception) { "{}" }
+            thread(name = "omni-grab") {
+                val opts = try { MediaGrabber.buildOptions(json, pageUrl, ua, cookie) } catch (e: Exception) {
+                    com.winwasm64.vpn.VpnLog.w(MediaGrabber.TAG, "поиск источников: ${e.message ?: e.javaClass.simpleName}")
+                    emptyList()
+                }
+                com.winwasm64.vpn.VpnLog.i(MediaGrabber.TAG, "«${state.title.take(40)}»: найдено вариантов — ${opts.size}")
+                Handler(Looper.getMainLooper()).post { state.options = opts }
+            }
+        }
+    }
 
     val tabs = remember {
         if (!BrowserSessionVault.initialized || BrowserSessionVault.tabs.isEmpty()) {
@@ -716,6 +745,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
         // v4.2.1: учёт воспроизведения — и там, где WebView не поддерживает скрипты «до загрузки» (старые версии)
         try { wv.evaluateJavascript(MediaState.DOCUMENT_START_SCRIPT, null) } catch (_: Exception) {}
+        try { wv.evaluateJavascript(MediaGrabber.SNIFF_SCRIPT, null) } catch (_: Exception) {}
     }
 
     fun uaFor(url: String?): String? = if (desktopMode || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
@@ -1170,6 +1200,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         tab.isLoading = true
                         tab.loadingProgress = 15
                         tab.lastErrorText = null
+                        tab.hasMedia = false
                         val host = Uri.parse(url).host ?: url
                         tab.loadingStatusText = "⏳ Загрузка страницы $host..."
                         if (!tab.isIncognito) ExtensionRuntime.onTabUpdated(extTabOf(tab), "loading", true, false)
@@ -1303,6 +1334,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             wv.addJavascriptInterface(OmniMediaBridge(tab), "OmniMedia")
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 WebViewCompat.addDocumentStartJavaScript(wv, MediaState.DOCUMENT_START_SCRIPT, setOf("*"))
+                WebViewCompat.addDocumentStartJavaScript(wv, MediaGrabber.SNIFF_SCRIPT, setOf("*"))
             }
         } catch (_: Exception) {
         }
@@ -1655,6 +1687,52 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 }
                             }
                         )
+                    }
+                }
+
+                // v4.3.0: шторка «Скачать видео»
+                val gs = grabSheet
+                if (gs != null) {
+                    OmniSheet(onDismiss = { grabSheet = null }) {
+                        SheetTitle("Скачать видео или аудио", gs.title)
+                        val opts = gs.options
+                        when {
+                            opts == null -> Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp, color = Omni.Accent)
+                                Spacer(Modifier.width(14.dp))
+                                Text("Ищу источники на странице…", color = Omni.TextDim, fontSize = 14.sp)
+                            }
+                            opts.isEmpty() -> Text(
+                                "Не удалось найти прямые ссылки на видео. Запустите воспроизведение на странице и попробуйте ещё раз — " +
+                                    "адреса медиа появляются, когда плеер начинает их запрашивать. DRM-потоки (Netflix и т.п.) скачать нельзя.",
+                                color = Omni.TextDim, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
+                            )
+                            else -> {
+                                val videos = opts.filter { !it.isAudio }
+                                val audios = opts.filter { it.isAudio }
+                                if (videos.isNotEmpty()) SheetSectionLabel("Видео")
+                                for (o in videos) {
+                                    SheetItem(OmniIcons.Download, o.title, o.subtitle, tint = Omni.Accent) {
+                                        MediaDownloadService.start(context, o.job)
+                                        grabSheet = null
+                                        Toast.makeText(context, "⬇ ${o.job.fileName}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                                if (audios.isNotEmpty()) SheetSectionLabel("Только звук")
+                                for (o in audios) {
+                                    SheetItem(OmniIcons.Play, o.title, o.subtitle, tint = Omni.Success) {
+                                        MediaDownloadService.start(context, o.job)
+                                        grabSheet = null
+                                        Toast.makeText(context, "⬇ ${o.job.fileName}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                                SheetDivider()
+                                Text(
+                                    "Файлы сохраняются в Movies/OmniBrowser и Music/OmniBrowser, прогресс — в уведомлении.",
+                                    color = Omni.TextFaint, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -2485,6 +2563,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+                // v4.3.0: плавающая кнопка «Скачать видео» (появляется, когда страница запросила медиа)
+                val grabTab = tabs.getOrNull(activeTabIndex)
+                if (!inPip && grabTab != null && grabTab.hasMedia && currentSection == 0) {
+                    SmallFloatingActionButton(
+                        onClick = { openMediaGrabber(grabTab) },
+                        containerColor = Omni.Accent,
+                        contentColor = Color.White,
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 22.dp)
+                    ) {
+                        Icon(OmniIcons.Download, contentDescription = "Скачать видео", modifier = Modifier.size(22.dp))
+                    }
+                }
             }
 
             // ===================== SECTION 1: TORRENT CLIENT + BROWSEC VPN + MEMORY ACCESS =====================
