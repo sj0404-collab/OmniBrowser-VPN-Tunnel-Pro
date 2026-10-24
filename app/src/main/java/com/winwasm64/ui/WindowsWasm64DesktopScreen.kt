@@ -609,7 +609,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         if (trimmed.startsWith("magnet:", ignoreCase = true)) return trimmed
         if (trimmed.startsWith("http://", ignoreCase = true) ||
             trimmed.startsWith("https://", ignoreCase = true) ||
-            trimmed.startsWith("javascript:", ignoreCase = true)
+            trimmed.startsWith("javascript:", ignoreCase = true) ||
+            trimmed.startsWith("data:", ignoreCase = true) ||
+            trimmed.startsWith("about:", ignoreCase = true)
         ) return trimmed
         return if (trimmed.contains(".") && !trimmed.contains(" ")) {
             "https://$trimmed"
