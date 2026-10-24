@@ -33,7 +33,59 @@ object MediaGrabber {
     val SNIFF_SCRIPT: String = """
 (function(){
   if (window.__omniGrab) return;
-  var G = window.__omniGrab = { urls: {}, order: [], reported: false, seenEl: false, frames: {} };
+  var G = window.__omniGrab = { urls: {}, order: [], reported: false, seenEl: false, frames: {}, pot: '', n: '' };
+  var b64url = function(arr){
+    var s = '';
+    for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_');
+  };
+  var pbFields = function(b){
+    var out = []; var i = 0;
+    var vi = function(){ var r = 0, sh = 0, x; do { x = b[i++]; r += (x & 127) * Math.pow(2, sh); sh += 7; } while (x & 128 && i < b.length); return r; };
+    while (i < b.length) {
+      var tag = vi(); var fn = Math.floor(tag / 8), wt = tag & 7;
+      if (wt === 0) vi();
+      else if (wt === 1) i += 8;
+      else if (wt === 2) { var len = vi(); if (len < 0 || i + len > b.length) break; out.push({ f: fn, v: b.subarray(i, i + len) }); i += len; }
+      else if (wt === 5) i += 4;
+      else break;
+    }
+    return out;
+  };
+  var findPot = function(b){
+    try {
+      var top = pbFields(b);
+      for (var i = 0; i < top.length; i++) {
+        if (top[i].f !== 19) continue;
+        var sc = pbFields(top[i].v);
+        for (var j = 0; j < sc.length; j++) if (sc[j].f === 2 && sc[j].v.length >= 40) return b64url(sc[j].v);
+      }
+      for (var k = 0; k < top.length; k++) {
+        if (top[k].v.length < 60) continue;
+        var nn = pbFields(top[k].v);
+        for (var m = 0; m < nn.length; m++) if (nn[m].f === 2 && nn[m].v.length >= 60 && nn[m].v.length <= 400) return b64url(nn[m].v);
+      }
+    } catch (e) {}
+    return '';
+  };
+  var noteBody = function(u, body){
+    try {
+      if (G.pot || !u || !body) return;
+      u = String(u);
+      if (u.indexOf('/videoplayback') < 0) return;
+      var arr = null;
+      if (body instanceof ArrayBuffer) arr = new Uint8Array(body);
+      else if (body && body.buffer instanceof ArrayBuffer) arr = new Uint8Array(body.buffer, body.byteOffset || 0, body.byteLength);
+      if (!arr || arr.length < 32 || arr.length > 65536) return;
+      var pot = findPot(arr);
+      if (!pot) return;
+      G.pot = pot;
+      var mn = u.match(/[?&]n=([^&#]+)/);
+      G.n = mn ? decodeURIComponent(mn[1]) : '';
+      report();
+      try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('PO-token плеера перехвачен из SABR-запроса (' + pot.length + ' зн.)'); } catch (e) {}
+    } catch (e) {}
+  };
   var isTop = true;
   try { isTop = (window.top === window); } catch (e) { isTop = false; }
   var pushToTop = function(){
@@ -100,6 +152,7 @@ object MediaGrabber {
       window.fetch = function(input, init){
         var u = '';
         try { u = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
+        try { if (init && init.body) noteBody(u, init.body); } catch (e) {}
         var p = of.apply(this, arguments);
         try {
           p.then(function(res){
@@ -130,6 +183,11 @@ object MediaGrabber {
         });
       } catch (e) {}
       return XO.apply(this, arguments);
+    };
+    var XS = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(body){
+      try { if (body) noteBody(this.__omniUrl, body); } catch (e) {}
+      return XS.apply(this, arguments);
     };
   } catch (e) {}
   try {
@@ -165,7 +223,7 @@ object MediaGrabber {
   } catch (e) {}
   try { var n = 0; var tm = setInterval(function(){ checkEls(); if (G.reported || ++n > 60) clearInterval(tm); }, 2000); } catch (e) {}
   window.__omniListMedia = function(){
-    var out = { page: location.href, title: document.title || '', els: [], yt: null, sniffed: [] };
+    var out = { page: location.href, title: document.title || '', els: [], yt: null, sniffed: [], pot: G.pot || '', n: G.n || '' };
     try {
       var vs = document.querySelectorAll('video, audio');
       for (var i = 0; i < vs.length; i++) {
@@ -220,6 +278,7 @@ object MediaGrabber {
         if (fr.els) for (var a = 0; a < fr.els.length; a++) out.els.push(fr.els[a]);
         if (fr.sniffed) for (var b = 0; b < fr.sniffed.length; b++) out.sniffed.push(fr.sniffed[b]);
         if (fr.yt && !out.yt) { out.yt = fr.yt; if (!out.title && fr.yt.title) out.title = fr.yt.title; }
+        if (fr.pot && !out.pot) { out.pot = fr.pot; out.n = fr.n || ''; }
       }
     } catch (e) {}
     try { return JSON.stringify(out); } catch (e) { return '{}'; }
@@ -401,7 +460,9 @@ object MediaGrabber {
     private fun YtFormat.copyUrl(u: String) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt)
 
     /** PO-token и уже расшифрованный параметр n из любого запроса плеера к googlevideo (одинаковы для всех форматов ролика). */
-    private fun sniffedPotAndN(sniffed: JSONArray): Pair<String, String?>? {
+    private fun sniffedPotAndN(root: JSONObject, sniffed: JSONArray): Pair<String, String?>? {
+        val pot0 = root.optString("pot")
+        if (pot0.isNotBlank()) return Pair(pot0, root.optString("n").ifBlank { null })
         var best: Pair<String, String?>? = null
         for (i in 0 until sniffed.length()) {
             val s = sniffed.optJSONObject(i) ?: continue
@@ -492,14 +553,20 @@ object MediaGrabber {
     private fun innerTubeFormats(videoId: String, http: TunnelHttp, only: Set<String>? = null): InnerTubeResult? {
         data class Client(val name: String, val version: String, val ua: String, val id: Int, val extra: JSONObject)
         val clients = listOf(
+            // yt-dlp (10.2026): visionos — клиент по умолчанию без PO-token и без шифрования подписей
+            Client(
+                "VISIONOS", "1.02",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15", 101,
+                JSONObject().put("deviceMake", "Apple").put("deviceModel", "RealityDevice17,1").put("osName", "visionOS").put("osVersion", "26.5.23O471")
+            ),
             Client(
                 "ANDROID_VR", "1.60.19",
                 "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip", 28,
                 JSONObject().put("androidSdkVersion", 32).put("osName", "Android").put("osVersion", "12L").put("deviceMake", "Oculus").put("deviceModel", "Quest 3")
             ),
             Client(
-                "IOS", "20.10.4",
-                "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)", 5,
+                "IOS", "21.26.4",
+                "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)", 5,
                 JSONObject().put("deviceMake", "Apple").put("deviceModel", "iPhone16,2").put("osName", "iPhone").put("osVersion", "18.3.2.22D82")
             )
         )
@@ -563,7 +630,7 @@ object MediaGrabber {
     /** Свежие адреса для тех же itag через новый закреплённый сервер (после 403 / падения сервера). */
     fun ytRefresh(videoId: String, itags: List<Int>): Pair<List<String>, String>? {
         val http = TunnelHttp()
-        val fb = innerTubeFormats(videoId, http, setOf("ANDROID_VR")) ?: return null
+        val fb = innerTubeFormats(videoId, http, setOf("VISIONOS", "ANDROID_VR")) ?: return null
         val server = http.serverKey ?: return null
         val urls = ArrayList<String>()
         for (t in itags) {
@@ -575,7 +642,7 @@ object MediaGrabber {
         return Pair(urls, server)
     }
 
-    private fun ytOptions(yt: JSONObject, sniffed: JSONArray, baseHeaders: Map<String, String>, pageTitle: String): List<Option> {
+    private fun ytOptions(root: JSONObject, yt: JSONObject, sniffed: JSONArray, baseHeaders: Map<String, String>, pageTitle: String): List<Option> {
         val videoId = yt.optString("id")
         var title = yt.optString("title").ifBlank { cleanTitle(pageTitle) }
         val durSec = yt.optLong("dur")
@@ -592,17 +659,17 @@ object MediaGrabber {
         var server = ""
         var itUa = ""
         var webMode = false
-        val potN = sniffedPotAndN(sniffed)
+        val potN = sniffedPotAndN(root, sniffed)
         if (formats.isNotEmpty() && potN != null) {
             val (pot, nVal) = potN
             val patched = formats.map { f -> f.copyUrl(patchYtUrl(f.url, pot, nVal)) }
             formats.clear(); formats.addAll(patched)
             webMode = true
-            VpnLog.i(TAG, "YouTube: адреса плеера страницы + pot/n из запросов плеера (${formats.size} форматов)")
+            VpnLog.i(TAG, "YouTube: адреса плеера страницы + PO-token/n из запросов плеера (${formats.size} форматов${if (potN.second == null) ", без n" else ""})")
         } else if (videoId.isNotBlank() && !yt.optBoolean("live")) {
-            if (formats.isNotEmpty()) VpnLog.w(TAG, "YouTube: плеер ещё не запрашивал видео (нет pot) — пробуем InnerTube")
+            if (formats.isNotEmpty()) VpnLog.w(TAG, "YouTube: PO-token плеера не перехвачен — пробуем InnerTube")
             val http = TunnelHttp()
-            val vr = innerTubeFormats(videoId, http, setOf("ANDROID_VR"))
+            val vr = innerTubeFormats(videoId, http, setOf("VISIONOS", "ANDROID_VR"))
             if (vr != null && vr.formats.isNotEmpty()) {
                 formats.clear(); known.clear()
                 for (f in vr.formats) if (known.add(f.itag)) formats.add(f)
@@ -849,7 +916,7 @@ object MediaGrabber {
 
         val yt = o.optJSONObject("yt")
         if (yt != null) {
-            val list = try { ytOptions(yt, sniffed, headers, pageTitle) } catch (e: Exception) {
+            val list = try { ytOptions(o, yt, sniffed, headers, pageTitle) } catch (e: Exception) {
                 VpnLog.w(TAG, "YouTube: ${e.message ?: e.javaClass.simpleName}"); emptyList()
             }
             if (list.isNotEmpty()) return list

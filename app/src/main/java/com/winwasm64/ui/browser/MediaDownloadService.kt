@@ -323,7 +323,7 @@ class MediaDownloadService : Service() {
 
     /** YouTube ответил 403 или закреплённый сервер упал: новые адреса для тех же itag через другой сервер. */
     private fun refreshYouTube(job: MediaGrabber.DownloadJob, why: String): Fetcher? {
-        if (job.ytId.isBlank() || job.itags.size != job.urls.size) return null
+        if (job.ytId.isBlank() || job.itags.size != job.urls.size || job.itags.isEmpty()) return null
         VpnLog.w(MediaGrabber.TAG, "YouTube: $why — запрашиваю свежие адреса через другой сервер")
         val r = MediaGrabber.ytRefresh(job.ytId, job.itags) ?: return null
         for (i in r.first.indices) job.urls[i] = r.first[i]
@@ -367,14 +367,13 @@ class MediaDownloadService : Service() {
                     }
                     code == 416 -> break
                     (code == 403 || code == 410) && isGoogle -> {
-                        if (job.server.isBlank()) throw IOException("YouTube отклонил ссылку (HTTP $code). Запустите воспроизведение на странице и повторите — тогда будут использованы адреса самого плеера")
-                        if (refreshes < 3) {
+                        if (refreshes < 2) {
                             refreshes++
                             resp.closer(); resp = null
                             val nf = refreshYouTube(job, "HTTP $code на ${MediaGrabber.fmtSize(pos).ifBlank { "0" }}")
                             if (nf != null) { fetcher = nf; attempts = 0; continue }
                         }
-                        throw IOException("YouTube отклонил ссылку (HTTP $code) даже после обновления адресов")
+                        throw IOException("YouTube отклонил ссылку (HTTP $code) — ни адреса плеера, ни InnerTube не подошли. Запустите видео на странице на пару секунд и повторите")
                     }
                     else -> throw IOException("HTTP $code")
                 }
