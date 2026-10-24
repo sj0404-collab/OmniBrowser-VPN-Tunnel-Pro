@@ -279,6 +279,41 @@ object MediaGrabber {
     });
   } catch (e) {}
   try { var n = 0; var tm = setInterval(function(){ checkEls(); if (G.reported || ++n > 60) clearInterval(tm); }, 2000); } catch (e) {}
+  // v4.3.6: загрузка файла самой страницей (тот же fetch, что у плеера) → байты в сервис через OmniMedia.dlChunk
+  var dlActive = {};
+  window.__omniDlCancel = function(id){ dlActive[id] = false; };
+  window.__omniDl = function(id, url, total){
+    dlActive[id] = true;
+    var CH = 1048576;
+    var pos = 0;
+    var toB64 = function(buf){
+      var u8 = new Uint8Array(buf); var s = ''; var step = 0x8000;
+      for (var i = 0; i < u8.length; i += step) s += String.fromCharCode.apply(null, u8.subarray(i, i + step));
+      return btoa(s);
+    };
+    var fail = function(msg){ dlActive[id] = false; try { OmniMedia.dlError(id, String(msg)); } catch (e) {} };
+    var finish = function(){ dlActive[id] = false; try { OmniMedia.dlDone(id, pos); } catch (e) {} };
+    var step = function(){
+      if (!dlActive[id]) { fail('cancelled'); return; }
+      var end = pos + CH - 1;
+      if (total > 0 && end >= total) end = total - 1;
+      var want = end - pos + 1;
+      var sep = url.indexOf('?') >= 0 ? '&' : '?';
+      var u = url.replace(/([?&])range=[^&]*/, function(m, p){ return p; }) + sep + 'range=' + pos + '-' + end;
+      fetch(u, { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'follow' }).then(function(res){
+        if (res.status !== 200 && res.status !== 206) { fail('HTTP ' + res.status); return null; }
+        return res.arrayBuffer();
+      }).then(function(buf){
+        if (!buf) return;
+        if (buf.byteLength === 0) { finish(); return; }
+        OmniMedia.dlChunk(id, toB64(buf));
+        pos += buf.byteLength;
+        if (total > 0 ? pos >= total : buf.byteLength < want) { finish(); return; }
+        step();
+      }).catch(function(e){ fail(e && e.message ? e.message : e); });
+    };
+    step();
+  };
   window.__omniListMedia = function(){
     var out = { page: location.href, title: document.title || '', els: [], yt: null, sniffed: [], pot: G.pot || '', n: G.n || '' };
     try {
@@ -366,13 +401,17 @@ object MediaGrabber {
         val ytId: String = "",
         val itags: List<Int> = emptyList(),
         /** Закреплённый сервер Browsec (host:port): все соединения загрузки идут через него. Пусто — обычный прокси браузера. */
-        @Volatile var server: String = ""
+        @Volatile var server: String = "",
+        /** v4.3.6: сначала пробовать скачать силами самой страницы (fetch в WebView вкладки [tabId]). */
+        var inPage: Boolean = false,
+        var tabId: String = ""
     ) {
         fun toJson(): String = JSONObject().apply {
             put("mode", mode); put("title", title); put("fileName", fileName); put("mime", mime)
             put("urls", JSONArray(urls)); put("headers", JSONObject(headers as Map<*, *>))
             put("expectedBytes", expectedBytes); put("isAudio", isAudio)
             put("ytId", ytId); put("itags", JSONArray(itags)); put("server", server)
+            put("inPage", inPage); put("tabId", tabId)
         }.toString()
 
         companion object {
@@ -390,7 +429,8 @@ object MediaGrabber {
                 DownloadJob(
                     o.getString("mode"), o.optString("title"), o.getString("fileName"), o.optString("mime", "application/octet-stream"),
                     urls, headers, o.optLong("expectedBytes", 0L), o.optBoolean("isAudio", false),
-                    o.optString("ytId"), itags, o.optString("server")
+                    o.optString("ytId"), itags, o.optString("server"),
+                    o.optBoolean("inPage", false), o.optString("tabId")
                 )
             } catch (_: Exception) { null }
         }
@@ -541,9 +581,14 @@ object MediaGrabber {
         while (result.get() == null && latch.count > 0 && System.currentTimeMillis() < deadline) {
             latch.await(200, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
-        val found = result.get()
+        var found = result.get()
+        var stale = false
+        if (found == null) {
+            // v4.3.6: проверка не успела (пик, медленный сервер) — доверяем устаревшему значению из кэша
+            egressCache.entries.firstOrNull { it.key in keys && it.value.first == ip }?.let { found = it.key; stale = true }
+        }
         val known = egressCache.filter { it.key in keys }.map { "${it.key.substringBefore('.')}=${it.value.first.ifBlank { "?" }}" }
-        if (found != null) VpnLog.i(TAG, "ссылка привязана к IP $ip — это сервер Browsec $found, качаем строго через него")
+        if (found != null) VpnLog.i(TAG, "ссылка привязана к IP $ip — это сервер Browsec $found${if (stale) " (по старым данным, свежая проверка не успела)" else ""}, качаем строго через него")
         else VpnLog.w(TAG, "ссылка привязана к IP $ip, но ни у одного сервера Browsec нет такого адреса (${known.joinToString(" ")}) — качаем через прокси браузера")
         return found
     }
@@ -768,6 +813,13 @@ object MediaGrabber {
         val potN = sniffedPotAndN(root, sniffed)
         if (formats.isNotEmpty() && potN != null) {
             val (pot, nVal) = potN
+            // v4.3.6: диагностика — одинаков ли n в SABR-адресе плеера и в адресах ответа плеера (если одинаков, плеер
+            // его не преобразовывал, и 403 объясняется не им)
+            try {
+                val nPage = Uri.parse(formats[0].url).getQueryParameter("n") ?: ""
+                VpnLog.i(TAG, "YouTube: n из запроса плеера=${nVal ?: "—"}, n в адресе ответа плеера=${nPage.ifBlank { "—" }}" +
+                    (if (nVal != null && nPage.isNotBlank()) (if (nVal == nPage) " (совпадают)" else " (разные — плеер преобразует n)") else ""))
+            } catch (_: Exception) {}
             val patched = formats.map { f -> f.copyUrl(patchYtUrl(f.url, pot, nVal)) }
             formats.clear(); formats.addAll(patched)
             webMode = true
@@ -825,7 +877,7 @@ object MediaGrabber {
             headers["Referer"] = "https://www.youtube.com/"
         }
         fun job(mode: String, file: String, mime: String, fs: List<YtFormat>, size: Long, audio: Boolean = false) =
-            DownloadJob(mode, title, file, mime, fs.map { it.url }.toMutableList(), headers, size, audio, videoId, fs.map { it.itag }, server)
+            DownloadJob(mode, title, file, mime, fs.map { it.url }.toMutableList(), headers, size, audio, videoId, fs.map { it.itag }, server, inPage = webMode)
 
         val audioMp4 = formats.filter { it.isAudio && it.container == "mp4" && (it.dflt || it.lang.isBlank()) }.maxByOrNull { it.br }
             ?: formats.filter { it.isAudio && it.container == "mp4" }.maxByOrNull { it.br }

@@ -348,6 +348,32 @@ class MediaDownloadService : Service() {
         var lastTick = System.currentTimeMillis()
         var tickBytes = 0L
         var speed = 0L
+        // v4.3.6: адреса плеера страницы сначала качает сама страница (её fetch сервер принимает, наш — 403)
+        if (job.inPage && InPageDownloads.available(job.tabId)) {
+            checkCancel()
+            val url = job.urls[index]
+            val clen = try { Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() ?: 0L } catch (_: Exception) { 0L }
+            val shown = if (expectedTotal > 0) expectedTotal else if (clen > 0) clen * parts else 0L
+            var lastP = System.currentTimeMillis()
+            var lastB = 0L
+            val t = InPageDownloads.start(job.tabId, url, clen, out) { b ->
+                val now = System.currentTimeMillis()
+                if (now - lastP >= 1000) {
+                    speed = (b - lastB) * 1000 / (now - lastP); lastP = now; lastB = b
+                    progress(job, already + b, shown, speed, if (parts > 1) "часть ${index + 1} из $parts" else "")
+                }
+            }
+            if (t != null) {
+                VpnLog.i(MediaGrabber.TAG, "часть ${index + 1}/$parts: качает сама страница (${MediaGrabber.fmtSize(clen).ifBlank { "размер неизвестен" }})")
+                val ok = InPageDownloads.await(t, 60_000L) { cancelCurrent.get() }
+                if (cancelCurrent.get()) throw CancelledException()
+                if (ok) { out.flush(); return t.bytes }
+                pos = t.bytes
+                VpnLog.w(MediaGrabber.TAG, "страница не смогла скачать (${t.error}) на ${MediaGrabber.fmtSize(pos).ifBlank { "0" }} — пробуем из приложения")
+            } else {
+                VpnLog.w(MediaGrabber.TAG, "вкладка закрыта — качаем из приложения")
+            }
+        }
         while (true) {
             checkCancel()
             val url = job.urls[index]

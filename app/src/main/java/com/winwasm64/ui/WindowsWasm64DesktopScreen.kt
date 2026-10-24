@@ -418,6 +418,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         val wv = tab.webView ?: return
         val state = MediaGrabState(tab.title)
         grabSheet = state
+        com.winwasm64.ui.browser.InPageDownloads.register(tab.id, wv)
         val pageUrl = wv.url ?: tab.url
         val ua = try { wv.settings.userAgentString } catch (_: Exception) { null }
         val cookie = if (tab.isIncognito) null else try { CookieManager.getInstance().getCookie(pageUrl) } catch (_: Exception) { null }
@@ -428,6 +429,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     com.winwasm64.vpn.VpnLog.w(MediaGrabber.TAG, "поиск источников: ${e.message ?: e.javaClass.simpleName}")
                     emptyList()
                 }
+                opts.forEach { it.job.tabId = tab.id }
                 com.winwasm64.vpn.VpnLog.i(MediaGrabber.TAG, "«${state.title.take(40)}»: найдено вариантов — ${opts.size}")
                 val notice = MediaGrabber.lastNotice
                 Handler(Looper.getMainLooper()).post { state.notice = notice; state.options = opts }

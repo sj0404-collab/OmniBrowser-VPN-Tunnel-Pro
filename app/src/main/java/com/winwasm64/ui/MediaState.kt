@@ -387,6 +387,16 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
         }
     }
 
+    // v4.3.6: загрузка файла силами страницы — см. InPageDownloads
+    @JavascriptInterface
+    fun dlChunk(id: String, b64: String) { com.winwasm64.ui.browser.InPageDownloads.onChunk(id, b64) }
+
+    @JavascriptInterface
+    fun dlDone(id: String, bytes: Double) { com.winwasm64.ui.browser.InPageDownloads.onDone(id, bytes.toLong()) }
+
+    @JavascriptInterface
+    fun dlError(id: String, msg: String) { com.winwasm64.ui.browser.InPageDownloads.onError(id, msg) }
+
     /** v4.3.0: страница сообщила, что на ней есть видео/аудио (элемент или медиа-запрос) — показать кнопку «Скачать». */
     @JavascriptInterface
     fun hasMedia(present: Boolean) {
