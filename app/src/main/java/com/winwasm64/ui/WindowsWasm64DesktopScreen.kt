@@ -1712,19 +1712,19 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 val audios = opts.filter { it.isAudio }
                                 if (videos.isNotEmpty()) SheetSectionLabel("Видео")
                                 for (o in videos) {
-                                    SheetItem(OmniIcons.Download, o.title, o.subtitle, tint = Omni.Accent) {
+                                    SheetItem(OmniIcons.Download, o.title, o.subtitle, tint = Omni.Accent, onClick = {
                                         MediaDownloadService.start(context, o.job)
                                         grabSheet = null
                                         Toast.makeText(context, "⬇ ${o.job.fileName}", Toast.LENGTH_SHORT).show()
-                                    }
+                                    })
                                 }
                                 if (audios.isNotEmpty()) SheetSectionLabel("Только звук")
                                 for (o in audios) {
-                                    SheetItem(OmniIcons.Play, o.title, o.subtitle, tint = Omni.Success) {
+                                    SheetItem(OmniIcons.Play, o.title, o.subtitle, tint = Omni.Success, onClick = {
                                         MediaDownloadService.start(context, o.job)
                                         grabSheet = null
                                         Toast.makeText(context, "⬇ ${o.job.fileName}", Toast.LENGTH_SHORT).show()
-                                    }
+                                    })
                                 }
                                 SheetDivider()
                                 Text(
