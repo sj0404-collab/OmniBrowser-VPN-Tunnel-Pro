@@ -167,6 +167,7 @@ class BrowserTabModel(
 /** v4.3.0: состояние шторки «Скачать видео»: null в options — ещё ищем. */
 class MediaGrabState(val title: String) {
     var options by mutableStateOf<List<MediaGrabber.Option>?>(null)
+    var notice by mutableStateOf("")
 }
 
 /**
@@ -428,7 +429,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     emptyList()
                 }
                 com.winwasm64.vpn.VpnLog.i(MediaGrabber.TAG, "«${state.title.take(40)}»: найдено вариантов — ${opts.size}")
-                Handler(Looper.getMainLooper()).post { state.options = opts }
+                val notice = MediaGrabber.lastNotice
+                Handler(Looper.getMainLooper()).post { state.notice = notice; state.options = opts }
             }
         }
     }
@@ -1703,11 +1705,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 Text("Ищу источники на странице…", color = Omni.TextDim, fontSize = 14.sp)
                             }
                             opts.isEmpty() -> Text(
-                                "Не удалось найти прямые ссылки на видео. Запустите воспроизведение на странице и попробуйте ещё раз — " +
+                                (if (gs.notice.isNotBlank()) "⚠ " + gs.notice + "\n\n" else "") + "Не удалось найти прямые ссылки на видео. Запустите воспроизведение на странице и попробуйте ещё раз — " +
                                     "адреса медиа появляются, когда плеер начинает их запрашивать. DRM-потоки (Netflix и т.п.) скачать нельзя.",
                                 color = Omni.TextDim, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
                             )
                             else -> {
+                                if (gs.notice.isNotBlank()) Text(
+                                    "⚠ " + gs.notice, color = Omni.Warning, fontSize = 12.sp,
+                                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp)
+                                )
                                 val videos = opts.filter { !it.isAudio }
                                 val audios = opts.filter { it.isAudio }
                                 if (videos.isNotEmpty()) SheetSectionLabel("Видео")

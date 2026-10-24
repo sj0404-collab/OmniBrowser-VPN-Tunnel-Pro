@@ -1816,6 +1816,15 @@ function alert(){}
         return null
     }
 
+    /** v4.3.5: все известные серверы автотуннеля, лучшие первыми (для подбора сервера по IP в ссылке googlevideo). */
+    fun tunnelServerKeysRanked(): List<String> {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val now = SystemClock.elapsedRealtime()
+        val ranked = rankTunnelServers(null, now, null, useCountry = false).map { it.key }
+        val rest = tunnelServers.map { it.key }.filter { it !in ranked }
+        return ranked + rest
+    }
+
     /**
      * v4.3.1: туннель к [host]:[port] через КОНКРЕТНЫЙ сервер Browsec [serverKey] (host:port).
      * Нужен загрузчику видео: адреса googlevideo привязаны к IP, с которого получен ответ плеера, — все соединения

@@ -342,6 +342,7 @@ class MediaDownloadService : Service() {
         var total = -1L
         var attempts = 0
         var refreshes = 0
+        var ipPinTried = job.server.isNotBlank()
         var rangesOk = true
         val buf = ByteArray(128 * 1024)
         var lastTick = System.currentTimeMillis()
@@ -367,6 +368,18 @@ class MediaDownloadService : Service() {
                     }
                     code == 416 -> break
                     (code == 403 || code == 410) && isGoogle -> {
+                        val webMode = job.headers.containsKey("Referer")
+                        if (webMode) {
+                            // адреса плеера страницы: единственное лекарство от 403 — тот же IP, что в ссылке
+                            if (!ipPinTried) {
+                                ipPinTried = true
+                                resp.closer(); resp = null
+                                val ip = try { android.net.Uri.parse(url).getQueryParameter("ip") ?: "" } catch (_: Exception) { "" }
+                                val srv = MediaGrabber.findServerForIp(ip)
+                                if (srv != null && srv != job.server) { job.server = srv; fetcher = PinnedFetcher(TunnelHttp(srv)); attempts = 0; continue }
+                            }
+                            throw IOException("YouTube отклонил ссылку (HTTP $code): адрес привязан к другому IP. Перезагрузите страницу (чтобы она открылась через доступный сервер), запустите видео и повторите")
+                        }
                         if (refreshes < 2) {
                             refreshes++
                             resp.closer(); resp = null

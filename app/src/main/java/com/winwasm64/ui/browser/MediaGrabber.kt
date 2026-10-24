@@ -502,6 +502,55 @@ object MediaGrabber {
         .replace(Regex("^\\(\\d+\\)\\s*"), "")
         .trim()
 
+    // ------------------------------------------------------------------ подбор сервера по IP в ссылке
+
+    private val egressCache = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+
+    /** Внешний IP сервера Browsec [serverKey] (кэш 30 мин). */
+    fun egressIp(serverKey: String): String? {
+        val c = egressCache[serverKey]
+        if (c != null && System.currentTimeMillis() - c.second < 1_800_000L) return c.first.ifBlank { null }
+        val ip = try {
+            TunnelHttp(serverKey).getText("https://api.ipify.org?format=text", emptyMap(), 4096).trim()
+        } catch (_: Exception) {
+            try { TunnelHttp(serverKey).getText("https://checkip.amazonaws.com/", emptyMap(), 4096).trim() } catch (_: Exception) { "" }
+        }
+        val ok = ip.length in 7..45 && ip.all { it.isDigit() || it == '.' || it == ':' || it.isLetter() && it.lowercaseChar() in 'a'..'f' }
+        egressCache[serverKey] = Pair(if (ok) ip else "", System.currentTimeMillis())
+        return if (ok) ip else null
+    }
+
+    /**
+     * Ссылки googlevideo привязаны к IP (`ip=` в адресе) того сервера, через который страница получила ответ плеера.
+     * Ищем сервер Browsec с таким внешним IP, чтобы качать строго через него. null — не нашли (страница шла напрямую
+     * или у сервера несколько внешних адресов).
+     */
+    fun findServerForIp(ip: String, maxServers: Int = 8, waitMs: Long = 12_000L): String? {
+        if (ip.isBlank()) return null
+        val keys = try { com.winwasm64.extensions.ExtensionProxy.tunnelServerKeysRanked() } catch (_: Exception) { emptyList() }.take(maxServers)
+        if (keys.isEmpty()) return null
+        egressCache.entries.firstOrNull { it.value.first == ip && System.currentTimeMillis() - it.value.second < 1_800_000L }?.let { return it.key }
+        val result = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val latch = java.util.concurrent.CountDownLatch(keys.size)
+        for (k in keys) {
+            Thread({
+                try { if (egressIp(k) == ip) result.compareAndSet(null, k) } catch (_: Exception) {} finally { latch.countDown() }
+            }, "omni-egress").apply { isDaemon = true; start() }
+        }
+        val deadline = System.currentTimeMillis() + waitMs
+        while (result.get() == null && latch.count > 0 && System.currentTimeMillis() < deadline) {
+            latch.await(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        val found = result.get()
+        val known = egressCache.filter { it.key in keys }.map { "${it.key.substringBefore('.')}=${it.value.first.ifBlank { "?" }}" }
+        if (found != null) VpnLog.i(TAG, "ссылка привязана к IP $ip — это сервер Browsec $found, качаем строго через него")
+        else VpnLog.w(TAG, "ссылка привязана к IP $ip, но ни у одного сервера Browsec нет такого адреса (${known.joinToString(" ")}) — качаем через прокси браузера")
+        return found
+    }
+
+    /** Подсказка для шторки (почему вариантов может не быть / что сделать). */
+    @Volatile var lastNotice: String = ""
+
     // ------------------------------------------------------------------ YouTube
 
     private class YtFormat(
@@ -723,8 +772,14 @@ object MediaGrabber {
             formats.clear(); formats.addAll(patched)
             webMode = true
             VpnLog.i(TAG, "YouTube: адреса плеера страницы + PO-token/n из запросов плеера (${formats.size} форматов${if (potN.second == null) ", без n" else ""})")
+            val boundIp = try { Uri.parse(formats[0].url).getQueryParameter("ip") ?: "" } catch (_: Exception) { "" }
+            server = findServerForIp(boundIp) ?: ""
+            if (server.isBlank()) lastNotice = "Ссылки плеера привязаны к IP $boundIp, подходящий сервер Browsec не найден — загрузка пойдёт через прокси браузера и может получить 403."
         } else if (videoId.isNotBlank() && !yt.optBoolean("live")) {
-            if (formats.isNotEmpty()) VpnLog.w(TAG, "YouTube: PO-token плеера не перехвачен — пробуем InnerTube")
+            if (formats.isNotEmpty()) {
+                VpnLog.w(TAG, "YouTube: PO-token плеера не перехвачен — пробуем InnerTube")
+                lastNotice = "PO-token плеера ещё не перехвачен: запустите видео и подождите 15–20 секунд (плеер получает токен не сразу), затем откройте шторку снова."
+            }
             val http = TunnelHttp()
             val vr = innerTubeFormats(videoId, http, setOf("VISIONOS", "ANDROID_VR"))
             if (vr != null && vr.formats.isNotEmpty()) {
@@ -961,6 +1016,7 @@ object MediaGrabber {
      * @param json ответ `__omniListMedia()`
      */
     fun buildOptions(json: String, pageUrl: String, userAgent: String?, cookie: String?): List<Option> {
+        lastNotice = ""
         val o = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
         val page = o.optString("page").ifBlank { pageUrl }
         val pageTitle = o.optString("title")
