@@ -52,6 +52,14 @@ object MediaGrabber {
     }
     return out;
   };
+  var looksLikePot = function(v){
+    try {
+      if (v.length < 50 || v.length > 600 || v[0] !== 0x32) return false;
+      var i = 1, len = 0, sh = 0, x;
+      do { x = v[i++]; len += (x & 127) * Math.pow(2, sh); sh += 7; } while (x & 128 && i < 6);
+      return len === v.length - i;
+    } catch (e) { return false; }
+  };
   var findPot = function(b){
     try {
       var top = pbFields(b);
@@ -60,30 +68,71 @@ object MediaGrabber {
         var sc = pbFields(top[i].v);
         for (var j = 0; j < sc.length; j++) if (sc[j].f === 2 && sc[j].v.length >= 40) return b64url(sc[j].v);
       }
-      for (var k = 0; k < top.length; k++) {
-        if (top[k].v.length < 60) continue;
-        var nn = pbFields(top[k].v);
-        for (var m = 0; m < nn.length; m++) if (nn[m].f === 2 && nn[m].v.length >= 60 && nn[m].v.length <= 400) return b64url(nn[m].v);
-      }
+      var scan = function(fields, depth){
+        for (var k = 0; k < fields.length; k++) {
+          if (looksLikePot(fields[k].v)) return b64url(fields[k].v);
+          if (depth < 3 && fields[k].v.length > 60) { var r = scan(pbFields(fields[k].v), depth + 1); if (r) return r; }
+        }
+        return '';
+      };
+      return scan(top, 0);
     } catch (e) {}
     return '';
   };
-  var noteBody = function(u, body){
+  var diag = { n: 0 };
+  var trace = function(msg){ try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace(msg); } catch (e) {} };
+  var describeBody = function(body){
     try {
-      if (G.pot || !u || !body) return;
-      u = String(u);
-      if (u.indexOf('/videoplayback') < 0) return;
-      var arr = null;
-      if (body instanceof ArrayBuffer) arr = new Uint8Array(body);
-      else if (body && body.buffer instanceof ArrayBuffer) arr = new Uint8Array(body.buffer, body.byteOffset || 0, body.byteLength);
-      if (!arr || arr.length < 32 || arr.length > 65536) return;
+      if (!body) return 'нет тела';
+      if (body instanceof ArrayBuffer) return 'ArrayBuffer ' + body.byteLength;
+      if (body.buffer instanceof ArrayBuffer) return 'TypedArray ' + body.byteLength;
+      if (typeof Blob !== 'undefined' && body instanceof Blob) return 'Blob ' + body.size;
+      if (typeof body === 'string') return 'string ' + body.length;
+      if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return 'ReadableStream';
+      return Object.prototype.toString.call(body);
+    } catch (e) { return '?'; }
+  };
+  var toBytes = function(body, cb){
+    try {
+      if (body instanceof ArrayBuffer) { cb(new Uint8Array(body)); return; }
+      if (body && body.buffer instanceof ArrayBuffer) { cb(new Uint8Array(body.buffer, body.byteOffset || 0, body.byteLength)); return; }
+      if (typeof Blob !== 'undefined' && body instanceof Blob && body.size < 65536) {
+        var fr = new FileReader();
+        fr.onload = function(){ try { cb(new Uint8Array(fr.result)); } catch (e) {} };
+        fr.readAsArrayBuffer(body);
+      }
+    } catch (e) {}
+  };
+  var gotBytes = function(u, arr){
+    try {
+      if (G.pot || !arr || arr.length < 32 || arr.length > 65536) return;
       var pot = findPot(arr);
-      if (!pot) return;
+      if (!pot) {
+        if (diag.n < 2) {
+          diag.n++;
+          var tf = pbFields(arr).map(function(f){ return f.f + ':' + f.v.length; }).join(' ');
+          trace('SABR-тело ' + arr.length + ' байт, PO-token не найден; поля: ' + tf.slice(0, 300));
+        }
+        return;
+      }
       G.pot = pot;
       var mn = u.match(/[?&]n=([^&#]+)/);
       G.n = mn ? decodeURIComponent(mn[1]) : '';
       report();
-      try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('PO-token плеера перехвачен из SABR-запроса (' + pot.length + ' зн.)'); } catch (e) {}
+      trace('PO-token плеера перехвачен из SABR-запроса (' + pot.length + ' зн.' + (G.n ? ', n есть' : ', без n') + ')');
+    } catch (e) {}
+  };
+  var noteBody = function(u, body, how){
+    try {
+      if (G.pot || !u) return;
+      u = String(u);
+      if (u.indexOf('/videoplayback') < 0) return;
+      if (diag.n < 1 && !G.pot) {
+        diag.n++;
+        trace('запрос плеера: ' + how + ', ' + describeBody(body) + ', itag=' + (u.indexOf('itag=') >= 0) + ', pot в адресе=' + (u.indexOf('pot=') >= 0) + ', sabr=' + (u.indexOf('sabr=1') >= 0));
+      }
+      if (!body) return;
+      toBytes(body, function(arr){ gotBytes(u, arr); });
     } catch (e) {}
   };
   var isTop = true;
@@ -152,7 +201,15 @@ object MediaGrabber {
       window.fetch = function(input, init){
         var u = '';
         try { u = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
-        try { if (init && init.body) noteBody(u, init.body); } catch (e) {}
+        try {
+          if (u && String(u).indexOf('/videoplayback') >= 0 && !G.pot) {
+            if (init && init.body) noteBody(u, init.body, 'fetch+init');
+            else if (input && typeof input === 'object' && input.clone && input.method && input.method.toUpperCase() === 'POST') {
+              noteBody(u, null, 'fetch+Request');
+              try { input.clone().arrayBuffer().then(function(buf){ gotBytes(String(u), new Uint8Array(buf)); }, function(){}); } catch (e) {}
+            } else noteBody(u, null, 'fetch GET');
+          }
+        } catch (e) {}
         var p = of.apply(this, arguments);
         try {
           p.then(function(res){
@@ -186,7 +243,7 @@ object MediaGrabber {
     };
     var XS = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.send = function(body){
-      try { if (body) noteBody(this.__omniUrl, body); } catch (e) {}
+      try { noteBody(this.__omniUrl, body, 'XHR'); } catch (e) {}
       return XS.apply(this, arguments);
     };
   } catch (e) {}
