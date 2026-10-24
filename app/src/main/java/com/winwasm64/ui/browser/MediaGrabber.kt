@@ -79,8 +79,7 @@ object MediaGrabber {
       if (!isYt && segRe.test(path) && !/mpegurl/i.test(ct)) return;
       if (/^image\//i.test(ct)) return;
       if (isYt) {
-        if (noHash.indexOf('itag=') < 0) return;
-        if (noHash.indexOf('sabr=1') >= 0 && noHash.indexOf('itag=') < 0) return;
+        if (noHash.indexOf('itag=') < 0 && noHash.indexOf('pot=') < 0) return;
         noHash = noHash.replace(/[&?](range|rn|rbuf|ump|srfvp|alr)=[^&]*/g, function(m){ return m.charAt(0) === '?' ? '?' : ''; });
         noHash = noHash.replace(/\?&/, '?').replace(/[?&]$/, '');
       }
@@ -399,7 +398,36 @@ object MediaGrabber {
         val codec get() = mime.substringAfter("codecs=\"", "").substringBefore('"')
     }
 
-    private fun heightOfItag(itag: Int): Int = when (itag) {
+    private fun YtFormat.copyUrl(u: String) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt)
+
+    /** PO-token и уже расшифрованный параметр n из любого запроса плеера к googlevideo (одинаковы для всех форматов ролика). */
+    private fun sniffedPotAndN(sniffed: JSONArray): Pair<String, String?>? {
+        var best: Pair<String, String?>? = null
+        for (i in 0 until sniffed.length()) {
+            val s = sniffed.optJSONObject(i) ?: continue
+            val url = s.optString("url")
+            if (!url.contains("/videoplayback")) continue
+            val u = try { Uri.parse(url) } catch (_: Exception) { continue }
+            val pot = u.getQueryParameter("pot") ?: continue
+            if (pot.isBlank()) continue
+            val n = u.getQueryParameter("n")
+            if (best == null || (best.second == null && n != null)) best = Pair(pot, n)
+            if (best.second != null) break
+        }
+        return best
+    }
+
+    private fun patchYtUrl(url: String, pot: String, n: String?): String {
+        var u = url
+        if (n != null) {
+            u = u.replace(Regex("([?&])n=[^&]*")) { m -> m.groupValues[1] + "n=" + Uri.encode(n) }
+            if (!Regex("[?&]n=").containsMatchIn(u)) u += (if (u.contains('?')) "&" else "?") + "n=" + Uri.encode(n)
+        }
+        if (!Regex("[?&]pot=").containsMatchIn(u)) u += (if (u.contains('?')) "&" else "?") + "pot=" + Uri.encode(pot)
+        return u
+    }
+
+
         160, 278, 394 -> 144; 133, 242, 395 -> 240; 134, 243, 396, 18 -> 360; 135, 244, 397 -> 480
         136, 247, 398, 22, 298, 302 -> 720; 137, 248, 399, 299, 303 -> 1080; 264, 271, 400, 308 -> 1440; 266, 313, 401, 315 -> 2160
         else -> 0
@@ -459,7 +487,9 @@ object MediaGrabber {
     /** Клиентский UA, которым получены адреса InnerTube (тем же UA их и качаем). */
     @Volatile private var lastInnerTubeUa: String = DEFAULT_UA
 
-    private fun innerTubeFormats(videoId: String, http: TunnelHttp): Pair<List<YtFormat>, String>? {
+    private class InnerTubeResult(val formats: List<YtFormat>, val title: String, val hls: String, val client: String)
+
+    private fun innerTubeFormats(videoId: String, http: TunnelHttp, only: Set<String>? = null): InnerTubeResult? {
         data class Client(val name: String, val version: String, val ua: String, val id: Int, val extra: JSONObject)
         val clients = listOf(
             Client(
@@ -474,6 +504,7 @@ object MediaGrabber {
             )
         )
         for (cl in clients) {
+            if (only != null && cl.name !in only) continue
             try {
                 val clientObj = JSONObject().put("clientName", cl.name).put("clientVersion", cl.version).put("hl", "en").put("gl", "US")
                 for (k in cl.extra.keys()) clientObj.put(k, cl.extra.get(k))
@@ -515,11 +546,12 @@ object MediaGrabber {
                 }
                 take(sd.optJSONArray("formats"), true)
                 take(sd.optJSONArray("adaptiveFormats"), false)
-                if (list.isNotEmpty()) {
+                val hls = sd.optString("hlsManifestUrl")
+                if (list.isNotEmpty() || hls.isNotBlank()) {
                     val title = o.optJSONObject("videoDetails")?.optString("title") ?: ""
                     lastInnerTubeUa = cl.ua
-                    VpnLog.i(TAG, "YouTube: форматы получены через клиент ${cl.name} (${list.size}), сервер ${http.serverKey ?: "?"}")
-                    return Pair(list, title)
+                    VpnLog.i(TAG, "YouTube: ответ клиента ${cl.name}: форматов ${list.size}${if (hls.isNotBlank()) ", есть HLS" else ""}, сервер ${http.serverKey ?: "?"}")
+                    return InnerTubeResult(list, title, hls, cl.name)
                 }
             } catch (e: Exception) {
                 VpnLog.w(TAG, "YouTube ${cl.name}: ${e.message ?: e.javaClass.simpleName}")
@@ -531,11 +563,11 @@ object MediaGrabber {
     /** Свежие адреса для тех же itag через новый закреплённый сервер (после 403 / падения сервера). */
     fun ytRefresh(videoId: String, itags: List<Int>): Pair<List<String>, String>? {
         val http = TunnelHttp()
-        val fb = innerTubeFormats(videoId, http) ?: return null
+        val fb = innerTubeFormats(videoId, http, setOf("ANDROID_VR")) ?: return null
         val server = http.serverKey ?: return null
         val urls = ArrayList<String>()
         for (t in itags) {
-            val f = fb.first.firstOrNull { it.itag == t } ?: run {
+            val f = fb.formats.firstOrNull { it.itag == t } ?: run {
                 VpnLog.w(TAG, "YouTube: itag $t больше не отдаётся"); return null
             }
             urls.add(f.url)
@@ -552,22 +584,48 @@ object MediaGrabber {
         val known = formats.map { it.itag }.toHashSet()
         for (f in sniffedYtFormats(sniffed)) if (known.add(f.itag)) formats.add(f)
 
-        // v4.3.1: адреса из ответа плеера страницы (web) требуют PO-token и привязаны к IP того сервера, через который
-        // их получил плеер, — при скачивании через другой сервер YouTube отвечает 403. Поэтому основной путь —
-        // InnerTube-клиент через ОДИН закреплённый сервер Browsec; адреса страницы остаются запасным вариантом.
+        // v4.3.2: три пути, по порядку надёжности (см. журнал 12:21 / 14:05):
+        //  A) адреса из ответа плеера страницы + PO-token (pot) и расшифрованный параметр n, подсмотренные в запросах
+        //     самого плеера — качаем через обычный прокси браузера, как и сама страница;
+        //  B) InnerTube ANDROID_VR через закреплённый сервер (без pot), если плеер ещё ничего не запрашивал;
+        //  C) InnerTube IOS → HLS-манифест (HLS iOS не требует pot) через закреплённый сервер.
         var server = ""
         var itUa = ""
-        if (videoId.isNotBlank() && !yt.optBoolean("live")) {
+        var webMode = false
+        val potN = sniffedPotAndN(sniffed)
+        if (formats.isNotEmpty() && potN != null) {
+            val (pot, nVal) = potN
+            val patched = formats.map { f -> f.copyUrl(patchYtUrl(f.url, pot, nVal)) }
+            formats.clear(); formats.addAll(patched)
+            webMode = true
+            VpnLog.i(TAG, "YouTube: адреса плеера страницы + pot/n из запросов плеера (${formats.size} форматов)")
+        } else if (videoId.isNotBlank() && !yt.optBoolean("live")) {
+            if (formats.isNotEmpty()) VpnLog.w(TAG, "YouTube: плеер ещё не запрашивал видео (нет pot) — пробуем InnerTube")
             val http = TunnelHttp()
-            val fb = innerTubeFormats(videoId, http)
-            if (fb != null && fb.first.isNotEmpty()) {
+            val vr = innerTubeFormats(videoId, http, setOf("ANDROID_VR"))
+            if (vr != null && vr.formats.isNotEmpty()) {
                 formats.clear(); known.clear()
-                for (f in fb.first) if (known.add(f.itag)) formats.add(f)
-                if (title.isBlank()) title = fb.second
+                for (f in vr.formats) if (known.add(f.itag)) formats.add(f)
+                if (title.isBlank()) title = vr.title
                 server = http.serverKey ?: ""
                 itUa = lastInnerTubeUa
             } else {
-                VpnLog.w(TAG, "YouTube: InnerTube не дал форматов — используем адреса страницы (возможен 403)")
+                val ios = innerTubeFormats(videoId, http, setOf("IOS"))
+                if (ios != null && ios.hls.isNotBlank()) {
+                    if (title.isBlank()) title = ios.title
+                    val h = LinkedHashMap<String, String>()
+                    h["User-Agent"] = lastInnerTubeUa
+                    val srv = http.serverKey ?: ""
+                    val list = hlsOptions(ios.hls, h, title.ifBlank { "YouTube $videoId" }, durSec, http, videoId, srv)
+                    if (list.isNotEmpty()) {
+                        VpnLog.i(TAG, "YouTube: используем HLS клиента IOS (${list.size} вариантов), сервер $srv")
+                        return list
+                    }
+                }
+                if (formats.isNotEmpty()) {
+                    VpnLog.w(TAG, "YouTube: InnerTube не помог — адреса страницы без pot (возможен 403; запустите видео и повторите)")
+                    webMode = true
+                }
             }
         }
         if (title.isBlank()) title = "YouTube $videoId"
@@ -580,7 +638,7 @@ object MediaGrabber {
         val name = safeName(title)
         // заголовки для googlevideo: UA должен совпадать с тем, кем получен адрес (web-адреса привязаны к UA/IP не строго, но Referer не нужен)
         val headers = LinkedHashMap<String, String>()
-        if (server.isNotBlank()) {
+        if (server.isNotBlank() && !webMode) {
             headers["User-Agent"] = itUa
         } else {
             headers["User-Agent"] = baseHeaders["User-Agent"] ?: DEFAULT_UA
@@ -715,8 +773,11 @@ object MediaGrabber {
         return out
     }
 
-    private fun hlsOptions(masterUrl: String, headers: Map<String, String>, title: String, durSec: Long): List<Option> {
-        val text = try { getText(masterUrl, headers, 2 * 1024 * 1024) } catch (e: Exception) {
+    private fun hlsOptions(
+        masterUrl: String, headers: Map<String, String>, title: String, durSec: Long,
+        http: TunnelHttp? = null, ytId: String = "", server: String = ""
+    ): List<Option> {
+        val text = try { if (http != null) http.getText(masterUrl, headers, 2 * 1024 * 1024) else getText(masterUrl, headers, 2 * 1024 * 1024) } catch (e: Exception) {
             VpnLog.w(TAG, "HLS: не удалось получить плейлист — ${e.message}")
             return emptyList()
         }
@@ -736,7 +797,7 @@ object MediaGrabber {
                 out.add(
                     Option(
                         "Видео ${if (h > 0) "${h}p" else "${v.bandwidth / 1000} кбит/с"} · HLS", "${v.codecs.ifBlank { "поток m3u8" }}${if (est > 0) " · ~${fmtSize(est)}" else ""}", false,
-                        DownloadJob("hls", title, "$name [${key}].$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(v.url), headers, est)
+                        DownloadJob("hls", title, "$name [${key}].$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(v.url), headers, est, ytId = ytId, server = server)
                     )
                 )
                 if (out.size >= 6) break
@@ -746,7 +807,7 @@ object MediaGrabber {
                 out.add(
                     Option(
                         "Только аудио · HLS", "аудиодорожка потока (${if (audio.codecs == "audio") "AAC" else audio.codecs})", true,
-                        DownloadJob("hls", title, "$name.aac", "audio/aac", mutableListOf(audio.url), headers, 0L, isAudio = true)
+                        DownloadJob("hls", title, "$name.aac", "audio/aac", mutableListOf(audio.url), headers, 0L, isAudio = true, ytId = ytId, server = server)
                     )
                 )
             }
@@ -754,7 +815,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Видео · HLS-поток", "сегменты m3u8 будут собраны в один файл", false,
-                    DownloadJob("hls", title, "$name.$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(masterUrl), headers, 0L)
+                    DownloadJob("hls", title, "$name.$ext", if (ext == "ts") "video/mp2t" else "video/mp4", mutableListOf(masterUrl), headers, 0L, ytId = ytId, server = server)
                 )
             )
         }
@@ -762,7 +823,7 @@ object MediaGrabber {
             out.add(
                 Option(
                     "Только аудио из потока · M4A", "скачать поток и извлечь звук", true,
-                    DownloadJob("hls_audio", title, "$name.m4a", "audio/mp4", mutableListOf(out.last { !it.isAudio }.job.urls[0]), headers, 0L, isAudio = true)
+                    DownloadJob("hls_audio", title, "$name.m4a", "audio/mp4", mutableListOf(out.last { !it.isAudio }.job.urls[0]), headers, 0L, isAudio = true, ytId = ytId, server = server)
                 )
             )
         }

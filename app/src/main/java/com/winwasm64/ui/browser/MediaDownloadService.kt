@@ -367,6 +367,7 @@ class MediaDownloadService : Service() {
                     }
                     code == 416 -> break
                     (code == 403 || code == 410) && isGoogle -> {
+                        if (job.server.isBlank()) throw IOException("YouTube отклонил ссылку (HTTP $code). Запустите воспроизведение на странице и повторите — тогда будут использованы адреса самого плеера")
                         if (refreshes < 3) {
                             refreshes++
                             resp.closer(); resp = null
@@ -402,7 +403,7 @@ class MediaDownloadService : Service() {
                 throw e
             } catch (e: IOException) {
                 attempts++
-                if (attempts > 5 || !rangesOk) throw e
+                if (attempts > 5 || !rangesOk || e.message?.startsWith("YouTube отклонил") == true) throw e
                 VpnLog.w(MediaGrabber.TAG, "обрыв на ${MediaGrabber.fmtSize(pos).ifBlank { "0" }} (${e.message}) — повтор $attempts/5")
                 // закреплённый сервер мог упасть — для YouTube переезжаем на другой вместе с новыми адресами
                 if (job.server.isNotBlank() && attempts >= 2 && refreshes < 3) {
@@ -425,12 +426,14 @@ class MediaDownloadService : Service() {
 
     private fun downloadHls(job: MediaGrabber.DownloadJob, playlistUrl: String, out: OutputStream) {
         var url = playlistUrl
-        var text = MediaGrabber.getText(url, job.headers, 4 * 1024 * 1024)
+        val http: TunnelHttp? = if (job.server.isNotBlank()) TunnelHttp(job.server) else null
+        fun text(u: String): String = if (http != null) http.getText(u, job.headers, 4 * 1024 * 1024) else MediaGrabber.getText(u, job.headers, 4 * 1024 * 1024)
+        var text = text(url)
         if (text.contains("#EXT-X-STREAM-INF")) {
             val v = MediaGrabber.parseMaster(text, url).filter { !it.audioOnly }.maxByOrNull { it.bandwidth }
                 ?: MediaGrabber.parseMaster(text, url).firstOrNull() ?: throw IOException("пустой мастер-плейлист")
             url = v.url
-            text = MediaGrabber.getText(url, job.headers, 4 * 1024 * 1024)
+            text = text(url)
         }
         val segs = ArrayList<Segment>()
         var initUrl: String? = null
@@ -469,14 +472,14 @@ class MediaDownloadService : Service() {
         var speed = 0L
         val expectedPerSeg = if (job.expectedBytes > 0) job.expectedBytes / segs.size else 0L
         if (initUrl != null) {
-            val b = fetchBytes(initUrl, job.headers)
+            val b = fetchBytes(initUrl, job.headers, http)
             out.write(b); done += b.size
         }
         for ((i, s) in segs.withIndex()) {
             checkCancel()
-            var data = fetchBytes(s.url, job.headers)
+            var data = fetchBytes(s.url, job.headers, http)
             if (s.keyUrl != null) {
-                val key = keys.getOrPut(s.keyUrl) { fetchBytes(s.keyUrl, job.headers) }
+                val key = keys.getOrPut(s.keyUrl) { fetchBytes(s.keyUrl, job.headers, http) }
                 if (key.size != 16) throw IOException("ключ AES неверной длины")
                 val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
                 cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(s.iv))
@@ -492,19 +495,28 @@ class MediaDownloadService : Service() {
         out.flush()
     }
 
-    private fun fetchBytes(url: String, headers: Map<String, String>): ByteArray {
+    private fun fetchBytes(url: String, headers: Map<String, String>, http: TunnelHttp?): ByteArray {
         var last: IOException? = null
         for (attempt in 1..4) {
             checkCancel()
-            val c = MediaGrabber.open(url, headers)
             try {
-                val code = c.responseCode
-                if (code !in 200..299) throw IOException("HTTP $code")
-                return MediaGrabber.readAll(c.inputStream, 256 * 1024 * 1024)
+                if (http != null) {
+                    http.request(url, headers).use { r ->
+                        if (r.code !in 200..299) throw IOException("HTTP ${r.code}")
+                        return MediaGrabber.readAll(r.body, 256 * 1024 * 1024)
+                    }
+                } else {
+                    val c = MediaGrabber.open(url, headers)
+                    try {
+                        val code = c.responseCode
+                        if (code !in 200..299) throw IOException("HTTP $code")
+                        return MediaGrabber.readAll(c.inputStream, 256 * 1024 * 1024)
+                    } finally { c.disconnect() }
+                }
             } catch (e: CancelledException) { throw e } catch (e: IOException) {
                 last = e
                 Thread.sleep(1000L * attempt)
-            } finally { c.disconnect() }
+            }
         }
         throw last ?: IOException("segment")
     }
