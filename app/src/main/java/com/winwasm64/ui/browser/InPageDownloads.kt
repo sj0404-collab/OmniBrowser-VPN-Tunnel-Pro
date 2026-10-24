@@ -66,9 +66,42 @@ object InPageDownloads {
         }
     }
 
+    /** Контекст приложения (для кэша и скрытого WebView решателя) — запоминается при регистрации вкладки. */
+    @Volatile var appContext: android.content.Context? = null
+
     /** Шторка загрузок запоминает WebView вкладки, чтобы сервис мог попросить страницу скачать файл. */
     fun register(tabId: String, wv: WebView) {
         webViews[tabId] = WeakReference(wv)
+        appContext = wv.context.applicationContext
+    }
+
+    // ---- v4.3.7: текст по адресу силами страницы (например, код плеера YouTube — он уже в кэше браузера)
+    private class TextWait { val latch = CountDownLatch(1); @Volatile var text: String? = null; @Volatile var error: String = "" }
+    private val texts = ConcurrentHashMap<String, TextWait>()
+
+    fun fetchText(tabId: String, url: String, timeoutMs: Long): String? {
+        val wv = webViews[tabId]?.get() ?: return null
+        val id = UUID.randomUUID().toString()
+        val w = TextWait()
+        texts[id] = w
+        main.post {
+            try {
+                wv.evaluateJavascript("(function(){ try { if (!window.__omniFetchText) return 'no'; window.__omniFetchText(" + org.json.JSONObject.quote(id) + "," + org.json.JSONObject.quote(url) + "); return 'ok'; } catch (e) { return 'err:' + e; } })()") { r ->
+                    if (r == null || !r.contains("ok")) { w.error = "страница не приняла запрос (${r ?: "null"})"; w.latch.countDown() }
+                }
+            } catch (e: Exception) { w.error = e.toString(); w.latch.countDown() }
+        }
+        val ok = w.latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        texts.remove(id)
+        if (!ok) { VpnLog.w(TAG, "страница не вернула ${url.take(80)} за ${timeoutMs / 1000} с"); return null }
+        if (w.text == null) VpnLog.w(TAG, "страница не смогла получить ${url.take(80)}: ${w.error}")
+        return w.text
+    }
+
+    fun onText(id: String, text: String, error: String) {
+        val w = texts[id] ?: return
+        if (error.isBlank() && text.isNotEmpty()) w.text = text else w.error = error.ifBlank { "пусто" }
+        w.latch.countDown()
     }
 
     fun available(tabId: String): Boolean = tabId.isNotBlank() && webViews[tabId]?.get() != null

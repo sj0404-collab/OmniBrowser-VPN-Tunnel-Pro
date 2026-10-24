@@ -1,0 +1,3 @@
+yt.solver.core.js / yt.solver.lib.min.js — https://github.com/yt-dlp/ejs 0.8.0 (Unlicense).
+yt.solver.core.js изменён: глобальный location не переопределяется, если уже существует (запуск в WebView).
+yt.solver.lib.min.js содержит meriyah (ISC, https://github.com/meriyah/meriyah) и astring (MIT, https://github.com/davidbonnet/astring).

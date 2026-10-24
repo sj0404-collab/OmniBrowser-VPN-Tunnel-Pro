@@ -314,6 +314,10 @@ object MediaGrabber {
     };
     step();
   };
+  window.__omniFetchText = function(id, url){
+    fetch(url, { credentials: 'omit' }).then(function(r){ if (!r.ok) throw 'HTTP ' + r.status; return r.text(); })
+      .then(function(t){ OmniMedia.textResult(id, t, ''); }).catch(function(e){ OmniMedia.textResult(id, '', String(e)); });
+  };
   window.__omniListMedia = function(){
     var out = { page: location.href, title: document.title || '', els: [], yt: null, sniffed: [], pot: G.pot || '', n: G.n || '' };
     try {
@@ -344,7 +348,7 @@ object MediaGrabber {
         var fm = [];
         var push = function(muxed){ return function(f){
           try {
-            fm.push({ itag: f.itag || 0, url: f.url || '', cipher: !!(f.signatureCipher || f.cipher), mime: f.mimeType || '', q: f.qualityLabel || f.quality || '', br: f.bitrate || 0, size: parseInt(f.contentLength || '0', 10) || 0, fps: f.fps || 0, h: f.height || 0, w: f.width || 0, muxed: muxed, lang: (f.audioTrack && f.audioTrack.displayName) || '', dflt: !!(f.audioTrack && f.audioTrack.audioIsDefault) });
+            fm.push({ itag: f.itag || 0, url: f.url || '', cipher: !!(f.signatureCipher || f.cipher), sc: f.signatureCipher || f.cipher || '', mime: f.mimeType || '', q: f.qualityLabel || f.quality || '', br: f.bitrate || 0, size: parseInt(f.contentLength || '0', 10) || 0, fps: f.fps || 0, h: f.height || 0, w: f.width || 0, muxed: muxed, lang: (f.audioTrack && f.audioTrack.displayName) || '', dflt: !!(f.audioTrack && f.audioTrack.audioIsDefault) });
           } catch (e) {}
         }; };
         if (pr && pr.streamingData) {
@@ -358,7 +362,15 @@ object MediaGrabber {
           dur: parseInt((pr && pr.videoDetails && pr.videoDetails.lengthSeconds) || '0', 10) || 0,
           live: !!(pr && pr.videoDetails && pr.videoDetails.isLive),
           formats: fm,
-          hls: (pr && pr.streamingData && pr.streamingData.hlsManifestUrl) || ''
+          hls: (pr && pr.streamingData && pr.streamingData.hlsManifestUrl) || '',
+          playerJs: (function(){
+            try {
+              var u = (window.ytcfg && ytcfg.get && ytcfg.get('PLAYER_JS_URL')) || '';
+              if (!u) { var sc = document.querySelector('script[src*="/s/player/"]'); if (sc) u = sc.src || sc.getAttribute('src') || ''; }
+              if (u && u.charAt(0) === '/') u = location.origin + u;
+              return u;
+            } catch (e) { return ''; }
+          })()
         };
       }
     } catch (e) {}
@@ -593,6 +605,50 @@ object MediaGrabber {
         return found
     }
 
+    /**
+     * v4.3.7: страница «скачать через сторонние сервисы» (data:-URL для новой вкладки): ссылка на видео + кнопки
+     * SaveFrom / 9xbuddy / Cobalt / Y2mate / Invidious / Piped с уже подставленным адресом.
+     */
+    fun altServicesUrl(videoUrl: String, title: String): String {
+        val u = videoUrl.trim()
+        val enc = Uri.encode(u)
+        var ytId = ""
+        try {
+            val p = Uri.parse(u)
+            val h = p.host ?: ""
+            if (h == "youtu.be") ytId = p.pathSegments.firstOrNull() ?: ""
+            else if (h.endsWith("youtube.com") || h.endsWith("youtube-nocookie.com")) {
+                ytId = p.getQueryParameter("v") ?: ""
+                if (ytId.isBlank()) { val segs = p.pathSegments; val i = segs.indexOfFirst { it == "shorts" || it == "embed" || it == "live" || it == "v" }; if (i >= 0 && i + 1 < segs.size) ytId = segs[i + 1] }
+            }
+        } catch (_: Exception) {}
+        ytId = ytId.filter { it.isLetterOrDigit() || it == '-' || it == '_' }
+        fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+        val items = ArrayList<Triple<String, String, String>>()
+        if (ytId.isNotBlank()) {
+            items.add(Triple("SaveFrom (ssyoutube)", "https://ssyoutube.com/watch?v=$ytId", "страница с выбором качества; при первом запуске возможна реклама"))
+            items.add(Triple("Y2mate", "https://www.y2mate.com/youtube/$ytId", "видео и mp3"))
+            items.add(Triple("Invidious — yewtu.be", "https://yewtu.be/watch?v=$ytId", "под видео кнопка Download (качество/только звук)"))
+            items.add(Triple("Invidious — inv.nadeko.net", "https://inv.nadeko.net/watch?v=$ytId", "запасной экземпляр Invidious"))
+            items.add(Triple("Piped", "https://piped.video/watch?v=$ytId", "кнопка Download под плеером"))
+        }
+        items.add(Triple("SaveFrom.net", "https://en.savefrom.net/#url=$enc", "универсальный загрузчик (YouTube, VK, TikTok, Instagram…)"))
+        items.add(Triple("9xbuddy", "https://9xbuddy.com/process?url=$enc", "универсальный, много сайтов"))
+        items.add(Triple("Cobalt", "https://cobalt.tools/", "без рекламы; ссылку нужно вставить вручную — она скопирована кнопкой выше"))
+        val sb = StringBuilder()
+        sb.append("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Скачать через сервисы</title>")
+        sb.append("<style>body{margin:0;padding:18px 16px 40px;background:#0f1115;color:#e8eaf0;font:15px/1.45 system-ui,Roboto,sans-serif}h1{font-size:18px;margin:0 0 4px}p.t{color:#9aa3b2;margin:0 0 14px;font-size:13px}")
+        sb.append(".url{display:flex;gap:8px;margin-bottom:18px}.url input{flex:1;min-width:0;background:#171a21;color:#cfd5e1;border:1px solid #2a2f3a;border-radius:10px;padding:10px 12px;font-size:13px}")
+        sb.append(".url button{background:#2f6fed;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-size:14px}a.s{display:block;background:#171a21;border:1px solid #2a2f3a;border-radius:14px;padding:12px 14px;margin-bottom:10px;color:#e8eaf0;text-decoration:none}")
+        sb.append("a.s b{display:block;font-size:16px;margin-bottom:2px}a.s span{color:#9aa3b2;font-size:13px}.n{color:#9aa3b2;font-size:12px;margin-top:16px}</style></head><body>")
+        sb.append("<h1>Скачать через сторонние сервисы</h1><p class=\"t\">").append(esc(title.ifBlank { "видео" })).append("</p>")
+        sb.append("<div class=\"url\"><input id=\"u\" readonly value=\"").append(esc(u)).append("\"><button onclick=\"cp()\">Копировать</button></div>")
+        for ((name, link, desc) in items) sb.append("<a class=\"s\" href=\"").append(esc(link)).append("\"><b>").append(esc(name)).append("</b><span>").append(esc(desc)).append("</span></a>")
+        sb.append("<p class=\"n\">Сервисы сторонние: какой-то может не открыться или показать рекламу — просто попробуйте следующий. Файл сохранится через обычную загрузку браузера.</p>")
+        sb.append("<script>function cp(){var i=document.getElementById('u');i.select();i.setSelectionRange(0,99999);try{if(navigator.clipboard){navigator.clipboard.writeText(i.value);}else{document.execCommand('copy');}}catch(e){try{document.execCommand('copy');}catch(x){}}var b=document.querySelector('.url button');b.textContent='Скопировано';setTimeout(function(){b.textContent='Копировать';},1500);}</script></body></html>")
+        return "data:text/html;charset=utf-8;base64," + android.util.Base64.encodeToString(sb.toString().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+    }
+
     /** Подсказка для шторки (почему вариантов может не быть / что сделать). */
     @Volatile var lastNotice: String = ""
 
@@ -600,7 +656,9 @@ object MediaGrabber {
 
     private class YtFormat(
         val itag: Int, val url: String, val mime: String, val q: String, val br: Int, val size: Long,
-        val fps: Int, val h: Int, val muxed: Boolean, val lang: String, val dflt: Boolean
+        val fps: Int, val h: Int, val muxed: Boolean, val lang: String, val dflt: Boolean,
+        /** signatureCipher: задача подписи `s` и имя параметра `sp`; needsSolve — адрес из ответа плеера (n ещё не решён). */
+        val sig: String = "", val sp: String = "", val needsSolve: Boolean = false
     ) {
         val isVideo get() = mime.startsWith("video/")
         val isAudio get() = mime.startsWith("audio/")
@@ -608,7 +666,7 @@ object MediaGrabber {
         val codec get() = mime.substringAfter("codecs=\"", "").substringBefore('"')
     }
 
-    private fun YtFormat.copyUrl(u: String) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt)
+    private fun YtFormat.copyUrl(u: String, solved: Boolean = false) = YtFormat(itag, u, mime, q, br, size, fps, h, muxed, lang, dflt, sig, sp, needsSolve && !solved)
 
     /** PO-token и уже расшифрованный параметр n из любого запроса плеера к googlevideo (одинаковы для всех форматов ролика). */
     private fun sniffedPotAndN(root: JSONObject, sniffed: JSONArray): Pair<String, String?>? {
@@ -627,6 +685,101 @@ object MediaGrabber {
             if (best.second != null) break
         }
         return best
+    }
+
+    private val solvedCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun nOf(url: String): String? = try { Uri.parse(url).getQueryParameter("n")?.ifBlank { null } } catch (_: Exception) { null }
+
+    /**
+     * v4.3.7: решает `n` и подпись для адресов из ответа плеера кодом плеера [playerJs] (см. [JsSolver]) и подставляет
+     * решения в [formats]. Возвращает false, если хотя бы одна задача осталась нерешённой.
+     */
+    private fun solveFormats(tabId: String, playerJs: String, formats: MutableList<YtFormat>): Boolean {
+        val key = playerJs.ifBlank { "unknown" }
+        val ns = LinkedHashSet<String>()
+        val sigs = LinkedHashSet<String>()
+        for (f in formats) {
+            if (!f.needsSolve) continue
+            nOf(f.url)?.let { ns.add(it) }
+            if (f.sig.isNotBlank()) sigs.add(f.sig)
+        }
+        if (ns.isEmpty() && sigs.isEmpty()) return true
+        val needN = ns.filter { !solvedCache.containsKey("$key|n|$it") }
+        val needS = sigs.filter { !solvedCache.containsKey("$key|sig|$it") }
+        if (needN.isNotEmpty() || needS.isNotEmpty()) {
+            val ctx = InPageDownloads.appContext
+            if (ctx == null) { VpnLog.w(TAG, "решатель n: нет контекста приложения"); return false }
+            val src = if (JsSolver.hasPlayer(key)) null else fetchPlayerSource(tabId, playerJs, ctx)
+            if (src == null && !JsSolver.hasPlayer(key)) {
+                VpnLog.w(TAG, "решатель n: не удалось получить код плеера ${playerJs.ifBlank { "(адрес плеера не найден на странице)" }}")
+                return false
+            }
+            val t0 = System.currentTimeMillis()
+            val res = JsSolver.solve(ctx, key, src, needN, needS, 90_000L)
+            if (res == null) { VpnLog.w(TAG, "решатель n: не ответил за 90 с"); return false }
+            if (res.optString("type") != "result") { VpnLog.w(TAG, "решатель n: ${res.optString("error").take(300)}"); return false }
+            val arr = res.optJSONArray("responses") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val typ = if (i == 0) "n" else "sig"
+                if (r.optString("type") != "result") {
+                    if ((typ == "n" && needN.isNotEmpty()) || (typ == "sig" && needS.isNotEmpty())) VpnLog.w(TAG, "решатель $typ: ${r.optString("error").take(300)}")
+                    continue
+                }
+                val data = r.optJSONObject("data") ?: continue
+                for (k in data.keys()) solvedCache["$key|$typ|$k"] = data.getString(k)
+            }
+            VpnLog.i(TAG, "YouTube: n/подпись решены кодом плеера за ${System.currentTimeMillis() - t0} мс (${needN.size} n, ${needS.size} подписей, плеер ${playerJs.substringAfter("/s/player/").substringBefore('/').ifBlank { "?" }})")
+        }
+        var ok = true
+        for (i in formats.indices) {
+            val f = formats[i]
+            if (!f.needsSolve) continue
+            var u = f.url
+            val nIn = nOf(u)
+            if (nIn != null) {
+                val sol = solvedCache["$key|n|$nIn"]
+                if (sol == null) ok = false
+                else u = u.replace(Regex("([?&])n=[^&]*")) { m -> m.groupValues[1] + "n=" + Uri.encode(sol) }
+            }
+            if (f.sig.isNotBlank()) {
+                val sol = solvedCache["$key|sig|${f.sig}"]
+                if (sol == null) ok = false
+                else u += (if (u.contains('?')) "&" else "?") + f.sp.ifBlank { "signature" } + "=" + Uri.encode(sol)
+            }
+            formats[i] = f.copyUrl(u, solved = true)
+        }
+        if (ns.isNotEmpty()) {
+            val n0 = ns.first()
+            VpnLog.i(TAG, "YouTube: n=$n0 → ${solvedCache["$key|n|$n0"] ?: "не решён"}")
+        }
+        return ok
+    }
+
+    /** Код плеера: кэш на диске → fetch самой страницей (он уже в кэше браузера) → через туннель. */
+    private fun fetchPlayerSource(tabId: String, url: String, ctx: android.content.Context): String? {
+        if (url.isBlank()) return null
+        val dir = java.io.File(ctx.cacheDir, "ytplayer").apply { mkdirs() }
+        val name = java.security.MessageDigest.getInstance("SHA-1").digest(url.toByteArray()).joinToString("") { "%02x".format(it) }
+        val file = java.io.File(dir, "$name.js")
+        if (file.isFile && file.length() > 200_000) return try { file.readText() } catch (_: Exception) { null }
+        val t0 = System.currentTimeMillis()
+        var src: String? = if (tabId.isNotBlank()) InPageDownloads.fetchText(tabId, url, 40_000L) else null
+        var how = "страницей"
+        if (src == null || src.length < 200_000) {
+            how = "через туннель"
+            src = try { TunnelHttp().getText(url, mapOf("User-Agent" to DEFAULT_UA), 6 * 1024 * 1024) } catch (e: Exception) {
+                VpnLog.w(TAG, "код плеера через туннель: ${e.message ?: e.javaClass.simpleName}"); null
+            }
+        }
+        if (src == null || src.length < 200_000) return null
+        VpnLog.i(TAG, "код плеера получен $how: ${src.length / 1024} КБ за ${System.currentTimeMillis() - t0} мс")
+        try {
+            file.writeText(src)
+            dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(3)?.forEach { it.delete() }
+        } catch (_: Exception) {}
+        return src
     }
 
     private fun patchYtUrl(url: String, pot: String, n: String?): String {
@@ -659,13 +812,24 @@ object MediaGrabber {
         val arr = yt.optJSONArray("formats") ?: JSONArray()
         for (i in 0 until arr.length()) {
             val f = arr.optJSONObject(i) ?: continue
-            if (f.optBoolean("cipher")) continue
-            val url = f.optString("url")
+            var url = f.optString("url")
+            var sig = ""
+            var sp = ""
+            if (f.optBoolean("cipher")) {
+                // v4.3.7: signatureCipher = "s=<задача>&sp=<имя параметра>&url=<адрес>" — подпись решается кодом плеера
+                val sc = f.optString("sc")
+                if (sc.isBlank()) continue
+                val q = Uri.parse("https://x/?$sc")
+                url = q.getQueryParameter("url") ?: ""
+                sig = q.getQueryParameter("s") ?: ""
+                sp = q.getQueryParameter("sp") ?: "signature"
+            }
             if (url.isBlank()) continue
             out.add(
                 YtFormat(
                     f.optInt("itag"), url, f.optString("mime"), f.optString("q"), f.optInt("br"), f.optLong("size"),
-                    f.optInt("fps"), f.optInt("h"), f.optBoolean("muxed"), f.optString("lang"), f.optBoolean("dflt")
+                    f.optInt("fps"), f.optInt("h"), f.optBoolean("muxed"), f.optString("lang"), f.optBoolean("dflt"),
+                    sig, sp, true
                 )
             )
         }
@@ -793,7 +957,7 @@ object MediaGrabber {
         return Pair(urls, server)
     }
 
-    private fun ytOptions(root: JSONObject, yt: JSONObject, sniffed: JSONArray, baseHeaders: Map<String, String>, pageTitle: String): List<Option> {
+    private fun ytOptions(root: JSONObject, yt: JSONObject, sniffed: JSONArray, baseHeaders: Map<String, String>, pageTitle: String, tabId: String): List<Option> {
         val videoId = yt.optString("id")
         var title = yt.optString("title").ifBlank { cleanTitle(pageTitle) }
         val durSec = yt.optLong("dur")
@@ -811,23 +975,33 @@ object MediaGrabber {
         var itUa = ""
         var webMode = false
         val potN = sniffedPotAndN(root, sniffed)
-        if (formats.isNotEmpty() && potN != null) {
-            val (pot, nVal) = potN
-            // v4.3.6: диагностика — одинаков ли n в SABR-адресе плеера и в адресах ответа плеера (если одинаков, плеер
-            // его не преобразовывал, и 403 объясняется не им)
-            try {
-                val nPage = Uri.parse(formats[0].url).getQueryParameter("n") ?: ""
-                VpnLog.i(TAG, "YouTube: n из запроса плеера=${nVal ?: "—"}, n в адресе ответа плеера=${nPage.ifBlank { "—" }}" +
-                    (if (nVal != null && nPage.isNotBlank()) (if (nVal == nPage) " (совпадают)" else " (разные — плеер преобразует n)") else ""))
-            } catch (_: Exception) {}
-            val patched = formats.map { f -> f.copyUrl(patchYtUrl(f.url, pot, nVal)) }
-            formats.clear(); formats.addAll(patched)
+        // v4.3.7: адреса из ответа плеера — «задачи» n (и подпись s), которые решает JS плеера; решаем их тем же кодом
+        // (решатель yt-dlp/ejs в скрытом WebView). Скопированный из SABR-запроса n был решением ДРУГОЙ задачи → 403 (журнал 19:09).
+        if (formats.isNotEmpty()) {
             webMode = true
-            VpnLog.i(TAG, "YouTube: адреса плеера страницы + PO-token/n из запросов плеера (${formats.size} форматов${if (potN.second == null) ", без n" else ""})")
-            val boundIp = try { Uri.parse(formats[0].url).getQueryParameter("ip") ?: "" } catch (_: Exception) { "" }
-            server = findServerForIp(boundIp) ?: ""
-            if (server.isBlank()) lastNotice = "Ссылки плеера привязаны к IP $boundIp, подходящий сервер Browsec не найден — загрузка пойдёт через прокси браузера и может получить 403."
-        } else if (videoId.isNotBlank() && !yt.optBoolean("live")) {
+            val playerJs = yt.optString("playerJs")
+            val solvedAll = try { solveFormats(tabId, playerJs, formats) } catch (e: Exception) {
+                VpnLog.w(TAG, "решатель n: ${e.message ?: e.javaClass.simpleName}"); false
+            }
+            val pot = potN?.first
+            if (pot != null) {
+                for (i in formats.indices) formats[i] = formats[i].copyUrl(patchYtUrl(formats[i].url, pot, null))
+                VpnLog.i(TAG, "YouTube: адреса плеера страницы + решённый n + PO-token из запроса плеера (${formats.size} форматов)")
+            } else {
+                // itag 18 (360p, видео+звук) — единственный формат, который googlevideo отдаёт без PO-token
+                val keep = formats.filter { it.itag == 18 }
+                formats.clear(); formats.addAll(keep)
+                lastNotice = "PO-token плеера ещё не перехвачен — пока доступно только 360p (itag 18, без токена). Запустите видео, подождите 15–20 секунд и откройте шторку снова для остальных качеств."
+                VpnLog.w(TAG, "YouTube: PO-token не перехвачен — только itag 18 (не требует токена)" + (if (keep.isEmpty()) ", но его нет в списке плеера" else ""))
+            }
+            if (!solvedAll) lastNotice = (lastNotice + " Не удалось решить параметр n кодом плеера — возможен 403.").trim()
+            if (formats.isNotEmpty()) {
+                val boundIp = try { Uri.parse(formats[0].url).getQueryParameter("ip") ?: "" } catch (_: Exception) { "" }
+                server = findServerForIp(boundIp) ?: ""
+                if (server.isBlank()) lastNotice = (lastNotice + " Ссылки плеера привязаны к IP $boundIp, подходящий сервер Browsec не найден — загрузка пойдёт через прокси браузера.").trim()
+            }
+        }
+        if (formats.isEmpty() && videoId.isNotBlank() && !yt.optBoolean("live")) {
             if (formats.isNotEmpty()) {
                 VpnLog.w(TAG, "YouTube: PO-token плеера не перехвачен — пробуем InnerTube")
                 lastNotice = "PO-token плеера ещё не перехвачен: запустите видео и подождите 15–20 секунд (плеер получает токен не сразу), затем откройте шторку снова."
@@ -835,7 +1009,7 @@ object MediaGrabber {
             val http = TunnelHttp()
             val vr = innerTubeFormats(videoId, http, setOf("VISIONOS", "ANDROID_VR"))
             if (vr != null && vr.formats.isNotEmpty()) {
-                formats.clear(); known.clear()
+                formats.clear(); known.clear(); webMode = false
                 for (f in vr.formats) if (known.add(f.itag)) formats.add(f)
                 if (title.isBlank()) title = vr.title
                 server = http.serverKey ?: ""
@@ -1067,7 +1241,7 @@ object MediaGrabber {
      * Собирает варианты загрузки. Выполнять в фоновом потоке (ходит в сеть: HLS-плейлисты, размер файлов, InnerTube).
      * @param json ответ `__omniListMedia()`
      */
-    fun buildOptions(json: String, pageUrl: String, userAgent: String?, cookie: String?): List<Option> {
+    fun buildOptions(json: String, pageUrl: String, userAgent: String?, cookie: String?, tabId: String = ""): List<Option> {
         lastNotice = ""
         val o = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
         val page = o.optString("page").ifBlank { pageUrl }
@@ -1081,7 +1255,7 @@ object MediaGrabber {
 
         val yt = o.optJSONObject("yt")
         if (yt != null) {
-            val list = try { ytOptions(o, yt, sniffed, headers, pageTitle) } catch (e: Exception) {
+            val list = try { ytOptions(o, yt, sniffed, headers, pageTitle, tabId) } catch (e: Exception) {
                 VpnLog.w(TAG, "YouTube: ${e.message ?: e.javaClass.simpleName}"); emptyList()
             }
             if (list.isNotEmpty()) return list

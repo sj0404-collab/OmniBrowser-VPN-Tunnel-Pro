@@ -397,6 +397,9 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
     @JavascriptInterface
     fun dlError(id: String, msg: String) { com.winwasm64.ui.browser.InPageDownloads.onError(id, msg) }
 
+    @JavascriptInterface
+    fun textResult(id: String, text: String, error: String) { com.winwasm64.ui.browser.InPageDownloads.onText(id, text, error) }
+
     /** v4.3.0: страница сообщила, что на ней есть видео/аудио (элемент или медиа-запрос) — показать кнопку «Скачать». */
     @JavascriptInterface
     fun hasMedia(present: Boolean) {

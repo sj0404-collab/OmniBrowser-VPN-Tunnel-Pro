@@ -168,6 +168,8 @@ class BrowserTabModel(
 class MediaGrabState(val title: String) {
     var options by mutableStateOf<List<MediaGrabber.Option>?>(null)
     var notice by mutableStateOf("")
+    /** v4.3.7: адрес страницы/видео для «скачать через сторонние сервисы». */
+    var shareUrl: String = ""
 }
 
 /**
@@ -420,12 +422,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         grabSheet = state
         com.winwasm64.ui.browser.InPageDownloads.register(tab.id, wv)
         val pageUrl = wv.url ?: tab.url
+        state.shareUrl = pageUrl
         val ua = try { wv.settings.userAgentString } catch (_: Exception) { null }
         val cookie = if (tab.isIncognito) null else try { CookieManager.getInstance().getCookie(pageUrl) } catch (_: Exception) { null }
         wv.evaluateJavascript("(function(){ try { return window.__omniListMedia ? window.__omniListMedia() : '{}'; } catch (e) { return '{}'; } })()") { raw ->
             val json = try { (org.json.JSONTokener(raw ?: "\"{}\"").nextValue() as? String) ?: "{}" } catch (_: Exception) { "{}" }
             thread(name = "omni-grab") {
-                val opts = try { MediaGrabber.buildOptions(json, pageUrl, ua, cookie) } catch (e: Exception) {
+                val opts = try { MediaGrabber.buildOptions(json, pageUrl, ua, cookie, tab.id) } catch (e: Exception) {
                     com.winwasm64.vpn.VpnLog.w(MediaGrabber.TAG, "поиск источников: ${e.message ?: e.javaClass.simpleName}")
                     emptyList()
                 }
@@ -445,6 +448,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     it.isNotBlank() &&
                         !it.contains("piped.video") &&
                         !it.startsWith("file:") &&
+                        !it.startsWith("data:") &&
                         !it.contains("translate.google") &&
                         !it.contains("translate.goog")
                 }
@@ -1706,11 +1710,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 Spacer(Modifier.width(14.dp))
                                 Text("Ищу источники на странице…", color = Omni.TextDim, fontSize = 14.sp)
                             }
-                            opts.isEmpty() -> Text(
-                                (if (gs.notice.isNotBlank()) "⚠ " + gs.notice + "\n\n" else "") + "Не удалось найти прямые ссылки на видео. Запустите воспроизведение на странице и попробуйте ещё раз — " +
-                                    "адреса медиа появляются, когда плеер начинает их запрашивать. DRM-потоки (Netflix и т.п.) скачать нельзя.",
-                                color = Omni.TextDim, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
-                            )
+                            opts.isEmpty() -> {
+                                Text(
+                                    (if (gs.notice.isNotBlank()) "⚠ " + gs.notice + "\n\n" else "") + "Не удалось найти прямые ссылки на видео. Запустите воспроизведение на странице и попробуйте ещё раз — " +
+                                        "адреса медиа появляются, когда плеер начинает их запрашивать. DRM-потоки (Netflix и т.п.) скачать нельзя.",
+                                    color = Omni.TextDim, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
+                                )
+                                SheetDivider()
+                                SheetItem(OmniIcons.Globe, "Через сторонние сервисы", "SaveFrom, Cobalt, Invidious и другие — в новой вкладке", tint = Omni.Accent, onClick = {
+                                    openNewTab(MediaGrabber.altServicesUrl(gs.shareUrl, gs.title))
+                                    grabSheet = null
+                                })
+                            }
                             else -> {
                                 if (gs.notice.isNotBlank()) Text(
                                     "⚠ " + gs.notice, color = Omni.Warning, fontSize = 12.sp,
@@ -1735,6 +1746,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     })
                                 }
                                 SheetDivider()
+                                SheetItem(OmniIcons.Globe, "Через сторонние сервисы", "SaveFrom, Cobalt, Invidious и другие — в новой вкладке", tint = Omni.TextDim, onClick = {
+                                    openNewTab(MediaGrabber.altServicesUrl(gs.shareUrl, gs.title))
+                                    grabSheet = null
+                                })
                                 Text(
                                     "Файлы сохраняются в Movies/OmniBrowser и Music/OmniBrowser, прогресс — в уведомлении.",
                                     color = Omni.TextFaint, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
