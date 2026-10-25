@@ -54,6 +54,17 @@
             </intent-filter>
         </service>
         <service
+            android:name=".vpn.AppsVpnTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_lock_lock"
+            android:label="VPN приложений"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data android:name="android.service.quicksettings.ACTIVE_TILE" android:value="false" />
+        </service>
+        <service
             android:name=".ui.browser.MediaDownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />

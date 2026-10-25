@@ -54,7 +54,11 @@ class MediaDownloadService : Service() {
         const val CHANNEL_ID = "omni_downloads"
         const val ACTION_START = "com.winwasm64.action.MEDIA_DOWNLOAD"
         const val ACTION_CANCEL = "com.winwasm64.action.MEDIA_DOWNLOAD_CANCEL"
+        const val ACTION_PAUSE = "com.winwasm64.action.MEDIA_DOWNLOAD_PAUSE"
+        const val ACTION_RESUME = "com.winwasm64.action.MEDIA_DOWNLOAD_RESUME"
+        const val ACTION_RESUME_ALL = "com.winwasm64.action.MEDIA_DOWNLOAD_RESUME_ALL"
         const val EXTRA_JOB = "job"
+        const val EXTRA_ID = "id"
         private const val NOTIF_PROGRESS = 7401
         private const val CHUNK = 8L * 1024 * 1024
         private val doneCounter = java.util.concurrent.atomic.AtomicInteger(7500)
@@ -62,19 +66,40 @@ class MediaDownloadService : Service() {
         val activeTabIds: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
         fun start(context: Context, job: MediaGrabber.DownloadJob) {
-            val i = Intent(context, MediaDownloadService::class.java).setAction(ACTION_START).putExtra(EXTRA_JOB, job.toJson())
+            val e = DownloadQueue.add(context, job)
+            send(context, Intent(context, MediaDownloadService::class.java).setAction(ACTION_START).putExtra(EXTRA_ID, e.id), foreground = true)
+        }
+
+        /** v4.5.0: пауза/продолжение/удаление по id записи очереди (см. [DownloadQueue]). */
+        fun pause(context: Context, id: String) = send(context, Intent(context, MediaDownloadService::class.java).setAction(ACTION_PAUSE).putExtra(EXTRA_ID, id), foreground = false)
+        fun resume(context: Context, id: String) {
+            DownloadQueue.setState(context, id, DownloadQueue.QUEUED)
+            send(context, Intent(context, MediaDownloadService::class.java).setAction(ACTION_RESUME).putExtra(EXTRA_ID, id), foreground = true)
+        }
+        fun cancel(context: Context, id: String) = send(context, Intent(context, MediaDownloadService::class.java).setAction(ACTION_CANCEL).putExtra(EXTRA_ID, id), foreground = false)
+
+        /** При старте приложения: если в очереди остались незавершённые загрузки — продолжаем их. */
+        fun resumePending(context: Context) {
+            DownloadQueue.load(context)
+            DownloadQueue.sweep(context)
+            if (!DownloadQueue.hasPending()) return
+            send(context, Intent(context, MediaDownloadService::class.java).setAction(ACTION_RESUME_ALL), foreground = true)
+        }
+
+        private fun send(context: Context, i: Intent, foreground: Boolean) {
             try {
-                ContextCompat.startForegroundService(context, i)
+                if (foreground) ContextCompat.startForegroundService(context, i) else context.startService(i)
             } catch (e: Exception) {
-                Toast.makeText(context, "Не удалось запустить загрузку: ${e.message}", Toast.LENGTH_LONG).show()
+                try { Toast.makeText(context, "Не удалось запустить загрузку: ${e.message}", Toast.LENGTH_LONG).show() } catch (_: Exception) {}
             }
         }
     }
 
-    private val queue = LinkedBlockingQueue<MediaGrabber.DownloadJob>()
+    private val queue = LinkedBlockingQueue<DownloadQueue.Entry>()
     private var worker: Thread? = null
     private val cancelCurrent = AtomicBoolean(false)
-    @Volatile private var current: MediaGrabber.DownloadJob? = null
+    private val pauseCurrent = AtomicBoolean(false)
+    @Volatile private var current: DownloadQueue.Entry? = null
     private lateinit var nm: NotificationManager
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -92,18 +117,52 @@ class MediaDownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        DownloadQueue.load(this)
+        val id = intent?.getStringExtra(EXTRA_ID)
         when (intent?.action) {
             ACTION_CANCEL -> {
-                cancelCurrent.set(true)
-                queue.clear()
+                val cur = current
+                if (id == null || cur?.id == id) {
+                    cancelCurrent.set(true)
+                    if (id == null) { queue.forEach { DownloadQueue.remove(this, it.id) }; queue.clear() }
+                } else {
+                    queue.removeAll { it.id == id }
+                    DownloadQueue.remove(this, id)
+                    try { nm.cancel(pausedNotifId(id)) } catch (_: Exception) {}
+                }
+                if (current == null) stopIfIdle()
                 return START_NOT_STICKY
             }
-            ACTION_START -> {
-                val job = intent.getStringExtra(EXTRA_JOB)?.let { MediaGrabber.DownloadJob.fromJson(it) }
-                if (job == null) { stopIfIdle(); return START_NOT_STICKY }
-                goForeground(buildProgressNotification(job, -1, 0, 0, 0, "в очереди"))
-                queue.add(job)
-                VpnLog.i(MediaGrabber.TAG, "в очередь: «${job.fileName}» (${job.mode}${if (job.expectedBytes > 0) ", ~" + MediaGrabber.fmtSize(job.expectedBytes) else ""})")
+            ACTION_PAUSE -> {
+                val cur = current
+                if (id != null && cur?.id == id) pauseCurrent.set(true)
+                else if (id != null) {
+                    queue.removeAll { it.id == id }
+                    DownloadQueue.setState(this, id, DownloadQueue.PAUSED)
+                    notifyPaused(DownloadQueue.get(id))
+                }
+                if (current == null) stopIfIdle()
+                return START_NOT_STICKY
+            }
+            ACTION_START, ACTION_RESUME -> {
+                val e = id?.let { DownloadQueue.get(it) }
+                if (e == null) { stopIfIdle(); return START_NOT_STICKY }
+                try { nm.cancel(pausedNotifId(e.id)) } catch (_: Exception) {}
+                if (current == null) goForeground(buildProgressNotification(e, -1, e.done, e.total, 0, "в очереди"))
+                if (e.state != DownloadQueue.RUNNING && queue.none { it.id == e.id }) {
+                    DownloadQueue.setState(this, e.id, DownloadQueue.QUEUED)
+                    queue.add(e)
+                }
+                val job = e.job
+                VpnLog.i(MediaGrabber.TAG, (if (intent.action == ACTION_RESUME) "продолжаем: " else "в очередь: ") + "«${job.fileName}» (${job.mode}${if (job.expectedBytes > 0) ", ~" + MediaGrabber.fmtSize(job.expectedBytes) else ""}${if (e.done > 0) ", есть " + MediaGrabber.fmtSize(DownloadQueue.partsBytes(this, e.id)) else ""})")
+                ensureWorker()
+            }
+            ACTION_RESUME_ALL -> {
+                val pend = DownloadQueue.queued().filter { q -> queue.none { it.id == q.id } && current?.id != q.id }
+                if (pend.isEmpty() && current == null) { stopIfIdle(); return START_NOT_STICKY }
+                pend.firstOrNull()?.let { if (current == null) goForeground(buildProgressNotification(it, -1, it.done, it.total, 0, "в очереди")) }
+                queue.addAll(pend)
+                if (pend.isNotEmpty()) VpnLog.i(MediaGrabber.TAG, "продолжаем после перезапуска: ${pend.size} загрузк(и)")
                 ensureWorker()
             }
             else -> stopIfIdle()
@@ -135,18 +194,30 @@ class MediaDownloadService : Service() {
         if (worker?.isAlive == true) return
         worker = Thread({
             while (true) {
-                val job = queue.poll(2, TimeUnit.SECONDS) ?: break
-                current = job
+                val entry = queue.poll(2, TimeUnit.SECONDS) ?: break
+                val job = entry.job
+                current = entry
                 cancelCurrent.set(false)
+                pauseCurrent.set(false)
+                DownloadQueue.setState(this, entry.id, DownloadQueue.RUNNING)
                 if (job.inPage && job.tabId.isNotBlank()) activeTabIds.add(job.tabId)
                 try {
-                    runJob(job)
+                    runJob(entry)
+                    DownloadQueue.remove(this, entry.id)
+                } catch (e: PausedException) {
+                    VpnLog.i(MediaGrabber.TAG, "пауза: «${job.fileName}» на ${MediaGrabber.fmtSize(DownloadQueue.partsBytes(this, entry.id)).ifBlank { "0" }}")
+                    DownloadQueue.setState(this, entry.id, DownloadQueue.PAUSED)
+                    notifyPaused(entry)
                 } catch (e: CancelledException) {
                     VpnLog.w(MediaGrabber.TAG, "отменено: «${job.fileName}»")
+                    DownloadQueue.remove(this, entry.id)
                     notifyDone(job, null, "Загрузка отменена")
                 } catch (e: Throwable) {
-                    VpnLog.e(MediaGrabber.TAG, "ошибка «${job.fileName}»: ${e.message ?: e.javaClass.simpleName}")
-                    notifyDone(job, null, "Ошибка: ${e.message ?: e.javaClass.simpleName}")
+                    val msg = e.message ?: e.javaClass.simpleName
+                    VpnLog.e(MediaGrabber.TAG, "ошибка «${job.fileName}»: $msg")
+                    // части остаются: «Повторить» в списке загрузок продолжит с того же места
+                    DownloadQueue.setState(this, entry.id, DownloadQueue.ERROR, msg)
+                    notifyDone(job, null, "Ошибка: $msg")
                 } finally {
                     current = null
                     if (job.tabId.isNotBlank()) activeTabIds.remove(job.tabId)
@@ -157,17 +228,43 @@ class MediaDownloadService : Service() {
     }
 
     private class CancelledException : IOException("cancelled")
+    private class PausedException : IOException("paused")
 
-    private fun checkCancel() { if (cancelCurrent.get()) throw CancelledException() }
+    private fun checkCancel() {
+        if (cancelCurrent.get()) throw CancelledException()
+        if (pauseCurrent.get()) throw PausedException()
+    }
+    private fun interrupted(): Boolean = cancelCurrent.get() || pauseCurrent.get()
 
     // ------------------------------------------------------------------ уведомления
 
-    private fun cancelPending(): PendingIntent = PendingIntent.getService(
-        this, 1, Intent(this, MediaDownloadService::class.java).setAction(ACTION_CANCEL),
-        PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
-    )
+    private fun piFlags() = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
+    private fun cancelPending(): PendingIntent = PendingIntent.getService(this, 1, Intent(this, MediaDownloadService::class.java).setAction(ACTION_CANCEL), piFlags())
+    private fun actionPending(action: String, id: String, req: Int): PendingIntent =
+        PendingIntent.getService(this, req, Intent(this, MediaDownloadService::class.java).setAction(action).putExtra(EXTRA_ID, id), piFlags())
+    private fun pausedNotifId(id: String): Int = 7600 + (id.hashCode() and 0xfff)
 
-    private fun buildProgressNotification(job: MediaGrabber.DownloadJob, percent: Int, done: Long, total: Long, speedBps: Long, stage: String): Notification {
+    private fun notifyPaused(e: DownloadQueue.Entry?) {
+        if (e == null) return
+        val text = buildString {
+            append("На паузе")
+            if (e.done > 0) append(" · ").append(MediaGrabber.fmtSize(e.done))
+            if (e.total > 0) append(" из ").append(MediaGrabber.fmtSize(e.total))
+        }
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_pause)
+            .setContentTitle(e.job.fileName)
+            .setContentText(text)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(false)
+            .addAction(android.R.drawable.ic_media_play, "Продолжить", actionPending(ACTION_RESUME, e.id, pausedNotifId(e.id) + 1))
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Удалить", actionPending(ACTION_CANCEL, e.id, pausedNotifId(e.id) + 2))
+            .build()
+        try { nm.notify(pausedNotifId(e.id), n) } catch (_: Exception) {}
+    }
+
+    private fun buildProgressNotification(e: DownloadQueue.Entry, percent: Int, done: Long, total: Long, speedBps: Long, stage: String): Notification {
+        val job = e.job
         val text = buildString {
             if (percent >= 0) append("$percent% · ")
             if (done > 0) append(MediaGrabber.fmtSize(done))
@@ -183,17 +280,20 @@ class MediaDownloadService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setProgress(100, if (percent < 0) 0 else percent, percent < 0)
+            .addAction(android.R.drawable.ic_media_pause, "Пауза", actionPending(ACTION_PAUSE, e.id, 2))
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Отмена", cancelPending())
             .build()
     }
 
     private var lastNotifAt = 0L
     private fun progress(job: MediaGrabber.DownloadJob, done: Long, total: Long, speedBps: Long, stage: String, force: Boolean = false) {
+        val e = current ?: return
+        DownloadQueue.progress(e.id, done, total, speedBps, stage)
         val now = System.currentTimeMillis()
         if (!force && now - lastNotifAt < 700) return
         lastNotifAt = now
         val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else -1
-        try { nm.notify(NOTIF_PROGRESS, buildProgressNotification(job, pct, done, total, speedBps, stage)) } catch (_: Exception) {}
+        try { nm.notify(NOTIF_PROGRESS, buildProgressNotification(e, pct, done, total, speedBps, stage)) } catch (_: Exception) {}
     }
 
     private fun notifyDone(job: MediaGrabber.DownloadJob, uri: Uri?, text: String) {
@@ -216,64 +316,55 @@ class MediaDownloadService : Service() {
 
     // ------------------------------------------------------------------ выполнение
 
-    private fun runJob(job: MediaGrabber.DownloadJob) {
+    private fun runJob(entry: DownloadQueue.Entry) {
+        val job = entry.job
         val t0 = System.currentTimeMillis()
-        progress(job, 0, job.expectedBytes, 0, "подключение…", force = true)
+        progress(job, DownloadQueue.partsBytes(this, entry.id), job.expectedBytes, 0, "подключение…", force = true)
+        // v4.5.0: все режимы качают в части filesDir/dl/<id>.pN — пауза/обрыв/перезапуск продолжают с того же места
+        val p0 = DownloadQueue.partFile(this, entry.id, 0)
+        val p1 = DownloadQueue.partFile(this, entry.id, 1)
         val result: Uri = when (job.mode) {
             "single" -> {
-                val sink = MediaSink.create(this, job)
-                try {
-                    sink.stream.use { out -> downloadUrl(job, 0, out, job.expectedBytes, 0L, 1) }
-                    sink.finish()
-                } catch (e: Throwable) { sink.abort(); throw e }
+                downloadUrl(job, 0, p0, job.expectedBytes, 0L, 1)
+                progress(job, p0.length(), p0.length(), 0, "сохранение…", force = true)
+                publishFile(job, p0)
             }
             "merge" -> {
-                val tv = tmp("v", extOf(job.fileName))
-                val ta = tmp("a", if (job.fileName.endsWith(".webm")) "webm" else "m4a")
+                val vSize = downloadUrl(job, 0, p0, job.expectedBytes, 0L, 2)
+                downloadUrl(job, 1, p1, job.expectedBytes, vSize, 2)
+                progress(job, 0, 0, 0, "склейка видео и звука…", force = true)
+                val merged = tmp("m", extOf(job.fileName))
                 try {
-                    val vSize = FileOutputStream(tv).use { downloadUrl(job, 0, it, job.expectedBytes, 0L, 2) }
-                    FileOutputStream(ta).use { downloadUrl(job, 1, it, job.expectedBytes, vSize, 2) }
-                    progress(job, 0, 0, 0, "склейка видео и звука…", force = true)
-                    val merged = tmp("m", extOf(job.fileName))
-                    try {
-                        Muxer.merge(tv, ta, merged, job.fileName.endsWith(".webm"))
-                        publishFile(job, merged)
-                    } finally { merged.delete() }
-                } finally { tv.delete(); ta.delete() }
+                    Muxer.merge(p0, p1, merged, job.fileName.endsWith(".webm"))
+                    publishFile(job, merged)
+                } finally { merged.delete() }
             }
             "audio_extract" -> {
-                val tv = tmp("v", "src")
+                downloadUrl(job, 0, p0, job.expectedBytes, 0L, 1)
+                progress(job, 0, 0, 0, "извлечение звука…", force = true)
+                val outF = tmp("x", extOf(job.fileName))
                 try {
-                    FileOutputStream(tv).use { downloadUrl(job, 0, it, job.expectedBytes, 0L, 1) }
-                    progress(job, 0, 0, 0, "извлечение звука…", force = true)
-                    val outF = tmp("x", extOf(job.fileName))
-                    try {
-                        Muxer.extractAudio(tv, outF, job.fileName.endsWith(".webm"))
-                        publishFile(job, outF)
-                    } finally { outF.delete() }
-                } finally { tv.delete() }
+                    Muxer.extractAudio(p0, outF, job.fileName.endsWith(".webm"))
+                    publishFile(job, outF)
+                } finally { outF.delete() }
             }
             "hls" -> {
-                val sink = MediaSink.create(this, job)
-                try {
-                    sink.stream.use { out -> downloadHls(job, job.urls[0], out) }
-                    sink.finish()
-                } catch (e: Throwable) { sink.abort(); throw e }
+                downloadHls(entry, job.urls[0], p0)
+                progress(job, p0.length(), p0.length(), 0, "сохранение…", force = true)
+                publishFile(job, p0)
             }
             "hls_audio" -> {
-                val tv = tmp("h", "ts")
+                downloadHls(entry, job.urls[0], p0)
+                progress(job, 0, 0, 0, "извлечение звука…", force = true)
+                val outF = tmp("x", "m4a")
                 try {
-                    FileOutputStream(tv).use { downloadHls(job, job.urls[0], it) }
-                    progress(job, 0, 0, 0, "извлечение звука…", force = true)
-                    val outF = tmp("x", "m4a")
-                    try {
-                        Muxer.extractAudio(tv, outF, false)
-                        publishFile(job, outF)
-                    } finally { outF.delete() }
-                } finally { tv.delete() }
+                    Muxer.extractAudio(p0, outF, false)
+                    publishFile(job, outF)
+                } finally { outF.delete() }
             }
             else -> throw IOException("неизвестный режим ${job.mode}")
         }
+        DownloadQueue.deleteParts(this, entry.id)
         val sec = (System.currentTimeMillis() - t0) / 1000
         val mainPath = MediaSink.lastPathHint
         VpnLog.ok(MediaGrabber.TAG, "готово: «${job.fileName}» за ${sec} с → $mainPath")
@@ -424,9 +515,18 @@ class MediaDownloadService : Service() {
      * Качает ссылку №[index] задания в поток кусками по 8 МБ (Range) с докачкой при обрыве. Возвращает число байт.
      * @param parts число частей задания (для процента), [already] — байты, скачанные предыдущими частями
      */
-    private fun downloadUrl(job: MediaGrabber.DownloadJob, index: Int, out: OutputStream, expectedTotal: Long, already: Long, parts: Int): Long {
+    private fun downloadUrl(job: MediaGrabber.DownloadJob, index: Int, part: File, expectedTotal: Long, already: Long, parts: Int): Long {
+        var out: OutputStream = FileOutputStream(part, true)
+        try {
+            return downloadUrlTo(job, index, part, { out }, { out.close(); part.delete(); out = FileOutputStream(part, false) }, expectedTotal, already, parts)
+        } finally { try { out.close() } catch (_: Exception) {} }
+    }
+
+    private fun downloadUrlTo(job: MediaGrabber.DownloadJob, index: Int, part: File, outRef: () -> OutputStream, restart: () -> Unit, expectedTotal: Long, already: Long, parts: Int): Long {
         var fetcher = fetcherFor(job)
-        var pos = 0L
+        var pos = part.length()
+        if (pos > 0) VpnLog.i(MediaGrabber.TAG, "часть ${index + 1}/$parts: продолжаем с ${MediaGrabber.fmtSize(pos)}")
+        var out = outRef()
         var total = -1L
         var attempts = 0
         var refreshes = 0
@@ -459,8 +559,8 @@ class MediaDownloadService : Service() {
                 }
                 if (t == null) { VpnLog.w(MediaGrabber.TAG, "вкладка закрыта — качаем из приложения"); break }
                 if (tries == 1) VpnLog.i(MediaGrabber.TAG, "часть ${index + 1}/$parts: качает сама страница (${MediaGrabber.fmtSize(clen).ifBlank { "размер неизвестен" }})")
-                val ok = InPageDownloads.await(t, 60_000L) { cancelCurrent.get() }
-                if (cancelCurrent.get()) throw CancelledException()
+                val ok = InPageDownloads.await(t, 60_000L) { interrupted() }
+                checkCancel()
                 pos = base + t.bytes
                 if (ok) { out.flush(); return pos }
                 val err = t.error ?: "?"
@@ -486,7 +586,10 @@ class MediaDownloadService : Service() {
                         if (total < 0) total = (resp.contentRange ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
                     }
                     code == 200 -> {
-                        if (pos > 0) throw IOException("сервер не поддерживает докачку")
+                        if (pos > 0) {
+                            VpnLog.w(MediaGrabber.TAG, "сервер не поддерживает докачку — качаем часть ${index + 1} заново")
+                            restart(); out = outRef(); pos = 0L
+                        }
                         rangesOk = false
                         if (total < 0) total = resp.contentLength
                     }
@@ -528,7 +631,7 @@ class MediaDownloadService : Service() {
                         tickBytes = 0; lastTick = now
                         progress(job, already + pos, shown, speed, if (parts > 1) "часть ${index + 1} из $parts" else "")
                     }
-                    if (cancelCurrent.get()) throw CancelledException()
+                    if (interrupted()) { out.flush(); checkCancel() }
                 }
                 attempts = 0
                 if (!rangesOk) break
@@ -536,6 +639,8 @@ class MediaDownloadService : Service() {
                 if (got == 0L) break
                 if (total < 0 && got < CHUNK) break
             } catch (e: CancelledException) {
+                throw e
+            } catch (e: PausedException) {
                 throw e
             } catch (e: IOException) {
                 attempts++
@@ -560,7 +665,17 @@ class MediaDownloadService : Service() {
 
     private class Segment(val url: String, val keyUrl: String?, val iv: ByteArray?)
 
-    private fun downloadHls(job: MediaGrabber.DownloadJob, playlistUrl: String, out: OutputStream) {
+    private fun downloadHls(entry: DownloadQueue.Entry, playlistUrl: String, part: File) {
+        val job = entry.job
+        val meta = DownloadQueue.metaFile(this, entry.id, "seg")
+        // сколько сегментов уже записано в part (пауза/обрыв) — продолжаем со следующего
+        var skip = if (part.length() > 0) (try { meta.readText().trim().toInt() } catch (_: Exception) { 0 }) else 0
+        if (skip > 0) VpnLog.i(MediaGrabber.TAG, "HLS: продолжаем с сегмента ${skip + 1} (${MediaGrabber.fmtSize(part.length())})")
+        else { part.delete(); meta.delete() }
+        FileOutputStream(part, true).use { out -> downloadHlsTo(job, playlistUrl, out, skip, part) { n -> try { meta.writeText(n.toString()) } catch (_: Exception) {} } }
+    }
+
+    private fun downloadHlsTo(job: MediaGrabber.DownloadJob, playlistUrl: String, out: OutputStream, skip: Int, part: File, onSeg: (Int) -> Unit) {
         var url = playlistUrl
         val http: TunnelHttp? = if (job.server.isNotBlank()) TunnelHttp(job.server) else null
         fun text(u: String): String = if (http != null) http.getText(u, job.headers, 4 * 1024 * 1024) else MediaGrabber.getText(u, job.headers, 4 * 1024 * 1024)
@@ -602,16 +717,17 @@ class MediaDownloadService : Service() {
         if (segs.isEmpty()) throw IOException("в плейлисте нет сегментов")
         VpnLog.i(MediaGrabber.TAG, "HLS: ${segs.size} сегментов${if (initUrl != null) " + init" else ""}${if (segs.any { it.keyUrl != null }) ", AES-128" else ""}")
         val keys = HashMap<String, ByteArray>()
-        var done = 0L
+        var done = part.length()
         var lastTick = System.currentTimeMillis()
         var tickBytes = 0L
         var speed = 0L
         val expectedPerSeg = if (job.expectedBytes > 0) job.expectedBytes / segs.size else 0L
-        if (initUrl != null) {
+        if (initUrl != null && skip == 0) {
             val b = fetchBytes(initUrl, job.headers, http)
             out.write(b); done += b.size
         }
         for ((i, s) in segs.withIndex()) {
+            if (i < skip) continue
             checkCancel()
             var data = fetchBytes(s.url, job.headers, http)
             if (s.keyUrl != null) {
@@ -622,6 +738,8 @@ class MediaDownloadService : Service() {
                 data = cipher.doFinal(data)
             }
             out.write(data)
+            out.flush()
+            onSeg(i + 1)
             done += data.size; tickBytes += data.size
             val now = System.currentTimeMillis()
             if (now - lastTick >= 1000) { speed = tickBytes * 1000 / (now - lastTick); tickBytes = 0; lastTick = now }

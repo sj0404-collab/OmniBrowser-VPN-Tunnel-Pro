@@ -27,6 +27,8 @@ object ExternalIntents {
     var pendingUrl: String?
         get() = pendingUrlState.value
         set(v) { pendingUrlState.value = v }
+    /** v4.5.0: плитка быстрых настроек просит открыть раздел «Приложения» (нет разрешения на VPN или пустой список). */
+    val openAppsRequest = androidx.compose.runtime.mutableIntStateOf(0)
 }
 
 class MainActivity : ComponentActivity() {
@@ -58,6 +60,7 @@ class MainActivity : ComponentActivity() {
             val u = intent.dataString
             if (!u.isNullOrBlank()) ExternalIntents.pendingUrl = u
         }
+        if (intent?.getBooleanExtra("omni_open_apps", false) == true) ExternalIntents.openAppsRequest.intValue++
     }
 
     // ===================== v4.2.0: картинка в картинке =====================

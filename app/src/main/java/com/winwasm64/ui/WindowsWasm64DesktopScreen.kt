@@ -611,6 +611,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             trimmed.startsWith("https://", ignoreCase = true) ||
             trimmed.startsWith("javascript:", ignoreCase = true) ||
             trimmed.startsWith("data:", ignoreCase = true) ||
+            trimmed.startsWith("file:", ignoreCase = true) ||
             trimmed.startsWith("about:", ignoreCase = true)
         ) return trimmed
         return if (trimmed.contains(".") && !trimmed.contains(" ")) {
@@ -1184,7 +1185,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         return true
                     }
                     if (!nextUrl.startsWith("http://", ignoreCase = true) &&
-                        !nextUrl.startsWith("https://", ignoreCase = true)
+                        !nextUrl.startsWith("https://", ignoreCase = true) &&
+                        !nextUrl.startsWith("file://", ignoreCase = true)
                     ) {
                         nativeAppsManager.openUrlInNativeApp(nextUrl)
                         return true
@@ -1446,6 +1448,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     }
 
     // v4.4.0: ссылки, пришедшие во время работы (из других приложений, из уведомления об обновлении)
+    val openAppsReq = com.winwasm64.ExternalIntents.openAppsRequest.intValue
+    LaunchedEffect(openAppsReq) {
+        if (openAppsReq > 0) {
+            currentSection = 3
+            Toast.makeText(context, "Плитка: разрешите VPN и включите «Приложения через серверы Browsec» здесь — дальше плитка будет работать из шторки", Toast.LENGTH_LONG).show()
+        }
+    }
     val pendingExternal = com.winwasm64.ExternalIntents.pendingUrl
     LaunchedEffect(pendingExternal) {
         val u = pendingExternal ?: return@LaunchedEffect
@@ -1458,6 +1467,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
     LaunchedEffect(Unit) {
+        // v4.5.0: незавершённые загрузки продолжаются после перезапуска приложения
+        try { com.winwasm64.ui.browser.MediaDownloadService.resumePending(context) } catch (_: Exception) {}
         com.winwasm64.ui.browser.UpdateChecker.autoCheck(context)
         com.winwasm64.ui.browser.AdBlockList.init(context, adBlockEnabled)
     }
@@ -1896,6 +1907,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         SheetItem(OmniIcons.Copy, "Копировать адрес", onClick = {
                             showMenuSheet = false
                             copyToClipboard(activeTab.url)
+                        })
+                        SheetItem(OmniIcons.Save, "Сохранить страницу офлайн", subtitle = "MHTML целиком: текст, картинки, стили · раздел «История → Загрузки»", onClick = {
+                            showMenuSheet = false
+                            val wv = activeTab.webView
+                            if (wv == null || activeTab.url.startsWith("file:")) Toast.makeText(context, "Нечего сохранять", Toast.LENGTH_SHORT).show()
+                            else com.winwasm64.ui.browser.PageArchiver.save(context, wv, activeTab.title, activeTab.url) { f ->
+                                Toast.makeText(context, if (f != null) "✅ Сохранено: ${f.name}" else "⚠ Не удалось сохранить страницу", Toast.LENGTH_LONG).show()
+                            }
                         })
                         SheetDivider()
                         SheetItem(OmniIcons.Extension, "Расширения", subtitle = "Chrome Web Store", onClick = {
@@ -3334,6 +3353,7 @@ private fun HistoryAndDownloadsSection(
         try {
             val pub = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             File(pub, "OmniTorrents").listFiles()?.let { list.addAll(it) }
+            File(pub, "OmniBrowser").listFiles()?.let { list.addAll(it) }
             pub?.listFiles()?.filter { it.isFile }?.take(30)?.let { list.addAll(it) }
         } catch (_: Exception) {
         }
@@ -3389,6 +3409,81 @@ private fun HistoryAndDownloadsSection(
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         Text("Доступ к памяти", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+
+            // v4.5.0: очередь загрузок браузера — пауза / продолжить / удалить, переживает перезапуск
+            val dlVersion = com.winwasm64.ui.browser.DownloadQueue.version.intValue
+            val dlEntries = remember(dlVersion) { com.winwasm64.ui.browser.DownloadQueue.snapshot() }
+            if (dlEntries.isNotEmpty()) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Загрузки браузера (${dlEntries.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        for (e in dlEntries) {
+                            val st = e.state
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(e.job.fileName, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                                Text(
+                                    com.winwasm64.ui.browser.DownloadQueue.fmt(e),
+                                    color = when (st) { com.winwasm64.ui.browser.DownloadQueue.ERROR -> Omni.Danger; com.winwasm64.ui.browser.DownloadQueue.RUNNING -> Omni.Success; else -> Omni.TextDim },
+                                    fontSize = 11.sp
+                                )
+                                if (e.total > 0) {
+                                    androidx.compose.material3.LinearProgressIndicator(
+                                        progress = { (e.done.toFloat() / e.total).coerceIn(0f, 1f) },
+                                        modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+                                        color = Omni.Accent, trackColor = Omni.SurfaceHighest
+                                    )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 4.dp)) {
+                                    if (st == com.winwasm64.ui.browser.DownloadQueue.RUNNING || st == com.winwasm64.ui.browser.DownloadQueue.QUEUED) {
+                                        Button(onClick = { com.winwasm64.ui.browser.MediaDownloadService.pause(context, e.id) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) { Text("⏸ Пауза", fontSize = 11.sp, color = Color.White) }
+                                    } else {
+                                        Button(onClick = { com.winwasm64.ui.browser.MediaDownloadService.resume(context, e.id) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) { Text(if (st == com.winwasm64.ui.browser.DownloadQueue.ERROR) "↻ Повторить" else "▶ Продолжить", fontSize = 11.sp, color = Color.White) }
+                                    }
+                                    Button(onClick = { com.winwasm64.ui.browser.MediaDownloadService.cancel(context, e.id) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) { Text("✕ Удалить", fontSize = 11.sp, color = Omni.TextDim) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // v4.5.0: сохранённые офлайн страницы (MHTML)
+            val savedPages = remember(refreshTrigger) { com.winwasm64.ui.browser.PageArchiver.list(context) }
+            if (savedPages.isNotEmpty()) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Сохранённые страницы (${savedPages.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        for (f in savedPages.take(30)) {
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(f.name.removeSuffix(".mht"), color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                                    Text(com.winwasm64.ui.browser.MediaGrabber.fmtSize(f.length()) + " · " + java.text.SimpleDateFormat("dd.MM HH:mm", java.util.Locale.getDefault()).format(java.util.Date(f.lastModified())), color = Omni.TextDim, fontSize = 11.sp)
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Button(onClick = { onOpenUrlInBrowser(com.winwasm64.ui.browser.PageArchiver.fileUrl(f)) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)) { Text("Открыть", fontSize = 11.sp, color = Color.White) }
+                                    OutlinedButton(onClick = { f.delete(); refreshTrigger++ }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) { Text("🗑", fontSize = 11.sp, color = Omni.Danger) }
+                                }
+                            }
+                        }
                     }
                 }
             }

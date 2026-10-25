@@ -3549,6 +3549,7 @@ class BrowsecVpnService : VpnService() {
                 if (android.os.SystemClock.elapsedRealtime() - PsiphonBackup.lastUsedAt > 600_000L) PsiphonBackup.stop()
                 isRunning = false
                 isPaused = false
+                AppsVpnTileService.refresh(this)
                 BrowsecLocalProxyServer.useBrowsecTunnel = false
                 closeVpnInterface()
                 stopForeground( true)
@@ -3605,6 +3606,7 @@ class BrowsecVpnService : VpnService() {
                 }
                 isRunning = true
                 isPaused = false
+                AppsVpnTileService.refresh(this)
                 transparentUnsupported = false // v4.1.0: каждое включение снова пробует прозрачный режим
                 BrowsecLocalProxyServer.useBrowsecTunnel = true
                 BrowsecLocalProxyServer.ensureRunning()
@@ -3838,6 +3840,7 @@ class BrowsecVpnService : VpnService() {
     override fun onDestroy() {
         isRunning = false
         isPaused = false
+        AppsVpnTileService.refresh(this)
         closeVpnInterface()
         if (activeInstance === this) activeInstance = null
         super.onDestroy()
