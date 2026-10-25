@@ -21,6 +21,11 @@ import com.winwasm64.ui.WindowsWasm64DesktopScreen
 import com.winwasm64.ui.theme.OmniTheme
 import com.winwasm64.vpn.BrowsecVpnService
 
+/** v4.4.0: адрес, пришедший в уже работающее приложение (onNewIntent) — экран браузера его подхватывает. */
+object ExternalIntents {
+    var pendingUrl by androidx.compose.runtime.mutableStateOf<String?>(null)
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,6 +49,11 @@ class MainActivity : ComponentActivity() {
     private fun handleIncomingIntent(intent: Intent?) {
         if (intent?.action == BrowsecVpnService.ACTION_OPEN_SERVER_PICKER) {
             BrowsecVpnService.openServerPickerRequestCount++
+        }
+        // v4.4.0: ссылка из другого приложения / уведомления, когда браузер уже запущен (singleTask → onNewIntent)
+        if (intent?.action == Intent.ACTION_VIEW) {
+            val u = intent.dataString
+            if (!u.isNullOrBlank()) ExternalIntents.pendingUrl = u
         }
     }
 

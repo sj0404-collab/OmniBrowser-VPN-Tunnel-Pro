@@ -1147,6 +1147,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (adBlockEnabled) {
                         val host = request.url.host?.lowercase() ?: ""
                         val blocked = AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
+                            com.winwasm64.ui.browser.AdBlockList.isBlocked(host) ||
                             customBlockedDomains.any { it.isNotBlank() && host.contains(it.lowercase()) } ||
                             reqUrl.contains("/pagead/") || reqUrl.contains("doubleclick.net") ||
                             reqUrl.contains("googleads.")
@@ -1375,8 +1376,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         return t
     }
 
+    var closeConfirmTabId by remember { mutableStateOf("") }
     fun closeTabAt(index: Int) {
         val t = tabs.getOrNull(index) ?: return
+        // v4.4.0: во вкладке идёт загрузка силами страницы — закрытие её прервёт; просим подтвердить вторым нажатием
+        if (MediaDownloadService.activeTabIds.contains(t.id) && closeConfirmTabId != t.id) {
+            closeConfirmTabId = t.id
+            Toast.makeText(context, "Во вкладке идёт загрузка видео — она прервётся. Нажмите ещё раз, чтобы закрыть", Toast.LENGTH_LONG).show()
+            return
+        }
+        closeConfirmTabId = ""
         t.webView?.let { w ->
             if (!t.isIncognito) ExtensionRuntime.detachTab(w, t.numericId)
             webViewContainer.removeView(w)
@@ -1434,6 +1443,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         onDispose {
             if (ExtensionRuntime.tabHost === extTabHost) ExtensionRuntime.tabHost = null
         }
+    }
+
+    // v4.4.0: ссылки, пришедшие во время работы (из других приложений, из уведомления об обновлении)
+    val pendingExternal = com.winwasm64.ExternalIntents.pendingUrl
+    LaunchedEffect(pendingExternal) {
+        val u = pendingExternal ?: return@LaunchedEffect
+        com.winwasm64.ExternalIntents.pendingUrl = null
+        if (u == initialIntentUri) return@LaunchedEffect
+        if (u.startsWith("magnet:", ignoreCase = true) || u.endsWith(".torrent", ignoreCase = true)) {
+            torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
+        } else if (u.startsWith("http", ignoreCase = true)) {
+            openNewTab(u); currentSection = 0
+        }
+    }
+    LaunchedEffect(Unit) {
+        com.winwasm64.ui.browser.UpdateChecker.autoCheck(context)
+        com.winwasm64.ui.browser.AdBlockList.init(context, adBlockEnabled)
     }
 
     LaunchedEffect(initialIntentUri) {
@@ -2211,6 +2237,19 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         })
                                     }
                                     Text("Заблокировано рекламных запросов и трекеров: $adBlockedCount", color = Omni.Success, fontSize = 12.sp)
+                                    var adListInfo by remember { mutableStateOf("") }
+                                    val adListSize = com.winwasm64.ui.browser.AdBlockList.size
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            if (adListSize > 0) "Список AdGuard DNS: $adListSize доменов" else "Список AdGuard DNS ещё не загружен",
+                                            color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f)
+                                        )
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            adListInfo = "Обновляю…"
+                                            com.winwasm64.ui.browser.AdBlockList.refreshNow(context) { r -> Handler(Looper.getMainLooper()).post { adListInfo = r } }
+                                        }) { Text("Обновить", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                    }
+                                    if (adListInfo.isNotBlank()) Text(adListInfo, color = Omni.TextDim, fontSize = 11.sp)
                                     var customDomain by remember { mutableStateOf("") }
                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                                         CompactDarkTextField(
@@ -2334,6 +2373,61 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                                 "settings" -> {
                                     Text("Настройки", color = Omni.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                                    // v4.4.0: обновления из GitHub Releases
+                                    var updateCheckOn by remember { mutableStateOf(prefs.getBoolean("update_check_on", true)) }
+                                    var updateStatus by remember { mutableStateOf("") }
+                                    val latestUpdate = com.winwasm64.ui.browser.UpdateChecker.latest
+                                    SettingSwitchRow("Проверять обновления", "Раз в 6 часов смотреть новые версии на GitHub (установлена ${com.winwasm64.ui.browser.UpdateChecker.currentVersion(context)})", updateCheckOn) { v ->
+                                        updateCheckOn = v
+                                        prefs.edit().putBoolean("update_check_on", v).apply()
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            updateStatus = "Проверяю…"
+                                            com.winwasm64.ui.browser.UpdateChecker.check(context, manual = true) { info, err ->
+                                                Handler(Looper.getMainLooper()).post {
+                                                    updateStatus = when {
+                                                        err != null -> "Не удалось проверить: $err"
+                                                        info != null -> "Доступна версия ${info.version}"
+                                                        else -> "У вас последняя версия"
+                                                    }
+                                                }
+                                            }
+                                        }) { Text("Проверить сейчас", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                        if (latestUpdate != null) Surface(color = Omni.AccentContainer, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            navigateTab(activeTab, latestUpdate.apkUrl); currentSection = 0
+                                            Toast.makeText(context, "Скачиваю ${latestUpdate.version}… после загрузки нажмите на уведомление, чтобы установить", Toast.LENGTH_LONG).show()
+                                        }) { Text("Скачать ${latestUpdate.version}", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                        if (updateStatus.isNotBlank()) Text(updateStatus, color = Omni.TextDim, fontSize = 11.sp)
+                                    }
+                                    // v4.4.0: экспорт / импорт настроек
+                                    var backupStatus by remember { mutableStateOf("") }
+                                    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                                        if (uri != null) {
+                                            try {
+                                                val n = com.winwasm64.ui.browser.SettingsBackup.import(context, uri)
+                                                backupStatus = "Импортировано ключей: $n. Перезапустите приложение, чтобы настройки применились."
+                                                Toast.makeText(context, backupStatus, Toast.LENGTH_LONG).show()
+                                            } catch (e: Exception) {
+                                                backupStatus = "Импорт не удался: ${e.message}"
+                                            }
+                                        }
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Резервная копия:", color = Omni.TextDim, fontSize = 11.sp)
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            persistBrowserSettings()
+                                            backupStatus = try { "Сохранено: " + com.winwasm64.ui.browser.SettingsBackup.export(context, includeJournal = false) } catch (e: Exception) { "Не удалось: ${e.message}" }
+                                        }) { Text("Экспорт настроек", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            persistBrowserSettings()
+                                            backupStatus = try { "Сохранено: " + com.winwasm64.ui.browser.SettingsBackup.export(context, includeJournal = true) } catch (e: Exception) { "Не удалось: ${e.message}" }
+                                        }) { Text("+ журнал", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(6.dp), modifier = Modifier.clickable {
+                                            importLauncher.launch("application/json")
+                                        }) { Text("Импорт", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                    }
+                                    if (backupStatus.isNotBlank()) Text(backupStatus, color = Omni.TextDim, fontSize = 11.sp)
                                     SettingSwitchRow("Не отслеживать (DNT и GPC)", "Отправлять сайтам запрет на отслеживание", doNotTrackEnabled) { v ->
                                         doNotTrackEnabled = v
                                         persistBrowserSettings()

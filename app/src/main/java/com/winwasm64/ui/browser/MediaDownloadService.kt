@@ -58,6 +58,8 @@ class MediaDownloadService : Service() {
         private const val NOTIF_PROGRESS = 7401
         private const val CHUNK = 8L * 1024 * 1024
         private val doneCounter = java.util.concurrent.atomic.AtomicInteger(7500)
+        /** v4.4.0: вкладки, страницы которых сейчас качают файл (закрытие прервёт загрузку). */
+        val activeTabIds: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
         fun start(context: Context, job: MediaGrabber.DownloadJob) {
             val i = Intent(context, MediaDownloadService::class.java).setAction(ACTION_START).putExtra(EXTRA_JOB, job.toJson())
@@ -136,6 +138,7 @@ class MediaDownloadService : Service() {
                 val job = queue.poll(2, TimeUnit.SECONDS) ?: break
                 current = job
                 cancelCurrent.set(false)
+                if (job.inPage && job.tabId.isNotBlank()) activeTabIds.add(job.tabId)
                 try {
                     runJob(job)
                 } catch (e: CancelledException) {
@@ -146,6 +149,7 @@ class MediaDownloadService : Service() {
                     notifyDone(job, null, "Ошибка: ${e.message ?: e.javaClass.simpleName}")
                 } finally {
                     current = null
+                    if (job.tabId.isNotBlank()) activeTabIds.remove(job.tabId)
                 }
             }
             android.os.Handler(android.os.Looper.getMainLooper()).post { stopIfIdle() }
@@ -271,8 +275,92 @@ class MediaDownloadService : Service() {
             else -> throw IOException("неизвестный режим ${job.mode}")
         }
         val sec = (System.currentTimeMillis() - t0) / 1000
-        VpnLog.ok(MediaGrabber.TAG, "готово: «${job.fileName}» за ${sec} с → ${MediaSink.lastPathHint}")
-        notifyDone(job, result, "Сохранено: ${MediaSink.lastPathHint}")
+        val mainPath = MediaSink.lastPathHint
+        VpnLog.ok(MediaGrabber.TAG, "готово: «${job.fileName}» за ${sec} с → $mainPath")
+        notifyDone(job, result, "Сохранено: $mainPath")
+        try { downloadExtras(job) } catch (e: CancelledException) { throw e } catch (e: Exception) {
+            VpnLog.w(MediaGrabber.TAG, "дополнения (субтитры/обложка): ${e.message ?: e.javaClass.simpleName}")
+        }
+    }
+
+    /** v4.4.0: субтитры (.srt → Download/OmniBrowser) и обложка (.jpg → Pictures/OmniBrowser) после основного файла. */
+    private fun downloadExtras(job: MediaGrabber.DownloadJob) {
+        if (job.extras.isEmpty()) return
+        val stem = MediaGrabber.safeName(job.fileName.substringBeforeLast('.'), "video")
+        val ua = mapOf("User-Agent" to (job.headers["User-Agent"] ?: MediaGrabber.DEFAULT_UA))
+        val subUrl = job.extras["sub_url"] ?: ""
+        if (subUrl.isNotBlank()) {
+            val url = subUrl + (if (subUrl.contains('?')) "&" else "?") + "fmt=json3"
+            var text: String? = if (job.tabId.isNotBlank()) InPageDownloads.fetchText(job.tabId, url, 20_000L) else null
+            if (text == null) text = try { String(fetchBytes(url, ua, null), Charsets.UTF_8) } catch (e: Exception) { VpnLog.w(MediaGrabber.TAG, "субтитры: ${e.message}"); null }
+            if (text != null) {
+                val srt = json3ToSrt(text)
+                if (srt.isNotBlank()) {
+                    val lang = job.extras["sub_lang"] ?: "sub"
+                    val where = DownloadSaver.saveBytes(this, "$stem.$lang.srt", "application/x-subrip", srt.toByteArray(Charsets.UTF_8))
+                    VpnLog.i(MediaGrabber.TAG, "субтитры ($lang) → $where")
+                } else VpnLog.w(MediaGrabber.TAG, "субтитры: пустой ответ (${text.length} зн.)")
+            }
+        }
+        val thumb = job.extras["thumb_url"] ?: ""
+        if (thumb.isNotBlank()) {
+            try {
+                val bytes = fetchBytes(thumb, ua, null)
+                if (bytes.size > 1000) {
+                    val where = saveImage("$stem.jpg", bytes)
+                    VpnLog.i(MediaGrabber.TAG, "обложка → $where")
+                }
+            } catch (e: Exception) { VpnLog.w(MediaGrabber.TAG, "обложка: ${e.message}") }
+        }
+    }
+
+    private fun saveImage(name: String, bytes: ByteArray): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val rel = Environment.DIRECTORY_PICTURES + "/OmniBrowser"
+            val cv = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, rel)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: throw IOException("медиатека недоступна")
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw IOException("не удалось открыть файл")
+            cv.clear(); cv.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            contentResolver.update(uri, cv, null, null)
+            return "$rel/$name"
+        }
+        @Suppress("DEPRECATION")
+        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "OmniBrowser").apply { mkdirs() }
+        val f = File(dir, name)
+        f.writeBytes(bytes)
+        MediaScannerConnection.scanFile(this, arrayOf(f.absolutePath), arrayOf("image/jpeg"), null)
+        return f.absolutePath
+    }
+
+    /** YouTube timedtext fmt=json3 → SubRip. */
+    private fun json3ToSrt(json: String): String {
+        val o = try { org.json.JSONObject(json) } catch (_: Exception) { return "" }
+        val events = o.optJSONArray("events") ?: return ""
+        val sb = StringBuilder()
+        var n = 0
+        fun ts(ms: Long): String = String.format(Locale.US, "%02d:%02d:%02d,%03d", ms / 3600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+        for (i in 0 until events.length()) {
+            val ev = events.optJSONObject(i) ?: continue
+            val segs = ev.optJSONArray("segs") ?: continue
+            val text = StringBuilder()
+            for (j in 0 until segs.length()) text.append(segs.optJSONObject(j)?.optString("utf8") ?: "")
+            val t = text.toString().trim()
+            if (t.isEmpty() || t == "\n") continue
+            val start = ev.optLong("tStartMs")
+            var dur = ev.optLong("dDurationMs")
+            if (dur <= 0) {
+                val next = events.optJSONObject(i + 1)
+                dur = if (next != null) (next.optLong("tStartMs") - start).coerceAtLeast(500) else 3000
+            }
+            n++
+            sb.append(n).append('\n').append(ts(start)).append(" --> ").append(ts(start + dur)).append('\n').append(t).append("\n\n")
+        }
+        return sb.toString()
     }
 
     private fun extOf(name: String): String = name.substringAfterLast('.', "bin")

@@ -399,6 +399,27 @@ object MediaGrabber {
           live: !!(pr && pr.videoDetails && pr.videoDetails.isLive),
           formats: fm,
           noUrl: noUrl,
+          captions: (function(){
+            var outc = [];
+            try {
+              var tr = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer && pr.captions.playerCaptionsTracklistRenderer.captionTracks || [];
+              for (var ci = 0; ci < tr.length; ci++) {
+                var t = tr[ci];
+                var nm = '';
+                try { nm = (t.name && (t.name.simpleText || (t.name.runs || []).map(function(r){ return r.text; }).join(''))) || ''; } catch (e) {}
+                outc.push({ url: t.baseUrl || '', lang: t.languageCode || '', name: nm, kind: t.kind || '' });
+              }
+            } catch (e) {}
+            return outc;
+          })(),
+          thumb: (function(){
+            try {
+              var th = pr && pr.videoDetails && pr.videoDetails.thumbnail && pr.videoDetails.thumbnail.thumbnails || [];
+              var best = null;
+              for (var ti = 0; ti < th.length; ti++) if (!best || (th[ti].width || 0) > (best.width || 0)) best = th[ti];
+              return best ? best.url : '';
+            } catch (e) { return ''; }
+          })(),
           hls: (pr && pr.streamingData && pr.streamingData.hlsManifestUrl) || '',
           playerJs: (function(){
             try {
@@ -453,14 +474,16 @@ object MediaGrabber {
         @Volatile var server: String = "",
         /** v4.3.6: сначала пробовать скачать силами самой страницы (fetch в WebView вкладки [tabId]). */
         var inPage: Boolean = false,
-        var tabId: String = ""
+        var tabId: String = "",
+        /** v4.4.0: дополнения — sub_url/sub_lang (субтитры json3 → .srt), thumb_url (обложка). */
+        val extras: Map<String, String> = emptyMap()
     ) {
         fun toJson(): String = JSONObject().apply {
             put("mode", mode); put("title", title); put("fileName", fileName); put("mime", mime)
             put("urls", JSONArray(urls)); put("headers", JSONObject(headers as Map<*, *>))
             put("expectedBytes", expectedBytes); put("isAudio", isAudio)
             put("ytId", ytId); put("itags", JSONArray(itags)); put("server", server)
-            put("inPage", inPage); put("tabId", tabId)
+            put("inPage", inPage); put("tabId", tabId); put("extras", JSONObject(extras as Map<*, *>))
         }.toString()
 
         companion object {
@@ -479,7 +502,8 @@ object MediaGrabber {
                     o.getString("mode"), o.optString("title"), o.getString("fileName"), o.optString("mime", "application/octet-stream"),
                     urls, headers, o.optLong("expectedBytes", 0L), o.optBoolean("isAudio", false),
                     o.optString("ytId"), itags, o.optString("server"),
-                    o.optBoolean("inPage", false), o.optString("tabId")
+                    o.optBoolean("inPage", false), o.optString("tabId"),
+                    LinkedHashMap<String, String>().also { m -> o.optJSONObject("extras")?.let { eo -> for (k in eo.keys()) m[k] = eo.getString(k) } }
                 )
             } catch (_: Exception) { null }
         }
@@ -1185,8 +1209,23 @@ object MediaGrabber {
             headers["Origin"] = "https://www.youtube.com"
             headers["Referer"] = "https://www.youtube.com/"
         }
+        // v4.4.0: субтитры (ru → ru авто → en → первые ручные) и обложка
+        val extras = LinkedHashMap<String, String>()
+        try {
+            val caps = yt.optJSONArray("captions") ?: JSONArray()
+            data class Cap(val url: String, val lang: String, val asr: Boolean)
+            val list = ArrayList<Cap>()
+            for (i in 0 until caps.length()) { val c = caps.optJSONObject(i) ?: continue; if (c.optString("url").isNotBlank()) list.add(Cap(c.optString("url"), c.optString("lang"), c.optString("kind") == "asr")) }
+            val pick = list.firstOrNull { it.lang.startsWith("ru") && !it.asr } ?: list.firstOrNull { it.lang.startsWith("ru") }
+                ?: list.firstOrNull { it.lang.startsWith("en") && !it.asr } ?: list.firstOrNull { !it.asr } ?: list.firstOrNull()
+            if (pick != null) { extras["sub_url"] = pick.url; extras["sub_lang"] = pick.lang + (if (pick.asr) "-auto" else "") }
+            val th = yt.optString("thumb")
+            if (th.isNotBlank()) extras["thumb_url"] = th
+            if (list.isNotEmpty() || th.isNotBlank()) VpnLog.i(TAG, "YouTube: субтитров ${list.size}${if (pick != null) " (берём ${extras["sub_lang"]})" else ""}${if (th.isNotBlank()) ", обложка есть" else ""}")
+        } catch (_: Exception) {}
         fun job(mode: String, file: String, mime: String, fs: List<YtFormat>, size: Long, audio: Boolean = false) =
-            DownloadJob(mode, title, file, mime, fs.map { it.url }.toMutableList(), headers, size, audio, videoId, fs.map { it.itag }, server, inPage = webMode)
+            DownloadJob(mode, title, file, mime, fs.map { it.url }.toMutableList(), headers, size, audio, videoId, fs.map { it.itag }, server, inPage = webMode,
+                extras = if (audio) extras.filterKeys { it == "thumb_url" } else extras)
 
         val audioMp4 = formats.filter { it.isAudio && it.container == "mp4" && (it.dflt || it.lang.isBlank()) }.maxByOrNull { it.br }
             ?: formats.filter { it.isAudio && it.container == "mp4" }.maxByOrNull { it.br }
