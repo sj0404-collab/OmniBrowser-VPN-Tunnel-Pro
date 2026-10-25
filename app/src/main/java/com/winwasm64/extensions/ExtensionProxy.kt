@@ -1844,12 +1844,24 @@ function alert(){}
         return a.first
     }
     private val affinitySwitchedAt = ConcurrentHashMap<String, Long>()
+    private val affinityHoldLoggedAt = ConcurrentHashMap<String, Long>()
 
     private fun setAffinity(pkg: String?, serverKey: String, reason: String? = null) {
         if (pkg == null) return
-        val prev = appAffinity.put(pkg, Pair(serverKey, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS))
+        val now = SystemClock.elapsedRealtime()
+        val cur = appAffinity[pkg]
+        if (cur != null && cur.first != serverKey && cur.second > now && now - (affinitySwitchedAt[pkg] ?: 0L) < 15_000L) {
+            // v4.4.8: не чаще одной смены сервера за 15 с на приложение — параллельные соединения в час пик
+            // приносили разных «победителей» и закрепление прыгало de83 → lv115 → de83 за одну секунду
+            if (now - (affinityHoldLoggedAt[pkg] ?: 0L) > 60_000L) {
+                affinityHoldLoggedAt[pkg] = now
+                com.winwasm64.vpn.VpnLog.i("Прил", "${com.winwasm64.vpn.VpnLog.label(pkg)}: держим сервер ${shortName(cur.first)} (сменили <15 с назад), хотя ответил ${shortName(serverKey)}")
+            }
+            return
+        }
+        val prev = appAffinity.put(pkg, Pair(serverKey, now + AFFINITY_TTL_MS))
         if (prev?.first != serverKey) {
-            affinitySwitchedAt[pkg] = SystemClock.elapsedRealtime()
+            affinitySwitchedAt[pkg] = now
             val who = com.winwasm64.vpn.VpnLog.label(pkg)
             com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null || (prev.second < SystemClock.elapsedRealtime())) "$who: все соединения приложения закреплены за сервером ${shortName(serverKey)} (адреса видео/CDN привязаны к IP)"
                 else "$who: сервер сменён ${shortName(prev.first)} → ${shortName(serverKey)} (${reason ?: "прежний не ответил"}) — приложение переоткроет соединения")

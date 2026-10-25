@@ -97,6 +97,7 @@ object PsiphonBackup {
             " · ↓${MediaFmt.size(rxBytes.get())} ↑${MediaFmt.size(txBytes.get())}" +
             (if (mode == MODE_ALWAYS) " · основной канал" else " · резерв")
         starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с, попыток $connectAttempts)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "") + (if (lastError.isNotBlank()) " · $lastError" else "")
+        SystemClock.elapsedRealtime() < pausedUntil -> "Psiphon: пауза ${(pausedUntil - SystemClock.elapsedRealtime()) / 60_000 + 1} мин — не подключился за ${GIVE_UP_MS / 60_000} мин (сеть фильтрует)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "")
         else -> "Psiphon: не запущен (${modeTitle()})"
     }
 
@@ -110,11 +111,17 @@ object PsiphonBackup {
     }
 
     /** Запуск (идемпотентно). [why] — для журнала. */
+    /** v4.4.8: после GIVE_UP_MS без связи останавливаемся на PAUSE_MS — 20 потоков впустую греют телефон, если сеть фильтрует Psiphon. */
+    private const val GIVE_UP_MS = 6 * 60_000L
+    private const val PAUSE_MS = 20 * 60_000L
+    @Volatile var pausedUntil = 0L
     fun ensureStarted(ctx: Context, why: String) {
         load(ctx)
         if (mode == MODE_OFF) return
+        if (SystemClock.elapsedRealtime() < pausedUntil && mode != MODE_ALWAYS) return
         synchronized(lock) {
             if (tunnel != null) return
+            pausedUntil = 0L
             starting = true
             connected = false
             lastError = ""
@@ -139,6 +146,15 @@ object PsiphonBackup {
                     embeddedCount = embedded.count { it == '\n' }
                     VpnLog.i(TAG, "встроенных серверов: $embeddedCount, удалённый список подтянется сам")
                     t.startTunneling(embedded)
+                    // сторож: не подключились за GIVE_UP_MS — пауза
+                    Thread({
+                        try { Thread.sleep(GIVE_UP_MS) } catch (_: InterruptedException) { return@Thread }
+                        if (tunnel === t && !connected && mode != MODE_ALWAYS) {
+                            pausedUntil = SystemClock.elapsedRealtime() + PAUSE_MS
+                            VpnLog.w(TAG, "за ${GIVE_UP_MS / 60_000} мин не подключился ($connectAttempts попыток, $lastDiag) — пауза ${PAUSE_MS / 60_000} мин, чтобы не греть телефон; сеть, похоже, фильтрует Psiphon")
+                            stop()
+                        }
+                    }, "PsiphonWatchdog").start()
                 } catch (e: Throwable) {
                     lastError = e.message ?: e.javaClass.simpleName
                     VpnLog.e(TAG, "не запустился: $lastError")
@@ -164,6 +180,7 @@ object PsiphonBackup {
 
     fun restart() {
         val ctx = appCtx ?: return
+        pausedUntil = 0L
         stop()
         Thread({ try { Thread.sleep(800) } catch (_: InterruptedException) {}; ensureStarted(ctx, "перезапуск") }, "PsiphonRestart").start()
     }
@@ -252,7 +269,8 @@ object PsiphonBackup {
             val quiet = connected && !important
             if (quiet) return
             if (m.contains("memory metrics") || type == "RequestingTactics" || type == "BuildInfo" || type == "SessionId" || type == "NetworkID" || type == "ApplicationParameters" || type == "RequestedTactics") return
-            if (m.contains("in-proxy protocol preferred")) return
+            if (m.contains("in-proxy protocol preferred") || m.contains("in-proxy protocol selection")) return
+            if (m.contains("failed to make dial parameters")) { if (diagLoggedAt.putIfAbsent("once:mdp", now) == null) VpnLog.i(TAG, "часть встроенных записей без ключа подписи — пропускаем их (это нормально)"); return }
             // шумные повторяющиеся сбои фоновых запросов — по одному разу за сеанс, с пояснением
             val once = when {
                 m.contains("roundtripperfailederror") || m.contains("inproxybroker") -> "брокер in-proxy (WebRTC-прокси волонтёров) недоступен — фронтинг через CDN не проходит"

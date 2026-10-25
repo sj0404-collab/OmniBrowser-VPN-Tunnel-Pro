@@ -2611,6 +2611,9 @@ object BrowsecLocalProxyServer {
         try {
             client.tcpNoDelay = true
             val isDnsIp = TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP
+            // v4.4.8: Android «Приватный DNS: авто» щупает наш DNS по 853/TLS — раньше это уходило на 1.1.1.1:53 и висело 10 с.
+            // Закрываем сразу: система тут же переходит на обычный DNS :53, который мы и обслуживаем.
+            if (isDnsIp && origPort == 853) return
             val target = if (isDnsIp) {
                 InetSocketAddress(InetAddress.getByName("1.1.1.1"), 53)
             } else {
