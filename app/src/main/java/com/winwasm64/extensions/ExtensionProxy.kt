@@ -1794,13 +1794,13 @@ function alert(){}
         return a.first
     }
 
-    private fun setAffinity(pkg: String?, serverKey: String) {
+    private fun setAffinity(pkg: String?, serverKey: String, reason: String? = null) {
         if (pkg == null) return
         val prev = appAffinity.put(pkg, Pair(serverKey, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS))
         if (prev?.first != serverKey) {
             val who = com.winwasm64.vpn.VpnLog.label(pkg)
-            com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null) "$who: все соединения приложения закреплены за сервером ${serverKey.substringBefore('.')} (адреса видео/CDN привязаны к IP)"
-                else "$who: сервер сменён ${prev.first.substringBefore('.')} → ${serverKey.substringBefore('.')} (прежний не ответил) — приложение переоткроет соединения")
+            com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null || (prev.second < SystemClock.elapsedRealtime())) "$who: все соединения приложения закреплены за сервером ${serverKey.substringBefore('.')} (адреса видео/CDN привязаны к IP)"
+                else "$who: сервер сменён ${prev.first.substringBefore('.')} → ${serverKey.substringBefore('.')} (${reason ?: "прежний не ответил"}) — приложение переоткроет соединения")
         }
     }
 
@@ -1851,9 +1851,21 @@ function alert(){}
         // и при перегруженных серверах Browsec в час пик мы не успевали ответить ему вовремя
         var list = rankTunnelServers(preferCountry, now, dest).take(4)
         // v4.4.1: закреплённый за приложением сервер — первым кандидатом (хедж через 4 с вместо 2,5)
-        val sticky = affinityServer(stickyKey)
-        val stickyUp = sticky?.let { k -> tunnelServers.firstOrNull { it.key == k } }
-        if (stickyUp != null) list = (listOf(stickyUp) + list.filter { it.key != stickyUp.key }).take(4)
+        // v4.4.2: пока сервер для приложения не выбран, выбирает его ПЕРВОЕ соединение, остальные параллельные ждут результата —
+        // иначе 5 одновременных соединений YouTube выбирали 5 разных победителей и «закрепление» прыгало каждую секунду
+        var stickyUp: Upstream? = affinityServer(stickyKey)?.let { k -> tunnelServers.firstOrNull { it.key == k } }
+        var leaderLatch: CountDownLatch? = null
+        if (stickyKey != null && stickyUp == null) {
+            val mine = CountDownLatch(1)
+            val other = affinityPending.putIfAbsent(stickyKey, mine)
+            if (other != null) {
+                try { other.await(8, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
+                stickyUp = affinityServer(stickyKey)?.let { k -> tunnelServers.firstOrNull { it.key == k } }
+            } else leaderLatch = mine
+        }
+        val stickyUpF: Upstream? = stickyUp
+        try {
+        if (stickyUpF != null) list = (listOf(stickyUpF) + list.filter { it.key != stickyUpF.key }).take(4)
         if (list.isEmpty()) return null
         maybeLogOverload()
 
@@ -1873,7 +1885,7 @@ function alert(){}
                 var err: Exception? = null
                 val t0 = SystemClock.elapsedRealtime()
                 try {
-                    r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000, allowWarm = stickyUp != null && up.key == stickyUp.key)
+                    r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000, allowWarm = stickyUpF != null && up.key == stickyUpF.key)
                     val ms = SystemClock.elapsedRealtime() - t0
                     noteConnectMs(up.key, ms)
                     noteDestMs(up.key, dest, ms)
@@ -1892,10 +1904,33 @@ function alert(){}
         launch(list[next++])
         val t0 = SystemClock.elapsedRealtime()
         val deadline = t0 + 12_000L
-        var hedgeAt = t0 + (if (stickyUp != null) 4_000L else 2_500L)
+        var hedgeAt = t0 + (if (stickyUpF != null) 4_000L else 2_500L)
+        var backup: Res? = null
+        var stickyDone = false
+        var stickyErr: String? = null
+        fun accept(r: Res, switchReason: String?): Triple<Socket, InputStream, String> {
+            won.set(true)
+            while (true) { val late = results.poll() ?: break; late.sock?.let { closeQuietly(it.first) } }
+            backup?.let { if (it !== r) it.sock?.let { s -> closeQuietly(s.first) } }
+            backup = null
+            val up = r.up
+            lastAutoTunnel = up.key
+            lastAutoTunnelAt = SystemClock.elapsedRealtime()
+            if (stickyUpF == null || up.key == stickyUpF.key || switchReason != null) setAffinity(stickyKey, up.key, switchReason)
+            val t = lastAutoTunnelAt
+            if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
+                appTunnelLoggedAt[up.key] = t
+                com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
+            }
+            return Triple(r.sock!!.first, CountingInputStream(r.sock.second, up.key), up.key)
+        }
         while (pendingN > 0) {
             val now2 = SystemClock.elapsedRealtime()
             if (now2 >= deadline) break
+            if (backup != null && stickyUpF != null && !stickyDone && now2 - t0 >= STICKY_WAIT_MS) {
+                stickyDone = true
+                return accept(backup!!, "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил за ${STICKY_WAIT_MS / 1000} с")
+            }
             val r = results.poll(maxOf(20L, minOf(hedgeAt, deadline) - now2), TimeUnit.MILLISECONDS)
             if (r == null) {
                 if (SystemClock.elapsedRealtime() >= hedgeAt) {
@@ -1906,30 +1941,36 @@ function alert(){}
             }
             pendingN--
             if (r.sock != null) {
-                if (won.compareAndSet(false, true)) {
-                    while (true) { val late = results.poll() ?: break; late.sock?.let { closeQuietly(it.first) } }
-                    val up = r.up
-                    lastAutoTunnel = up.key
-                    lastAutoTunnelAt = SystemClock.elapsedRealtime()
-                    setAffinity(stickyKey, up.key)
-                    val t = lastAutoTunnelAt
-                    if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
-                        appTunnelLoggedAt[up.key] = t
-                        com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
-                    }
-                    return Triple(r.sock.first, CountingInputStream(r.sock.second, up.key), up.key)
-                } else {
-                    closeQuietly(r.sock.first)
+                if (stickyUpF != null && r.up.key != stickyUpF.key && !stickyDone && SystemClock.elapsedRealtime() - t0 < STICKY_WAIT_MS) {
+                    // закреплённый сервер ещё отвечает — чужой успех держим в запасе, адреса видео привязаны к IP закреплённого
+                    if (backup == null) backup = r else closeQuietly(r.sock.first)
+                    continue
                 }
+                if (stickyUpF != null && r.up.key == stickyUpF.key) stickyDone = true
+                return accept(r, if (stickyUpF != null && r.up.key != stickyUpF.key) "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил за ${(SystemClock.elapsedRealtime() - t0) / 1000} с" else null)
             } else {
                 val e = r.err
-                if (e is ProxyRefusedException && e.code != 407 && e.code !in 500..599) { won.set(true); return null } // адресат/порт запрещён — идём напрямую
+                if (e is ProxyRefusedException && e.code != 407 && e.code !in 500..599) { won.set(true); backup?.sock?.let { closeQuietly(it.first) }; return null } // адресат/порт запрещён — идём напрямую
+                if (stickyUpF != null && r.up.key == stickyUpF.key) {
+                    stickyDone = true
+                    stickyErr = e?.message ?: e?.javaClass?.simpleName ?: "ошибка"
+                    val b = backup
+                    if (b != null) return accept(b, "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил: ${stickyErr.take(60)}")
+                }
                 if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 2_500L }
             }
         }
+        val b = backup
+        if (b != null) return accept(b, "закреплённый ${stickyUpF?.key?.substringBefore('.')} не ответил: ${stickyErr?.take(60) ?: "таймаут"}")
         won.set(true)
         return null
+        } finally {
+            if (leaderLatch != null) { affinityPending.remove(stickyKey!!, leaderLatch); leaderLatch.countDown() }
+        }
     }
+
+    private const val STICKY_WAIT_MS = 9_000L
+    private val affinityPending = ConcurrentHashMap<String, CountDownLatch>()
 
     /** v4.3.5: все известные серверы автотуннеля, лучшие первыми (для подбора сервера по IP в ссылке googlevideo). */
     fun tunnelServerKeysRanked(): List<String> {
