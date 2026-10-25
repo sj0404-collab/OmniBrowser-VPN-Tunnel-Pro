@@ -2607,6 +2607,7 @@ object BrowsecLocalProxyServer {
         var logErr: String? = null
         var upstream: Socket? = null
         var viaTunnel: String? = null
+        var rxConn = 0L
         try {
             client.tcpNoDelay = true
             val isDnsIp = TunPackets.inetToIp(remoteAddr) == TunPackets.DNS_IP
@@ -2703,7 +2704,7 @@ object BrowsecLocalProxyServer {
                 pipeClientToServerV38(pin, upOut, host, origPort, st, profile, shouldBypass)
                 try { upSock.shutdownOutput() } catch (_: Exception) {}
             }
-            pipeServerToClientV38(upStream, out, st, profile, true)
+            rxConn = pipeServerToClientV38(upStream, out, st, profile, true)
             try { client.shutdownOutput() } catch (_: Exception) {}
             t1.join(2000)
         } catch (e: Exception) {
@@ -2714,7 +2715,7 @@ object BrowsecLocalProxyServer {
             profile?.activeSockets?.decrementAndGet()
             try { upstream?.close() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
-            VpnLog.conn(profile?.packageName, logHost, origPort, viaTunnel?.let { "Browsec $it" } ?: countryCode, System.currentTimeMillis() - logStart, logErr)
+            VpnLog.conn(profile?.packageName, logHost, origPort, viaTunnel?.let { if (com.winwasm64.extensions.ExtensionProxy.isPsiphonKey(it)) "Psiphon" else "Browsec $it" } ?: countryCode, System.currentTimeMillis() - logStart, logErr, rxConn)
             profile?.noteConn(logErr == null, st.pingMs.toLong(), viaTunnel, logErr)
         }
     }
@@ -2915,6 +2916,7 @@ object BrowsecLocalProxyServer {
                 val logStart = System.currentTimeMillis()
                 var logErr: String? = null
                 var viaKey: String? = null
+                var rxConn = 0L
                 try {
                     val upstream = openAppsOutboundSocket(host, port, st, appProfile)
                     viaKey = (upstream as? TunneledSocket)?.serverKey?.takeIf { it.isNotBlank() }
@@ -2935,7 +2937,7 @@ object BrowsecLocalProxyServer {
                         pipeClientToServerV38(inp, upOut, host, port, st, appProfile, shouldBypass)
                     }
                     val t2 = Thread {
-                        pipeServerToClientV38(upIn, out, st, appProfile, allowBypass)
+                        rxConn = pipeServerToClientV38(upIn, out, st, appProfile, allowBypass)
                     }
                     t1.start()
                     t2.start()
@@ -2947,7 +2949,7 @@ object BrowsecLocalProxyServer {
                     throw e
                 } finally {
                     if (appProfile != null) {
-                        VpnLog.conn(appProfile.packageName, host, port, (viaKey?.let { "Browsec $it" } ?: effectiveCountry) + " · системный прокси", System.currentTimeMillis() - logStart, logErr)
+                        VpnLog.conn(appProfile.packageName, host, port, (viaKey?.let { if (com.winwasm64.extensions.ExtensionProxy.isPsiphonKey(it)) "Psiphon" else "Browsec $it" } ?: effectiveCountry) + " · системный прокси", System.currentTimeMillis() - logStart, logErr, rxConn)
                         appProfile.noteConn(logErr == null, st.pingMs.toLong(), viaKey, logErr)
                     }
                 }
@@ -3158,12 +3160,14 @@ object BrowsecLocalProxyServer {
         st: ServerNodeRuntimeState,
         appProfile: AppTunnelProfile?,
         allowBypass: Boolean
-    ) {
+    ): Long {
+        var total = 0L
         try {
             val buf = ByteArray(32 * 1024)
             while (true) {
                 val n = inp.read(buf)
                 if (n <= 0) break
+                total += n
                 if (allowBypass) {
                     st.recordRx(n.toLong())
                     appProfile?.rxBytes?.addAndGet(n.toLong())
@@ -3173,6 +3177,7 @@ object BrowsecLocalProxyServer {
             }
         } catch (_: Exception) {
         }
+        return total
     }
 
     /**

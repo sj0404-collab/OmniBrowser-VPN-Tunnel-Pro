@@ -40,9 +40,14 @@ object VpnLog {
     private val repeats = java.util.concurrent.ConcurrentHashMap<String, Rep>()
     private val okRepeats = java.util.concurrent.ConcurrentHashMap<String, Rep>()
 
-    fun conn(pkg: String?, host: String, port: Int, profile: String, ms: Long, err: String?) {
+    fun conn(pkg: String?, host: String, port: Int, profile: String, ms: Long, err: String?, rxBytes: Long = -1L) {
         val who = label(pkg)
-        val dur = if (ms >= 1000) String.format(java.util.Locale.US, "%.1f с", ms / 1000.0) else "$ms мс"
+        var dur = if (ms >= 1000) String.format(java.util.Locale.US, "%.1f с", ms / 1000.0) else "$ms мс"
+        // v4.4.4: объём и средняя скорость приёма по соединению — видно, какие соединения «ползут»
+        if (rxBytes > 0) {
+            val vol = if (rxBytes >= 1048576) String.format(java.util.Locale.US, "%.1f МБ", rxBytes / 1048576.0) else String.format(java.util.Locale.US, "%.0f КБ", rxBytes / 1024.0)
+            dur += " · ↓$vol" + (if (ms >= 2000) String.format(java.util.Locale.US, " (%.0f КБ/с)", rxBytes / 1024.0 / (ms / 1000.0)) else "")
+        }
         if (err == null) {
             // v4.4.1: одинаковые успешные соединения (YouTube открывает десятки к googlevideo) — не чаще раза в 5 с
             val okKey = "ok|$who|$host:$port"
