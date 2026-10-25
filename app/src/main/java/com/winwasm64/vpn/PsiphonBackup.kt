@@ -47,6 +47,9 @@ object PsiphonBackup {
     @Volatile var availableRegions: List<String> = emptyList(); private set
     val rxBytes = AtomicLong(); val txBytes = AtomicLong()
     @Volatile var lastUsedAt: Long = 0L
+    @Volatile var embeddedCount: Int = 0
+    @Volatile var lastDiag: String = ""
+    @Volatile var connectAttempts: Int = 0
 
     private var tunnel: PsiphonTunnel? = null
     private val lock = Any()
@@ -93,7 +96,7 @@ object PsiphonBackup {
             (if (clientAddress.isNotBlank()) " · IP $clientAddress" else "") +
             " · ↓${MediaFmt.size(rxBytes.get())} ↑${MediaFmt.size(txBytes.get())}" +
             (if (mode == MODE_ALWAYS) " · основной канал" else " · резерв")
-        starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с)" + (if (lastError.isNotBlank()) " · $lastError" else "")
+        starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с, попыток $connectAttempts)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "") + (if (lastError.isNotBlank()) " · $lastError" else "")
         else -> "Psiphon: не запущен (${modeTitle()})"
     }
 
@@ -116,6 +119,8 @@ object PsiphonBackup {
             connected = false
             lastError = ""
             startedAt = SystemClock.elapsedRealtime()
+            connectAttempts = 0
+            lastDiag = ""
             val host = Host(ctx.applicationContext)
             val t = try { PsiphonTunnel.newPsiphonTunnel(host) } catch (e: Throwable) {
                 starting = false
@@ -128,7 +133,12 @@ object PsiphonBackup {
             Thread({
                 try {
                     t.setVpnMode(false)
-                    t.startTunneling("")
+                    // v4.4.5: встроенный список серверов (429 записей из публичного списка Psiphon) — первое подключение
+                    // не зависит от того, доступен ли s3.amazonaws.com на сети пользователя
+                    val embedded = try { ctx.assets.open("psiphon/servers.txt").bufferedReader().use { it.readText() } } catch (e: Exception) { VpnLog.w(TAG, "встроенный список серверов не прочитан: ${e.message}"); "" }
+                    embeddedCount = embedded.count { it == '\n' }
+                    VpnLog.i(TAG, "встроенных серверов: $embeddedCount, удалённый список подтянется сам")
+                    t.startTunneling(embedded)
                 } catch (e: Throwable) {
                     lastError = e.message ?: e.javaClass.simpleName
                     VpnLog.e(TAG, "не запустился: $lastError")
@@ -178,8 +188,8 @@ object PsiphonBackup {
         o.put("TunnelPoolSize", 1)
         o.put("PortForwardFailureThreshold", 10)
         o.put("EmitBytesTransferred", true)
-        o.put("EmitDiagnosticNotices", false)
-        o.put("EstablishTunnelTimeoutSeconds", 0)
+        o.put("EmitDiagnosticNotices", true)
+        o.put("EmitServerAlerts", true)
         return o.toString()
     }
 
@@ -187,14 +197,24 @@ object PsiphonBackup {
         override fun getContext(): Context = ctx
         override fun getPsiphonConfig(): String = buildConfig(ctx)
         override fun onDiagnosticMessage(message: String) {
-            // только важное: ошибки и смена состояния, иначе журнал тонет
+            // v4.4.5: диагностика в журнал с ограничением частоты — иначе не понять, почему не подключается
+            val type = message.substringBefore(':').trim()
             val m = message.lowercase()
-            if (m.contains("error") || m.contains("failed")) {
-                val now = SystemClock.elapsedRealtime()
-                if (now - diagLoggedAt > 30_000L) { diagLoggedAt = now; VpnLog.w(TAG, message.take(180)) }
-            }
+            val now = SystemClock.elapsedRealtime()
+            val important = m.contains("error") || m.contains("fail") || m.contains("alert") || m.contains("timeout") || m.contains("panic")
+            if (type == "ConnectingServer") { connectAttempts++; lastDiag = "пробуем сервер " + Regex("\"region\":\"([A-Z]+)\"").find(message)?.groupValues?.get(1).orEmpty() + " " + Regex("\"protocol\":\"([A-Z0-9-]+)\"").find(message)?.groupValues?.get(1).orEmpty() }
+            if (type == "RemoteServerListResourceDownloaded" || m.contains("remote server list")) lastDiag = "список серверов получен"
+            val quiet = connected && !important
+            if (quiet) return
+            val key = if (important) "!" + type else type
+            val last = diagLoggedAt[key] ?: 0L
+            val minGap = if (important) 15_000L else 8_000L
+            if (now - last < minGap) return
+            diagLoggedAt[key] = now
+            if (!important && now - startedAt > 180_000L) return // после 3 мин без связи — только важное
+            if (important) VpnLog.w(TAG, message.take(220)) else VpnLog.i(TAG, message.take(160))
         }
-        @Volatile private var diagLoggedAt = 0L
+        private val diagLoggedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
         override fun onListeningHttpProxyPort(port: Int) { httpPort = port; VpnLog.i(TAG, "локальный HTTP-прокси 127.0.0.1:$port") }
         override fun onListeningSocksProxyPort(port: Int) { socksPort = port }
         override fun onHttpProxyPortInUse(port: Int) { VpnLog.w(TAG, "порт $port занят — Psiphon не сможет принять соединения") }
