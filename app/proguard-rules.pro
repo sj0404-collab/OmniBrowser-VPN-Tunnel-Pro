@@ -11,3 +11,8 @@
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**
+
+# Psiphon (gomobile JNI)
+-keep class go.** { *; }
+-keep class psi.** { *; }
+-keep class ca.psiphon.** { *; }

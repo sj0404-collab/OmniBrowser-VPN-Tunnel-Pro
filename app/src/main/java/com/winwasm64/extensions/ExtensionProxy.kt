@@ -1121,7 +1121,7 @@ function alert(){}
         lastAutoTunnelAt = t
         if (t - (tunnelLoggedAt[host] ?: 0L) > 60_000L) {
             tunnelLoggedAt[host] = t
-            com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → автотуннель через Browsec ${up.key}")
+            com.winwasm64.vpn.VpnLog.ok("Браузер", "$host → автотуннель через ${describe(up)}")
         }
     }
 
@@ -1737,6 +1737,48 @@ function alert(){}
 
     fun noteDestAlive(host: String, port: Int) { val k = "$host:$port"; deadDestUntil.remove(k); deadDestServers.remove(k) }
 
+    // ===================== v4.4.3: Psiphon как ещё один «сервер» пула =====================
+    @Volatile private var psiphonUp: Upstream? = null
+
+    /** Локальный HTTP-прокси Psiphon, если он подключён (ключ 127.0.0.1:8921). */
+    fun psiphonUpstream(): Upstream? {
+        val pb = com.winwasm64.vpn.PsiphonBackup
+        if (!pb.ready()) return null
+        val cur = psiphonUp
+        if (cur != null && cur.port == pb.httpPort) return cur
+        return Upstream("HTTP", "127.0.0.1", pb.httpPort).also { psiphonUp = it }
+    }
+
+    fun isPsiphonKey(key: String): Boolean = key.startsWith("127.0.0.1:") && key == psiphonUp?.key
+
+    /** Короткое имя сервера для журнала: lv115 / Psiphon. */
+    fun shortName(key: String): String = if (isPsiphonKey(key)) "Psiphon" else key.substringBefore('.')
+    fun describe(up: Upstream): String = if (isPsiphonKey(up.key)) "Psiphon (${up.key})" else "Browsec ${up.key}"
+
+    private fun upstreamByKey(key: String): Upstream? =
+        tunnelServers.firstOrNull { it.key == key } ?: psiphonUpstream()?.takeIf { it.key == key }
+
+    /** Подмешиваем Psiphon к ранжированному списку по режиму. */
+    private fun withPsiphon(list: List<Upstream>, forceFirst: Boolean = false): List<Upstream> {
+        val ps = psiphonUpstream() ?: return list
+        val now = SystemClock.elapsedRealtime()
+        if ((tunnelDownUntil[ps.key] ?: 0L) > now) return list
+        val mode = com.winwasm64.vpn.PsiphonBackup.mode
+        if (mode == com.winwasm64.vpn.PsiphonBackup.MODE_OFF) return list
+        val rest = list.filter { it.key != ps.key }
+        val first = mode == com.winwasm64.vpn.PsiphonBackup.MODE_ALWAYS || forceFirst || rest.isEmpty() || poolOverloaded()
+        return if (first) listOf(ps) + rest else rest + ps
+    }
+
+    fun onPsiphonConnected() {
+        psiphonUpstream()?.let { tunnelDownUntil.remove(it.key); tunnelConnectMs.remove(it.key) }
+    }
+
+    private fun startPsiphonIfNeeded(why: String) {
+        val ctx = (if (::appContext.isInitialized) appContext else null) ?: com.winwasm64.vpn.BrowsecVpnService.appContext ?: return
+        try { com.winwasm64.vpn.PsiphonBackup.ensureStarted(ctx, why) } catch (_: Throwable) {}
+    }
+
     // ===================== v4.4.1: тёплый пул TLS-соединений к серверу =====================
     private class WarmSock(val sock: Socket, val at: Long)
     private val warmPool = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<WarmSock>>()
@@ -1799,8 +1841,8 @@ function alert(){}
         val prev = appAffinity.put(pkg, Pair(serverKey, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS))
         if (prev?.first != serverKey) {
             val who = com.winwasm64.vpn.VpnLog.label(pkg)
-            com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null || (prev.second < SystemClock.elapsedRealtime())) "$who: все соединения приложения закреплены за сервером ${serverKey.substringBefore('.')} (адреса видео/CDN привязаны к IP)"
-                else "$who: сервер сменён ${prev.first.substringBefore('.')} → ${serverKey.substringBefore('.')} (${reason ?: "прежний не ответил"}) — приложение переоткроет соединения")
+            com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null || (prev.second < SystemClock.elapsedRealtime())) "$who: все соединения приложения закреплены за сервером ${shortName(serverKey)} (адреса видео/CDN привязаны к IP)"
+                else "$who: сервер сменён ${shortName(prev.first)} → ${shortName(serverKey)} (${reason ?: "прежний не ответил"}) — приложение переоткроет соединения")
         }
     }
 
@@ -1829,6 +1871,7 @@ function alert(){}
         if (now - overloadLoggedAt < 300_000L) return
         if (!poolOverloaded()) return
         overloadLoggedAt = now
+        startPsiphonIfNeeded("серверы Browsec перегружены")
         val (alive, total, best) = poolHealth()
         com.winwasm64.vpn.VpnLog.w("Прил", "серверы Browsec перегружены: отвечают $alive из $total, лучший CONNECT $best мс — час пик бесплатного пула; видео может буферизоваться, это не ошибка приложения")
     }
@@ -1850,17 +1893,18 @@ function alert(){}
         // v4.2.12: четыре кандидата и хедж через 2,5 с (было 3 и 4 с) — Telegram сам рвёт соединение через ~8–10 с,
         // и при перегруженных серверах Browsec в час пик мы не успевали ответить ему вовремя
         var list = rankTunnelServers(preferCountry, now, dest).take(4)
+        psiphonUpstream()?.let { ps -> if (list.none { it.key == ps.key }) { val full = rankTunnelServers(preferCountry, now, dest); if (full.any { it.key == ps.key }) list = list.take(3) + ps } }
         // v4.4.1: закреплённый за приложением сервер — первым кандидатом (хедж через 4 с вместо 2,5)
         // v4.4.2: пока сервер для приложения не выбран, выбирает его ПЕРВОЕ соединение, остальные параллельные ждут результата —
         // иначе 5 одновременных соединений YouTube выбирали 5 разных победителей и «закрепление» прыгало каждую секунду
-        var stickyUp: Upstream? = affinityServer(stickyKey)?.let { k -> tunnelServers.firstOrNull { it.key == k } }
+        var stickyUp: Upstream? = affinityServer(stickyKey)?.let { k -> upstreamByKey(k) }
         var leaderLatch: CountDownLatch? = null
         if (stickyKey != null && stickyUp == null) {
             val mine = CountDownLatch(1)
             val other = affinityPending.putIfAbsent(stickyKey, mine)
             if (other != null) {
                 try { other.await(8, TimeUnit.SECONDS) } catch (_: InterruptedException) {}
-                stickyUp = affinityServer(stickyKey)?.let { k -> tunnelServers.firstOrNull { it.key == k } }
+                stickyUp = affinityServer(stickyKey)?.let { k -> upstreamByKey(k) }
             } else leaderLatch = mine
         }
         val stickyUpF: Upstream? = stickyUp
@@ -1920,8 +1964,9 @@ function alert(){}
             val t = lastAutoTunnelAt
             if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
                 appTunnelLoggedAt[up.key] = t
-                com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через сервер Browsec ${up.key} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
+                com.winwasm64.vpn.VpnLog.ok("Прил", "приложения идут через ${describe(up)} (CONNECT ${tunnelConnectMs[up.key] ?: 0} мс)")
             }
+            if (isPsiphonKey(up.key)) com.winwasm64.vpn.PsiphonBackup.lastUsedAt = SystemClock.elapsedRealtime()
             return Triple(r.sock!!.first, CountingInputStream(r.sock.second, up.key), up.key)
         }
         while (pendingN > 0) {
@@ -1929,7 +1974,7 @@ function alert(){}
             if (now2 >= deadline) break
             if (backup != null && stickyUpF != null && !stickyDone && now2 - t0 >= STICKY_WAIT_MS) {
                 stickyDone = true
-                return accept(backup!!, "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил за ${STICKY_WAIT_MS / 1000} с")
+                return accept(backup!!, "закреплённый ${shortName(stickyUpF.key)} не ответил за ${STICKY_WAIT_MS / 1000} с")
             }
             val r = results.poll(maxOf(20L, minOf(hedgeAt, deadline) - now2), TimeUnit.MILLISECONDS)
             if (r == null) {
@@ -1947,7 +1992,7 @@ function alert(){}
                     continue
                 }
                 if (stickyUpF != null && r.up.key == stickyUpF.key) stickyDone = true
-                return accept(r, if (stickyUpF != null && r.up.key != stickyUpF.key) "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил за ${(SystemClock.elapsedRealtime() - t0) / 1000} с" else null)
+                return accept(r, if (stickyUpF != null && r.up.key != stickyUpF.key) "закреплённый ${shortName(stickyUpF.key)} не ответил за ${(SystemClock.elapsedRealtime() - t0) / 1000} с" else null)
             } else {
                 val e = r.err
                 if (e is ProxyRefusedException && e.code != 407 && e.code !in 500..599) { won.set(true); backup?.sock?.let { closeQuietly(it.first) }; return null } // адресат/порт запрещён — идём напрямую
@@ -1955,13 +2000,13 @@ function alert(){}
                     stickyDone = true
                     stickyErr = e?.message ?: e?.javaClass?.simpleName ?: "ошибка"
                     val b = backup
-                    if (b != null) return accept(b, "закреплённый ${stickyUpF.key.substringBefore('.')} не ответил: ${stickyErr.take(60)}")
+                    if (b != null) return accept(b, "закреплённый ${shortName(stickyUpF.key)} не ответил: ${stickyErr.take(60)}")
                 }
                 if (next < list.size && pendingN == 0) { launch(list[next++]); hedgeAt = SystemClock.elapsedRealtime() + 2_500L }
             }
         }
         val b = backup
-        if (b != null) return accept(b, "закреплённый ${stickyUpF?.key?.substringBefore('.')} не ответил: ${stickyErr?.take(60) ?: "таймаут"}")
+        if (b != null) return accept(b, "закреплённый ${stickyUpF?.key?.let { shortName(it) }} не ответил: ${stickyErr?.take(60) ?: "таймаут"}")
         won.set(true)
         return null
         } finally {
@@ -2011,7 +2056,7 @@ function alert(){}
 
     fun openPinnedTunnel(host: String, port: Int, serverKey: String): Pair<Socket, InputStream>? {
         if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
-        val up = tunnelServers.firstOrNull { it.key == serverKey } ?: return null
+        val up = upstreamByKey(serverKey) ?: return null
         val t0 = SystemClock.elapsedRealtime()
         return try {
             val r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 12_000)
@@ -2055,7 +2100,7 @@ function alert(){}
             tunnelDownUntil[up.key] = t + 180_000L
             if (t - (appTunnelFailLoggedAt[up.key] ?: 0L) > 60_000L) {
                 appTunnelFailLoggedAt[up.key] = t
-                com.winwasm64.vpn.VpnLog.w("Прил", "сервер Browsec ${up.key} не отвечает (${e.message ?: e.javaClass.simpleName}) — 3 мин пропускаем")
+                com.winwasm64.vpn.VpnLog.w("Прил", "сервер ${describe(up)} не отвечает (${e.message ?: e.javaClass.simpleName}) — ${if (isPsiphonKey(up.key)) "1 мин" else "3 мин"} пропускаем")
             }
         }
     }
@@ -2161,7 +2206,7 @@ function alert(){}
                 com.winwasm64.vpn.VpnLog.w("Прил", "все серверы Browsec в паузе после 503/таймаутов — пробуем ${alive.take(4).joinToString(", ") { it.host.substringBefore('.') }} всё равно, чтобы приложения не остались без туннеля")
             }
         }
-        if (alive.isEmpty()) return alive
+        if (alive.isEmpty()) return withPsiphon(alive)
         val byScore = alive.sortedBy { scoreFor(dest, it) }
         val best = scoreFor(dest, byScore.first())
         val limit = (best * 1.5).toLong() + 200
@@ -2173,7 +2218,7 @@ function alert(){}
             val cur = alive.firstOrNull { it.key == lastAutoTunnel }
             if (cur != null && scoreFor(dest, cur) <= (best * 1.3).toLong() + 100) head = listOf(cur)
         }
-        return (head + byScore).distinctBy { it.key }
+        return withPsiphon((head + byScore).distinctBy { it.key })
     }
 
     /** Активный замер: CONNECT www.google.com:443 через 10 лучших по TCP-пингу серверов, параллельно. */

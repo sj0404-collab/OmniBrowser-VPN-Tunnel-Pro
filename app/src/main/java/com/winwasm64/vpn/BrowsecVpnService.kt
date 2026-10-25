@@ -3537,6 +3537,8 @@ class BrowsecVpnService : VpnService() {
         when (intent?.action) {
             ACTION_DISCONNECT -> {
                 logSessionSummary()
+                // v4.4.3: Psiphon гасим вместе с VPN приложений, если браузер им не пользовался последние 10 мин
+                if (android.os.SystemClock.elapsedRealtime() - PsiphonBackup.lastUsedAt > 600_000L) PsiphonBackup.stop()
                 isRunning = false
                 isPaused = false
                 BrowsecLocalProxyServer.useBrowsecTunnel = false
@@ -3698,6 +3700,7 @@ class BrowsecVpnService : VpnService() {
             perAppVpnInterface = pfd
             if (pfd == null) VpnLog.e("Туннель", "Android не создал VPN-интерфейс (нет разрешения VPN или включено другое VPN-приложение)")
             else VpnLog.ok("Туннель", "VPN приложений поднят, профиль $activeCountry: " + VpnLog.appList(routedPackages) + (if (wantTransparent) " · прозрачный режим" else " · режим прокси"))
+            try { PsiphonBackup.ensureStarted(this, "VPN приложений") } catch (_: Throwable) {}
             if (pfd != null && sessionStartedAt == 0L) {
                 // v4.2.13: точка отсчёта сеанса — время работы и трафик по приложениям покажем при отключении
                 sessionStartedAt = System.currentTimeMillis()

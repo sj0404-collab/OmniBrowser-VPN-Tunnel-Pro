@@ -39,6 +39,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     private val tvHint = TextView(context)
     private val btnAdd = TextView(context)
     private val btnTunnel = TextView(context)
+    private val btnPsiphon = TextView(context)
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -117,6 +118,15 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             refresh()
         }
         addView(btnTunnel, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        // v4.4.3: запасной канал Psiphon — авто / всегда / выкл
+        pill(btnPsiphon, "") {
+            PsiphonBackup.load(context)
+            val next = when (PsiphonBackup.mode) { PsiphonBackup.MODE_AUTO -> PsiphonBackup.MODE_ALWAYS; PsiphonBackup.MODE_ALWAYS -> PsiphonBackup.MODE_OFF; else -> PsiphonBackup.MODE_AUTO }
+            PsiphonBackup.setMode(context, next)
+            Toast.makeText(context, "Psiphon: " + PsiphonBackup.modeTitle(next), Toast.LENGTH_SHORT).show()
+            refresh()
+        }
+        addView(btnPsiphon, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
         refresh()
     }
 
@@ -162,6 +172,9 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         }
         btnTunnel.text = if (BrowsecVpnService.appsViaBrowsecTunnel) "🌍 Приложения через серверы Browsec: ВКЛ" else "🌍 Приложения через серверы Browsec: ВЫКЛ (обход DPI)"
         btnTunnel.alpha = if (BrowsecVpnService.appsViaBrowsecTunnel && !ExtensionProxy.appTunnelAvailable()) 0.7f else 1f
+        PsiphonBackup.load(context)
+        btnPsiphon.text = "🛡 " + PsiphonBackup.statusLine() + " · режим: " + when (PsiphonBackup.mode) { PsiphonBackup.MODE_ALWAYS -> "ВСЕГДА"; PsiphonBackup.MODE_OFF -> "ВЫКЛ"; else -> "АВТО" } + " (нажмите — сменить)"
+        btnPsiphon.alpha = if (PsiphonBackup.mode == PsiphonBackup.MODE_OFF) 0.6f else 1f
         tvApps.setTextColor(if (BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && routed.isEmpty()) 0xFFFDD663.toInt() else 0xFFECECEC.toInt())
         tvHint.visibility = if (compact) GONE else VISIBLE
         tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Настоящую смену IP дают серверы Browsec: для браузера — через расширение, для приложений — кнопкой ниже. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."

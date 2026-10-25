@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Библиотека Psiphon (ca.psiphon:psiphontunnel) публикуется в репозитории на GitHub
+        maven { url = uri("https://raw.github.com/Psiphon-Labs/psiphon-tunnel-core-Android-library/master") }
     }
 }
 

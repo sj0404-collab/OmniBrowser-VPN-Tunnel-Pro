@@ -14,7 +14,7 @@ android {
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber
-        versionName = "4.4.2"
+        versionName = "4.4.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -26,7 +26,8 @@ android {
 
         // Только ARM-устройства (телефоны/планшеты). x86/x86_64 нужны лишь эмуляторам ПК
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // v4.4.3: только arm64 — библиотека Psiphon весит 31 МБ на каждую архитектуру
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -68,6 +69,8 @@ android {
     }
 
     packaging {
+        // v4.4.3: нативные библиотеки сжимаются в APK (Psiphon: 31 МБ → ~11 МБ при скачивании)
+        jniLibs { useLegacyPackaging = true }
         resources {
             excludes += listOf(
                 "/META-INF/{AL2.0,LGPL2.1}",
@@ -106,6 +109,8 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.webkit)
+    // v4.4.3: запасной канал Psiphon
+    implementation("ca.psiphon:psiphontunnel:2.0.42")
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
 }
