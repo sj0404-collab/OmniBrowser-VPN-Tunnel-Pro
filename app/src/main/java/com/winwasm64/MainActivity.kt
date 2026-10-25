@@ -23,7 +23,10 @@ import com.winwasm64.vpn.BrowsecVpnService
 
 /** v4.4.0: адрес, пришедший в уже работающее приложение (onNewIntent) — экран браузера его подхватывает. */
 object ExternalIntents {
-    var pendingUrl by androidx.compose.runtime.mutableStateOf<String?>(null)
+    val pendingUrlState = androidx.compose.runtime.mutableStateOf<String?>(null)
+    var pendingUrl: String?
+        get() = pendingUrlState.value
+        set(v) { pendingUrlState.value = v }
 }
 
 class MainActivity : ComponentActivity() {
