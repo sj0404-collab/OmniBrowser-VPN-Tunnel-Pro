@@ -1171,11 +1171,17 @@ function alert(){}
     private fun basic(c: Pair<String, String>): String =
         Base64.encodeToString("${c.first}:${c.second}".toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
-    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String, direct: Boolean = false, readTimeoutMs: Int = 5_000): Pair<Socket, InputStream> {
+    private fun viaHttpProxy(up: Upstream, host: String, port: Int, url: String, direct: Boolean = false, readTimeoutMs: Int = 5_000, allowWarm: Boolean = false): Pair<Socket, InputStream> {
         var attempt = 0
+        var warmTried = false
         while (true) {
             val used = creds[up.key]
-            val s = openToProxy(up, readTimeoutMs)
+            // v4.4.1: заранее открытое TLS-соединение к серверу (тёплый пул) — экономит TCP+TLS-рукопожатие (~0,3–1 с) на каждом CONNECT
+            val warm = if (allowWarm && !warmTried) takeWarm(up) else null
+            warmTried = true
+            val fromWarm = warm != null
+            val s = warm ?: openToProxy(up, readTimeoutMs)
+            if (fromWarm) try { s.soTimeout = readTimeoutMs } catch (_: Exception) {}
             try {
             val sb = StringBuilder()
                 .append("CONNECT ").append(host).append(':').append(port).append(" HTTP/1.1\r\n")
@@ -1189,14 +1195,20 @@ function alert(){}
             out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
             out.flush()
             val inp = BufferedInputStream(s.getInputStream())
-            val head = readHead(inp)
+            val head = try { readHead(inp) } catch (e: IOException) {
+                closeQuietly(s)
+                if (fromWarm) { warmDead.incrementAndGet(); continue } // тёплое соединение умерло — пробуем свежее
+                throw e
+            }
             if (head == null) {
                 closeQuietly(s)
+                if (fromWarm) { warmDead.incrementAndGet(); continue }
                 throw IOException("Прокси ${up.key} закрыл соединение")
             }
             val code = statusCode(head)
             if (code == 200) {
                 s.soTimeout = 0
+                if (allowWarm) scheduleWarm(up)
                 return s to inp
             }
             closeQuietly(s)
@@ -1725,7 +1737,103 @@ function alert(){}
 
     fun noteDestAlive(host: String, port: Int) { val k = "$host:$port"; deadDestUntil.remove(k); deadDestServers.remove(k) }
 
-    fun openAppTunnel(host: String, port: Int, preferCountry: String?): Triple<Socket, InputStream, String>? {
+    // ===================== v4.4.1: тёплый пул TLS-соединений к серверу =====================
+    private class WarmSock(val sock: Socket, val at: Long)
+    private val warmPool = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<WarmSock>>()
+    private val warmFilling = ConcurrentHashMap<String, AtomicBoolean>()
+    private val warmDead = AtomicInteger()
+    private val warmUsed = AtomicInteger()
+    private const val WARM_MAX_AGE_MS = 25_000L
+    private const val WARM_PER_SERVER = 2
+
+    private fun takeWarm(up: Upstream): Socket? {
+        val q = warmPool[up.key] ?: return null
+        while (true) {
+            val w = q.poll() ?: return null
+            if (SystemClock.elapsedRealtime() - w.at > WARM_MAX_AGE_MS || w.sock.isClosed) { closeQuietly(w.sock); continue }
+            warmUsed.incrementAndGet()
+            return w.sock
+        }
+    }
+
+    /** Подогреваем до [WARM_PER_SERVER] соединений к серверу, за которым закреплено приложение (пока VPN приложений работает). */
+    private fun scheduleWarm(up: Upstream) {
+        if (!com.winwasm64.vpn.BrowsecVpnService.isRunning || com.winwasm64.vpn.BrowsecVpnService.isPaused) return
+        if (appAffinity.values.none { it.first == up.key }) return
+        val flag = warmFilling.getOrPut(up.key) { AtomicBoolean(false) }
+        if (!flag.compareAndSet(false, true)) return
+        pool.execute {
+            try {
+                val q = warmPool.getOrPut(up.key) { java.util.concurrent.ConcurrentLinkedQueue() }
+                // выбрасываем устаревшие
+                val it = q.iterator()
+                while (it.hasNext()) { val w = it.next(); if (SystemClock.elapsedRealtime() - w.at > WARM_MAX_AGE_MS || w.sock.isClosed) { it.remove(); closeQuietly(w.sock) } }
+                var guard = 0
+                while (q.size < WARM_PER_SERVER && guard++ < WARM_PER_SERVER && (tunnelDownUntil[up.key] ?: 0L) < SystemClock.elapsedRealtime()) {
+                    try { q.add(WarmSock(openToProxy(up, 9_000), SystemClock.elapsedRealtime())) } catch (_: Exception) { break }
+                }
+            } finally { flag.set(false) }
+        }
+    }
+
+    fun warmStats(): String = "тёплых использовано ${warmUsed.get()}, умерло ${warmDead.get()}"
+
+    // ===================== v4.4.1: привязка приложения к серверу =====================
+    // Адреса googlevideo (YouTube), CDN Telegram и т.п. привязаны к IP, с которого приложение получило ответ API:
+    // если следующее соединение уйдёт через другой сервер Browsec — 403/обрыв и «буферизация» каждые несколько секунд.
+    // Поэтому все соединения одного приложения идут через один сервер, пока он отвечает.
+    private val appAffinity = ConcurrentHashMap<String, Pair<String, Long>>()  // пакет → (сервер, срок)
+    private const val AFFINITY_TTL_MS = 20 * 60_000L
+
+    fun affinityServer(pkg: String?): String? {
+        if (pkg == null) return null
+        val a = appAffinity[pkg] ?: return null
+        val now = SystemClock.elapsedRealtime()
+        if (a.second < now) { appAffinity.remove(pkg); return null }
+        if ((tunnelDownUntil[a.first] ?: 0L) > now) return null
+        return a.first
+    }
+
+    private fun setAffinity(pkg: String?, serverKey: String) {
+        if (pkg == null) return
+        val prev = appAffinity.put(pkg, Pair(serverKey, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS))
+        if (prev?.first != serverKey) {
+            val who = com.winwasm64.vpn.VpnLog.label(pkg)
+            com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null) "$who: все соединения приложения закреплены за сервером ${serverKey.substringBefore('.')} (адреса видео/CDN привязаны к IP)"
+                else "$who: сервер сменён ${prev.first.substringBefore('.')} → ${serverKey.substringBefore('.')} (прежний не ответил) — приложение переоткроет соединения")
+        }
+    }
+
+    fun clearAffinity(pkg: String?) { if (pkg != null) appAffinity.remove(pkg) }
+
+    // ===================== v4.4.1: индикатор перегрузки пула =====================
+    @Volatile private var overloadLoggedAt = 0L
+    /** Сводка состояния пула: (серверов отвечает, всего измерено, лучший CONNECT мс). */
+    fun poolHealth(): Triple<Int, Int, Long> {
+        val now = SystemClock.elapsedRealtime()
+        val measured = tunnelServers.filter { tunnelConnectMs.containsKey(it.key) || (tunnelDownUntil[it.key] ?: 0L) > now }
+        val alive = measured.filter { (tunnelDownUntil[it.key] ?: 0L) < now && (tunnelConnectMs[it.key] ?: 9_000L) < 3_000L }
+        val best = alive.minOfOrNull { tunnelConnectMs[it.key] ?: 9_000L } ?: (measured.minOfOrNull { tunnelConnectMs[it.key] ?: 9_000L } ?: 0L)
+        return Triple(alive.size, measured.size, best)
+    }
+
+    /** true, если пул явно перегружен (час пик): отвечает меньше половины серверов или лучший CONNECT > 2,5 с. */
+    fun poolOverloaded(): Boolean {
+        val (alive, total, best) = poolHealth()
+        if (total < 3) return false
+        return alive * 2 < total || best > 2_500L
+    }
+
+    private fun maybeLogOverload() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - overloadLoggedAt < 300_000L) return
+        if (!poolOverloaded()) return
+        overloadLoggedAt = now
+        val (alive, total, best) = poolHealth()
+        com.winwasm64.vpn.VpnLog.w("Прил", "серверы Browsec перегружены: отвечают $alive из $total, лучший CONNECT $best мс — час пик бесплатного пула; видео может буферизоваться, это не ошибка приложения")
+    }
+
+    fun openAppTunnel(host: String, port: Int, preferCountry: String?, stickyKey: String? = null): Triple<Socket, InputStream, String>? {
         if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
         if (isDeadDest(host, port)) return null
         val now = SystemClock.elapsedRealtime()
@@ -1741,8 +1849,13 @@ function alert(){}
         val dest = destKey(host)
         // v4.2.12: четыре кандидата и хедж через 2,5 с (было 3 и 4 с) — Telegram сам рвёт соединение через ~8–10 с,
         // и при перегруженных серверах Browsec в час пик мы не успевали ответить ему вовремя
-        val list = rankTunnelServers(preferCountry, now, dest).take(4)
+        var list = rankTunnelServers(preferCountry, now, dest).take(4)
+        // v4.4.1: закреплённый за приложением сервер — первым кандидатом (хедж через 4 с вместо 2,5)
+        val sticky = affinityServer(stickyKey)
+        val stickyUp = sticky?.let { k -> tunnelServers.firstOrNull { it.key == k } }
+        if (stickyUp != null) list = (listOf(stickyUp) + list.filter { it.key != stickyUp.key }).take(4)
         if (list.isEmpty()) return null
+        maybeLogOverload()
 
         // v4.2.5: «хеджирование» — если сервер не ответил на CONNECT за 4 с, параллельно пробуем следующий; побеждает первый ответ.
         // Сервер запоминает задержку до конкретного адресата (Telegram DC и т.п.), и в следующий раз к нему идёт лучший для него сервер.
@@ -1760,7 +1873,7 @@ function alert(){}
                 var err: Exception? = null
                 val t0 = SystemClock.elapsedRealtime()
                 try {
-                    r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000)
+                    r = viaHttpProxy(up, host, port, (if (port == 80) "http://" else "https://") + host + "/", readTimeoutMs = 9_000, allowWarm = stickyUp != null && up.key == stickyUp.key)
                     val ms = SystemClock.elapsedRealtime() - t0
                     noteConnectMs(up.key, ms)
                     noteDestMs(up.key, dest, ms)
@@ -1779,7 +1892,7 @@ function alert(){}
         launch(list[next++])
         val t0 = SystemClock.elapsedRealtime()
         val deadline = t0 + 12_000L
-        var hedgeAt = t0 + 2_500L
+        var hedgeAt = t0 + (if (stickyUp != null) 4_000L else 2_500L)
         while (pendingN > 0) {
             val now2 = SystemClock.elapsedRealtime()
             if (now2 >= deadline) break
@@ -1798,6 +1911,7 @@ function alert(){}
                     val up = r.up
                     lastAutoTunnel = up.key
                     lastAutoTunnelAt = SystemClock.elapsedRealtime()
+                    setAffinity(stickyKey, up.key)
                     val t = lastAutoTunnelAt
                     if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
                         appTunnelLoggedAt[up.key] = t

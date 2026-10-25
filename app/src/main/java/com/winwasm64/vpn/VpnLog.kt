@@ -38,11 +38,21 @@ object VpnLog {
     /** Соединение приложения через VPN: куда, через какой профиль, сколько заняло, ошибка. */
     private class Rep(var firstAt: Long, var count: Int)
     private val repeats = java.util.concurrent.ConcurrentHashMap<String, Rep>()
+    private val okRepeats = java.util.concurrent.ConcurrentHashMap<String, Rep>()
 
     fun conn(pkg: String?, host: String, port: Int, profile: String, ms: Long, err: String?) {
         val who = label(pkg)
         val dur = if (ms >= 1000) String.format(java.util.Locale.US, "%.1f с", ms / 1000.0) else "$ms мс"
-        if (err == null) { add("📱", "Прил", "$who → $host:$port · профиль $profile · длилось $dur"); return }
+        if (err == null) {
+            // v4.4.1: одинаковые успешные соединения (YouTube открывает десятки к googlevideo) — не чаще раза в 5 с
+            val okKey = "ok|$who|$host:$port"
+            val nowOk = System.currentTimeMillis()
+            val prev = okRepeats[okKey]
+            if (prev != null && nowOk - prev.firstAt < 5_000L) { prev.count++; return }
+            val extra = if (prev != null && prev.count > 0) " (+${prev.count} похожих за ${(nowOk - prev.firstAt) / 1000} с)" else ""
+            okRepeats[okKey] = Rep(nowOk, 0)
+            add("📱", "Прил", "$who → $host:$port · профиль $profile · длилось $dur$extra"); return
+        }
         // v4.2.17: одинаковые ошибки одного приложения к одному адресату — не чаще раза в 15 с, остальные считаем
         val key = "$who|$host:$port|${err.substringBefore(" (")}"
         val now = System.currentTimeMillis()

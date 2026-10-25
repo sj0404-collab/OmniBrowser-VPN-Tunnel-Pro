@@ -154,7 +154,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
                 when {
                     !BrowsecVpnService.transparentActive -> " (режим прокси — что игнорирует прокси, идёт напрямую)."
                     BrowsecVpnService.appsViaBrowsecTunnel && ExtensionProxy.appTunnelAvailable() ->
-                        ". Весь их TCP — через серверы Browsec" + (ExtensionProxy.lastAutoTunnel?.let { " ($it)" } ?: "") + ", QUIC → TCP."
+                        ". Весь их TCP — через серверы Browsec" + (ExtensionProxy.lastAutoTunnel?.let { " ($it)" } ?: "") + ", QUIC → TCP." +
+                            (try { if (ExtensionProxy.poolOverloaded()) { val (a, t, b) = ExtensionProxy.poolHealth(); " ⚠ Серверы Browsec перегружены: отвечают $a из $t, лучший CONNECT $b мс — час пик, видео может буферизоваться." } else "" } catch (_: Exception) { "" })
                     BrowsecVpnService.appsViaBrowsecTunnel -> ". Пока через обход DPI: включите расширение Browsec в браузере — и приложения пойдут через его серверы."
                     else -> ". Весь их TCP — через обход DPI, QUIC → TCP."
                 }

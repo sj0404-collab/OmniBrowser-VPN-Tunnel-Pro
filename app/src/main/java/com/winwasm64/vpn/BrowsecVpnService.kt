@@ -2638,7 +2638,7 @@ object BrowsecLocalProxyServer {
             // v4.1.1: любой TCP-порт (Telegram ходит на 5222 и по IP без SNI); если прокси откажет в порте — напрямую
             if (!isDnsIp && BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
                 val t0 = System.currentTimeMillis()
-                var r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                var r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode, profile?.packageName)
                 // v4.2.17: мгновенный null = кандидатов не было вовсе (пул в паузе). Не отказываем сразу — ждём до 4,5 с,
                 // пока сервер освободится; Telegram такую задержку переживает, а мгновенный отказ повторяет 40 раз в секунду
                 var waits = 0
@@ -2646,7 +2646,7 @@ object BrowsecLocalProxyServer {
                     !com.winwasm64.extensions.ExtensionProxy.isDeadDest(host, origPort)) {
                     waits++
                     try { Thread.sleep(1_500) } catch (_: InterruptedException) { break }
-                    r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode)
+                    r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, origPort, countryCode, profile?.packageName)
                 }
                 if (r != null) {
                     up = r.first
@@ -2749,6 +2749,22 @@ object BrowsecLocalProxyServer {
         st: ServerNodeRuntimeState,
         appProfile: AppTunnelProfile?
     ): Socket {
+        var lastErr: Exception? = null
+        // v4.2.0: прокси приложений 127.0.0.1:89xx (Telegram с настроенным прокси) тоже идёт через туннель Browsec,
+        // как и прозрачный туннель — иначе Telegram с прокси «Соединение…» на сети, где его IP режут
+        // v4.4.1: сначала туннель (DNS адресата не нужен — его делает сервер Browsec), DoH-резолв только для прямого пути
+        if (BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
+            try {
+                val t0 = System.currentTimeMillis()
+                val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, port, appProfile?.countryCode ?: BrowsecVpnService.activeCountry, appProfile?.packageName)
+                if (r != null) {
+                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
+                    return TunneledSocket(r.first, r.second, r.third)
+                }
+            } catch (e: Exception) {
+                lastErr = e
+            }
+        }
         val candidates = FastMultiDnsResolver.buildCandidateIps(
             host = host,
             ecsSubnet = st.node.ecsSubnet,
@@ -2760,21 +2776,6 @@ object BrowsecLocalProxyServer {
                 appProfile?.txBytes?.addAndGet(tx)
             }
         )
-        var lastErr: Exception? = null
-        // v4.2.0: прокси приложений 127.0.0.1:89xx (Telegram с настроенным прокси) тоже идёт через туннель Browsec,
-        // как и прозрачный туннель — иначе Telegram с прокси «Соединение…» на сети, где его IP режут
-        if (BrowsecVpnService.appsViaBrowsecTunnel && com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) {
-            try {
-                val t0 = System.currentTimeMillis()
-                val r = com.winwasm64.extensions.ExtensionProxy.openAppTunnel(host, port, appProfile?.countryCode ?: BrowsecVpnService.activeCountry)
-                if (r != null) {
-                    st.pingMs = (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1)
-                    return TunneledSocket(r.first, r.second)
-                }
-            } catch (e: Exception) {
-                lastErr = e
-            }
-        }
         for (ip in candidates) {
             try {
                 val t0 = System.currentTimeMillis()
@@ -2798,7 +2799,7 @@ object BrowsecLocalProxyServer {
     }
 
     /** Сокет внутри CONNECT-туннеля Browsec: входной поток уже обёрнут буфером, поэтому отдаём его вместо сырого. */
-    private class TunneledSocket(private val inner: Socket, private val input: InputStream) : Socket() {
+    private class TunneledSocket(private val inner: Socket, private val input: InputStream, val serverKey: String = "") : Socket() {
         override fun getInputStream(): InputStream = input
         override fun getOutputStream(): java.io.OutputStream = inner.getOutputStream()
         override fun close() = inner.close()
@@ -2910,30 +2911,46 @@ object BrowsecLocalProxyServer {
                     host.endsWith(".gvt2.com", ignoreCase = true) ||
                     host.contains("play.googleapis.com", ignoreCase = true)
 
-                val upstream = openAppsOutboundSocket(host, port, st, appProfile)
-                val established = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
-                out.write(established)
-                out.flush()
-                if (allowBypass) {
-                    st.recordRx(established.size.toLong())
-                    appProfile?.rxBytes?.addAndGet(established.size.toLong())
-                }
+                // v4.4.1: этот путь (системный прокси VPN — так ходит YouTube/Cronet) теперь тоже в журнале и в счётчиках приложения
+                val logStart = System.currentTimeMillis()
+                var logErr: String? = null
+                var viaKey: String? = null
+                try {
+                    val upstream = openAppsOutboundSocket(host, port, st, appProfile)
+                    viaKey = (upstream as? TunneledSocket)?.serverKey?.takeIf { it.isNotBlank() }
+                    val established = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
+                    out.write(established)
+                    out.flush()
+                    if (allowBypass) {
+                        st.recordRx(established.size.toLong())
+                        appProfile?.rxBytes?.addAndGet(established.size.toLong())
+                    }
 
-                val upIn = upstream.getInputStream()
-                val upOut = upstream.getOutputStream()
+                    val upIn = upstream.getInputStream()
+                    val upOut = upstream.getOutputStream()
 
-                val shouldBypass = allowBypass && !isPlayStoreBinaryCdn
-                val t1 = Thread {
-                    pipeClientToServerV38(inp, upOut, host, port, st, appProfile, shouldBypass)
+                    // внутри TLS-туннеля Browsec резать ClientHello не нужно (и вредно: 80+ микрозаписей на каждое соединение)
+                    val shouldBypass = allowBypass && !isPlayStoreBinaryCdn && viaKey == null
+                    val t1 = Thread {
+                        pipeClientToServerV38(inp, upOut, host, port, st, appProfile, shouldBypass)
+                    }
+                    val t2 = Thread {
+                        pipeServerToClientV38(upIn, out, st, appProfile, allowBypass)
+                    }
+                    t1.start()
+                    t2.start()
+                    t1.join()
+                    t2.join()
+                    upstream.close()
+                } catch (e: Exception) {
+                    logErr = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
+                    throw e
+                } finally {
+                    if (appProfile != null) {
+                        VpnLog.conn(appProfile.packageName, host, port, (viaKey?.let { "Browsec $it" } ?: effectiveCountry) + " · системный прокси", System.currentTimeMillis() - logStart, logErr)
+                        appProfile.noteConn(logErr == null, st.pingMs.toLong(), viaKey, logErr)
+                    }
                 }
-                val t2 = Thread {
-                    pipeServerToClientV38(upIn, out, st, appProfile, allowBypass)
-                }
-                t1.start()
-                t2.start()
-                t1.join()
-                t2.join()
-                upstream.close()
             } else if (method.isNotEmpty() && target.isNotEmpty()) {
                 val uri = try { java.net.URI(target) } catch (_: Exception) { null }
                 val hostHeader = lines.drop(1).firstOrNull { it.startsWith("Host:", ignoreCase = true) }
