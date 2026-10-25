@@ -184,7 +184,16 @@ object PsiphonBackup {
         o.put("LocalHttpProxyPort", HTTP_PORT)
         o.put("LocalSocksProxyPort", SOCKS_PORT)
         o.put("EgressRegion", region)
-        o.put("ConnectionWorkerPoolSize", 10)
+        // v4.4.6: по журналу 4.4.5 — при активном VPN приложений Android отдаёт библиотеке DNS нашего же TUN (10.215.173.2),
+        // недостижимый из процесса браузера: падали meek/tactics/список серверов. Резолвим через публичные DNS.
+        o.put("DNSResolverPreferredAlternateServers", org.json.JSONArray(listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1")))
+        o.put("DNSResolverAlternateServers", org.json.JSONArray(listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1")))
+        o.put("DNSResolverPreferAlternateServerProbability", 1.0)
+        // больше параллельных попыток (на враждебной сети каждая попытка — 10–20 с таймаута)
+        o.put("ConnectionWorkerPoolSize", 20)
+        // сначала протоколы, которые труднее отличить от обычного трафика (TLS/QUIC/meek), потом всё остальное
+        o.put("InitialLimitTunnelProtocols", org.json.JSONArray(listOf("TLS-OSSH", "QUIC-OSSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH", "FRONTED-MEEK-QUIC-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "SHADOWSOCKS-OSSH")))
+        o.put("InitialLimitTunnelProtocolsCandidateCount", 60)
         o.put("TunnelPoolSize", 1)
         o.put("PortForwardFailureThreshold", 10)
         o.put("EmitBytesTransferred", true)
@@ -202,10 +211,17 @@ object PsiphonBackup {
             val m = message.lowercase()
             val now = SystemClock.elapsedRealtime()
             val important = m.contains("error") || m.contains("fail") || m.contains("alert") || m.contains("timeout") || m.contains("panic")
-            if (type == "ConnectingServer") { connectAttempts++; lastDiag = "пробуем сервер " + Regex("\"region\":\"([A-Z]+)\"").find(message)?.groupValues?.get(1).orEmpty() + " " + Regex("\"protocol\":\"([A-Z0-9-]+)\"").find(message)?.groupValues?.get(1).orEmpty() }
+            if (type == "ConnectingServer") {
+                connectAttempts++
+                lastDiag = "пробуем сервер " + Regex("\"region\":\"([A-Z]+)\"").find(message)?.groupValues?.get(1).orEmpty() + " " + Regex("\"protocol\":\"([A-Z0-9-]+)\"").find(message)?.groupValues?.get(1).orEmpty()
+                val now2 = SystemClock.elapsedRealtime()
+                if (now2 - (diagLoggedAt["cs"] ?: 0L) > 20_000L) { diagLoggedAt["cs"] = now2; VpnLog.i(TAG, "попытка №$connectAttempts: $lastDiag") }
+                return
+            }
             if (type == "RemoteServerListResourceDownloaded" || m.contains("remote server list")) lastDiag = "список серверов получен"
             val quiet = connected && !important
             if (quiet) return
+            if (m.contains("memory metrics") || type == "RequestingTactics" || type == "BuildInfo" || type == "SessionId" || type == "NetworkID") return
             val key = if (important) "!" + type else type
             val last = diagLoggedAt[key] ?: 0L
             val minGap = if (important) 15_000L else 8_000L
