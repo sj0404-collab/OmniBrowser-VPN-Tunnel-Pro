@@ -1832,14 +1832,24 @@ function alert(){}
         val a = appAffinity[pkg] ?: return null
         val now = SystemClock.elapsedRealtime()
         if (a.second < now) { appAffinity.remove(pkg); return null }
-        if ((tunnelDownUntil[a.first] ?: 0L) > now) return null
+        if ((tunnelDownUntil[a.first] ?: 0L) > now) {
+            // v4.4.7: в час пик все серверы по очереди уходят в «паузу», и приложение прыгало lv115 → de83 → lv115 по 4 раза в секунду,
+            // каждый раз переоткрывая соединения к видео, привязанным к IP. Если весь пул в паузе или сервер сменили <15 с назад —
+            // держимся за текущий: медленный, но живой сервер лучше вечного переключения.
+            val switchedAgo = now - (affinitySwitchedAt[pkg] ?: 0L)
+            val poolDead = tunnelServers.isNotEmpty() && tunnelServers.all { (tunnelDownUntil[it.key] ?: 0L) > now || isPsiphonKey(it.key) }
+            if (poolDead || switchedAgo < 15_000L) return a.first
+            return null
+        }
         return a.first
     }
+    private val affinitySwitchedAt = ConcurrentHashMap<String, Long>()
 
     private fun setAffinity(pkg: String?, serverKey: String, reason: String? = null) {
         if (pkg == null) return
         val prev = appAffinity.put(pkg, Pair(serverKey, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS))
         if (prev?.first != serverKey) {
+            affinitySwitchedAt[pkg] = SystemClock.elapsedRealtime()
             val who = com.winwasm64.vpn.VpnLog.label(pkg)
             com.winwasm64.vpn.VpnLog.i("Прил", if (prev == null || (prev.second < SystemClock.elapsedRealtime())) "$who: все соединения приложения закреплены за сервером ${shortName(serverKey)} (адреса видео/CDN привязаны к IP)"
                 else "$who: сервер сменён ${shortName(prev.first)} → ${shortName(serverKey)} (${reason ?: "прежний не ответил"}) — приложение переоткроет соединения")

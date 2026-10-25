@@ -218,18 +218,66 @@ object PsiphonBackup {
                 if (now2 - (diagLoggedAt["cs"] ?: 0L) > 20_000L) { diagLoggedAt["cs"] = now2; VpnLog.i(TAG, "попытка №$connectAttempts: $lastDiag") }
                 return
             }
-            if (type == "RemoteServerListResourceDownloaded" || m.contains("remote server list")) lastDiag = "список серверов получен"
+            if (type == "RemoteServerListResourceDownloaded" && !m.contains("\"bytes\":0")) lastDiag = "список серверов получен"
+            // v4.4.7: классификация причин отказа + сводка раз в минуту вместо потока сырых сообщений
+            if (m.contains("failed to connect to ")) {
+                val cause = when {
+                    m.contains("resolve") -> "dns"
+                    m.contains("quic") -> "quic"
+                    m.contains("handshake") || m.contains("obfuscator") -> "handshake"
+                    m.contains("eof") || m.contains("reset") -> "reset"
+                    m.contains("meek") -> "meek"
+                    m.contains("i/o timeout") || m.contains("i\\/o timeout") || m.contains("deadline exceeded") -> "tcp"
+                    else -> "other"
+                }
+                failCounts.merge(cause, 1) { a, b -> a + b }
+                if (!connected && now - summaryAt > 60_000L) {
+                    summaryAt = now
+                    val total = failCounts.values.sum()
+                    val parts = failCounts.entries.sortedByDescending { it.value }.joinToString(" · ") { (k, v) ->
+                        when (k) { "tcp" -> "TCP-таймаут $v"; "quic" -> "QUIC без ответа $v"; "dns" -> "DNS $v"; "reset" -> "сброс/EOF $v"; "handshake" -> "рукопожатие $v"; "meek" -> "meek/CDN $v"; else -> "прочее $v" } }
+                    val top = failCounts.maxByOrNull { it.value }?.key
+                    val hint = when (top) {
+                        "tcp", "quic" -> " — адреса серверов Psiphon, похоже, фильтруются провайдером"
+                        "dns" -> " — DNS-запросы не проходят"
+                        "reset", "handshake" -> " — DPI рвёт соединение после рукопожатия"
+                        else -> ""
+                    }
+                    VpnLog.w(TAG, "сводка: попыток $connectAttempts, отказов $total: $parts$hint")
+                    lastDiag = "попыток $connectAttempts · " + (when (top) { "tcp" -> "TCP-таймауты"; "quic" -> "QUIC без ответа"; "dns" -> "DNS не проходит"; "reset", "handshake" -> "DPI рвёт рукопожатие"; else -> "отказы" })
+                    failCounts.clear()
+                }
+                return
+            }
             val quiet = connected && !important
             if (quiet) return
-            if (m.contains("memory metrics") || type == "RequestingTactics" || type == "BuildInfo" || type == "SessionId" || type == "NetworkID") return
+            if (m.contains("memory metrics") || type == "RequestingTactics" || type == "BuildInfo" || type == "SessionId" || type == "NetworkID" || type == "ApplicationParameters" || type == "RequestedTactics") return
+            if (m.contains("in-proxy protocol preferred")) return
+            // шумные повторяющиеся сбои фоновых запросов — по одному разу за сеанс, с пояснением
+            val once = when {
+                m.contains("roundtripperfailederror") || m.contains("inproxybroker") -> "брокер in-proxy (WebRTC-прокси волонтёров) недоступен — фронтинг через CDN не проходит"
+                m.contains("dsl fetch failed") -> "запрос свежих серверов (DSL) не прошёл"
+                m.contains("failed to fetch common remote server list") || (type == "RemoteServerListResourceDownloaded" && m.contains("\"bytes\":0")) -> "удалённый список серверов не скачивается (S3 заблокирован/фильтруется) — работаем на встроенных 429"
+                m.contains("tactics request failed") -> "tactics-сервер не отвечает — Psiphon не может подстроиться под сеть"
+                m.contains("meek round trip failed") -> "meek через CDN не отвечает"
+                else -> null
+            }
+            if (once != null) {
+                if (diagLoggedAt.putIfAbsent("once:" + once, now) == null) VpnLog.w(TAG, once)
+                return
+            }
             val key = if (important) "!" + type else type
             val last = diagLoggedAt[key] ?: 0L
             val minGap = if (important) 15_000L else 8_000L
             if (now - last < minGap) return
             diagLoggedAt[key] = now
             if (!important && now - startedAt > 180_000L) return // после 3 мин без связи — только важное
-            if (important) VpnLog.w(TAG, message.take(220)) else VpnLog.i(TAG, message.take(160))
+            if (important) VpnLog.w(TAG, compact(message, 230)) else VpnLog.i(TAG, compact(message, 170))
         }
+        /** Начало и конец сообщения — конец обычно и есть причина (`i/o timeout`, `EOF`, `connection refused`). */
+        private fun compact(s: String, max: Int): String = if (s.length <= max) s else s.take(max / 2 - 10) + " … " + s.takeLast(max / 2 + 5)
+        private val failCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        @Volatile private var summaryAt = 0L
         private val diagLoggedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
         override fun onListeningHttpProxyPort(port: Int) { httpPort = port; VpnLog.i(TAG, "локальный HTTP-прокси 127.0.0.1:$port") }
         override fun onListeningSocksProxyPort(port: Int) { socksPort = port }
