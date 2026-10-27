@@ -13,6 +13,8 @@ interface AiHost {
     fun runJs(js: String, cb: (String?) -> Unit)
     fun openUrl(url: String)
     fun download(url: String)
+    /** v4.8.0: выбор файлов для чата (системный выбор документов, несколько). */
+    fun pickFiles(cb: (List<android.net.Uri>) -> Unit)
 }
 
 /** Агент = системная инструкция + набор инструментов. */
@@ -62,23 +64,47 @@ object AiTools {
         "search_web" to fn("search_web", "Поиск в интернете (DuckDuckGo). Возвращает до 8 результатов: заголовок, адрес, фрагмент.", Triple("query", "string", "поисковый запрос")),
         "fetch_url" to fn("fetch_url", "Скачать страницу по адресу в фоне (без открытия вкладки) и вернуть её текст без HTML, до 9000 знаков.", Triple("url", "string", "полный адрес http(s)")),
         "run_js" to fn("run_js", "Выполнить JavaScript на текущей странице (клик, прокрутка, ввод текста, извлечение данных). Верни значение через return внутри выражения-функции. Результат — строка до 3000 знаков.", Triple("code", "string", "JS-код, например (function(){document.querySelector('button').click();return 'ok'})()")),
-        "download_url" to fn("download_url", "Поставить файл/видео по адресу в очередь загрузок браузера.", Triple("url", "string", "адрес файла или страницы с видео"))
+        "download_url" to fn("download_url", "Поставить файл/видео по адресу в очередь загрузок браузера.", Triple("url", "string", "адрес файла или страницы с видео")),
+        // v4.8.0: файлы чата (RAG) и генерация картинок
+        "list_files" to fn("list_files", "Список файлов, прикреплённых к чату: имя, тип, размер текста/число изображений, расшифровка речи."),
+        "search_files" to fn("search_files", "Поиск по содержимому прикреплённых файлов (BM25): возвращает самые релевантные фрагменты с указанием файла и номера фрагмента. Используй для вопросов по документам любого объёма.", Triple("query", "string", "что искать — ключевые слова или вопрос")),
+        "read_file" to fn("read_file", "Прочитать прикреплённый файл последовательно: фрагменты с номера from (с 0) — по 5 за раз. Так можно прочитать файл целиком, фрагмент за фрагментом.", Triple("name", "string", "имя файла (или его часть)"), Triple("from", "integer", "номер первого фрагмента, с 0")),
+        "generate_image" to fn("generate_image", "Сгенерировать картинку по текстовому описанию (Pollinations, бесплатно). Описание давай на английском, подробно: объект, стиль, свет, фон. Результат откроется у пользователя в новой вкладке; верни ссылку в ответе.", Triple("prompt", "string", "подробное описание на английском"), Triple("size", "string", "square | wide | tall"))
     )
 
-    /** Массив tools для запроса: встроенные инструменты агента + MCP. null — у агента инструментов нет. */
-    fun toolsFor(agent: AiAgent, mcp: List<McpClient.Tool>): JSONArray? {
-        if (!agent.hasTools) return null
+    val fileTools = listOf("list_files", "search_files", "read_file")
+
+    /** Массив tools для запроса: встроенные инструменты агента + файлы + генерация + MCP. null — инструментов нет. */
+    fun toolsFor(agent: AiAgent, mcp: List<McpClient.Tool>, hasDocs: Boolean, wantImage: Boolean): JSONArray? {
+        val names = LinkedHashSet(agent.tools)
+        if (hasDocs) names.addAll(fileTools)
+        if (wantImage || agent.hasTools) names.add("generate_image")
+        if (names.isEmpty()) return null
         val arr = JSONArray()
-        for (t in agent.tools) builtin[t]?.let { arr.put(it) }
-        for (t in mcp) arr.put(JSONObject().put("type", "function").put("function", JSONObject().put("name", t.fnName).put("description", "[MCP ${t.server.name}] " + t.description).put("parameters", t.schema)))
+        for (t in names) builtin[t]?.let { arr.put(it) }
+        if (agent.hasTools) for (t in mcp) arr.put(JSONObject().put("type", "function").put("function", JSONObject().put("name", t.fnName).put("description", "[MCP ${t.server.name}] " + t.description).put("parameters", t.schema)))
         return arr
     }
 
+    /** Похоже ли сообщение на просьбу нарисовать/сгенерировать картинку. */
+    fun wantsImage(text: String): Boolean = Regex("(нарису|сгенерир|перегенерир|создай (картин|изображ|фото|лого|обло)|сделай (картин|изображ|лого|обло|арт)|перерису|изобрази|draw |generate (an? )?(image|picture|logo)|make (an? )?(image|picture|logo))", RegexOption.IGNORE_CASE).containsMatchIn(text)
+
     /** Выполнить инструмент (фоновый поток). */
-    fun execute(ctx: Context, host: AiHost?, name: String, args: JSONObject, mcp: List<McpClient.Tool>): String {
+    fun execute(ctx: Context, host: AiHost?, chatId: String, name: String, args: JSONObject, mcp: List<McpClient.Tool>): String {
         mcp.firstOrNull { it.fnName == name }?.let { return McpClient.call(it, args).take(TOOL_RESULT_LIMIT) }
         return try {
             when (name) {
+                "list_files" -> AiFiles.listing(chatId).ifBlank { "К чату файлы не прикреплены" }
+                "search_files" -> AiFiles.retrieve(chatId, args.optString("query"), TOOL_RESULT_LIMIT).ifBlank { "Ничего не найдено (или файлы без текста). Есть: " + AiFiles.listing(chatId) }
+                "read_file" -> AiFiles.read(chatId, args.optString("name"), args.optInt("from", 0), 5)
+                "generate_image" -> {
+                    val prompt = args.optString("prompt").trim()
+                    if (prompt.isBlank()) return "Нужно описание"
+                    val (w, h) = when (args.optString("size")) { "wide" -> 1280 to 720; "tall" -> 768 to 1344; else -> 1024 to 1024 }
+                    val url = "https://image.pollinations.ai/prompt/" + URLEncoder.encode(prompt, "UTF-8").replace("+", "%20") + "?width=$w&height=$h&nologo=true&seed=" + (1..999_999).random()
+                    onMain<Unit>(host) { hh, cb -> hh.openUrl(url); cb(Unit) }
+                    "Картинка сгенерирована и открыта в новой вкладке. Ссылка: $url"
+                }
                 "read_page" -> readPage(host, retries = 3)
                 "page_links" -> onMain<String?>(host) { h, cb -> h.runJs(LINKS_JS, cb) }?.let { unquote(it) }?.take(TOOL_RESULT_LIMIT) ?: "Страница недоступна"
                 "open_url" -> {

@@ -270,6 +270,47 @@ object MediaState {
     var vis = function(name, val){ try { Object.defineProperty(document, name, { get: function(){ return val; }, configurable: true }); } catch (e) {} };
     vis('hidden', false); vis('webkitHidden', false); vis('visibilityState', 'visible'); vis('webkitVisibilityState', 'visible');
     try { if (document.hasFocus) document.hasFocus = function(){ return true; }; } catch (e) {}
+    // v4.8.0: «продолжить с места» — позиция длинных видео запоминается (OmniMedia.position) и восстанавливается
+    // при следующем открытии той же страницы/ролика, если в адресе нет явного t=/start=.
+    try {
+      var posKey = function(){
+        try {
+          var h = location.hostname || '', u = new URL(location.href);
+          if (h === 'youtube.com' || h.slice(-12) === '.youtube.com' || h === 'youtu.be' || h.slice(-21) === '.youtube-nocookie.com') {
+            var id = u.searchParams.get('v');
+            if (!id) { var m = u.pathname.match(/\/(shorts|embed|live|v)\/([A-Za-z0-9_-]{6,})/); if (m) id = m[2]; }
+            if (!id && h === 'youtu.be') id = u.pathname.slice(1);
+            return id ? 'yt:' + id : '';
+          }
+          return u.origin + u.pathname + u.search;
+        } catch (e) { return ''; }
+      };
+      var hasExplicitStart = function(){ try { var u = new URL(location.href); return !!(u.searchParams.get('t') || u.searchParams.get('start') || /[?&#]t=/.test(location.hash)); } catch (e) { return false; } };
+      var lastSaveAt = 0, restoredFor = '';
+      document.addEventListener('timeupdate', function(e){
+        try {
+          var v = e.target; if (!v || v.tagName !== 'VIDEO' || v.paused) return;
+          var now = Date.now(); if (now - lastSaveAt < 3000) return; lastSaveAt = now;
+          var d = v.duration; if (!isFinite(d) || d < 120 || v.currentTime < 10) return;
+          var k = posKey(); if (!k) return;
+          if (window.OmniMedia && OmniMedia.position) OmniMedia.position(k, v.currentTime, d);
+        } catch (x) {}
+      }, true);
+      var tryRestore = function(v){
+        try {
+          if (!v || v.tagName !== 'VIDEO') return;
+          var d = v.duration; if (!isFinite(d) || d < 120) return;
+          var k = posKey(); if (!k || restoredFor === k || hasExplicitStart()) return;
+          restoredFor = k;
+          if (v.currentTime > 8) return;
+          var saved = (window.OmniMedia && OmniMedia.savedPosition) ? OmniMedia.savedPosition(k) : 0;
+          if (saved > 10 && saved < d - 15) { v.currentTime = saved; if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('продолжаем с ' + Math.round(saved) + ' с'); }
+        } catch (x) {}
+      };
+      document.addEventListener('loadedmetadata', function(e){ tryRestore(e.target); }, true);
+      document.addEventListener('playing', function(e){ tryRestore(e.target); }, true);
+      document.addEventListener('durationchange', function(e){ try { var v = e.target; if (v && v.tagName === 'VIDEO' && restoredFor && restoredFor !== posKey()) { restoredFor = ''; } tryRestore(v); } catch (x) {} }, true);
+    } catch (e) {}
   } catch (e) {}
 })();
 """
@@ -405,6 +446,13 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
     fun hasMedia(present: Boolean) {
         Handler(Looper.getMainLooper()).post { tab.hasMedia = present }
     }
+
+    /** v4.8.0: позиция длинного видео — для «продолжить с места». */
+    @JavascriptInterface
+    fun position(key: String, seconds: Double, duration: Double) { MediaPositions.save(key, seconds, duration) }
+
+    @JavascriptInterface
+    fun savedPosition(key: String): Double = MediaPositions.get(key)
 
     @JavascriptInterface
     fun state(playing: Boolean) {

@@ -43,8 +43,14 @@ object ExternalIntents {
 }
 
 class MainActivity : ComponentActivity() {
+    override fun onStop() {
+        super.onStop()
+        try { com.winwasm64.ui.MediaPositions.flush() } catch (_: Exception) {}
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.winwasm64.ui.MediaPositions.init(this)
         CrashCatcher.install(this)
         handleIncomingIntent(intent)
         registerPipReceiver()

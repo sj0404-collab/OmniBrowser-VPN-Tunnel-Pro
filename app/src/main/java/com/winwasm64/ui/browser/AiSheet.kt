@@ -61,6 +61,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.winwasm64.ui.theme.Omni
+import com.winwasm64.vpn.VpnLog
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -96,10 +97,11 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     "chats" -> SheetTitle("Чаты", "${AiAssistant.chats.size} сохранено · хранятся на устройстве")
                     "providers" -> SheetTitle("Провайдеры и модели", "Каталог обновляется автоматически каждые 6 ч · ключи только на устройстве")
                     "agents" -> SheetTitle("Агенты и MCP", "Инструменты браузера + внешние MCP-серверы")
-                    else -> SheetTitle(
-                        (chat?.title ?: "ИИ-ассистент").ifBlank { "ИИ-ассистент" },
-                        subtitle = status.ifBlank { "${agent.emoji} ${agent.title} · " + (if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected)) }
-                    )
+                    else -> Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 4.dp, bottom = 4.dp)) {
+                        Text((chat?.title ?: "ИИ-ассистент").ifBlank { "ИИ-ассистент" }, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Omni.Text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(status.ifBlank { "${agent.emoji} ${agent.title} · " + (if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected)) },
+                            fontSize = 11.sp, color = Omni.TextDim, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
             }
             if (view == "chat") {
@@ -144,6 +146,8 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     Text(if (agent.hasTools) "Агент сам вызывает инструменты (поиск, открытие страниц, чтение, JS, загрузки" + (if (AiAssistant.mcpEnabled(ctx) && McpClient.tools.value.isNotEmpty()) ", MCP: ${McpClient.tools.value.size}" else "") + ") и показывает шаги в чате."
                         else "Спросите что угодно или нажмите быстрое действие — ассистент прочитает открытую страницу.", color = Omni.TextFaint, fontSize = 12.sp)
                     Spacer(Modifier.height(6.dp))
+                    Text("Кнопка «+» слева от поля ввода прикрепляет файлы: фото, PDF, документы, архивы, аудио и видео любого объёма — ассистент ищет по ним и читает их целиком. Для фото/сканов нужна модель со зрением (ключ api.navy, LLM7, Gemini, Groq), для речи — ключ Groq или api.navy.", color = Omni.TextFaint, fontSize = 12.sp)
+                    Spacer(Modifier.height(6.dp))
                     Text("Без ключей работают Pollinations и LLM7 (turbo). Бесплатный ключ LLM7/Groq/OpenRouter/Gemini открывает полные модели — см. ⚙.", color = Omni.TextFaint, fontSize = 12.sp)
                 }
             } else LazyColumn(state = lazy, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
@@ -160,10 +164,39 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
             if (agent.hasTools) AiChip("Найди похожее", false, enabled = !busy) { send("Найди в интернете 3–5 источников по теме этой страницы и кратко сравни их с ней.", true) }
         }
 
+        // файлы чата (v4.8.0)
+        val docsMap by AiFiles.docs
+        val processing by AiFiles.processing
+        val chatDocs = chat?.let { docsMap[it.id] } ?: emptyList()
+        if (chatDocs.isNotEmpty() || processing.isNotBlank()) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (processing.isNotBlank()) { CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = Omni.Accent); Text(processing, color = Omni.TextDim, fontSize = 11.sp, maxLines = 1) }
+                for (d in chatDocs) {
+                    val icon = when (d.kind) { "image" -> "🖼"; "audio" -> "🎵"; "video" -> "🎬"; "pdf" -> "📄"; "archive" -> "🗜"; "other" -> "📦"; else -> "📝" }
+                    Row(Modifier.clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).border(0.5.dp, Omni.Outline, RoundedCornerShape(12.dp)).padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.clickable { Toast.makeText(ctx, "${d.name}: ${d.summary}", Toast.LENGTH_LONG).show() }) {
+                            Text("$icon ${d.name}", color = Omni.Text, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(160.dp))
+                            Text(d.summary, color = Omni.TextFaint, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(160.dp))
+                        }
+                        OmniIconButton(OmniIcons.Close, "Убрать", onClick = { chat?.let { AiFiles.remove(ctx, it.id, d) } }, tint = Omni.TextFaint, size = 28.dp, iconSize = 14.dp)
+                    }
+                }
+            }
+        }
+
         // ввод
         var input by remember { mutableStateOf("") }
         var usePage by remember { mutableStateOf(true) }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            OmniIconButton(OmniIcons.Add, "Прикрепить файлы", onClick = {
+                val c = chat ?: return@OmniIconButton
+                host.pickFiles { uris ->
+                    AiFiles.attach(ctx, c.id, uris) { added ->
+                        Toast.makeText(ctx, "Добавлено: " + added.joinToString(", ") { it.name }, Toast.LENGTH_SHORT).show()
+                        VpnLog.i(AiAssistant.TAG, "к чату «${c.title}» прикреплено ${added.size} файл(ов)")
+                    }
+                }
+            }, tint = if (chatDocs.isEmpty()) Omni.TextDim else Omni.Accent, size = 40.dp, iconSize = 22.dp)
             Box(
                 Modifier.weight(1f).heightIn(min = 44.dp).clip(RoundedCornerShape(22.dp)).background(Omni.SurfaceHighest).padding(horizontal = 16.dp, vertical = 12.dp),
                 contentAlignment = Alignment.CenterStart
@@ -178,7 +211,7 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     keyboardActions = KeyboardActions(onSend = { send(input, usePage); input = "" }),
                     modifier = Modifier.fillMaxWidth()
                 )
-                if (input.isEmpty()) Text(if (agent.hasTools) "Задача агенту…" else "Вопрос ассистенту…", color = Omni.TextFaint, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (input.isEmpty()) Text(if (chatDocs.isNotEmpty()) "Спросите о файлах…" else if (agent.hasTools) "Задача агенту…" else "Вопрос ассистенту…", color = Omni.TextFaint, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.width(8.dp))
             if (busy) {

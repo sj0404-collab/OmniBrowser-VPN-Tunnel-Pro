@@ -893,6 +893,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         cb?.onReceiveValue(uris)
     }
 
+    // v4.8.0: файлы для ИИ-чата
+    var aiFilesCallback by remember { mutableStateOf<((List<Uri>) -> Unit)?>(null) }
+    val aiFilesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
+        val cb = aiFilesCallback
+        aiFilesCallback = null
+        if (uris.isNotEmpty()) {
+            for (u in uris) try { context.contentResolver.takePersistableUriPermission(u, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            cb?.invoke(uris)
+        }
+    }
     val extensionFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
             try {
@@ -1865,6 +1875,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             override fun download(url: String) {
                                 val t = tab() ?: return
                                 startWebDownload(t, url, t.webView?.settings?.userAgentString, null, null)
+                            }
+                            override fun pickFiles(cb: (List<Uri>) -> Unit) {
+                                aiFilesCallback = cb
+                                try { aiFilesPicker.launch(arrayOf("*/*")) } catch (e: Exception) { Toast.makeText(context, "Не удалось открыть выбор файлов: ${e.message}", Toast.LENGTH_SHORT).show() }
                             }
                         }
                     }

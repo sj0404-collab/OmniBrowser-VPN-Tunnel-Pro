@@ -131,6 +131,7 @@ object AiAssistant {
         loaded = true
         AiCatalog.load(ctx)
         McpClient.load(ctx)
+        AiFiles.load(ctx)
         try {
             val f = chatsFile(ctx)
             if (f.exists()) {
@@ -174,6 +175,7 @@ object AiAssistant {
     }
 
     fun deleteChat(ctx: Context, c: Chat) {
+        AiFiles.removeChat(ctx, c.id)
         chats.remove(c)
         if (current.value === c) current.value = chats.firstOrNull() ?: newChat(ctx)
         save(ctx)
@@ -273,7 +275,9 @@ object AiAssistant {
             val o = try { JSONObject(data) } catch (_: Exception) { continue }
             o.optJSONObject("error")?.let { lastErr = it.optString("message") }
             val ch = o.optJSONArray("choices")?.optJSONObject(0) ?: continue
-            val delta = ch.optJSONObject("delta") ?: ch.optJSONObject("message") ?: continue
+            val finish = if (ch.isNull("finish_reason")) "" else ch.optString("finish_reason")
+            val delta = ch.optJSONObject("delta") ?: ch.optJSONObject("message")
+            if (delta == null) { if (finish.isNotBlank()) break else continue }
             val t = if (delta.isNull("content")) "" else delta.optString("content")
             if (t.isNotEmpty()) { sb.append(t); onDelta(t) }
             val rr = delta.optString("reasoning").ifBlank { delta.optString("reasoning_content") }
@@ -291,6 +295,8 @@ object AiAssistant {
                     }
                 }
             }
+            // v4.8.0: конец ответа — не ждём закрытия соединения (через прокси оно может висеть до таймаута)
+            if (finish.isNotBlank() && finish != "null") break
         }
         val tc = if (toolCalls.isEmpty()) null else JSONArray().also { a -> toolCalls.values.forEach { a.put(it) } }
         if (sb.isEmpty() && tc == null && rs.isEmpty() && !cancel.get()) { err(lastErr ?: "пустой ответ"); return null }
@@ -301,14 +307,40 @@ object AiAssistant {
     private const val SYSTEM = "Ты — встроенный помощник браузера OmniBrowser. Отвечай на русском языке (если пользователь не пишет на другом), кратко и по делу, без вступлений. " +
         "Если дан текст страницы — опирайся на него и не выдумывай. Форматируй ответ простым текстом: короткие абзацы, списки через «•», без markdown-заголовков."
 
-    private fun buildMessages(chat: Chat, agent: AiAgent, pageContext: String?): JSONArray {
+    private const val FILES_RULES = "К чату прикреплены файлы (список ниже). Правила: 1) отвечай строго по их содержимому, ничего не выдумывай; " +
+        "2) фрагменты, найденные по вопросу, даны в сообщении пользователя — если их мало, вызывай search_files с другими словами или читай файл целиком через read_file (по 5 фрагментов, увеличивая from), пока не найдёшь ответ; " +
+        "3) никогда не говори, что не можешь открыть или прочитать файл — он уже прочитан и доступен инструментами; " +
+        "4) фото, сканы PDF и кадры видео присланы тебе как изображения — описывай именно то, что на них видно; " +
+        "5) если просят перерисовать/перегенерировать картинку — подробно опиши её по-английски и вызови generate_image с этим описанием и нужными изменениями; " +
+        "6) если ответа в файлах действительно нет — скажи это прямо и укажи, что именно проверил."
+
+    private fun buildMessages(chat: Chat, agent: AiAgent, pageContext: String?, docsListing: String): JSONArray {
         val arr = JSONArray()
         val sys = SYSTEM + (if (agent.system.isNotBlank()) "\n\n" + agent.system else "") +
+            (if (docsListing.isNotBlank()) "\n\n" + FILES_RULES + "\n\nФайлы чата:\n" + docsListing else "") +
             (if (!pageContext.isNullOrBlank()) "\n\nКонтекст текущей страницы:\n$pageContext" else "")
         arr.put(JSONObject().put("role", "system").put("content", sys))
         val hist = chat.messages.filter { it.kind == "text" && (it.role == "user" || (it.role == "assistant" && it.text.isNotBlank() && !it.text.startsWith("⚠"))) }.takeLast(14)
         for (m in hist) arr.put(JSONObject().put("role", m.role).put("content", m.text.take(12000)))
         return arr
+    }
+
+    private val lastImagesSent = HashMap<String, Int>()
+    private val imageWords = Regex("(фото|картин|изображ|скан|кадр|видео|снимк|скриншот|рисун|схем|график|таблиц|что (тут|здесь|там|на |изображ)|посмотри|взглян|опиши|pdf|photo|image|picture|screenshot|look)", RegexOption.IGNORE_CASE)
+
+    /** Сообщение пользователя с найденными фрагментами файлов и изображениями (для моделей со зрением). */
+    private fun userContent(chat: Chat, userText: String, withImages: Boolean): Any {
+        var text = userText
+        val docs = AiFiles.of(chat.id)
+        if (docs.any { it.chunks.isNotEmpty() }) {
+            val frags = AiFiles.retrieve(chat.id, userText, 12_000)
+            if (frags.isNotBlank()) text += "\n\n[Фрагменты из прикреплённых файлов, найденные по вопросу — при необходимости ищи дальше инструментами]\n" + frags
+        }
+        if (!withImages) return text
+        val imgs = AiFiles.images(chat.id).takeLast(6)
+        val parts = JSONArray().put(JSONObject().put("type", "text").put("text", text + "\n\n[Приложены изображения: " + imgs.joinToString(", ") { it.first.name } + "]"))
+        for ((_, path) in imgs) AiFiles.imageDataUrl(path)?.let { parts.put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", it))) }
+        return parts
     }
 
     fun stop() { cancel.set(true) }
@@ -327,18 +359,39 @@ object AiAssistant {
         busy.value = true
         cancel.set(false)
         status.value = ""
-        val api = buildMessages(chat, agent, pageContext)
+        val docsListing = AiFiles.listing(chat.id)
+        val api = buildMessages(chat, agent, pageContext, docsListing)
+        // изображения отправляем, если о них спрашивают или они появились после прошлого вопроса
+        val imgCount = AiFiles.images(chat.id).size
+        val withImages = imgCount > 0 && (imageWords.containsMatchIn(userText) || lastImagesSent[chat.id] != imgCount)
+        if (imgCount > 0) lastImagesSent[chat.id] = imgCount
+        // последнее сообщение пользователя заменяем на расширенное (фрагменты файлов + картинки)
+        api.put(api.length() - 1, JSONObject().put("role", "user").put("content", userContent(chat, userText, withImages)))
         val mcpTools = if (mcpEnabled(app) && agent.hasTools) McpClient.tools.value else emptyList()
-        val tools = AiTools.toolsFor(agent, mcpTools)
+        val tools = AiTools.toolsFor(agent, mcpTools, hasDocs = docsListing.isNotBlank(), wantImage = AiTools.wantsImage(userText))
         Thread({
             val main = android.os.Handler(android.os.Looper.getMainLooper())
             val sel = selected(app)
-            val order = if (sel == "auto") autoOrder(app) else providers.filter { it.id == sel }
+            var order = if (sel == "auto") autoOrder(app) else providers.filter { it.id == sel }
             val errors = ArrayList<String>()
             var ok = false
+            val visionModels = HashMap<String, String>()
+            if (withImages) {
+                val skipped = ArrayList<String>()
+                order = order.filter { p -> val vm = AiCatalog.visionModel(p.id, model(app, p.id)); if (vm != null) { visionModels[p.id] = vm; true } else { skipped.add(p.title); false } }
+                if (skipped.isNotEmpty()) VpnLog.i(TAG, "изображения: без зрения пропущены " + skipped.joinToString(", "))
+                if (order.isEmpty()) {
+                    main.post {
+                        reply.text = "⚠ Чтобы посмотреть изображения, нужна модель со «зрением», а среди доступных её нет (Pollinations без ключа и LLM7-turbo картинки не принимают — это проверено).\n" +
+                            "Бесплатные варианты: ключ api.navy (gemini-2.5-flash), ключ LLM7 (gemini/claude/gpt), Google AI Studio (gemini-flash), Groq (llama-4-scout), OpenRouter (:free с vision), OpenCode (nemotron-3.5-super-vl-free). Добавьте ключ в ⚙ Провайдеры — и повторите вопрос."
+                        busy.value = false; save(app)
+                    }
+                    return@Thread
+                }
+            }
             for (p in order) {
                 if (cancel.get()) break
-                val model = model(app, p.id)
+                val model = visionModels[p.id] ?: model(app, p.id)
                 main.post { status.value = "${p.title} · $model…" }
                 val t0 = SystemClock.elapsedRealtime()
                 val r = runWithProvider(app, p, model, api, tools, reply, chat, host, mcpTools, main)
@@ -408,7 +461,7 @@ object AiAssistant {
                 val step = Msg("tool", "🔧 $name ${argsRaw.take(160)}", kind = "tool")
                 main.post { chat.messages.add(chat.messages.size - 1, step); status.value = "$name…" }
                 val t0 = SystemClock.elapsedRealtime()
-                val result = AiTools.execute(app, host, name, args, mcpTools)
+                val result = AiTools.execute(app, host, chat.id, name, args, mcpTools)
                 val ms = SystemClock.elapsedRealtime() - t0
                 VpnLog.i(TAG, "инструмент $name → ${result.length} зн. за $ms мс")
                 main.post { step.text = "🔧 $name ${argsRaw.take(160)}\n→ ${result.lines().firstOrNull()?.take(120) ?: ""} (${result.length} зн., $ms мс)" }
@@ -439,6 +492,43 @@ object AiAssistant {
     }
 
     fun testAll(ctx: Context) { for (p in providers) if (configured(ctx, p)) test(ctx, p) }
+
+    /** v4.8.0: распознавание речи (OpenAI-совместимый /audio/transcriptions) по ключу Groq (whisper-large-v3-turbo) или api.navy (whisper-1). */
+    fun transcribe(ctx: Context, file: java.io.File): Pair<String?, String?> {
+        if (file.length() > 25_000_000) return null to "файл больше 25 МБ — распознавание не принимает"
+        val cands = ArrayList<Triple<String, String, String>>()
+        if (key(ctx, "groq").isNotBlank()) cands.add(Triple("groq", "https://api.groq.com/openai/v1/audio/transcriptions", "whisper-large-v3-turbo"))
+        if (key(ctx, "navy").isNotBlank()) cands.add(Triple("navy", "https://api.navy/v1/audio/transcriptions", "whisper-1"))
+        if (customUrl(ctx).contains("/chat/completions")) cands.add(Triple("custom", customUrl(ctx).replace("/chat/completions", "/audio/transcriptions"), "whisper-1"))
+        if (cands.isEmpty()) return null to "нужен бесплатный ключ Groq или api.navy (⚙ Провайдеры)"
+        var lastErr = ""
+        for ((pid, url, model) in cands) {
+            try {
+                val boundary = "----omni" + System.currentTimeMillis()
+                val h = LinkedHashMap<String, String>()
+                h["Content-Type"] = "multipart/form-data; boundary=$boundary"
+                val k = key(ctx, pid); if (k.isNotBlank()) h["Authorization"] = "Bearer $k"
+                val c = MediaGrabber.open(url, h, "POST", 300_000)
+                c.doOutput = true
+                c.setChunkedStreamingMode(65536)
+                c.outputStream.use { o ->
+                    fun field(n: String, v: String) = o.write(("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n").toByteArray())
+                    field("model", model); field("response_format", "json"); field("temperature", "0")
+                    o.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"${file.name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").toByteArray())
+                    file.inputStream().use { it.copyTo(o) }
+                    o.write("\r\n--$boundary--\r\n".toByteArray())
+                }
+                val code = c.responseCode
+                val raw = (if (code in 200..299) c.inputStream else (c.errorStream ?: c.inputStream)).bufferedReader().readText()
+                c.disconnect()
+                if (code !in 200..299) { lastErr = "$pid: ${errorText(code, raw)}"; VpnLog.w(TAG, "распознавание $lastErr"); continue }
+                val text = try { JSONObject(raw).optString("text") } catch (_: Exception) { raw }
+                VpnLog.i(TAG, "распознавание речи ($pid/$model): ${text.length} зн.")
+                return text to null
+            } catch (e: Exception) { lastErr = "$pid: ${e.message}" }
+        }
+        return null to lastErr
+    }
 
     /** JS для сбора контекста страницы: выделение, заголовок, адрес и текст (до 9000 знаков). */
     const val PAGE_JS = "(function(){try{var s=window.getSelection?String(window.getSelection()):'';var t=document.body?document.body.innerText:'';" +
