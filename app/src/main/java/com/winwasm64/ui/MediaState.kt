@@ -320,15 +320,8 @@ object MediaState {
       var anyPlaying = function(){ var vs = document.querySelectorAll('video'); for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended && vs[i].currentTime > 0) return true; } return false; };
       var visible = function(el){ try { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; } catch (e) { return false; } };
       var say = function(m){ try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('автозапуск: ' + m); } catch (e) {} };
-      var autonavOn = false;
-      document.addEventListener('playing', function(){
-        try {
-          if (!isYt() || autonavOn) return;
-          var b = document.querySelector('.ytm-autonav-toggle-button-container, button[aria-label*="Autoplay"], button[aria-label*="Автовоспроизведение"]');
-          if (b && b.getAttribute('aria-pressed') === 'false' && window.OmniMedia && OmniMedia.autoNext && OmniMedia.autoNext()) { b.click(); say('включён переключатель автовоспроизведения YouTube'); }
-          autonavOn = true;
-        } catch (e) {}
-      }, true);
+      // v4.9.1: переключатель автовоспроизведения YouTube больше не трогаем — синтетический клик по элементам
+      // управления плеера m.youtube.com мог сработать как тап по плееру (пауза). Переход делает только обработчик ended.
       var goNextYt = function(startVid, startHref){
         var changed = function(){ return location.href !== startHref || curVid() !== startVid || anyPlaying(); };
         try { var p = document.getElementById('movie_player'); if (p && typeof p.nextVideo === 'function') { p.nextVideo(); say('плеер → nextVideo()'); } } catch (e) {}
