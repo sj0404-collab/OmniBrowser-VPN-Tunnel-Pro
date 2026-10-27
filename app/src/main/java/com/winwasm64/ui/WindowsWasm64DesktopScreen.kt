@@ -405,6 +405,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var extPopupFor by remember { mutableStateOf<String?>(null) }
     var extOptionsFor by remember { mutableStateOf<String?>(null) }
     var showExtensionsSheet by remember { mutableStateOf(false) }
+    var showAiSheet by remember { mutableStateOf(false) }
     var showTabsSheet by remember { mutableStateOf(false) }
     var showMenuSheet by remember { mutableStateOf(false) }
     var findBarVisible by remember { mutableStateOf(false) }
@@ -1845,6 +1846,25 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         )
                     }
                 }
+                // Шторка ИИ-ассистента (v4.6.0)
+                if (showAiSheet) {
+                    OmniSheet(onDismiss = { showAiSheet = false }) {
+                        com.winwasm64.ui.browser.AiSheetContent(
+                            requestPage = { cb ->
+                                val wv = activeTab.webView
+                                if (wv == null) cb(null)
+                                else try {
+                                    wv.evaluateJavascript(com.winwasm64.ui.browser.AiAssistant.PAGE_JS) { raw -> cb(com.winwasm64.ui.browser.AiAssistant.parsePage(raw)) }
+                                } catch (_: Exception) { cb(null) }
+                            },
+                            onOpenUrl = { u ->
+                                showAiSheet = false
+                                openNewTab(u)
+                            },
+                            onDismiss = { showAiSheet = false }
+                        )
+                    }
+                }
                 extPopupFor?.let { id -> ExtensionPageDialog(id, options = false) { extPopupFor = null } }
                 extOptionsFor?.let { id -> ExtensionPageDialog(id, options = true) { extOptionsFor = null } }
 
@@ -1921,6 +1941,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             }
                         })
                         SheetDivider()
+                        SheetItem(OmniIcons.Code, "ИИ-ассистент", subtitle = "Кратко о странице, перевод, вопросы · бесплатные модели", tint = Omni.Accent, onClick = {
+                            showMenuSheet = false
+                            showAiSheet = true
+                        })
                         SheetItem(OmniIcons.Extension, "Расширения", subtitle = "Chrome Web Store", onClick = {
                             showMenuSheet = false
                             showExtensionsSheet = true
