@@ -1846,17 +1846,31 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         )
                     }
                 }
-                // Шторка ИИ-ассистента (v4.6.0)
+                // Шторка ИИ-ассистента (v4.6.0; v4.7.0 — агенты/MCP, мост читает актуальную вкладку)
                 if (showAiSheet) {
+                    val aiHost = remember {
+                        object : com.winwasm64.ui.browser.AiHost {
+                            private fun tab(): BrowserTabModel? = tabs.getOrNull(activeTabIndex.coerceIn(0, (tabs.size - 1).coerceAtLeast(0)))
+                            override fun currentPage(cb: (com.winwasm64.ui.browser.AiAssistant.PageInfo?) -> Unit) {
+                                val wv = tab()?.webView
+                                if (wv == null) { cb(null); return }
+                                try { wv.evaluateJavascript(com.winwasm64.ui.browser.AiAssistant.PAGE_JS) { raw -> cb(com.winwasm64.ui.browser.AiAssistant.parsePage(raw)) } } catch (_: Exception) { cb(null) }
+                            }
+                            override fun runJs(js: String, cb: (String?) -> Unit) {
+                                val wv = tab()?.webView
+                                if (wv == null) { cb(null); return }
+                                try { wv.evaluateJavascript(js) { raw -> cb(raw) } } catch (e: Exception) { cb("error: ${e.message}") }
+                            }
+                            override fun openUrl(url: String) { openNewTab(url) }
+                            override fun download(url: String) {
+                                val t = tab() ?: return
+                                startWebDownload(t, url, t.webView?.settings?.userAgentString, null, null)
+                            }
+                        }
+                    }
                     OmniSheet(onDismiss = { showAiSheet = false }) {
                         com.winwasm64.ui.browser.AiSheetContent(
-                            requestPage = { cb ->
-                                val wv = activeTab.webView
-                                if (wv == null) cb(null)
-                                else try {
-                                    wv.evaluateJavascript(com.winwasm64.ui.browser.AiAssistant.PAGE_JS) { raw -> cb(com.winwasm64.ui.browser.AiAssistant.parsePage(raw)) }
-                                } catch (_: Exception) { cb(null) }
-                            },
+                            host = aiHost,
                             onOpenUrl = { u ->
                                 showAiSheet = false
                                 openNewTab(u)

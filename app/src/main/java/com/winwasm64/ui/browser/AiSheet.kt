@@ -11,6 +11,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -35,12 +36,14 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.Icon
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -58,72 +61,92 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.winwasm64.ui.theme.Omni
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * v4.6.0: шторка ИИ-ассистента. [requestPage] запрашивает текст/выделение текущей страницы (через WebView JS),
- * [onOpenUrl] открывает ссылку (страницы получения ключей) и закрывает шторку.
+ * Шторка ИИ-ассистента: чат (с агентами и инструментами), список чатов, провайдеры/каталог моделей, агенты и MCP.
+ * [host] — мост к браузеру (текущая страница, JS, открыть адрес, скачать). [onOpenUrl] открывает ссылку и закрывает шторку.
  */
 @Composable
-fun AiSheetContent(
-    requestPage: ((AiAssistant.PageInfo?) -> Unit) -> Unit,
-    onOpenUrl: (String) -> Unit,
-    onDismiss: () -> Unit
-) {
+fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
-    var settings by remember { mutableStateOf(false) }
+    AiAssistant.init(ctx)
+    LaunchedEffect(Unit) { AiCatalog.refreshIfStale(ctx); if (AiAssistant.mcpEnabled(ctx)) McpClient.refreshAll(ctx) }
+    var view by remember { mutableStateOf("chat") } // chat | chats | providers | agents
     var selected by remember { mutableStateOf(AiAssistant.selected(ctx)) }
     val busy by AiAssistant.busy
     val status by AiAssistant.status
+    val chat by AiAssistant.current
+    val agent = AiTools.agent(chat?.agent ?: "chat")
 
     fun send(question: String, withPage: Boolean) {
         val q = question.trim()
         if (q.isBlank() || busy) return
-        if (withPage) requestPage { p -> AiAssistant.ask(ctx, q, AiAssistant.contextOf(p)) }
-        else AiAssistant.ask(ctx, q, null)
+        if (withPage) host.currentPage { p -> AiAssistant.ask(ctx, q, AiAssistant.contextOf(p), host) }
+        else AiAssistant.ask(ctx, q, null, host)
     }
 
     Column(Modifier.fillMaxWidth().imePadding()) {
         Row(Modifier.fillMaxWidth().padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (view != "chat") OmniIconButton(OmniIcons.Back, "Назад", onClick = { view = "chat" })
             Box(Modifier.weight(1f)) {
-                SheetTitle(
-                    if (settings) "Провайдеры и ключи" else "ИИ-ассистент",
-                    subtitle = if (settings) "Бесплатные модели · ключи хранятся только на устройстве"
-                    else status.ifBlank { if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected) }
-                )
+                when (view) {
+                    "chats" -> SheetTitle("Чаты", "${AiAssistant.chats.size} сохранено · хранятся на устройстве")
+                    "providers" -> SheetTitle("Провайдеры и модели", "Каталог обновляется автоматически каждые 6 ч · ключи только на устройстве")
+                    "agents" -> SheetTitle("Агенты и MCP", "Инструменты браузера + внешние MCP-серверы")
+                    else -> SheetTitle(
+                        (chat?.title ?: "ИИ-ассистент").ifBlank { "ИИ-ассистент" },
+                        subtitle = status.ifBlank { "${agent.emoji} ${agent.title} · " + (if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected)) }
+                    )
+                }
             }
-            if (!settings) OmniIconButton(OmniIcons.Delete, "Очистить", onClick = { AiAssistant.stop(); AiAssistant.clear() })
-            OmniIconButton(if (settings) OmniIcons.Back else OmniIcons.Tune, if (settings) "Назад" else "Провайдеры", onClick = { settings = !settings })
+            if (view == "chat") {
+                OmniIconButton(OmniIcons.Add, "Новый чат", onClick = { AiAssistant.stop(); AiAssistant.newChat(ctx); AiAssistant.save(ctx) })
+                OmniIconButton(OmniIcons.History, "Чаты", onClick = { view = "chats" })
+                OmniIconButton(OmniIcons.Apps, "Агенты и MCP", onClick = { view = "agents" })
+                OmniIconButton(OmniIcons.Tune, "Провайдеры", onClick = { view = "providers" })
+            }
         }
-        if (settings) {
-            AiSettings(onOpenUrl = { onDismiss(); onOpenUrl(it) })
-            return@Column
+        when (view) {
+            "chats" -> { AiChatsList(onPick = { view = "chat" }); return@Column }
+            "providers" -> { AiSettings(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
+            "agents" -> { AiAgentsView(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
         }
 
-        // выбор провайдера
+        // агент и провайдер
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (a in AiTools.agents) AiChip("${a.emoji} ${a.title}", agent.id == a.id, enabled = !busy) { chat?.agent = a.id; AiAssistant.save(ctx) }
+        }
+        Spacer(Modifier.height(6.dp))
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             AiChip("Авто", selected == "auto") { selected = "auto"; AiAssistant.setSelected(ctx, "auto") }
             for (p in AiAssistant.providers) {
                 val ok = AiAssistant.configured(ctx, p)
                 AiChip(p.title + (if (ok) "" else " 🔑"), selected == p.id, dim = !ok) {
-                    if (ok) { selected = p.id; AiAssistant.setSelected(ctx, p.id) } else settings = true
+                    if (ok) { selected = p.id; AiAssistant.setSelected(ctx, p.id) } else view = "providers"
                 }
             }
         }
         Spacer(Modifier.height(8.dp))
 
         // лента сообщений
-        val list = AiAssistant.messages
+        val list = chat?.messages ?: remember { mutableStateListOf<AiAssistant.Msg>() }
         val lazy = rememberLazyListState()
         val lastText = list.lastOrNull()?.text ?: ""
         LaunchedEffect(list.size, lastText.length) { if (list.isNotEmpty()) lazy.scrollToItem(list.size - 1) }
         Box(Modifier.fillMaxWidth().heightIn(min = 140.dp, max = 380.dp)) {
             if (list.isEmpty()) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp)) {
-                    Text("Спросите что угодно или нажмите быстрое действие — ассистент прочитает открытую страницу.", color = Omni.TextDim, fontSize = 13.sp)
+                    Text("${agent.emoji} ${agent.title}: ${agent.hint}.", color = Omni.TextDim, fontSize = 13.sp)
                     Spacer(Modifier.height(6.dp))
-                    Text("Без ключей работает Pollinations (1 ответ в 30 с). Бесплатный ключ Groq, OpenRouter или Gemini снимает лимиты — см. ⚙.", color = Omni.TextFaint, fontSize = 12.sp)
+                    Text(if (agent.hasTools) "Агент сам вызывает инструменты (поиск, открытие страниц, чтение, JS, загрузки" + (if (AiAssistant.mcpEnabled(ctx) && McpClient.tools.value.isNotEmpty()) ", MCP: ${McpClient.tools.value.size}" else "") + ") и показывает шаги в чате."
+                        else "Спросите что угодно или нажмите быстрое действие — ассистент прочитает открытую страницу.", color = Omni.TextFaint, fontSize = 12.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text("Без ключей работают Pollinations и LLM7 (turbo). Бесплатный ключ LLM7/Groq/OpenRouter/Gemini открывает полные модели — см. ⚙.", color = Omni.TextFaint, fontSize = 12.sp)
                 }
-            } else LazyColumn(state = lazy, modifier = Modifier.fillMaxWidth(), contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
+            } else LazyColumn(state = lazy, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
                 itemsIndexed(list, key = { i, _ -> i }) { _, m -> AiBubble(m, isLast = m === list.lastOrNull(), busy = busy) }
             }
         }
@@ -134,6 +157,7 @@ fun AiSheetContent(
             AiChip("Переведи на русский", false, enabled = !busy) { send("Переведи текст страницы (или выделенный фрагмент, если он есть) на русский язык. Сохраняй структуру, ничего не добавляй.", true) }
             AiChip("Объясни выделенное", false, enabled = !busy) { send("Объясни простыми словами выделенный фрагмент (если выделения нет — ключевую мысль страницы). Если это термин или код — поясни, что он делает.", true) }
             AiChip("Главные факты", false, enabled = !busy) { send("Выпиши из страницы ключевые факты, цифры, даты и имена списком. Только то, что есть в тексте.", true) }
+            if (agent.hasTools) AiChip("Найди похожее", false, enabled = !busy) { send("Найди в интернете 3–5 источников по теме этой страницы и кратко сравни их с ней.", true) }
         }
 
         // ввод
@@ -154,7 +178,7 @@ fun AiSheetContent(
                     keyboardActions = KeyboardActions(onSend = { send(input, usePage); input = "" }),
                     modifier = Modifier.fillMaxWidth()
                 )
-                if (input.isEmpty()) Text("Вопрос ассистенту…", color = Omni.TextFaint, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (input.isEmpty()) Text(if (agent.hasTools) "Задача агенту…" else "Вопрос ассистенту…", color = Omni.TextFaint, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             Spacer(Modifier.width(8.dp))
             if (busy) {
@@ -173,7 +197,8 @@ fun AiSheetContent(
                 if (usePage) Text("✓", color = Color.White, fontSize = 11.sp)
             }
             Spacer(Modifier.width(8.dp))
-            Text("Передавать текст страницы вместе с вопросом", color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.clickable { usePage = !usePage })
+            Text("Передавать текст страницы вместе с вопросом", color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f).clickable { usePage = !usePage })
+            TextButton(onClick = { AiAssistant.stop(); AiAssistant.clearCurrent(ctx) }, enabled = list.isNotEmpty()) { Text("Очистить", color = Omni.TextFaint, fontSize = 11.sp) }
         }
     }
 }
@@ -197,6 +222,10 @@ private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean) {
     val ctx = LocalContext.current
     val text by m.textState
     val user = m.role == "user"
+    if (m.kind == "tool") {
+        Text(text, color = Omni.TextFaint, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
+        return
+    }
     Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalAlignment = if (user) Alignment.End else Alignment.Start) {
         Box(
             Modifier
@@ -209,7 +238,7 @@ private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = Omni.Accent)
                     Spacer(Modifier.width(8.dp))
-                    Text("думает…", color = Omni.TextDim, fontSize = 13.sp)
+                    Text(if (isLast && busy) "думает…" else "—", color = Omni.TextDim, fontSize = 13.sp)
                 }
             } else SelectionContainer { Text(text, color = Omni.Text, fontSize = 14.sp, lineHeight = 20.sp) }
         }
@@ -217,33 +246,126 @@ private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean) {
             TextButton(onClick = {
                 (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("ai", text))
                 Toast.makeText(ctx, "Скопировано", Toast.LENGTH_SHORT).show()
-            }, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+            }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
                 Text("Копировать", color = Omni.TextFaint, fontSize = 11.sp)
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------- чаты
+@Composable
+private fun AiChatsList(onPick: () -> Unit) {
+    val ctx = LocalContext.current
+    val fmt = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
+    val cur by AiAssistant.current
+    Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState())) {
+        SheetItem(OmniIcons.Add, "Новый чат", subtitle = "Текущий агент: ${AiTools.agent(cur?.agent ?: "chat").title}", tint = Omni.Accent, onClick = { AiAssistant.newChat(ctx); AiAssistant.save(ctx); onPick() })
+        SheetDivider()
+        for (c in AiAssistant.chats.toList()) {
+            val title by c.titleState
+            val a = AiTools.agent(c.agent)
+            SheetItem(
+                OmniIcons.History, "${a.emoji} $title",
+                subtitle = "${fmt.format(Date(c.updated))} · ${c.messages.count { it.kind == "text" }} сообщ." + (c.messages.lastOrNull { it.role == "assistant" && it.kind == "text" }?.text?.let { " · " + it.replace('\n', ' ').take(60) } ?: ""),
+                titleColor = if (cur === c) Omni.Accent else Omni.Text,
+                onClick = { AiAssistant.select(ctx, c); onPick() },
+                trailing = { OmniIconButton(OmniIcons.Delete, "Удалить", onClick = { AiAssistant.deleteChat(ctx, c) }, tint = Omni.TextFaint, size = 36.dp, iconSize = 18.dp) }
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+// ---------------------------------------------------------------------- агенты и MCP
+@Composable
+private fun AiAgentsView(onOpenUrl: (String) -> Unit) {
+    val ctx = LocalContext.current
+    val servers by McpClient.servers
+    val tools by McpClient.tools
+    val st by McpClient.status
+    var mcpOn by remember { mutableStateOf(AiAssistant.mcpEnabled(ctx)) }
+    Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
+        SheetSectionLabel("Агенты")
+        for (a in AiTools.agents) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                Text("${a.emoji} ${a.title}", color = Omni.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text(a.hint + (if (a.hasTools) " · инструменты: " + a.tools.joinToString(", ") else ""), color = Omni.TextDim, fontSize = 11.sp)
+            }
+        }
+        SheetSectionLabel("MCP-серверы")
+        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Давать агентам инструменты MCP", color = Omni.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
+            Switch(checked = mcpOn, onCheckedChange = { mcpOn = it; AiAssistant.setMcpEnabled(ctx, it); if (it) McpClient.refreshAll(ctx) }, colors = SwitchDefaults.colors(checkedTrackColor = Omni.Accent))
+        }
+        Text("Streamable HTTP (JSON-RPC). Подключено инструментов: ${tools.size}. Проверено: DeepWiki и Context7.", color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 20.dp))
+        for (s in servers) {
+            val res = st[s.url]
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(s.name, color = Omni.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(s.url, color = Omni.TextDim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Switch(checked = s.enabled, onCheckedChange = { McpClient.setEnabled(ctx, s, it) }, colors = SwitchDefaults.colors(checkedTrackColor = Omni.Accent))
+                }
+                if (!res.isNullOrBlank()) Text(res, color = if (res.startsWith("✓")) Omni.Success else if (res.startsWith("⏳")) Omni.TextDim else Omni.Danger, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                Row {
+                    TextButton(onClick = { McpClient.refresh(ctx, s) }) { Text("Проверить", color = Omni.Accent, fontSize = 12.sp) }
+                    TextButton(onClick = { McpClient.remove(ctx, s) }) { Text("Удалить", color = Omni.TextFaint, fontSize = 12.sp) }
+                }
+            }
+        }
+        var name by remember { mutableStateOf("") }
+        var url by remember { mutableStateOf("") }
+        var token by remember { mutableStateOf("") }
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).padding(12.dp)) {
+            Text("Добавить MCP-сервер", color = Omni.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            AiField(name, "название", KeyboardType.Text) { name = it }
+            AiField(url, "https://host/mcp", KeyboardType.Uri) { url = it }
+            AiField(token, "токен (необязательно)", KeyboardType.Password) { token = it }
+            Row {
+                TextButton(onClick = {
+                    if (url.startsWith("http")) { McpClient.add(ctx, McpClient.Server(name.ifBlank { url.substringAfter("//").substringBefore('/') }, url.trim(), token.trim(), true).also { McpClient.refresh(ctx, it) }); name = ""; url = ""; token = "" }
+                }, enabled = url.startsWith("http")) { Text("Добавить и проверить", color = Omni.Accent, fontSize = 12.sp) }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { onOpenUrl("https://github.com/modelcontextprotocol/servers#-remote-servers") }) { Text("Каталог серверов ↗", color = Omni.TextDim, fontSize = 12.sp) }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+// ---------------------------------------------------------------------- провайдеры
 @Composable
 private fun AiSettings(onOpenUrl: (String) -> Unit) {
     val ctx = LocalContext.current
     val results by AiAssistant.testResults
+    val catalog by AiCatalog.models
+    val refreshing by AiCatalog.refreshing
+    val last by AiCatalog.lastRefresh
+    val fmt = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
     Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Ответ ищется по порядку: провайдеры с ключом → Pollinations → OpenCode.", color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f))
-            TextButton(onClick = { AiAssistant.testAll(ctx) }) { Text("Проверить все", color = Omni.Accent, fontSize = 12.sp) }
+            Column(Modifier.weight(1f)) {
+                Text("Авто: провайдеры с ключом → Pollinations → LLM7 → OpenCode.", color = Omni.TextDim, fontSize = 12.sp)
+                Text("Каталог: ${catalog.values.sumOf { it.size }} моделей · " + (if (last > 0) "обновлён ${fmt.format(Date(last))}" else "не обновлялся") + " · ● без ключа ○ по ключу", color = Omni.TextFaint, fontSize = 11.sp)
+            }
+            TextButton(onClick = { AiCatalog.refreshAll(ctx) }, enabled = !refreshing) { Text(if (refreshing) "…" else "Обновить", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = { AiAssistant.testAll(ctx) }) { Text("Тест всех", color = Omni.Accent, fontSize = 12.sp) }
         }
         for (p in AiAssistant.providers) {
             var key by remember(p.id) { mutableStateOf(AiAssistant.key(ctx, p.id)) }
             var model by remember(p.id) { mutableStateOf(AiAssistant.model(ctx, p.id)) }
             var url by remember(p.id) { mutableStateOf(AiAssistant.customUrl(ctx)) }
-            var models by remember(p.id) { mutableStateOf(AiAssistant.cachedModels(ctx, p.id)) }
             var menu by remember(p.id) { mutableStateOf(false) }
             var loading by remember(p.id) { mutableStateOf(false) }
+            val entries = catalog[p.id] ?: emptyList()
             val res = results[p.id]
             Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).padding(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(p.title, color = Omni.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    if (entries.isNotEmpty()) Text("${entries.count { it.anon }}● ${entries.count { !it.anon }}○  ", color = Omni.TextFaint, fontSize = 11.sp)
                     Text(if (p.needsKey) "нужен ключ" else "без ключа", color = if (p.needsKey) Omni.Warning else Omni.Success, fontSize = 11.sp)
                 }
                 Text(p.note, color = Omni.TextDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
@@ -258,15 +380,18 @@ private fun AiSettings(onOpenUrl: (String) -> Unit) {
                     Spacer(Modifier.width(6.dp))
                     Box {
                         TextButton(onClick = {
-                            if (models.isNotEmpty()) menu = true
-                            else { loading = true; AiAssistant.fetchModels(ctx, p) { l, e -> loading = false; models = l; if (l.isNotEmpty()) menu = true else Toast.makeText(ctx, e ?: "список пуст", Toast.LENGTH_SHORT).show() } }
-                        }, enabled = !loading) { Text(if (loading) "…" else "Список ▾", color = Omni.Accent, fontSize = 12.sp) }
-                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, modifier = Modifier.background(Omni.SurfaceHighest).heightIn(max = 320.dp)) {
-                            DropdownMenuItem(text = { Text("↻ обновить список", color = Omni.TextDim, fontSize = 12.sp) }, onClick = {
+                            if (entries.isNotEmpty()) menu = true
+                            else { loading = true; AiCatalog.refreshProvider(ctx, p) { l, e -> loading = false; if (l.isNotEmpty()) menu = true else Toast.makeText(ctx, e ?: "список пуст", Toast.LENGTH_SHORT).show() } }
+                        }, enabled = !loading && p.id != "custom") { Text(if (loading) "…" else "Список ▾", color = Omni.Accent, fontSize = 12.sp) }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, modifier = Modifier.background(Omni.SurfaceHighest).heightIn(max = 340.dp)) {
+                            DropdownMenuItem(text = { Text("↻ обновить список с сайта", color = Omni.TextDim, fontSize = 12.sp) }, onClick = {
                                 menu = false; loading = true
-                                AiAssistant.fetchModels(ctx, p) { l, e -> loading = false; if (l.isNotEmpty()) { models = l; menu = true } else Toast.makeText(ctx, e ?: "список пуст", Toast.LENGTH_SHORT).show() }
+                                AiCatalog.refreshProvider(ctx, p) { l, e -> loading = false; if (l.isNotEmpty()) menu = true else Toast.makeText(ctx, e ?: "список пуст", Toast.LENGTH_SHORT).show() }
                             })
-                            for (id in models) DropdownMenuItem(text = { Text(id, color = if (id == model) Omni.Accent else Omni.Text, fontSize = 13.sp) }, onClick = { model = id; AiAssistant.setModel(ctx, p.id, id); menu = false })
+                            for (e in entries) DropdownMenuItem(
+                                text = { Text((if (e.anon) "● " else "○ ") + e.id, color = if (e.id == model) Omni.Accent else Omni.Text, fontSize = 13.sp) },
+                                onClick = { model = e.id; AiAssistant.setModel(ctx, p.id, e.id); menu = false }
+                            )
                         }
                     }
                 }

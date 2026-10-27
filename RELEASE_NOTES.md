@@ -1,3 +1,20 @@
+**OmniBrowser VPN Tunnel Pro 4.7.0**
+
+**ИИ-ассистент: агенты, MCP, сохранённые чаты, автообновляемый каталог моделей**
+- **Каталог моделей с автообновлением** (каждые 6 ч и по кнопке «Обновить»): списки тянутся прямо с сайтов провайдеров (`/models`) и с models.dev, поэтому временные демо-модели появляются и исчезают сами: `:free` на OpenRouter, `-free` в OpenCode Zen, tier=turbo у LLM7, tier=free у api.airforce, premium=false у api.navy. В списке моделей пометки: ● отвечает без ключа, ○ по бесплатному ключу.
+- **Новые провайдеры (каждый проверен реальным запросом 27.10.2026):**
+  - **LLM7** (api.llm7.io) — *без ключа* turbo-модели: gpt-oss:20b, minimax-m2.7, codestral-latest, mistral-Nemo, nemotron-3-nano (ограничение по IP: несколько запросов в час на модель, 1 запрос/с); по бесплатному ключу dash.llm7.io — полные модели: gemini-3-flash, claude-haiku/sonnet, gpt-6-luna, deepseek-v4, kimi-k3, glm-5.3 и др. Function calling работает.
+  - **api.navy** — по бесплатному ключу (Discord) non-premium модели: gemini-2.5-flash, gemini-3-flash-preview, deepseek-v4-flash/pro, gpt-oss-120b, mistral-large-4, command-a, glm-5.3…
+  - **api.airforce** — по бесплатному ключу tier=free: mistral-large-latest, gpt-oss-20b, llama-instant, glm-4.7-flash, codestral, kimi-k2.7-code…
+  - **NVIDIA NIM** — бесплатные кредиты по ключу build.nvidia.com, список из 85 моделей открыт.
+  - Проверены и отклонены: GitHub Models (models.github.ai отвечает «OK» без API — эндпоинт недоступен), api.voids.top (502), mlvoca (403), g4f.dev (405), a4f.co (521), DuckDuckGo-поиск из датацентра (капча 202 — поэтому поиск агента идёт через Brave → Bing → DDG).
+- **Чаты сохраняются** (устройство, `files/ai/chats.json`): список чатов с датой и агентом, новый чат «+», удаление, название из первого вопроса; каждый чат помнит своего агента.
+- **Агенты** (чипы над чатом): 💬 Помощник · 🧭 Браузер-агент (open_url, read_page, page_links, search_web, fetch_url, run_js, download_url) · 🔎 Исследователь (поиск + сверка источников) · 💻 Программист · 🌐 Переводчик. Агент сам вызывает инструменты циклом до 8 шагов, шаги видны в чате («🔧 search_web … → 1200 зн., 900 мс»), всё пишется в журнал [ИИ]. Если модель не умеет tools — запрос автоматически повторяется без них.
+- **MCP** (Model Context Protocol, Streamable HTTP/JSON-RPC): раздел «Агенты и MCP» → серверы по URL с необязательным токеном, переключатель, «Проверить» (initialize → tools/list). Инструменты включённых серверов добавляются агентам. Предустановлены (выключены) проверенные публичные DeepWiki (`mcp.deepwiki.com/mcp`, 3 инструмента) и Context7 (`mcp.context7.com/mcp`).
+- Ответы без инструментов идут потоком; у моделей с «reasoning» (gpt-oss) при пустом content показывается итог рассуждения вместо «пустого ответа».
+
+---
+
 **OmniBrowser VPN Tunnel Pro 4.6.0**
 
 **Встроенный ИИ-ассистент (меню → «ИИ-ассистент»)**
