@@ -309,6 +309,73 @@ object MediaState {
       };
       document.addEventListener('loadedmetadata', function(e){ tryRestore(e.target); }, true);
       document.addEventListener('playing', function(e){ tryRestore(e.target); }, true);
+    } catch (e) {}
+    // v4.9.0: автозапуск следующего видео. После события ended (не реклама) ждём 2.5 с: если сайт сам не переключил
+    // ролик — YouTube: nextVideo() плеера → кнопка «Далее» на конечной заставке → первая рекомендация;
+    // другие сайты: видимая кнопка/ссылка «Следующее видео / Next».
+    try {
+      var isYt = function(){ var h = location.hostname || ''; return h === 'youtube.com' || h.slice(-12) === '.youtube.com' || h.slice(-21) === '.youtube-nocookie.com'; };
+      var curVid = function(){ try { return new URL(location.href).searchParams.get('v') || ''; } catch (e) { return ''; } };
+      var isAd = function(){ try { var p = document.getElementById('movie_player') || document.querySelector('.html5-video-player'); return !!(p && p.classList && p.classList.contains('ad-showing')) || !!document.querySelector('.ytp-ad-player-overlay, .ad-interrupting'); } catch (e) { return false; } };
+      var anyPlaying = function(){ var vs = document.querySelectorAll('video'); for (var i = 0; i < vs.length; i++) { if (!vs[i].paused && !vs[i].ended && vs[i].currentTime > 0) return true; } return false; };
+      var visible = function(el){ try { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; } catch (e) { return false; } };
+      var say = function(m){ try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('автозапуск: ' + m); } catch (e) {} };
+      var autonavOn = false;
+      document.addEventListener('playing', function(){
+        try {
+          if (!isYt() || autonavOn) return;
+          var b = document.querySelector('.ytm-autonav-toggle-button-container, button[aria-label*="Autoplay"], button[aria-label*="Автовоспроизведение"]');
+          if (b && b.getAttribute('aria-pressed') === 'false' && window.OmniMedia && OmniMedia.autoNext && OmniMedia.autoNext()) { b.click(); say('включён переключатель автовоспроизведения YouTube'); }
+          autonavOn = true;
+        } catch (e) {}
+      }, true);
+      var goNextYt = function(startVid, startHref){
+        var changed = function(){ return location.href !== startHref || curVid() !== startVid || anyPlaying(); };
+        try { var p = document.getElementById('movie_player'); if (p && typeof p.nextVideo === 'function') { p.nextVideo(); say('плеер → nextVideo()'); } } catch (e) {}
+        setTimeout(function(){
+          if (changed()) return;
+          var btn = document.querySelector('ytm-autonav-endscreen-renderer a[href*="/watch"], .autonav-endscreen-upnext-button, .autonav-endscreen-upnext-thumbnail, [class*="autonav-endscreen"] a[href*="/watch"], .ytp-autonav-endscreen-upnext-button, a.ytp-autonav-endscreen-link-container');
+          if (btn) { btn.click(); say('кнопка «Далее» на заставке'); }
+          setTimeout(function(){
+            if (changed()) return;
+            var links = document.querySelectorAll('ytm-item-section-renderer a[href*="/watch?v="], ytm-video-with-context-renderer a[href*="/watch?v="], ytm-compact-video-renderer a[href*="/watch?v="], a.compact-media-item-image[href*="/watch?v="], ytd-compact-video-renderer a[href*="/watch?v="], a[href*="/watch?v="]');
+            for (var i = 0; i < links.length; i++) {
+              var a = links[i]; var href = a.getAttribute('href') || ''; var m = href.match(/[?&]v=([A-Za-z0-9_-]{6,})/);
+              if (!m || m[1] === startVid) continue;
+              say('первая рекомендация ' + m[1]); a.click();
+              setTimeout(function(){ if (!changed()) location.href = href; }, 1500);
+              return;
+            }
+            say('следующее видео не найдено');
+          }, 2000);
+        }, 2000);
+      };
+      var goNextGeneric = function(startHref){
+        var els = document.querySelectorAll('a, button, [role="button"]');
+        var re = /^(следующ\w*( видео| серия| эпизод| ролик)?|дальше|далее|next( video| episode)?|play next|смотреть следующ\w*)$/i;
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i]; var t = ((el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '').trim()).replace(/\s+/g, ' ');
+          if (t && t.length < 40 && re.test(t) && visible(el)) { say('кнопка «' + t + '»'); el.click(); return; }
+        }
+        var ln = document.querySelector('a[rel="next"]');
+        if (ln && ln.href && ln.href !== startHref) { say('ссылка rel=next'); location.href = ln.href; return; }
+        say('на этом сайте следующее видео не найдено');
+      };
+      document.addEventListener('ended', function(e){
+        try {
+          var v = e.target; if (!v || v.tagName !== 'VIDEO') return;
+          if (!(window.OmniMedia && OmniMedia.autoNext && OmniMedia.autoNext())) return;
+          if (!isFinite(v.duration) || v.duration < 45) return;
+          if (isYt() && (isAd() || location.pathname.indexOf('/shorts/') === 0)) return;
+          var startHref = location.href, startVid = curVid();
+          setTimeout(function(){
+            try {
+              if (location.href !== startHref || anyPlaying()) return; // сайт переключил сам
+              if (isYt()) goNextYt(startVid, startHref); else goNextGeneric(startHref);
+            } catch (x) {}
+          }, 2500);
+        } catch (x) {}
+      }, true);
       document.addEventListener('durationchange', function(e){ try { var v = e.target; if (v && v.tagName === 'VIDEO' && restoredFor && restoredFor !== posKey()) { restoredFor = ''; } tryRestore(v); } catch (x) {} }, true);
     } catch (e) {}
   } catch (e) {}
@@ -453,6 +520,10 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
 
     @JavascriptInterface
     fun savedPosition(key: String): Double = MediaPositions.get(key)
+
+    /** v4.9.0: включён ли автозапуск следующего видео (настройка браузера). */
+    @JavascriptInterface
+    fun autoNext(): Boolean = MediaPositions.autoNext
 
     @JavascriptInterface
     fun state(playing: Boolean) {

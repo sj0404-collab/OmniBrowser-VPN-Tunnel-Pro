@@ -302,6 +302,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var textZoomPercent by remember { mutableIntStateOf(prefs.getInt("text_zoom_pct", 100)) }
     var dohServer by remember { mutableStateOf(prefs.getString("doh_server", "1.1.1.1") ?: "1.1.1.1") }
     var blockThirdPartyCookies by remember { mutableStateOf(prefs.getBoolean("block_3p_cookies", false)) }
+    var autoNextVideo by remember { mutableStateOf(prefs.getBoolean("auto_next_video", true)) }
     var doNotTrackEnabled by remember { mutableStateOf(prefs.getBoolean("dnt_enabled", true)) }
     var homePageUrl by remember { mutableStateOf(prefs.getString("home_page_url", "https://www.google.com") ?: "https://www.google.com") }
     var darkReaderEnabled by remember { mutableStateOf(prefs.getBoolean("dark_reader", false)) }
@@ -2506,6 +2507,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     SettingSwitchRow("Не отслеживать (DNT и GPC)", "Отправлять сайтам запрет на отслеживание", doNotTrackEnabled) { v ->
                                         doNotTrackEnabled = v
                                         persistBrowserSettings()
+                                    }
+                                    SettingSwitchRow("Автозапуск следующего видео", "YouTube: после окончания ролика — следующий из рекомендаций/плейлиста (и в фоне, и в PiP); другие сайты — кнопка «Следующее»", autoNextVideo) { v ->
+                                        autoNextVideo = v
+                                        com.winwasm64.ui.MediaPositions.autoNext = v
+                                        prefs.edit().putBoolean("auto_next_video", v).apply()
                                     }
                                     SettingSwitchRow("Блокировать сторонние cookies", "Меньше слежки; вход через Google/VK на некоторых сайтах может сломаться", blockThirdPartyCookies) { v ->
                                         blockThirdPartyCookies = v

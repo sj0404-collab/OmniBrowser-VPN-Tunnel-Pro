@@ -17,8 +17,12 @@ object MediaPositions {
     private var loaded = false
     private var lastPersist = 0L
 
+    /** v4.9.0: автозапуск следующего видео (ключ auto_next_video в настройках браузера, по умолчанию включён). */
+    @Volatile var autoNext: Boolean = true
+
     fun init(context: Context) {
         ctx = context.applicationContext
+        autoNext = context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean("auto_next_video", true)
         synchronized(map) {
             if (loaded) return
             loaded = true
