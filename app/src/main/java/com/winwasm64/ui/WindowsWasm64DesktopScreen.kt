@@ -612,6 +612,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             trimmed.startsWith("javascript:", ignoreCase = true) ||
             trimmed.startsWith("data:", ignoreCase = true) ||
             trimmed.startsWith("file:", ignoreCase = true) ||
+            trimmed.startsWith("content:", ignoreCase = true) ||
             trimmed.startsWith("about:", ignoreCase = true)
         ) return trimmed
         return if (trimmed.contains(".") && !trimmed.contains(" ")) {
@@ -1462,8 +1463,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         if (u == initialIntentUri) return@LaunchedEffect
         if (u.startsWith("magnet:", ignoreCase = true) || u.endsWith(".torrent", ignoreCase = true)) {
             torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
-        } else if (u.startsWith("http", ignoreCase = true)) {
+        } else if (u.startsWith("http", ignoreCase = true) || u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) {
             openNewTab(u); currentSection = 0
+        } else {
+            // v4.5.1: текст без ссылки («Поделиться», «Найти в OmniBrowser», системный поиск) — в поисковик
+            openNewTab(normalizeInputToUrl(u)); currentSection = 0
         }
     }
     LaunchedEffect(Unit) {
@@ -1480,7 +1484,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             ) {
                 torrentEngine.startFromMagnetOrUrl(initialIntentUri)
                 currentSection = 1
-            } else if (initialIntentUri.startsWith("http", ignoreCase = true)) {
+            } else if (initialIntentUri.startsWith("http", ignoreCase = true) || initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) {
                 navigateTab(activeTab, initialIntentUri)
                 currentSection = 0
             }

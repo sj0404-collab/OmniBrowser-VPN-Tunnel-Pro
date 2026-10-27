@@ -29,6 +29,17 @@ object ExternalIntents {
         set(v) { pendingUrlState.value = v }
     /** v4.5.0: плитка быстрых настроек просит открыть раздел «Приложения» (нет разрешения на VPN или пустой список). */
     val openAppsRequest = androidx.compose.runtime.mutableIntStateOf(0)
+
+    /** Из текста «Поделиться» вытаскиваем первую ссылку; если ссылки нет — возвращаем сам текст (уйдёт в поиск). */
+    fun extractUrl(text: String?): String? {
+        val t = text?.trim().orEmpty()
+        if (t.isEmpty()) return null
+        val m = Regex("(?i)\\b(?:https?://|magnet:\\?)[^\\s<>\"']+").find(t)
+        if (m != null) return m.value.trimEnd('.', ',', ')', ']')
+        val bare = Regex("(?i)\\b(?:www\\.)?[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:/[^\\s]*)?").find(t)
+        if (bare != null && t.length < 200 && !t.contains(' ')) return "https://" + bare.value
+        return t
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -59,6 +70,20 @@ class MainActivity : ComponentActivity() {
         if (intent?.action == Intent.ACTION_VIEW) {
             val u = intent.dataString
             if (!u.isNullOrBlank()) ExternalIntents.pendingUrl = u
+        }
+        // v4.5.1: «Поделиться» ссылкой/текстом, системный поиск и «Найти в OmniBrowser» из выделенного текста
+        if (intent?.action == Intent.ACTION_SEND) {
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: intent.getStringExtra(Intent.EXTRA_SUBJECT)
+            val u = ExternalIntents.extractUrl(text)
+            if (!u.isNullOrBlank()) ExternalIntents.pendingUrl = u
+        }
+        if (intent?.action == Intent.ACTION_WEB_SEARCH) {
+            val q = intent.getStringExtra(android.app.SearchManager.QUERY)
+            if (!q.isNullOrBlank()) ExternalIntents.pendingUrl = ExternalIntents.extractUrl(q)
+        }
+        if (intent?.action == Intent.ACTION_PROCESS_TEXT && Build.VERSION.SDK_INT >= 23) {
+            val q = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
+            if (!q.isNullOrBlank()) ExternalIntents.pendingUrl = ExternalIntents.extractUrl(q)
         }
         if (intent?.getBooleanExtra("omni_open_apps", false) == true) ExternalIntents.openAppsRequest.intValue++
     }
