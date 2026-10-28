@@ -304,6 +304,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var textZoomPercent by remember { mutableIntStateOf(prefs.getInt("text_zoom_pct", 100)) }
     var dohServer by remember { mutableStateOf(prefs.getString("doh_server", "1.1.1.1") ?: "1.1.1.1") }
     var blockThirdPartyCookies by remember { mutableStateOf(prefs.getBoolean("block_3p_cookies", false)) }
+    var webrtcTcpAll by remember { mutableStateOf(prefs.getBoolean("webrtc_tcp_all", false)) }
     var autoNextVideo by remember { mutableStateOf(prefs.getBoolean("auto_next_video", true)) }
     var doNotTrackEnabled by remember { mutableStateOf(prefs.getBoolean("dnt_enabled", true)) }
     var homePageUrl by remember { mutableStateOf(prefs.getString("home_page_url", "https://www.google.com") ?: "https://www.google.com") }
@@ -2587,6 +2588,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         autoNextVideo = v
                                         com.winwasm64.ui.MediaPositions.autoNext = v
                                         prefs.edit().putBoolean("auto_next_video", v).apply()
+                                    }
+                                    SettingSwitchRow("WebRTC через прокси (TCP) на всех сайтах", "Как «блокировка WebRTC» в Browsec: медиапоток не уходит с домашнего IP по UDP, а идёт через сервер VPN. Для GeForce NOW/NVIDIA включено всегда; звонки на других сайтах могут стать медленнее", webrtcTcpAll) { v ->
+                                        webrtcTcpAll = v
+                                        com.winwasm64.ui.MediaPositions.webrtcTcpAll = v
+                                        prefs.edit().putBoolean("webrtc_tcp_all", v).apply()
                                     }
                                     SettingSwitchRow("Блокировать сторонние cookies", "Меньше слежки; вход через Google/VK на некоторых сайтах может сломаться", blockThirdPartyCookies) { v ->
                                         blockThirdPartyCookies = v

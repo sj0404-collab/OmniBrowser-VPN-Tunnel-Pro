@@ -19,10 +19,13 @@ object MediaPositions {
 
     /** v4.9.0: автозапуск следующего видео (ключ auto_next_video в настройках браузера, по умолчанию включён). */
     @Volatile var autoNext: Boolean = true
+    /** v4.10.3: WebRTC только через прокси (TCP) на всех сайтах (для GeForce NOW/NVIDIA — всегда). */
+    @Volatile var webrtcTcpAll: Boolean = false
 
     fun init(context: Context) {
         ctx = context.applicationContext
         autoNext = context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean("auto_next_video", true)
+        webrtcTcpAll = context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean("webrtc_tcp_all", false)
         synchronized(map) {
             if (loaded) return
             loaded = true

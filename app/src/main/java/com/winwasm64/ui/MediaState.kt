@@ -102,6 +102,91 @@ object MediaState {
       };
     }
   } catch (e) {}
+  // v4.10.3: WebRTC — диагностика в журнал и режим «только через прокси (TCP)». Chrome с Browsec (блокировка WebRTC)
+  // ставит disable_non_proxied_udp: медиа идёт не по UDP с домашнего IP, а TCP/relay через прокси — так GeForce NOW
+  // видит один и тот же IP у сессии и потока. В WebView такой политики нет — эмулируем: UDP-кандидаты (свои и удалённые)
+  // отбрасываем, остаются TCP/relay, а TCP-соединения WebRTC Chromium ведёт через настроенный прокси.
+  try {
+    var RPC0 = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if (RPC0 && !RPC0.__omniWrapped) {
+      var hnw = (location.hostname || '').toLowerCase();
+      var gfnHost = /(^|\.)(geforcenow\.com|nvidiagrid\.net|nvidia\.com|geforce\.com)$/.test(hnw);
+      var tcpOnly = gfnHost || (function(){ try { return !!(window.OmniMedia && OmniMedia.webrtcTcp && OmniMedia.webrtcTcp()); } catch (e) { return false; } })();
+      var rsay = function(m){ try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('WebRTC: ' + m); } catch (e) {} };
+      var candProto = function(c){ var p = String(c || '').replace(/^a=/, '').split(' '); return p.length > 2 ? p[2].toLowerCase() : ''; };
+      var isUdpCand = function(c){ return candProto(c) === 'udp'; };
+      var stripUdp = function(sdp){ return String(sdp || '').split(/\r\n|\n/).filter(function(l){ return !(l.indexOf('a=candidate:') === 0 && isUdpCand(l)); }).join('\r\n'); };
+      var countSdp = function(st, sdp){ String(sdp || '').split(/\r\n|\n/).forEach(function(l){ if (l.indexOf('a=candidate:') === 0) { if (isUdpCand(l)) st.ru++; else st.rt++; } }); };
+      var P = RPC0.prototype;
+      var origAEL = P.addEventListener;
+      var pcCount = 0;
+      var Wrapped = function(cfg){
+        var pc = new RPC0(cfg);
+        var id = ++pcCount;
+        var st = { lu: 0, lt: 0, lr: 0, ru: 0, rt: 0, logged: {} };
+        pc.__omniSt = st;
+        try { rsay('#' + id + ' создано · ICE-серверов: ' + ((cfg && cfg.iceServers) ? cfg.iceServers.length : 0) + ' · политика: ' + ((cfg && cfg.iceTransportPolicy) || 'all') + (tcpOnly ? ' · режим «только через прокси (TCP)»' : '')); } catch (e) {}
+        origAEL.call(pc, 'icecandidate', function(e){
+          try {
+            var c = e.candidate && e.candidate.candidate;
+            if (!c) { rsay('#' + id + ' свои кандидаты: udp ' + st.lu + ', tcp ' + st.lt + ', relay ' + st.lr + (tcpOnly ? ' (udp странице не отдаём)' : '')); return; }
+            if (isUdpCand(c)) st.lu++; else st.lt++;
+            if (c.indexOf(' typ relay') >= 0) st.lr++;
+          } catch (x) {}
+        });
+        origAEL.call(pc, 'iceconnectionstatechange', function(){
+          try {
+            var s = pc.iceConnectionState;
+            if (s !== 'connected' && s !== 'completed' && s !== 'failed' && s !== 'disconnected' && s !== 'closed') return;
+            if (st.logged[s]) return; st.logged[s] = 1;
+            pc.getStats().then(function(r){
+              var pair = null, cands = {};
+              r.forEach(function(v){ if (v.type === 'local-candidate' || v.type === 'remote-candidate') cands[v.id] = v; });
+              r.forEach(function(v){ if (v.type === 'candidate-pair' && (v.selected || v.nominated || v.state === 'succeeded') && (!pair || (v.bytesReceived || 0) > (pair.bytesReceived || 0))) pair = v; });
+              var d = function(c){ return c ? ((c.candidateType || '?') + '/' + (c.protocol || '?') + ' ' + (c.address || c.ip || '') + ':' + (c.port || '')) : '?'; };
+              rsay('#' + id + ' ICE ' + s + (pair ? ' · пара: ' + d(cands[pair.localCandidateId]) + ' → ' + d(cands[pair.remoteCandidateId]) : ' · рабочей пары нет') + ' · удалённые кандидаты: udp ' + st.ru + ', tcp ' + st.rt);
+            }).catch(function(){ rsay('#' + id + ' ICE ' + s); });
+          } catch (x) {}
+        });
+        return pc;
+      };
+      Wrapped.prototype = P; Wrapped.__omniWrapped = true;
+      try { Wrapped.generateCertificate = RPC0.generateCertificate.bind(RPC0); } catch (e) {}
+      var origAdd = P.addIceCandidate, origSetRemote = P.setRemoteDescription;
+      P.addIceCandidate = function(c){
+        try {
+          var st = this.__omniSt; var line = c && (typeof c === 'string' ? c : c.candidate);
+          if (st && line) { if (isUdpCand(line)) st.ru++; else st.rt++; }
+          if (tcpOnly && line && isUdpCand(line)) { var cb = arguments[1]; if (typeof cb === 'function') { try { cb(); } catch (e) {} } return Promise.resolve(); }
+        } catch (e) {}
+        return origAdd.apply(this, arguments);
+      };
+      P.setRemoteDescription = function(desc){
+        try {
+          var st = this.__omniSt;
+          if (desc && desc.sdp) {
+            if (st) countSdp(st, desc.sdp);
+            if (tcpOnly) { var a = Array.prototype.slice.call(arguments); a[0] = { type: desc.type, sdp: stripUdp(desc.sdp) }; return origSetRemote.apply(this, a); }
+          }
+        } catch (e) {}
+        return origSetRemote.apply(this, arguments);
+      };
+      if (tcpOnly) {
+        var wrapHandler = function(fn){ return (typeof fn === 'function') ? function(e){ if (e && e.candidate && e.candidate.candidate && isUdpCand(e.candidate.candidate)) return; return fn.apply(this, arguments); } : fn; };
+        P.addEventListener = function(type, fn, opt){ if (type === 'icecandidate') { var w = wrapHandler(fn); if (fn && w !== fn) { try { fn.__omniW = w; } catch (e) {} } return origAEL.call(this, type, w, opt); } return origAEL.call(this, type, fn, opt); };
+        var origREL = P.removeEventListener;
+        P.removeEventListener = function(type, fn, opt){ return origREL.call(this, type, (fn && fn.__omniW) || fn, opt); };
+        var dOn = Object.getOwnPropertyDescriptor(P, 'onicecandidate');
+        if (dOn && dOn.set) Object.defineProperty(P, 'onicecandidate', { configurable: true, get: dOn.get, set: function(fn){ dOn.set.call(this, wrapHandler(fn)); } });
+        ['localDescription', 'currentLocalDescription', 'pendingLocalDescription'].forEach(function(name){
+          var dd = Object.getOwnPropertyDescriptor(P, name);
+          if (dd && dd.get) Object.defineProperty(P, name, { configurable: true, get: function(){ var v = dd.get.call(this); if (!v || !v.sdp) return v; try { return new RTCSessionDescription({ type: v.type, sdp: stripUdp(v.sdp) }); } catch (e) { return v; } } });
+        });
+      }
+      window.RTCPeerConnection = Wrapped;
+      try { window.webkitRTCPeerConnection = Wrapped; } catch (e) {}
+    }
+  } catch (e) {}
   try {
     var last = null;
     var report = function(){
@@ -550,6 +635,9 @@ class OmniMediaBridge(private val tab: BrowserTabModel) {
     /** v4.9.0: включён ли автозапуск следующего видео (настройка браузера). */
     @JavascriptInterface
     fun autoNext(): Boolean = MediaPositions.autoNext
+
+    @JavascriptInterface
+    fun webrtcTcp(): Boolean = MediaPositions.webrtcTcpAll
 
     @JavascriptInterface
     fun state(playing: Boolean) {
