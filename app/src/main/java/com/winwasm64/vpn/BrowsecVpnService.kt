@@ -2533,7 +2533,7 @@ object BrowsecLocalProxyServer {
     }
 
     /** v4.10.7: пакет-владелец UDP-сокета приложения (Android 10+), для диагностики WebRTC в журнале. */
-    private fun udpOwnerPackage(appPort: Int, remoteIp: Int, remotePort: Int): String? {
+    fun udpOwnerPackage(appPort: Int, remoteIp: Int, remotePort: Int): String? {
         val ctx = BrowsecVpnService.appContext ?: return null
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         return try {
@@ -3760,7 +3760,7 @@ class BrowsecVpnService : VpnService() {
                     st.recordTx(tx)
                     st.recordRx(rx)
                 },
-                udpOwner = { appPort, remoteIp, remotePort -> udpOwnerPackage(appPort, remoteIp, remotePort) }
+                udpOwner = { appPort, remoteIp, remotePort -> BrowsecLocalProxyServer.udpOwnerPackage(appPort, remoteIp, remotePort) }
             )
             tunEngine = engine
             engine.start()
