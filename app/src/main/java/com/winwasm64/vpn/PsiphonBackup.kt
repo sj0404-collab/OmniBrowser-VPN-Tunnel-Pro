@@ -198,8 +198,11 @@ object PsiphonBackup {
         o.put("DataRootDirectory", dir.absolutePath)
         o.put("DataStoreDirectory", dir.absolutePath)
         o.put("UseIndistinguishableTLS", true)
-        o.put("LocalHttpProxyPort", HTTP_PORT)
-        o.put("LocalSocksProxyPort", SOCKS_PORT)
+        // v4.10.8: порты 0 — библиотека сама берёт свободные (фиксированные 8921/8922 оставались занятыми
+        // предыдущим экземпляром при быстром перезапуске → «bind: address already in use», Psiphon не стартовал).
+        // Реальные порты приходят в onListeningHttpProxyPort / onListeningSocksProxyPort.
+        o.put("LocalHttpProxyPort", 0)
+        o.put("LocalSocksProxyPort", 0)
         o.put("EgressRegion", region)
         // v4.4.6: по журналу 4.4.5 — при активном VPN приложений Android отдаёт библиотеке DNS нашего же TUN (10.215.173.2),
         // недостижимый из процесса браузера: падали meek/tactics/список серверов. Резолвим через публичные DNS.
