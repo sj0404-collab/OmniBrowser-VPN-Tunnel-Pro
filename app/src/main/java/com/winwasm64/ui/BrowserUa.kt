@@ -24,7 +24,25 @@ object BrowserUa {
         val ua = def.replace(Regex("; wv\\)"), ")").replace(Regex("\\s*Version/\\d+(\\.\\d+)*"), "")
             .replace(Regex("\\s{2,}"), " ").trim()
         cachedMobile = ua
+        logEngineOnce(context, def)
         return ua
+    }
+
+    @Volatile private var engineLogged = false
+
+    /** v4.10.7: версия движка в журнале — WebRTC/DTLS зависят от неё (Chromium 127 в Lemur = DTLS 1.2; свежий Chromium = DTLS 1.3 + ML-KEM). */
+    private fun logEngineOnce(context: Context, defaultUa: String) {
+        if (engineLogged) return
+        engineLogged = true
+        try {
+            val pkg = androidx.webkit.WebViewCompat.getCurrentWebViewPackage(context)
+            val major = chromeVersion(defaultUa).first
+            com.winwasm64.vpn.VpnLog.i(
+                "Браузер",
+                "движок WebView: ${pkg?.packageName ?: "неизвестен"} ${pkg?.versionName ?: ""} (Chromium $major; для сравнения Lemur Browser — Chromium 127)"
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     private fun chromeVersion(ua: String): Pair<String, String> {

@@ -28,7 +28,9 @@ class TransparentTunEngine(
     private val listenerPort: Int,
     private val protectDatagram: (DatagramSocket) -> Unit,
     private val onDnsQuery: (packet: ByteArray, len: Int, ihl: Int, out: OutputStream) -> Unit,
-    private val onUdpTraffic: (tx: Long, rx: Long) -> Unit
+    private val onUdpTraffic: (tx: Long, rx: Long) -> Unit,
+    /** v4.10.7: подпись приложения-владельца UDP-потока (для диагностики WebRTC); null → «приложение». */
+    private val udpOwner: (appPort: Int, remoteIp: Int, remotePort: Int) -> String? = { _, _, _ -> null }
 ) {
     companion object {
         @Volatile
@@ -46,7 +48,7 @@ class TransparentTunEngine(
 
     private data class UdpKey(val appPort: Int, val remoteIp: Int, val remotePort: Int)
 
-    private class UdpFlow(val sock: DatagramSocket) {
+    private class UdpFlow(val sock: DatagramSocket, val probe: UdpFlowProbe) {
         @Volatile
         var lastActive: Long = System.currentTimeMillis()
     }
@@ -221,7 +223,8 @@ class TransparentTunEngine(
             } catch (_: Exception) {
                 return
             }
-            val created = UdpFlow(sock)
+            val remoteLabel = TunPackets.ipToInet(dst).hostAddress + ":" + dport
+            val created = UdpFlow(sock, UdpFlowProbe(remoteLabel) { VpnLog.label(udpOwner(sport, dst, dport)) })
             val prev = udpFlows.putIfAbsent(k, created)
             if (prev != null) {
                 try { sock.close() } catch (_: Exception) {}
@@ -235,6 +238,7 @@ class TransparentTunEngine(
             flow.sock.send(DatagramPacket(buf, payloadOff, payloadLen, TunPackets.ipToInet(dst), dport))
             flow.lastActive = System.currentTimeMillis()
             onUdpTraffic(payloadLen.toLong(), 0L)
+            try { flow.probe.onTx(buf, payloadOff, payloadLen) } catch (_: Throwable) {}
         } catch (_: Exception) {
         }
     }
@@ -249,11 +253,13 @@ class TransparentTunEngine(
                         pkt.length = rbuf.size
                         flow.sock.receive(pkt)
                     } catch (_: SocketTimeoutException) {
+                        try { flow.probe.tick() } catch (_: Throwable) {}
                         continue
                     }
                     flow.lastActive = System.currentTimeMillis()
                     val fromIp = TunPackets.inetToIp(pkt.address)
                     if (fromIp == 0) continue
+                    try { flow.probe.onRx(rbuf, 0, pkt.length); flow.probe.tick() } catch (_: Throwable) {}
                     val out = TunPackets.buildUdpV4(fromIp, pkt.port, TunPackets.TUN_IP, k.appPort, rbuf, 0, pkt.length)
                     writePacket(out, 0, out.size)
                     onUdpTraffic(0L, pkt.length.toLong())
@@ -262,6 +268,7 @@ class TransparentTunEngine(
             } finally {
                 udpFlows.remove(k, flow)
                 try { flow.sock.close() } catch (_: Exception) {}
+                try { flow.probe.onClose() } catch (_: Throwable) {}
             }
         }
     }

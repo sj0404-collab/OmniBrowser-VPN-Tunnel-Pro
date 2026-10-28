@@ -2532,6 +2532,28 @@ object BrowsecLocalProxyServer {
         return null
     }
 
+    /** v4.10.7: пакет-владелец UDP-сокета приложения (Android 10+), для диагностики WebRTC в журнале. */
+    private fun udpOwnerPackage(appPort: Int, remoteIp: Int, remotePort: Int): String? {
+        val ctx = BrowsecVpnService.appContext ?: return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        return try {
+            val cm = ctx.getSystemService(ConnectivityManager::class.java)
+            val uid = cm?.getConnectionOwnerUid(
+                OsConstants.IPPROTO_UDP,
+                InetSocketAddress(TunPackets.ipToInet(TunPackets.TUN_IP), appPort),
+                InetSocketAddress(TunPackets.ipToInet(remoteIp), remotePort)
+            ) ?: -1
+            if (uid < 0) return null
+            uidPackageCache[uid] ?: run {
+                val routed = BrowsecVpnService.routedPackages
+                val pkgs = ctx.packageManager.getPackagesForUid(uid) ?: emptyArray()
+                (pkgs.firstOrNull { routed.contains(it) } ?: pkgs.firstOrNull())?.also { uidPackageCache[uid] = it }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun profileForLoopbackClient(client: Socket): AppTunnelProfile? = try {
         profileForConnection(
             InetSocketAddress(client.inetAddress, client.port),
@@ -3737,7 +3759,8 @@ class BrowsecVpnService : VpnService() {
                     val st = BrowsecLocalProxyServer.activeServerState()
                     st.recordTx(tx)
                     st.recordRx(rx)
-                }
+                },
+                udpOwner = { appPort, remoteIp, remotePort -> udpOwnerPackage(appPort, remoteIp, remotePort) }
             )
             tunEngine = engine
             engine.start()
