@@ -991,6 +991,9 @@ function alert(){}
     @Volatile private var stickyUp: Upstream? = null
     @Volatile private var stickyAt: Long = 0L
     private fun setSticky(up: Upstream) {
+        // v4.10.4: только серверы общего списка (tunnelServers). Прокси, который PAC даёт отдельному сайту (browsec.com → gr21,
+        // требует логин/пароль), «сервером сессии» становиться не должен — иначе все остальные сайты получают 407.
+        if (up.type == "DIRECT" || (tunnelServers.isNotEmpty() && tunnelServers.none { it.key == up.key })) return
         val prev = stickyUp
         stickyUp = up
         stickyAt = SystemClock.elapsedRealtime()
@@ -1086,7 +1089,11 @@ function alert(){}
             }
             val nextTick = minOf(deadline, if (!liveStarted) liveAt else if (!autoStarted) stage1At else if (!directStarted) stage2At else deadline)
             val r = results.poll(maxOf(20L, nextTick - now), TimeUnit.MILLISECONDS) ?: continue
-            val sock = r.sock ?: continue
+            if (r.sock == null) {
+                if (sticky != null && r.up?.key == sticky.key) { stickyUp = null } // v4.10.4: сервер сессии не ответил — забываем его
+                continue
+            }
+            val sock = r.sock
             won.set(true)
             drainAndClose(results)
             when (r.kind) {
