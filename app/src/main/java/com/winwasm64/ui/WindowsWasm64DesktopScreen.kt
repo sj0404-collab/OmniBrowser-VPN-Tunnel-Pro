@@ -159,6 +159,8 @@ class BrowserTabModel(
     var proxyRepairCount by mutableIntStateOf(0)
     /** v4.3.0: на странице замечено видео/аудио — показываем плавающую кнопку «Скачать». */
     var hasMedia by mutableStateOf(false)
+    /** v4.9.2: «Версия для ПК» только для этой вкладки (меню → «Открыть в версии для ПК»). */
+    var desktopSite by mutableStateOf(false)
     @Volatile var mediaPlaying: Boolean = false // v4.2.0: во вкладке играет видео/аудио
     var webView: WebView? = null
     val numericId: Int = BrowserSessionVault.nextNumericId()
@@ -762,7 +764,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         try { wv.evaluateJavascript(MediaGrabber.SNIFF_SCRIPT, null) } catch (_: Exception) {}
     }
 
-    fun uaFor(url: String?): String? = if (desktopMode || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
+    fun uaFor(url: String?, tab: BrowserTabModel? = null): String? =
+        if (desktopMode || tab?.desktopSite == true || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
 
     fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
         val target = normalizeInputToUrl(rawInput)
@@ -791,7 +794,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        wv.settings.userAgentString = uaFor(target)
+        wv.settings.userAgentString = uaFor(target, tab)
         val extraHeaders = buildMap {
             put("X-Forwarded-For", nodeInfo.remoteIp)
             put("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
@@ -1205,10 +1208,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         return true
                     }
                     if (view != null && request.isForMainFrame) {
-                        val wantDesktop = uaFor(nextUrl) != null
+                        val wantDesktop = uaFor(nextUrl, tab) != null
                         val isDesktop = view.settings.userAgentString == ExtensionStore.DESKTOP_UA
                         if (wantDesktop != isDesktop) {
-                            view.settings.userAgentString = uaFor(nextUrl)
+                            view.settings.userAgentString = uaFor(nextUrl, tab)
                             view.loadUrl(nextUrl)
                             return true
                         }
@@ -1586,7 +1589,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         MediaState.activeTabId = current.id
         MediaState.activeMediaPlaying = current.mediaPlaying
         applyTabVisibility(webViewContainer, current)
-        current.webView?.settings?.userAgentString = uaFor(current.url)
+        current.webView?.settings?.userAgentString = uaFor(current.url, current)
         // v4.2.9: активная вкладка держит аудиофокус (системные «pause» игнорирует), остальные — нет
         val playingBg = tabs.filter { it !== current && it.mediaPlaying }.map { "«${it.title.take(30)}»" }
         com.winwasm64.vpn.VpnLog.i("Видео", "переключение на вкладку «${current.title.take(40)}»" +
@@ -1816,7 +1819,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                 // Шторка вкладок
                 if (showTabsSheet) {
-                    OmniSheet(onDismiss = { showTabsSheet = false }) {
+                    OmniSheet(onDismiss = { showTabsSheet = false }, scrollable = false) {
                         TabsSheetContent(
                             tabs = tabs.map { TabRowInfo(it.title, it.url, it.isIncognito, it.isLoading) },
                             activeIndex = activeTabIndex,
@@ -1839,7 +1842,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                 // Шторка расширений Chrome
                 if (showExtensionsSheet) {
-                    OmniSheet(onDismiss = { showExtensionsSheet = false }) {
+                    OmniSheet(onDismiss = { showExtensionsSheet = false }, scrollable = false) {
                         ExtensionsSheetContent(
                             onOpenPopup = { id ->
                                 showExtensionsSheet = false
@@ -1883,7 +1886,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             }
                         }
                     }
-                    OmniSheet(onDismiss = { showAiSheet = false }) {
+                    OmniSheet(onDismiss = { showAiSheet = false }, scrollable = false) {
                         com.winwasm64.ui.browser.AiSheetContent(
                             host = aiHost,
                             onOpenUrl = { u ->
@@ -1961,6 +1964,27 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             showMenuSheet = false
                             copyToClipboard(activeTab.url)
                         })
+                        // v4.9.2: версия для ПК только для текущей вкладки — для сайтов, которые в мобильном виде не открываются
+                        val tabDesktop = activeTab.desktopSite || desktopMode
+                        SheetItem(
+                            OmniIcons.Desktop,
+                            if (tabDesktop) "Открыть в мобильной версии" else "Открыть в версии для ПК",
+                            subtitle = if (tabDesktop) "Эта вкладка сейчас открыта как на компьютере" else "Только эта вкладка: страница перезагрузится как на компьютере",
+                            tint = if (tabDesktop) Omni.Accent else Omni.Text,
+                            onClick = {
+                                showMenuSheet = false
+                                val wv = activeTab.webView
+                                if (desktopMode && !activeTab.desktopSite) {
+                                    desktopMode = false
+                                    persistBrowserSettings()
+                                } else {
+                                    activeTab.desktopSite = !activeTab.desktopSite
+                                }
+                                wv?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
+                                com.winwasm64.vpn.VpnLog.i("Браузер", (if (uaFor(activeTab.url, activeTab) != null) "вкладка открыта в версии для ПК: " else "вкладка вернулась в мобильную версию: ") + activeTab.url.take(80))
+                                wv?.reload()
+                            }
+                        )
                         SheetItem(OmniIcons.Save, "Сохранить страницу офлайн", subtitle = "MHTML целиком: текст, картинки, стили · раздел «История → Загрузки»", onClick = {
                             showMenuSheet = false
                             val wv = activeTab.webView
@@ -1996,9 +2020,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             showMenuSheet = false
                             activeExtensionPopup = "youtube"
                         })
-                        SheetSwitchItem(OmniIcons.Desktop, "Версия для ПК", checked = desktopMode, onCheckedChange = { v ->
+                        SheetSwitchItem(OmniIcons.Desktop, "Версия для ПК для всех вкладок", subtitle = "Для одной страницы — пункт «Открыть в версии для ПК» выше", checked = desktopMode, onCheckedChange = { v ->
                             desktopMode = v
-                            activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url)
+                            activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
                             activeTab.webView?.reload()
                             persistBrowserSettings()
                         })
@@ -2073,7 +2097,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
                 // 5. Панели (VPN, блокировщик, YouTube, закладки, настройки) — единая шторка
                 if (activeExtensionPopup != null) {
-                    OmniSheet(onDismiss = { activeExtensionPopup = null }) {
+                    OmniSheet(onDismiss = { activeExtensionPopup = null }, scrollable = false) {
                         Column(
                             modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -2520,7 +2544,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     }
                                     SettingSwitchRow("Версия для ПК", "Открывать сайты как на компьютере", desktopMode) { v ->
                                         desktopMode = v
-                                        activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url)
+                                        activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
                                         activeTab.webView?.reload()
                                         persistBrowserSettings()
                                     }

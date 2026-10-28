@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -343,7 +345,7 @@ fun OmniBottomBar(selected: Int, items: List<OmniNavItem>, onSelect: (Int) -> Un
 /** Единая шторка снизу для всех меню и панелей. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun OmniSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+fun OmniSheet(onDismiss: () -> Unit, scrollable: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -352,7 +354,10 @@ fun OmniSheet(onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit
         contentColor = Omni.Text,
         dragHandle = { BottomSheetDefaults.DragHandle(color = Omni.Outline) }
     ) {
-        Column(Modifier.fillMaxWidth().padding(bottom = 16.dp), content = content)
+        // v4.9.2: содержимое длиннее экрана прокручивается (раньше меню обрезалось снизу); шторки со своим
+        // LazyColumn/прокруткой передают scrollable = false.
+        val m = if (scrollable) Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 16.dp) else Modifier.fillMaxWidth().padding(bottom = 16.dp)
+        Column(m, content = content)
     }
 }
 
