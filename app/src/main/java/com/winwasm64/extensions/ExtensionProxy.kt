@@ -984,6 +984,19 @@ function alert(){}
 
     private class RaceResult(val sock: Pair<Socket, InputStream>?, val kind: Int, val up: Upstream?)
 
+    // v4.10.2: «сервер сессии» браузера. Chrome с PAC Browsec держит все соединения на одном прокси (один внешний IP),
+    // а наша гонка выбирала победителя на каждое соединение — внешний IP скакал между lt94/lv115/…, и сервисы, которые
+    // сверяют IP сессии (GeForce NOW → 0x00000157, вход Google, банки), ломались. Теперь последний выигравший сервер
+    // стартует первым с форой 1,2 с; остальные подключаются к гонке, только если он не ответил.
+    @Volatile private var stickyUp: Upstream? = null
+    @Volatile private var stickyAt: Long = 0L
+    private fun setSticky(up: Upstream) {
+        val prev = stickyUp
+        stickyUp = up
+        stickyAt = SystemClock.elapsedRealtime()
+        if (prev?.key != up.key) com.winwasm64.vpn.VpnLog.i("Браузер", "сервер сессии браузера: ${up.key.substringBefore('.')} — все соединения через один выход, пока он отвечает")
+    }
+
     /**
      * Ступенчатая гонка маршрутов (v4.1.1). WebView ждёт ответ на CONNECT около 10 с, поэтому:
      *  t=0      — до двух серверов расширения из PAC параллельно (пропуская «упавшие»);
@@ -1032,11 +1045,18 @@ function alert(){}
 
         val t0 = SystemClock.elapsedRealtime()
         val deadline = t0 + 9_500L
+        // v4.10.2: ступень «сервер сессии» — прошлый победитель один, с форой
+        val sticky = stickyUp?.takeIf { s -> t0 - stickyAt < 20 * 60_000L && !isDown(s) && (tunnelDownUntil[s.key] ?: 0L) <= t0 }
+        val stickyKind = if (sticky != null && proxies.any { it.key == sticky.key }) 0 else 1
+        if (sticky != null) launch(stickyKind, sticky) { if (sticky.type == "SOCKS5") viaSocks5(sticky, host, port) else viaHttpProxy(sticky, host, port, url) }
         // ступень 0: серверы расширения
-        val live = proxies.filter { !isDown(it) }.take(2)
-        for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
-        val stage1At = if (live.isEmpty()) t0 else t0 + 1_500L
-        var stage2At = if (live.isEmpty()) t0 + 3_000L else t0 + 5_000L
+        val live = proxies.filter { !isDown(it) && it.key != sticky?.key }.take(2)
+        var liveStarted = sticky == null
+        if (liveStarted) for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
+        val shift = if (sticky != null) 1_200L else 0L
+        val liveAt = t0 + shift
+        val stage1At = if (live.isEmpty() && sticky == null) t0 else t0 + 1_500L + shift
+        var stage2At = if (live.isEmpty() && sticky == null) t0 + 3_000L else t0 + 5_000L + shift
         var autoStarted = false
         var directStarted = false
         // v4.2.5: если DNS провайдера подменяет адреса (все заблокированные сайты «резолвятся» в один IP фильтра), прямой путь
@@ -1046,7 +1066,11 @@ function alert(){}
         while (true) {
             val poisoned = poisonedNow()
             val now = SystemClock.elapsedRealtime()
-            if (!autoStarted && (now >= stage1At || pending.get() == 0)) {
+            if (!liveStarted && (now >= liveAt || pending.get() == 0)) {
+                liveStarted = true
+                for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
+            }
+            if (!autoStarted && liveStarted && (now >= stage1At || pending.get() == 0)) {
                 autoStarted = true
                 for (p in autoTunnelCandidates(3, host)) launch(1, p) { viaHttpProxy(p, host, port, url) }
                 if (pending.get() == 0) stage2At = now
@@ -1060,14 +1084,14 @@ function alert(){}
                 drainAndClose(results)
                 return null
             }
-            val nextTick = minOf(deadline, if (!autoStarted) stage1At else if (!directStarted) stage2At else deadline)
+            val nextTick = minOf(deadline, if (!liveStarted) liveAt else if (!autoStarted) stage1At else if (!directStarted) stage2At else deadline)
             val r = results.poll(maxOf(20L, nextTick - now), TimeUnit.MILLISECONDS) ?: continue
             val sock = r.sock ?: continue
             won.set(true)
             drainAndClose(results)
             when (r.kind) {
-                0 -> noteUpstreamOk(r.up!!, host)
-                1 -> noteAutoTunnel(r.up!!, host)
+                0 -> { noteUpstreamOk(r.up!!, host); setSticky(r.up) }
+                1 -> { noteAutoTunnel(r.up!!, host); setSticky(r.up) }
                 else -> if (!hasDirectInRoute) noteFallback(host)
             }
             return sock

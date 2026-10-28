@@ -13,8 +13,9 @@ object DirectSites {
     private const val PREFS = "omni_browser_v21_prefs"
     private const val KEY = "direct_sites"
 
-    /** Встроенные: GeForce NOW и серверы NVIDIA. */
-    private val builtIn = setOf("geforcenow.com", "nvidiagrid.net", "nvidia.com", "gfn.run")
+    /** v4.10.2: встроенных правил нет — GeForce NOW через Browsec работает (как в Lemur), а напрямую у многих закрыт.
+     *  Список полностью под управлением пользователя (переключатель в меню). */
+    private val builtIn = emptySet<String>()
 
     @Volatile private var user: Set<String> = emptySet()
     @Volatile private var appContext: Context? = null
@@ -41,7 +42,7 @@ object DirectSites {
     fun isDirect(host: String, port: Int): Boolean {
         val h = host.lowercase().trimEnd('.')
         if (h.isEmpty()) return false
-        if (h.all { it.isDigit() || it == '.' }) return port != 80 && port != 443
+        if (h.all { it.isDigit() || it == '.' }) return h in user // IP-адреса — только если добавлены явно (v4.10.2)
         for (d in builtIn) if (h == d || h.endsWith(".$d")) return true
         val u = user
         for (d in u) if (h == d || h.endsWith(".$d")) return true
