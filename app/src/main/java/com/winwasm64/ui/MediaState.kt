@@ -102,61 +102,78 @@ object MediaState {
       };
     }
   } catch (e) {}
-  // v4.10.3: WebRTC — диагностика в журнал и режим «только через прокси (TCP)». Chrome с Browsec (блокировка WebRTC)
-  // ставит disable_non_proxied_udp: медиа идёт не по UDP с домашнего IP, а TCP/relay через прокси — так GeForce NOW
-  // видит один и тот же IP у сессии и потока. В WebView такой политики нет — эмулируем: UDP-кандидаты (свои и удалённые)
-  // отбрасываем, остаются TCP/relay, а TCP-соединения WebRTC Chromium ведёт через настроенный прокси.
+  // v4.10.3/4.10.5: WebRTC — диагностика в журнал и режим «только через прокси (TCP)» (по переключателю в настройках).
+  // Для GeForce NOW режим НЕ включаем: GFN требует UDP (с блокировкой WebRTC даёт 0xC0F2220F) — проверено 4.10.3.
   try {
     var RPC0 = window.RTCPeerConnection || window.webkitRTCPeerConnection;
     if (RPC0 && !RPC0.__omniWrapped) {
-      var hnw = (location.hostname || '').toLowerCase();
-      var gfnHost = /(^|\.)(geforcenow\.com|nvidiagrid\.net|nvidia\.com|geforce\.com)$/.test(hnw);
-      var tcpOnly = gfnHost || (function(){ try { return !!(window.OmniMedia && OmniMedia.webrtcTcp && OmniMedia.webrtcTcp()); } catch (e) { return false; } })();
+      var tcpOnly = (function(){ try { return !!(window.OmniMedia && OmniMedia.webrtcTcp && OmniMedia.webrtcTcp()); } catch (e) { return false; } })();
       var rsay = function(m){ try { if (window.OmniMedia && OmniMedia.trace) OmniMedia.trace('WebRTC: ' + m); } catch (e) {} };
       var candProto = function(c){ var p = String(c || '').replace(/^a=/, '').split(' '); return p.length > 2 ? p[2].toLowerCase() : ''; };
+      var candType = function(c){ var m = String(c || '').match(/ typ ([a-z]+)/); return m ? m[1] : '?'; };
+      var candAddr = function(c){ var p = String(c || '').replace(/^a=/, '').split(' '); return p.length > 5 ? (p[4] + ':' + p[5]) : ''; };
       var isUdpCand = function(c){ return candProto(c) === 'udp'; };
       var stripUdp = function(sdp){ return String(sdp || '').split(/\r\n|\n/).filter(function(l){ return !(l.indexOf('a=candidate:') === 0 && isUdpCand(l)); }).join('\r\n'); };
-      var countSdp = function(st, sdp){ String(sdp || '').split(/\r\n|\n/).forEach(function(l){ if (l.indexOf('a=candidate:') === 0) { if (isUdpCand(l)) st.ru++; else st.rt++; } }); };
+      var sdpSummary = function(sdp){
+        var lines = String(sdp || '').split(/\r\n|\n/); var udp = 0, tcp = 0, m = [], codecs = {}, first = '';
+        lines.forEach(function(l){
+          if (l.indexOf('a=candidate:') === 0) { if (isUdpCand(l)) { udp++; if (!first) first = candType(l) + '/udp ' + candAddr(l); } else tcp++; }
+          else if (l.indexOf('m=') === 0) m.push(l.split(' ')[0].slice(2));
+          else if (l.indexOf('a=rtpmap:') === 0) { var c = l.split(' ')[1]; if (c) codecs[c.split('/')[0]] = 1; }
+        });
+        return 'медиа ' + (m.join('+') || '-') + ' · кандидаты udp ' + udp + ', tcp ' + tcp + (first ? ' (' + first + ')' : '') + ' · кодеки ' + (Object.keys(codecs).join(',') || '-');
+      };
       var P = RPC0.prototype;
       var origAEL = P.addEventListener;
       var pcCount = 0;
       var Wrapped = function(cfg){
         var pc = new RPC0(cfg);
-        var id = ++pcCount;
-        var st = { lu: 0, lt: 0, lr: 0, ru: 0, rt: 0, logged: {} };
-        pc.__omniSt = st;
+        var id = ++pcCount; var t0 = Date.now();
+        var st = { lu: 0, lt: 0, lr: 0, ru: 0, rt: 0, logged: {}, first: '' };
+        pc.__omniSt = st; pc.__omniId = id; pc.__omniT0 = t0;
+        var ago = function(){ return Math.round((Date.now() - t0) / 100) / 10 + ' с'; };
         try { rsay('#' + id + ' создано · ICE-серверов: ' + ((cfg && cfg.iceServers) ? cfg.iceServers.length : 0) + ' · политика: ' + ((cfg && cfg.iceTransportPolicy) || 'all') + (tcpOnly ? ' · режим «только через прокси (TCP)»' : '')); } catch (e) {}
         origAEL.call(pc, 'icecandidate', function(e){
           try {
             var c = e.candidate && e.candidate.candidate;
-            if (!c) { rsay('#' + id + ' свои кандидаты: udp ' + st.lu + ', tcp ' + st.lt + ', relay ' + st.lr + (tcpOnly ? ' (udp странице не отдаём)' : '')); return; }
+            if (!c) { rsay('#' + id + ' свои кандидаты собраны за ' + ago() + ': udp ' + st.lu + ', tcp ' + st.lt + ', relay ' + st.lr + (st.first ? ' · первый: ' + st.first : '') + (tcpOnly ? ' (udp странице не отдаём)' : '')); return; }
             if (isUdpCand(c)) st.lu++; else st.lt++;
             if (c.indexOf(' typ relay') >= 0) st.lr++;
+            if (!st.first) st.first = candType(c) + '/' + candProto(c) + ' ' + candAddr(c);
           } catch (x) {}
         });
+        origAEL.call(pc, 'icegatheringstatechange', function(){ try { if (pc.iceGatheringState === 'gathering') rsay('#' + id + ' сбор кандидатов начат (' + ago() + ')'); } catch (x) {} });
+        origAEL.call(pc, 'track', function(e){ try { var tr = e.track; rsay('#' + id + ' получен трек ' + (tr ? tr.kind : '?') + ' (' + ago() + ')'); } catch (x) {} });
+        var statsLine = function(label){
+          pc.getStats().then(function(r){
+            var pair = null, cands = {}, inbound = [];
+            r.forEach(function(v){ if (v.type === 'local-candidate' || v.type === 'remote-candidate') cands[v.id] = v; });
+            r.forEach(function(v){ if (v.type === 'candidate-pair' && (v.selected || v.nominated || v.state === 'succeeded' || v.state === 'in-progress') && (!pair || (v.bytesReceived || 0) > (pair.bytesReceived || 0))) pair = v; });
+            r.forEach(function(v){ if (v.type === 'inbound-rtp') inbound.push((v.kind || v.mediaType || '?') + ': ' + Math.round((v.bytesReceived || 0) / 1024) + ' КБ, пакетов ' + (v.packetsReceived || 0) + ', потеряно ' + (v.packetsLost || 0) + (v.kind === 'video' ? ', кадров ' + (v.framesDecoded || 0) + ' декодер ' + (v.decoderImplementation || '?') : '')); });
+            var d = function(c){ return c ? ((c.candidateType || '?') + '/' + (c.protocol || '?') + ' ' + (c.address || c.ip || '') + ':' + (c.port || '')) : '?'; };
+            rsay('#' + id + ' ' + label + ' (' + ago() + ')' + (pair ? ' · пара ' + pair.state + ': ' + d(cands[pair.localCandidateId]) + ' → ' + d(cands[pair.remoteCandidateId]) + ' · отправлено ' + Math.round((pair.bytesSent || 0) / 1024) + ' КБ, получено ' + Math.round((pair.bytesReceived || 0) / 1024) + ' КБ' : ' · пары нет') + (inbound.length ? ' · приём: ' + inbound.join('; ') : ''));
+          }).catch(function(e){ rsay('#' + id + ' ' + label + ' (' + ago() + ') · статистика недоступна: ' + e); });
+        };
         origAEL.call(pc, 'iceconnectionstatechange', function(){
           try {
             var s = pc.iceConnectionState;
-            if (s !== 'connected' && s !== 'completed' && s !== 'failed' && s !== 'disconnected' && s !== 'closed') return;
-            if (st.logged[s]) return; st.logged[s] = 1;
-            pc.getStats().then(function(r){
-              var pair = null, cands = {};
-              r.forEach(function(v){ if (v.type === 'local-candidate' || v.type === 'remote-candidate') cands[v.id] = v; });
-              r.forEach(function(v){ if (v.type === 'candidate-pair' && (v.selected || v.nominated || v.state === 'succeeded') && (!pair || (v.bytesReceived || 0) > (pair.bytesReceived || 0))) pair = v; });
-              var d = function(c){ return c ? ((c.candidateType || '?') + '/' + (c.protocol || '?') + ' ' + (c.address || c.ip || '') + ':' + (c.port || '')) : '?'; };
-              rsay('#' + id + ' ICE ' + s + (pair ? ' · пара: ' + d(cands[pair.localCandidateId]) + ' → ' + d(cands[pair.remoteCandidateId]) : ' · рабочей пары нет') + ' · удалённые кандидаты: udp ' + st.ru + ', tcp ' + st.rt);
-            }).catch(function(){ rsay('#' + id + ' ICE ' + s); });
+            if (st.logged['ice' + s]) return; st.logged['ice' + s] = 1;
+            if (s === 'checking' || s === 'new') { rsay('#' + id + ' ICE ' + s + ' (' + ago() + ') · удалённые кандидаты: udp ' + st.ru + ', tcp ' + st.rt); return; }
+            statsLine('ICE ' + s);
+            if (s === 'connected' || s === 'completed') { setTimeout(function(){ try { if (pc.connectionState !== 'closed') statsLine('через 5 с после соединения'); } catch (x) {} }, 5000); setTimeout(function(){ try { if (pc.connectionState !== 'closed') statsLine('через 20 с после соединения'); } catch (x) {} }, 20000); }
           } catch (x) {}
         });
+        origAEL.call(pc, 'connectionstatechange', function(){ try { var s = pc.connectionState; if (s === 'failed' || s === 'disconnected') statsLine('соединение ' + s); } catch (x) {} });
         return pc;
       };
       Wrapped.prototype = P; Wrapped.__omniWrapped = true;
       try { Wrapped.generateCertificate = RPC0.generateCertificate.bind(RPC0); } catch (e) {}
-      var origAdd = P.addIceCandidate, origSetRemote = P.setRemoteDescription;
+      var origAdd = P.addIceCandidate, origSetRemote = P.setRemoteDescription, origClose = P.close;
+      P.close = function(){ try { var st = this.__omniSt; if (st && !st.logged.closed) { st.logged.closed = 1; rsay('#' + this.__omniId + ' закрыто страницей через ' + Math.round((Date.now() - this.__omniT0) / 100) / 10 + ' с · ICE ' + this.iceConnectionState + ', соединение ' + this.connectionState); } } catch (e) {} return origClose.apply(this, arguments); };
       P.addIceCandidate = function(c){
         try {
           var st = this.__omniSt; var line = c && (typeof c === 'string' ? c : c.candidate);
-          if (st && line) { if (isUdpCand(line)) st.ru++; else st.rt++; }
+          if (st && line) { if (isUdpCand(line)) st.ru++; else st.rt++; if (st.ru + st.rt === 1) rsay('#' + this.__omniId + ' первый удалённый кандидат: ' + candType(line) + '/' + candProto(line) + ' ' + candAddr(line)); }
           if (tcpOnly && line && isUdpCand(line)) { var cb = arguments[1]; if (typeof cb === 'function') { try { cb(); } catch (e) {} } return Promise.resolve(); }
         } catch (e) {}
         return origAdd.apply(this, arguments);
@@ -165,7 +182,7 @@ object MediaState {
         try {
           var st = this.__omniSt;
           if (desc && desc.sdp) {
-            if (st) countSdp(st, desc.sdp);
+            if (st) { String(desc.sdp).split(/\r\n|\n/).forEach(function(l){ if (l.indexOf('a=candidate:') === 0) { if (isUdpCand(l)) st.ru++; else st.rt++; } }); rsay('#' + this.__omniId + ' удалённый ' + (desc.type || '?') + ': ' + sdpSummary(desc.sdp)); }
             if (tcpOnly) { var a = Array.prototype.slice.call(arguments); a[0] = { type: desc.type, sdp: stripUdp(desc.sdp) }; return origSetRemote.apply(this, a); }
           }
         } catch (e) {}
