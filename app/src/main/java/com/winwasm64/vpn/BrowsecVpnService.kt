@@ -3732,6 +3732,9 @@ class BrowsecVpnService : VpnService() {
             perAppVpnInterface = pfd
             if (pfd == null) VpnLog.e("Туннель", "Android не создал VPN-интерфейс (нет разрешения VPN или включено другое VPN-приложение)")
             else VpnLog.ok("Туннель", "VPN приложений поднят, профиль $activeCountry: " + VpnLog.appList(routedPackages) + (if (wantTransparent) " · прозрачный режим" else " · режим прокси"))
+            // v4.10.9: явно пишем, пойдут ли приложения через серверы Browsec — иначе «сайт не открылся» в Chrome выглядит как сбой VPN
+            if (!appsViaBrowsecTunnel) VpnLog.w("Туннель", "приложения идут НАПРЯМУЮ через обход DPI: кнопка «Приложения через серверы Browsec» выключена — заблокированные сайты (GeForce NOW, Instagram и т.п.) из приложений не откроются; включите её во вкладке «Приложения»")
+            else if (!com.winwasm64.extensions.ExtensionProxy.appTunnelAvailable()) VpnLog.w("Туннель", "серверы Browsec для приложений пока недоступны (расширение в браузере не поднялось) — временно обход DPI напрямую")
             try { PsiphonBackup.ensureStarted(this, "VPN приложений") } catch (_: Throwable) {}
             if (pfd != null && sessionStartedAt == 0L) {
                 // v4.2.13: точка отсчёта сеанса — время работы и трафик по приложениям покажем при отключении
