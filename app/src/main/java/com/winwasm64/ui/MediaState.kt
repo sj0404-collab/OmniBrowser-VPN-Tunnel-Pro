@@ -118,7 +118,8 @@ object MediaState {
         var lines = String(sdp || '').split(/\r\n|\n/); var udp = 0, tcp = 0, m = [], codecs = {}, first = '';
         lines.forEach(function(l){
           if (l.indexOf('a=candidate:') === 0) { if (isUdpCand(l)) { udp++; if (!first) first = candType(l) + '/udp ' + candAddr(l); } else tcp++; }
-          else if (l.indexOf('m=') === 0) m.push(l.split(' ')[0].slice(2));
+          else if (l.indexOf('m=') === 0) { var mp = l.split(' '); m.push(mp[0].slice(2) + (mp[1] === '0' ? '(откл.)' : '')); }
+          else if (l.indexOf('a=setup:') === 0) codecs['dtls-' + l.slice(8)] = 1;
           else if (l.indexOf('a=rtpmap:') === 0) { var c = l.split(' ')[1]; if (c) codecs[c.split('/')[0]] = 1; }
         });
         return 'медиа ' + (m.join('+') || '-') + ' · кандидаты udp ' + udp + ', tcp ' + tcp + (first ? ' (' + first + ')' : '') + ' · кодеки ' + (Object.keys(codecs).join(',') || '-');
@@ -126,12 +127,15 @@ object MediaState {
       var P = RPC0.prototype;
       var origAEL = P.addEventListener;
       var pcCount = 0;
+      var capsLogged = false;
+      var logCaps = function(){ if (capsLogged) return; capsLogged = true; try { var v = (window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities) ? RTCRtpReceiver.getCapabilities('video') : null; var names = {}; ((v && v.codecs) || []).forEach(function(c){ names[String(c.mimeType || '').replace('video/', '')] = 1; }); rsay('декодеры видео WebView: ' + (Object.keys(names).join(',') || 'нет данных')); } catch (e) {} };
       var Wrapped = function(cfg){
         var pc = new RPC0(cfg);
         var id = ++pcCount; var t0 = Date.now();
         var st = { lu: 0, lt: 0, lr: 0, ru: 0, rt: 0, logged: {}, first: '' };
         pc.__omniSt = st; pc.__omniId = id; pc.__omniT0 = t0;
         var ago = function(){ return Math.round((Date.now() - t0) / 100) / 10 + ' с'; };
+        logCaps();
         try { rsay('#' + id + ' создано · ICE-серверов: ' + ((cfg && cfg.iceServers) ? cfg.iceServers.length : 0) + ' · политика: ' + ((cfg && cfg.iceTransportPolicy) || 'all') + (tcpOnly ? ' · режим «только через прокси (TCP)»' : '')); } catch (e) {}
         origAEL.call(pc, 'icecandidate', function(e){
           try {
@@ -146,12 +150,13 @@ object MediaState {
         origAEL.call(pc, 'track', function(e){ try { var tr = e.track; rsay('#' + id + ' получен трек ' + (tr ? tr.kind : '?') + ' (' + ago() + ')'); } catch (x) {} });
         var statsLine = function(label){
           pc.getStats().then(function(r){
-            var pair = null, cands = {}, inbound = [];
+            var pair = null, cands = {}, inbound = [], tr = null;
+            r.forEach(function(v){ if (v.type === 'transport') tr = v; });
             r.forEach(function(v){ if (v.type === 'local-candidate' || v.type === 'remote-candidate') cands[v.id] = v; });
             r.forEach(function(v){ if (v.type === 'candidate-pair' && (v.selected || v.nominated || v.state === 'succeeded' || v.state === 'in-progress') && (!pair || (v.bytesReceived || 0) > (pair.bytesReceived || 0))) pair = v; });
             r.forEach(function(v){ if (v.type === 'inbound-rtp') inbound.push((v.kind || v.mediaType || '?') + ': ' + Math.round((v.bytesReceived || 0) / 1024) + ' КБ, пакетов ' + (v.packetsReceived || 0) + ', потеряно ' + (v.packetsLost || 0) + (v.kind === 'video' ? ', кадров ' + (v.framesDecoded || 0) + ' декодер ' + (v.decoderImplementation || '?') : '')); });
             var d = function(c){ return c ? ((c.candidateType || '?') + '/' + (c.protocol || '?') + ' ' + (c.address || c.ip || '') + ':' + (c.port || '')) : '?'; };
-            rsay('#' + id + ' ' + label + ' (' + ago() + ')' + (pair ? ' · пара ' + pair.state + ': ' + d(cands[pair.localCandidateId]) + ' → ' + d(cands[pair.remoteCandidateId]) + ' · отправлено ' + Math.round((pair.bytesSent || 0) / 1024) + ' КБ, получено ' + Math.round((pair.bytesReceived || 0) / 1024) + ' КБ' : ' · пары нет') + (inbound.length ? ' · приём: ' + inbound.join('; ') : ''));
+            rsay('#' + id + ' ' + label + ' (' + ago() + ')' + (pair ? ' · пара ' + pair.state + ': ' + d(cands[pair.localCandidateId]) + ' → ' + d(cands[pair.remoteCandidateId]) + ' · отправлено ' + Math.round((pair.bytesSent || 0) / 1024) + ' КБ, получено ' + Math.round((pair.bytesReceived || 0) / 1024) + ' КБ · STUN: наших запросов ' + (pair.requestsSent || 0) + ', ответов на них ' + (pair.responsesReceived || 0) + ', запросов от сервера ' + (pair.requestsReceived || 0) : ' · пары нет') + (tr ? ' · DTLS ' + (tr.dtlsState || '?') + (tr.dtlsRole ? '/' + tr.dtlsRole : '') + (tr.tlsVersion ? ' ' + tr.tlsVersion : '') + ', пакетов получено ' + (tr.packetsReceived || 0) : '') + (inbound.length ? ' · приём: ' + inbound.join('; ') : ''));
           }).catch(function(e){ rsay('#' + id + ' ' + label + ' (' + ago() + ') · статистика недоступна: ' + e); });
         };
         origAEL.call(pc, 'iceconnectionstatechange', function(){
@@ -168,7 +173,12 @@ object MediaState {
       };
       Wrapped.prototype = P; Wrapped.__omniWrapped = true;
       try { Wrapped.generateCertificate = RPC0.generateCertificate.bind(RPC0); } catch (e) {}
-      var origAdd = P.addIceCandidate, origSetRemote = P.setRemoteDescription, origClose = P.close;
+      var origAdd = P.addIceCandidate, origSetRemote = P.setRemoteDescription, origClose = P.close, origSetLocal = P.setLocalDescription;
+      P.setLocalDescription = function(desc){
+        var self = this; var pr = origSetLocal.apply(this, arguments);
+        try { if (pr && pr.then) pr.then(function(){ try { var ld = self.localDescription; if (ld && ld.sdp && self.__omniSt && !self.__omniSt.logged['local' + ld.type]) { self.__omniSt.logged['local' + ld.type] = 1; rsay('#' + self.__omniId + ' наш ' + ld.type + ': ' + sdpSummary(ld.sdp)); } } catch (e) {} }, function(e){ rsay('#' + self.__omniId + ' setLocalDescription отклонён: ' + e); }); } catch (e) {}
+        return pr;
+      };
       P.close = function(){ try { var st = this.__omniSt; if (st && !st.logged.closed) { st.logged.closed = 1; rsay('#' + this.__omniId + ' закрыто страницей через ' + Math.round((Date.now() - this.__omniT0) / 100) / 10 + ' с · ICE ' + this.iceConnectionState + ', соединение ' + this.connectionState); } } catch (e) {} return origClose.apply(this, arguments); };
       P.addIceCandidate = function(c){
         try {
