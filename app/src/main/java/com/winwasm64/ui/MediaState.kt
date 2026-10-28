@@ -69,6 +69,39 @@ object MediaState {
     const val DOCUMENT_START_SCRIPT = """
 (function(){
   if (window.__omniMediaHooked) return; window.__omniMediaHooked = true;
+  // v4.10.0: маскировка WebView под Chrome там, где WebView не умеет подменять UA Client Hints:
+  // navigator.userAgentData без бренда «Android WebView» и объект window.chrome (GeForce NOW и др. проверяют их).
+  try {
+    var ua0 = navigator.userAgent || '';
+    var isWin = ua0.indexOf('Windows NT') >= 0;
+    var cm = ua0.match(/Chrome\/(\d+)((?:\.\d+)*)/); var maj = cm ? cm[1] : '131'; var full = cm ? (cm[1] + (cm[2] || '.0.0.0')) : '131.0.0.0';
+    var uad = navigator.userAgentData;
+    var needFix = !uad || !uad.brands || uad.brands.some(function(b){ return /WebView/i.test(b.brand || ''); }) || (isWin && (uad.mobile || uad.platform !== 'Windows'));
+    if (needFix) {
+      var brands = [{ brand: 'Chromium', version: maj }, { brand: 'Google Chrome', version: maj }, { brand: 'Not)A;Brand', version: '99' }];
+      var fullList = [{ brand: 'Chromium', version: full }, { brand: 'Google Chrome', version: full }, { brand: 'Not)A;Brand', version: '99.0.0.0' }];
+      var am = ua0.match(/Android (\d+(?:\.\d+)*)/);
+      var low = { brands: brands, mobile: !isWin, platform: isWin ? 'Windows' : 'Android' };
+      var high = { architecture: isWin ? 'x86' : 'arm', bitness: '64', model: '', platformVersion: isWin ? '15.0.0' : (am ? am[1] : '13'), uaFullVersion: full, fullVersionList: fullList, wow64: false, formFactors: [isWin ? 'Desktop' : 'Mobile'] };
+      var data = { brands: brands, mobile: low.mobile, platform: low.platform,
+        getHighEntropyValues: function(hints){ var r = { brands: brands, mobile: low.mobile, platform: low.platform }; (hints || []).forEach(function(h){ if (h in high) r[h] = high[h]; }); return Promise.resolve(r); },
+        toJSON: function(){ return low; } };
+      try { Object.defineProperty(Navigator.prototype, 'userAgentData', { get: function(){ return data; }, configurable: true }); }
+      catch (e) { try { Object.defineProperty(navigator, 'userAgentData', { value: data, configurable: true }); } catch (x) {} }
+    }
+    if (!window.chrome) {
+      var noop = function(){};
+      window.chrome = {
+        app: { isInstalled: false, getDetails: function(){ return null; }, getIsInstalled: function(){ return false; }, installState: function(cb){ if (cb) cb('not_installed'); }, runningState: function(){ return 'cannot_run'; },
+               InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+        runtime: { id: undefined, connect: function(){ return { onMessage: { addListener: noop, removeListener: noop }, onDisconnect: { addListener: noop, removeListener: noop }, postMessage: noop, disconnect: noop }; }, sendMessage: noop,
+                   OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                   PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }, PlatformArch: { ARM: 'arm', ARM64: 'arm64', X86_32: 'x86-32', X86_64: 'x86-64' } },
+        csi: function(){ return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 }; },
+        loadTimes: function(){ return { requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, commitLoadTime: Date.now() / 1000, finishDocumentLoadTime: 0, finishLoadTime: 0, firstPaintTime: 0, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }; }
+      };
+    }
+  } catch (e) {}
   try {
     var last = null;
     var report = function(){

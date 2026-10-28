@@ -764,8 +764,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         try { wv.evaluateJavascript(MediaGrabber.SNIFF_SCRIPT, null) } catch (_: Exception) {}
     }
 
-    fun uaFor(url: String?, tab: BrowserTabModel? = null): String? =
-        if (desktopMode || tab?.desktopSite == true || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else null
+    // v4.10.0: мобильный User-Agent как у Chrome для Android (без «; wv» и «Version/4.0»): сайты вроде GeForce NOW,
+    // Google-вход, Stadia-подобные веб-приложения отказывают «Android WebView», но работают в Chrome/Brave/Edge.
+    val mobileUa = remember { BrowserUa.mobile(context) }
+    fun uaFor(url: String?, tab: BrowserTabModel? = null): String =
+        if (desktopMode || tab?.desktopSite == true || StoreBridge.isStoreUrl(url)) ExtensionStore.DESKTOP_UA else mobileUa
+    /** Ставит UA и подсказки клиента (Sec-CH-UA / navigator.userAgentData) согласованно. */
+    fun applyUa(wv: WebView?, url: String?, tab: BrowserTabModel?) {
+        if (wv == null) return
+        val ua = uaFor(url, tab)
+        if (wv.settings.userAgentString != ua) wv.settings.userAgentString = ua
+        BrowserUa.applyClientHints(wv, ua == ExtensionStore.DESKTOP_UA)
+    }
 
     fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
         val target = normalizeInputToUrl(rawInput)
@@ -794,7 +804,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         persistBrowserSettings()
 
         val wv = tab.webView ?: return
-        wv.settings.userAgentString = uaFor(target, tab)
+        applyUa(wv, target, tab)
         val extraHeaders = buildMap {
             put("X-Forwarded-For", nodeInfo.remoteIp)
             put("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
@@ -1024,6 +1034,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             settings.cacheMode = WebSettings.LOAD_DEFAULT
             settings.textZoom = textZoomPercent
             if (tab.isIncognito) settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            applyUa(this, tab.url, tab) // v4.10.0: UA «как Chrome» с самого первого запроса
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, !blockThirdPartyCookies)
@@ -1134,6 +1145,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                 }
 
+                // v4.10.0: запросы разрешений со страниц: DRM (Widevine) — всегда; микрофон/камера — если выданы приложению
+                override fun onPermissionRequest(request: android.webkit.PermissionRequest?) {
+                    if (request == null) return
+                    try {
+                        val granted = request.resources.filter { r ->
+                            when (r) {
+                                android.webkit.PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID, android.webkit.PermissionRequest.RESOURCE_MIDI_SYSEX -> true
+                                android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE -> androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE -> androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                else -> false
+                            }
+                        }
+                        com.winwasm64.vpn.VpnLog.i("Браузер", "${request.origin?.host ?: "страница"} запросила ${request.resources.joinToString()} → разрешено: ${if (granted.isEmpty()) "ничего" else granted.joinToString()}")
+                        if (granted.isEmpty()) request.deny() else request.grant(granted.toTypedArray())
+                    } catch (_: Exception) { try { request.deny() } catch (_: Exception) {} }
+                }
+
                 override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
                     if (view != null) {
                         fullscreenCustomView = view
@@ -1208,10 +1236,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         return true
                     }
                     if (view != null && request.isForMainFrame) {
-                        val wantDesktop = uaFor(nextUrl, tab) != null
+                        val wantDesktop = uaFor(nextUrl, tab) == ExtensionStore.DESKTOP_UA
                         val isDesktop = view.settings.userAgentString == ExtensionStore.DESKTOP_UA
                         if (wantDesktop != isDesktop) {
-                            view.settings.userAgentString = uaFor(nextUrl, tab)
+                            applyUa(view, nextUrl, tab)
                             view.loadUrl(nextUrl)
                             return true
                         }
@@ -1589,7 +1617,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         MediaState.activeTabId = current.id
         MediaState.activeMediaPlaying = current.mediaPlaying
         applyTabVisibility(webViewContainer, current)
-        current.webView?.settings?.userAgentString = uaFor(current.url, current)
+        applyUa(current.webView, current.url, current)
         // v4.2.9: активная вкладка держит аудиофокус (системные «pause» игнорирует), остальные — нет
         val playingBg = tabs.filter { it !== current && it.mediaPlaying }.map { "«${it.title.take(30)}»" }
         com.winwasm64.vpn.VpnLog.i("Видео", "переключение на вкладку «${current.title.take(40)}»" +
@@ -1668,11 +1696,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             ctrl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             ctrl.hide(WindowInsetsCompat.Type.systemBars())
             act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            try { win.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {} // v4.10.0: экран не гаснет в полноэкранной игре/видео
         }
         onDispose {
             if (act != null && win != null && act.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
                 WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
                 act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                try { win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {}
             }
         }
     }
@@ -1980,8 +2010,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 } else {
                                     activeTab.desktopSite = !activeTab.desktopSite
                                 }
-                                wv?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
-                                com.winwasm64.vpn.VpnLog.i("Браузер", (if (uaFor(activeTab.url, activeTab) != null) "вкладка открыта в версии для ПК: " else "вкладка вернулась в мобильную версию: ") + activeTab.url.take(80))
+                                applyUa(wv, activeTab.url, activeTab)
+                                com.winwasm64.vpn.VpnLog.i("Браузер", (if (uaFor(activeTab.url, activeTab) == ExtensionStore.DESKTOP_UA) "вкладка открыта в версии для ПК: " else "вкладка вернулась в мобильную версию: ") + activeTab.url.take(80))
                                 wv?.reload()
                             }
                         )
@@ -2022,7 +2052,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         })
                         SheetSwitchItem(OmniIcons.Desktop, "Версия для ПК для всех вкладок", subtitle = "Для одной страницы — пункт «Открыть в версии для ПК» выше", checked = desktopMode, onCheckedChange = { v ->
                             desktopMode = v
-                            activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
+                            applyUa(activeTab.webView, activeTab.url, activeTab)
                             activeTab.webView?.reload()
                             persistBrowserSettings()
                         })
@@ -2544,7 +2574,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     }
                                     SettingSwitchRow("Версия для ПК", "Открывать сайты как на компьютере", desktopMode) { v ->
                                         desktopMode = v
-                                        activeTab.webView?.settings?.userAgentString = uaFor(activeTab.url, activeTab)
+                                        applyUa(activeTab.webView, activeTab.url, activeTab)
                                         activeTab.webView?.reload()
                                         persistBrowserSettings()
                                     }
