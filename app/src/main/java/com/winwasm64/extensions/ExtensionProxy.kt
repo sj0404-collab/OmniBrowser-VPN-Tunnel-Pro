@@ -114,6 +114,7 @@ object ExtensionProxy {
 
     fun init(context: Context) {
         appContext = context.applicationContext
+        DirectSites.init(context)
         loadPersisted()
         registerNetworkWatch()
     }
@@ -944,10 +945,13 @@ function alert(){}
                     return
                 }
                 val url = (if (hp.second == 80) "http://" else "https://") + hp.first + "/"
-                val route = pacLookup(url, hp.first) ?: listOf(DIRECT)
+                // v4.10.1: сайты «напрямую» (GeForce NOW и список пользователя) — мимо PAC и закреплённых серверов
+                val forcedDirect = DirectSites.isDirect(hp.first, hp.second)
+                if (forcedDirect) DirectSites.note(hp.first, hp.second)
+                val route = if (forcedDirect) listOf(DIRECT) else (pacLookup(url, hp.first) ?: listOf(DIRECT))
                 // v4.1.1: ступенчатая гонка вместо последовательного перебора — ответ на CONNECT всегда укладывается в ~8 с
                 // v4.3.8: закреплённый за хостом сервер (загрузка видео, привязанного к IP) имеет приоритет
-                val up = pinnedConnect(hp.first, hp.second) ?: raceConnect(route, hp.first, hp.second, url)
+                val up = (if (forcedDirect) null else pinnedConnect(hp.first, hp.second)) ?: raceConnect(route, hp.first, hp.second, url)
                 if (up == null) {
                     com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
                     respond(client, 502, "Proxy Error")
@@ -969,7 +973,8 @@ function alert(){}
                     respond(client, 400, "Bad Request")
                     return
                 }
-                val route = pacLookup(first[1], u.host) ?: listOf(DIRECT)
+                val plainPort = if (u.port > 0) u.port else 80
+                val route = if (DirectSites.isDirect(u.host, plainPort)) { DirectSites.note(u.host, plainPort); listOf(DIRECT) } else (pacLookup(first[1], u.host) ?: listOf(DIRECT))
                 forwardHttp(client, inp, text, u, route)
             }
         } catch (e: Exception) {

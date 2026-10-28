@@ -311,6 +311,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var youtubeBoostEnabled by remember { mutableStateOf(prefs.getBoolean("yt_boost", true)) }
     var devToolsEnabled by remember { mutableStateOf(false) }
     var desktopMode by remember { mutableStateOf(prefs.getBoolean("desktop_mode", false)) }
+    var directSitesVersion by remember { mutableIntStateOf(0) } // v4.10.1: перерисовка пункта «Сайт напрямую»
     var longPressedUrl by remember { mutableStateOf<String?>(null) }
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
@@ -1994,6 +1995,26 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             showMenuSheet = false
                             copyToClipboard(activeTab.url)
                         })
+                        // v4.10.1: сайт напрямую, без VPN браузера (стриминг игр, банки)
+                        val curSite = com.winwasm64.extensions.DirectSites.siteKey(try { Uri.parse(activeTab.url).host } catch (_: Exception) { null })
+                        if (curSite.isNotEmpty()) {
+                            val builtInDirect = com.winwasm64.extensions.DirectSites.isBuiltIn(curSite)
+                            val userDirect = directSitesVersion >= 0 && com.winwasm64.extensions.DirectSites.isUser(curSite)
+                            SheetSwitchItem(
+                                OmniIcons.Globe,
+                                "Сайт напрямую, без VPN браузера",
+                                subtitle = if (builtInDirect) "$curSite всегда идёт напрямую (встроенное правило для стриминга игр)" else if (userDirect) "$curSite и поддомены идут мимо прокси" else "Для $curSite: игровые стримы (GeForce NOW), банки, сайты, которым мешает прокси",
+                                checked = builtInDirect || userDirect,
+                                onCheckedChange = { v ->
+                                    if (!builtInDirect) {
+                                        com.winwasm64.extensions.DirectSites.set(context, curSite, v)
+                                        directSitesVersion++
+                                        showMenuSheet = false
+                                        activeTab.webView?.reload()
+                                    }
+                                }
+                            )
+                        }
                         // v4.9.2: версия для ПК только для текущей вкладки — для сайтов, которые в мобильном виде не открываются
                         val tabDesktop = activeTab.desktopSite || desktopMode
                         SheetItem(
