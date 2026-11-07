@@ -7,38 +7,56 @@ import java.net.Proxy
 import java.net.URL
 
 /**
- * v4.11.0: честная проверка «какой у меня IP» — напрямую и через VPN/прокси браузера.
+ * v4.11.0: честная проверка «какой у меня IP» — без прокси и через VPN/прокси браузера.
  *
- * Зачем: в приложении нигде не было видно внешний IP, поэтому «меняется он или нет» приходилось гадать.
- * Здесь два независимых запроса (без прокси и через локальный прокси браузера), результат сравнивается
- * в [com.winwasm64.vpn.VpnScope.ipCompare].
+ * v4.12.1: запрос «без прокси» по умолчанию идёт В ОБХОД чужого VPN (сокет привязан к физической сети),
+ * пробуется несколько сервисов, и в результат пишется, каким путём получен ответ и почему не вышло,
+ * если не вышло. Без этого на экране оставался адрес чужого VPN без единого намёка на причину.
  */
 object EgressCheck {
 
-    data class Info(val ip: String = "", val where: String = "", val org: String = "", val error: String? = null, val hosting: Boolean = false) {
+    data class Info(
+        val ip: String = "",
+        val where: String = "",
+        val org: String = "",
+        val error: String? = null,
+        val hosting: Boolean = false,
+        /** Каким путём получен ответ: «в обход чужого VPN», «напрямую», «через VPN/прокси». */
+        val source: String = ""
+    ) {
         val ok: Boolean get() = ip.isNotBlank()
         fun label(): String = when {
             !ok -> error ?: "нет ответа"
-            where.isBlank() -> ip
-            else -> "$ip · $where" + (if (org.isNotBlank()) " · $org" else "")
+            else -> ip + (if (where.isNotBlank()) " · $where" else "") + (if (org.isNotBlank()) " · $org" else "")
         }
     }
 
-    private const val PRIMARY = "https://ipinfo.io/json"
-    private const val FALLBACK = "https://api.ipify.org?format=text"
+    private val ENDPOINTS = listOf(
+        "https://ipinfo.io/json",
+        "http://ip-api.com/json/?fields=status,countryCode,country,isp,query",
+        "https://api.ipify.org?format=text"
+    )
 
     /**
-     * IP без прокси — «домашний». v4.12.0: сначала пробуем в ОБХОД чужого VPN
-     * (сокет/соединение привязано к физической сети), иначе показывался бы выход чужого VPN.
+     * «Домашний» IP: сначала в обход чужого VPN (иначе виден выход чужого VPN), при неудаче — обычным путём,
+     * и тогда в [Info.source] честно написано, что обход не сработал.
      */
     fun direct(): Info {
         val bypassed = fetch(useProxy = false, bypassVpn = true)
-        val info = if (bypassed.ok) bypassed else fetch(useProxy = false)
-        VpnLog.i("IP", "без прокси: " + info.label() + (if (bypassed.ok) " (в обход чужого VPN)" else ""))
-        return info
+        if (bypassed.ok) {
+            VpnLog.i("IP", "без прокси (в обход чужого VPN): " + bypassed.label())
+            return bypassed
+        }
+        val plain = fetch(useProxy = false, bypassVpn = false)
+        val out = plain.copy(
+            error = if (plain.ok) null else ("обход не сработал: ${bypassed.error ?: "нет ответа"}; напрямую: ${plain.error ?: "нет ответа"}"),
+            source = if (plain.ok) "напрямую (обход чужого VPN не удался: ${bypassed.error ?: "нет ответа"})" else plain.source
+        )
+        VpnLog.w("IP", "без прокси: " + out.label() + " · " + out.source)
+        return out
     }
 
-    /** IP через локальный прокси браузера (тот, куда смотрит WebView и VPN). */
+    /** IP через локальный прокси браузера (тот, куда смотрят WebView и VPN). */
     fun viaBrowserProxy(): Info {
         val info = fetch(useProxy = true)
         VpnLog.i("IP", "через VPN/прокси: " + info.label())
@@ -46,31 +64,33 @@ object EgressCheck {
     }
 
     private fun fetch(useProxy: Boolean, bypassVpn: Boolean = false): Info {
-        try {
-            val text = if (useProxy) {
-                MediaGrabber.getText(PRIMARY, emptyMap(), 8192)
-            } else {
-                readText(PRIMARY, bypassVpn)
+        val source = when {
+            useProxy -> "через VPN/прокси"
+            bypassVpn -> "в обход чужого VPN"
+            else -> "напрямую"
+        }
+        val errors = ArrayList<String>()
+        for (url in ENDPOINTS) {
+            try {
+                val text = if (useProxy) MediaGrabber.getText(url, emptyMap(), 8192) else readText(url, bypassVpn)
+                val parsed = parse(url, text)
+                if (parsed != null && parsed.ip.isNotBlank()) return parsed.copy(source = source)
+                errors += "${hostOf(url)}: пустой ответ"
+            } catch (e: Exception) {
+                errors += "${hostOf(url)}: ${e.message ?: e.javaClass.simpleName}"
             }
-            parse(text)?.let { return it }
-        } catch (e: Exception) {
-            VpnLog.w("IP", "ipinfo.io не ответил (${e.message})")
         }
-        // запасной сервис — только адрес
-        return try {
-            val ip = (if (useProxy) MediaGrabber.getText(FALLBACK, emptyMap(), 4096) else readText(FALLBACK)).trim()
-            if (ip.isNotBlank()) Info(ip = ip) else Info(error = "пустой ответ")
-        } catch (e: Exception) {
-            Info(error = e.message ?: "нет ответа")
-        }
+        return Info(error = errors.joinToString("; "), source = source)
     }
 
+    private fun hostOf(url: String): String = try { URL(url).host } catch (_: Exception) { url }
+
     private fun readText(url: String, bypassVpn: Boolean = false): String {
-        val c = (if (bypassVpn) com.winwasm64.vpn.NetworkBypass.openConnection(url) else null)
-            ?: (URL(url).openConnection(Proxy.NO_PROXY) as HttpURLConnection)
+        val bypassed = if (bypassVpn) com.winwasm64.vpn.NetworkBypass.openConnection(url) else null
+        val c = bypassed ?: (URL(url).openConnection(Proxy.NO_PROXY) as HttpURLConnection)
         return try {
-            c.connectTimeout = 12_000
-            c.readTimeout = 15_000
+            c.connectTimeout = if (bypassVpn) 8_000 else 12_000
+            c.readTimeout = 10_000
             c.instanceFollowRedirects = true
             c.setRequestProperty("User-Agent", MediaGrabber.DEFAULT_UA)
             c.setRequestProperty("Accept", "application/json, text/plain, */*")
@@ -81,17 +101,28 @@ object EgressCheck {
         }
     }
 
-    private fun parse(json: String): Info? = try {
-        val o = JSONObject(json)
-        val ip = o.optString("ip").trim()
-        if (ip.isBlank()) null else Info(
-            ip = ip,
-            where = countryRu(o.optString("country").trim().ifBlank { o.optString("region").trim() }),
-            org = cleanOrg(o.optString("org").trim()),
-            hosting = looksLikeHosting(o.optString("org") + " " + o.optString("hostname"))
-        )
-    } catch (_: Exception) {
-        null
+    /** Разбор ответа любого из сервисов: ipinfo.io, ip-api.com, ipify. */
+    private fun parse(url: String, text: String): Info? {
+        val body = text.trim()
+        if (!body.startsWith("{") && !body.startsWith("[")) {
+            // ipify отдаёт просто адрес
+            return if (body.length in 7..45 && body.none { it.isWhitespace() }) Info(ip = body) else null
+        }
+        return try {
+            val o = JSONObject(body)
+            val ip = o.optString("ip").ifBlank { o.optString("query") }.trim()
+            if (ip.isBlank()) return null
+            val countryCode = o.optString("country").ifBlank { o.optString("countryCode") }.trim()
+            val org = o.optString("org").ifBlank { o.optString("isp") }.trim()
+            Info(
+                ip = ip,
+                where = countryRu(countryCode),
+                org = cleanOrg(org),
+                hosting = looksLikeHosting(org + " " + o.optString("hostname"))
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** «Sabiedrība ar ierobežotu atbildību DELSKA Latvia» → «DELSKA». */
@@ -102,7 +133,7 @@ object EgressCheck {
             "SIA ", "LLC ", "Ltd ", "GmbH ", "Inc. ", "Inc "
         )) s = s.replace(junk, " ")
         s = s.replace(Regex("\\bAS\\d{3,8}\\b"), " ")
-        s = s.replace(Regex("\\bAS\\d{3,8}\\b"), " ").replace(Regex("\\s+"), " ").trim()
+        s = s.replace(Regex("\\s+"), " ").trim()
         return s
     }
 
@@ -117,7 +148,7 @@ object EgressCheck {
 
     /**
      * Похоже на дата-центр/хостинг, а не на мобильного оператора. Если «домашний» IP такой —
-     * значит на телефоне включён ЕЩЁ ОДИН VPN (не OmniBrowser), и путаница «какой VPN сейчас работает» идёт оттуда.
+     * значит на телефоне (или на роутере) включён ЕЩЁ ОДИН VPN, и путаница «какой VPN сейчас работает» идёт оттуда.
      */
     fun looksLikeHosting(text: String): Boolean {
         val t = text.lowercase()

@@ -4102,12 +4102,18 @@ private fun NativeAppsWithBrowsecSection(
                                             Thread {
                                                 val d = EgressCheck.direct()
                                                 val v = EgressCheck.viaBrowserProxy()
-                                                val extra = if (d.hosting)
-                                                    "\n⚠ «домашний» IP принадлежит хостингу (${d.org}), а не мобильному оператору — значит на телефоне работает ЕЩЁ ОДИН VPN (не OmniBrowser), и оба VPN складываются."
-                                                else ""
+                                                val bypassOk = d.source.startsWith("в обход")
+                                                val extra = buildString {
+                                                    if (d.hosting) append(
+                                                        "\n⚠ «домашний» IP принадлежит хостингу (${d.org}), а не мобильному оператору — значит на телефоне или на роутере работает ЕЩЁ ОДИН VPN (не OmniBrowser)."
+                                                    )
+                                                    if (d.hosting && !bypassOk) append(
+                                                        "\n⚠ обход чужого VPN не сработал — чужой VPN, скорее всего, стоит на роутере или включён режим «блокировать соединения без VPN»."
+                                                    )
+                                                }
                                                 val line = com.winwasm64.vpn.VpnScope.ipCompare(d.ip, v.ip) +
-                                                    "\nбез VPN: ${d.ip.ifBlank { "?" }} · ${d.where} · ${d.org.ifBlank { "—" }}" +
-                                                    "\nчерез VPN: ${v.ip.ifBlank { "?" }} · ${v.where} · ${v.org.ifBlank { "—" }}" + extra
+                                                    "\nбез VPN: ${d.label()} (${d.source})" +
+                                                    "\nчерез VPN: ${v.label()} (${v.source})" + extra
                                                 com.winwasm64.vpn.VpnLog.i("IP", line)
                                                 Handler(Looper.getMainLooper()).post {
                                                     ipCheckLine = line
