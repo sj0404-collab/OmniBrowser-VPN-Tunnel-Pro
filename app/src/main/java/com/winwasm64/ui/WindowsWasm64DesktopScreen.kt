@@ -3000,6 +3000,18 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         factory = { fsHost },
                         modifier = Modifier.fillMaxSize()
                     )
+                    // v4.24.0: курсор виртуальной мыши рисуем здесь, поверх вида игры.
+                    // В самой странице его не видно: клиент GeForce NOW занимает экран
+                    // через HTML-fullscreen, и наши элементы остаются под этим слоем.
+                    if (com.winwasm64.ui.browser.OmniCursor.active) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val cx = com.winwasm64.ui.browser.OmniCursor.fx * size.width
+                            val cy = com.winwasm64.ui.browser.OmniCursor.fy * size.height
+                            drawCircle(color = Color(0x55FFC857), radius = 22f, center = Offset(cx, cy))
+                            drawCircle(color = Color(0xFFFFC857), radius = 10f, center = Offset(cx, cy))
+                            drawCircle(color = Color(0xCC101216), radius = 4f, center = Offset(cx, cy))
+                        }
+                    }
                     if (!inPip) Row(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) {
                         // v4.16.0: в полноэкранной игре (GeForce NOW и подобные) клавиатура, которую просит
                         // страница, могла не открыться — даём кнопку, которая показывает её принудительно.
