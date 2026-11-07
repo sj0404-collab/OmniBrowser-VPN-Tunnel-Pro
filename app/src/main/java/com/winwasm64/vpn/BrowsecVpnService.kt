@@ -3597,6 +3597,7 @@ class BrowsecVpnService : VpnService() {
         appContext = applicationContext
         VpnLog.init(this)
         NetworkBypass.init(this)
+        NetworkBypass.ensure()
         appsViaBrowsecTunnel = getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean(PREF_APPS_VIA_BROWSEC, true)
         syncRoutedFromPrefs(this)
         createNotificationChannel()

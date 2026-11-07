@@ -42,18 +42,43 @@ object EgressCheck {
      * и тогда в [Info.source] честно написано, что обход не сработал.
      */
     fun direct(): Info {
-        val bypassed = fetch(useProxy = false, bypassVpn = true)
-        if (bypassed.ok) {
-            VpnLog.i("IP", "без прокси (в обход чужого VPN): " + bypassed.label())
-            return bypassed
+        // 1) привязка ОТДЕЛЬНОГО сокета к физической сети
+        val bySocket = fetch(useProxy = false, bypass = Bypass.SOCKET)
+        if (bySocket.ok) {
+            VpnLog.i("IP", "без прокси (в обход чужого VPN, сокет): " + bySocket.label())
+            return bySocket
         }
-        val plain = fetch(useProxy = false, bypassVpn = false)
+        // 2) v4.13.0: на прошивках с EPERM сокет привязать нельзя — привязываем ПРОЦЕСС и повторяем
+        val method = com.winwasm64.vpn.NetworkBypass.ensure()
+        if (method == "процесс") {
+            val byProcess = fetch(useProxy = false, bypass = Bypass.NONE)
+            if (byProcess.ok) {
+                VpnLog.i("IP", "без прокси (в обход чужого VPN, процесс): " + byProcess.label())
+                return byProcess.copy(source = "в обход чужого VPN (процесс)")
+            }
+        }
+        // 3) обычный путь — и честно пишем, что обход не вышел
+        val plain = fetch(useProxy = false, bypass = Bypass.NONE)
+        val reason = shortReason(bySocket.error)
         val out = plain.copy(
-            error = if (plain.ok) null else ("обход не сработал: ${bypassed.error ?: "нет ответа"}; напрямую: ${plain.error ?: "нет ответа"}"),
-            source = if (plain.ok) "напрямую (обход чужого VPN не удался: ${bypassed.error ?: "нет ответа"})" else plain.source
+            error = if (plain.ok) null else ("обход не сработал ($reason); напрямую: ${shortReason(plain.error)}"),
+            source = if (plain.ok) "напрямую, обход не удался: $reason" else plain.source
         )
-        VpnLog.w("IP", "без прокси: " + out.label() + " · " + out.source)
+        VpnLog.w("IP", "без прокси: " + out.label() + " · " + out.source + " · подробно: ${bySocket.error}")
         return out
+    }
+
+    /** «Binding socket to network 319 failed: EPERM (Operation not permitted)» → «EPERM — система не разрешает привязку». */
+    fun shortReason(err: String?): String {
+        if (err.isNullOrBlank()) return "нет ответа"
+        val e = when {
+            err.contains("EPERM", true) -> "EPERM — система не разрешает привязку"
+            err.contains("EHOSTUNREACH", true) -> "нет маршрута"
+            err.contains("timeout", true) || err.contains("timed out", true) -> "таймаут"
+            err.contains("HTTP 4", true) -> "сервис отказал"
+            else -> err.substringBefore(';').take(60)
+        }
+        return e
     }
 
     /** IP через локальный прокси браузера (тот, куда смотрят WebView и VPN). */
@@ -63,16 +88,18 @@ object EgressCheck {
         return info
     }
 
-    private fun fetch(useProxy: Boolean, bypassVpn: Boolean = false): Info {
+    private enum class Bypass { NONE, SOCKET }
+
+    private fun fetch(useProxy: Boolean, bypass: Bypass = Bypass.NONE): Info {
         val source = when {
             useProxy -> "через VPN/прокси"
-            bypassVpn -> "в обход чужого VPN"
+            bypass == Bypass.SOCKET -> "в обход чужого VPN (сокет)"
             else -> "напрямую"
         }
         val errors = ArrayList<String>()
         for (url in ENDPOINTS) {
             try {
-                val text = if (useProxy) MediaGrabber.getText(url, emptyMap(), 8192) else readText(url, bypassVpn)
+                val text = if (useProxy) MediaGrabber.getText(url, emptyMap(), 8192) else readText(url, bypass == Bypass.SOCKET)
                 val parsed = parse(url, text)
                 if (parsed != null && parsed.ip.isNotBlank()) return parsed.copy(source = source)
                 errors += "${hostOf(url)}: пустой ответ"

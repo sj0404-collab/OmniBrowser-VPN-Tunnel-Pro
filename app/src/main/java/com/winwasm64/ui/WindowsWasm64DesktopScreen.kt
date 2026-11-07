@@ -1620,6 +1620,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         try { com.winwasm64.ui.browser.MediaDownloadService.resumePending(context) } catch (_: Exception) {}
         com.winwasm64.vpn.NetworkBypass.init(context)
         com.winwasm64.vpn.NetworkBypass.enabled = bypassForeignVpn
+        // v4.13.0: держим весь процесс на физической сети, пока обход включён (на прошивках с EPERM это единственный путь)
+        if (bypassForeignVpn) com.winwasm64.vpn.NetworkBypass.ensure()
         com.winwasm64.extensions.ExtensionProxy.pinSessionServer = pinSessionServer
         com.winwasm64.ui.browser.UpdateChecker.autoCheck(context)
         com.winwasm64.ui.browser.AdBlockList.init(context, adBlockEnabled)
@@ -2681,6 +2683,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) { v ->
                                         bypassForeignVpn = v
                                         com.winwasm64.vpn.NetworkBypass.enabled = v
+                                        if (v) com.winwasm64.vpn.NetworkBypass.ensure() else com.winwasm64.vpn.NetworkBypass.unbindProcess()
                                         prefs.edit().putBoolean("bypass_foreign_vpn", v).apply()
                                     }
                                     // v4.4.0: экспорт / импорт настроек
