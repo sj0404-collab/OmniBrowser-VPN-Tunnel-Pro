@@ -29,16 +29,28 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * v4.19.0: клавиатура, которая реально печатает.
+ * v4.20.0: панель ввода, которая делает в странице настоящую работу.
  *
- * Проблема с устройства: в полноэкранной игре (GeForce NOW) клавиатура открывалась, но
- * нажатия до игры не доходили — приходилось выходить из полного экрана и заходить снова.
- * Причина в том, что система показывает IME для WebView, а страница слушает клавиши на
- * своём элементе: если DOM-фокус потерян (мы забрали его кнопкой), символы уходят «в никуда».
+ * История: в полноэкранной игре (GeForce NOW) клавиатура открывалась, но нажатия до игры
+ * не доходили — приходилось выходить из полного экрана и заходить снова.
  *
- * Здесь другой путь: своё поле ввода, а каждый символ уходит **прямо в страницу** —
- * событием клавиатуры (`keydown`/`keypress`/`keyup`) и вставкой текста в активный элемент.
- * Печатает даже тогда, когда родная экранная клавиатура сайта не реагирует.
+ * Что выяснилось на устройстве (4.19.0):
+ *  • печать символов работает — текст вставляется в активное поле страницы;
+ *  • кнопки не работали, потому что они отправляли синтетические события клавиш
+ *    (`keydown`/`keypress`/`keyup`). Игра их игнорирует: браузер помечает такие события
+ *    `isTrusted = false`, и всё, что не является вставкой текста, отбрасывается.
+ *
+ * Поэтому здесь кнопки не «изображают» нажатия, а меняют страницу по-настоящему:
+ *  • текст и пробел — вставка в значение поля (`setRangeText` / `execCommand('insertText')`);
+ *  • ⌫ — удаление символа перед курсором правкой значения, а не событием Backspace;
+ *  • Enter — сначала настоящая отправка формы (`requestSubmit`/submit-кнопка), если не вышло —
+ *    нажатие (`click()`) ближайшей видимой кнопки «Далее/OK/Отправить/Войти/Продолжить»;
+ *  • «Далее» — то же нажатие, но без попытки отправки формы (на случай, когда форма не находится);
+ *  • Tab — передача фокуса следующему элементу страницы;
+ *  • стрелки — перемещение курсора внутри поля (и события клавиш для тех, кто их слушает);
+ *  • «Стереть всё» — очистка поля страницы.
+ *
+ * Каждое нажатие пишется в журнал (`панель ввода: …`) — так видно, доходит ли нажатие до нас.
  */
 @Composable
 fun OmniKeyPanel(
@@ -47,35 +59,30 @@ fun OmniKeyPanel(
     onShowSystemKeyboard: () -> Unit
 ) {
     var proxy by remember { mutableStateOf("") }
-    // v4.19.0: клавиатуру показываем для СВОЕГО поля — так IME не конфликтует с фокусом страницы,
-    // а символы уходят в игру по одному. Именно этого не хватало: раньше IME открывался «в никуда».
     val focus = remember { FocusRequester() }
+
     LaunchedEffect(Unit) {
         try { focus.requestFocus() } catch (_: Throwable) {}
-        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта: символы и удаление уходят в страницу напрямую (родная клавиатура сайта не нужна)")
+        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта: текст, удаление и кнопки действуют прямо в странице")
     }
 
-    fun deleteBackward() {
+    fun run(name: String) {
         val wv = webView ?: return
+        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода: «$name»")
         try {
-            wv.evaluateJavascript("try{window.__omniKeyDel&&window.__omniKeyDel()}catch(e){}", null)
+            wv.evaluateJavascript(
+                "try{window.__omniAct&&window.__omniAct('${esc(name)}')}catch(e){}",
+                null
+            )
         } catch (_: Throwable) {
         }
     }
 
-    fun clearField() {
-        val wv = webView ?: return
-        try {
-            wv.evaluateJavascript("try{window.__omniKeyClear&&window.__omniKeyClear()}catch(e){}", null)
-        } catch (_: Throwable) {
-        }
-    }
-
-    fun send(key: String, code: String, ch: String) {
+    fun insertChar(ch: String) {
         val wv = webView ?: return
         try {
             wv.evaluateJavascript(
-                "try{window.__omniKeyFn&&window.__omniKeyFn('${esc(key)}','${esc(code)}','${esc(ch)}')}catch(e){}",
+                "try{window.__omniInsert&&window.__omniInsert('${esc(ch)}')}catch(e){}",
                 null
             )
         } catch (_: Throwable) {
@@ -89,26 +96,29 @@ fun OmniKeyPanel(
             .padding(10.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("⌨ Ввод в страницу (работает и когда клавиатура сайта не реагирует)", fontSize = 11.sp, color = Color(0xFFECECEC), modifier = Modifier.weight(1f))
+            Text(
+                "⌨ Ввод в страницу (работает и когда клавиатура сайта не реагирует)",
+                fontSize = 11.sp,
+                color = Color(0xFFECECEC),
+                modifier = Modifier.weight(1f)
+            )
             Button(
                 onClick = onShowSystemKeyboard,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF)),
                 modifier = Modifier.padding(end = 6.dp)
             ) { Text("системная", fontSize = 10.sp, color = Color.White) }
-            Button(onClick = onClose, colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))) {
-                Text("✕", fontSize = 11.sp, color = Color.White)
-            }
+            Button(
+                onClick = onClose,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))
+            ) { Text("✕", fontSize = 11.sp, color = Color.White) }
         }
         BasicTextField(
             value = proxy,
             onValueChange = { next ->
                 if (next.length > proxy.length) {
-                    // добавленные символы — по одному
-                    next.substring(proxy.length).forEach { ch -> send(ch.toString(), codeFor(ch), ch.toString()) }
+                    next.substring(proxy.length).forEach { ch -> insertChar(ch.toString()) }
                 } else if (next.length < proxy.length) {
-                    // v4.20.0: удаление нельзя делать событием Backspace — браузер на синтетическое
-                    // событие поле не чистит. Правим значение активного элемента напрямую.
-                    repeat(proxy.length - next.length) { deleteBackward() }
+                    repeat(proxy.length - next.length) { run("del") }
                 }
                 proxy = if (next.length > 400) next.takeLast(400) else next
             },
@@ -134,43 +144,30 @@ fun OmniKeyPanel(
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             @Composable
-            fun actionButton(title: String, action: () -> Unit) {
+            fun keyButton(title: String, action: String) {
                 Button(
-                    onClick = action,
+                    onClick = {
+                        run(action)
+                        // возвращаем фокус своему полю, чтобы клавиатура не захлопнулась
+                        try { focus.requestFocus() } catch (_: Throwable) {}
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))
                 ) { Text(title, fontSize = 11.sp, color = Color.White) }
             }
 
-            @Composable
-            fun keyButton(title: String, key: String, code: String, ch: String = "") {
-                actionButton(title) { send(key, code, ch) }
-            }
-
-            keyButton("Пробел", " ", "Space", " ")
-            keyButton("Enter", "Enter", "Enter", "\n")
-            actionButton("⌫") { deleteBackward() }
-            keyButton("Tab", "Tab", "Tab", "\t")
-            keyButton("Esc", "Escape", "Escape")
-            keyButton("←", "ArrowLeft", "ArrowLeft")
-            keyButton("↑", "ArrowUp", "ArrowUp")
-            keyButton("↓", "ArrowDown", "ArrowDown")
-            keyButton("→", "ArrowRight", "ArrowRight")
-            actionButton("Стереть всё") {
-                clearField()
-                proxy = ""
-            }
+            keyButton("Пробел", "space")
+            keyButton("Enter", "enter")
+            keyButton("Далее", "submit")
+            keyButton("⌫", "del")
+            keyButton("Tab", "tab")
+            keyButton("Esc", "esc")
+            keyButton("←", "left")
+            keyButton("↑", "up")
+            keyButton("↓", "down")
+            keyButton("→", "right")
+            keyButton("Стереть всё", "clear")
         }
     }
-}
-
-/** Код физической клавиши для события: KeyA, Digit1, Space… */
-private fun codeFor(ch: Char): String = when {
-    ch.isLetter() && ch.code < 128 -> "Key" + ch.uppercaseChar()
-    ch.isDigit() -> "Digit$ch"
-    ch == ' ' -> "Space"
-    ch == '\n' -> "Enter"
-    ch == '\t' -> "Tab"
-    else -> ""
 }
 
 private fun esc(s: String): String = s
@@ -182,82 +179,241 @@ private fun esc(s: String): String = s
     .replace("\t", "\\t")
 
 /**
- * JS-приёмник клавиш. Ставится один раз на WebView (idempotent).
- * Печатает в активный элемент (input/textarea/contenteditable) и дублирует событие на document —
- * так его видят и обычные поля, и игры, которые слушают клавиатуру на уровне страницы.
+ * Приёмник ввода. Ставится один раз на страницу (idempotent), вызывается из Kotlin:
+ *   __omniInsert('символ')  — вставить символ
+ *   __omniAct('space'|'enter'|'submit'|'del'|'tab'|'esc'|'left'|'up'|'down'|'right'|'clear')
+ *
+ * Ключевая мысль: событие клавиши от нас страница считает поддельным (isTrusted = false),
+ * поэтому всё, что можно, делаем правкой DOM: вставляем и удаляем текст, отправляем форму,
+ * нажимаем кнопку через click(), двигаем фокус. События клавиш всё равно дублируем — тем,
+ * кто их слушает, это не мешает.
  */
 const val OMNI_KEY_JS = """
 (function(){
-  if (!window.__omniKeyDel) {
-    window.__omniKeyDel = function() {
-      try {
-        var el = document.activeElement;
-        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-          var s = el.selectionStart == null ? el.value.length : el.selectionStart;
-          var e2 = el.selectionEnd == null ? s : el.selectionEnd;
-          if (s === e2 && s > 0) s = s - 1;
-          if (el.setRangeText) { el.setRangeText('', s, e2, 'end'); }
-          else { el.value = (el.value || '').slice(0, s) + (el.value || '').slice(e2); }
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          return true;
-        }
-        if (document.queryCommandSupported && document.queryCommandSupported('delete')) {
-          return document.execCommand('delete', false, null);
-        }
-      } catch (e) {}
-      try {
-        (document.activeElement || document.body).dispatchEvent(
-          new KeyboardEvent('keydown', {key: 'Backspace', code: 'Backspace', bubbles: true, cancelable: true}));
-      } catch (e) {}
+  if (window.__omniInsert) return;
+
+  function field() {
+    var el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return el;
+    var all = document.querySelectorAll('input, textarea');
+    for (var i = 0; i < all.length; i++) {
+      var c = all[i];
+      if (c.offsetParent === null) continue;
+      var t = (c.type || 'text').toLowerCase();
+      if (t === 'hidden' || t === 'checkbox' || t === 'radio' || c.disabled || c.readOnly) continue;
+      return c;
+    }
+    return null;
+  }
+
+  function fire(el, type, extra) {
+    try {
+      var o = {bubbles: true, cancelable: true};
+      if (extra) for (var k in extra) o[k] = extra[k];
+      el.dispatchEvent(new Event(type, {bubbles: true}));
+      if (type === 'keydown' || type === 'keyup') el.dispatchEvent(new KeyboardEvent(type, o));
+      if (type === 'keypress') el.dispatchEvent(new KeyboardEvent(type, o));
+    } catch (e) {}
+  }
+
+  function putText(el, txt) {
+    if (!el) {
+      if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
+        try { document.execCommand('insertText', false, txt); return true; } catch (e) {}
+      }
       return false;
-    };
-    window.__omniKeyClear = function() {
-      try {
-        var el = document.activeElement;
-        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-          el.value = '';
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          return true;
+    }
+    try {
+      var s = el.selectionStart, e2 = el.selectionEnd;
+      if (s === null || s === undefined) { s = el.value.length; e2 = s; }
+      if (el.setRangeText) {
+        el.setRangeText(txt, s, e2, 'end');
+      } else {
+        el.value = el.value.slice(0, s) + txt + el.value.slice(e2);
+        try { el.selectionStart = el.selectionEnd = s + txt.length; } catch (e) {}
+      }
+      fire(el, 'input');
+      fire(el, 'change');
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function visible(el) {
+    if (!el) return false;
+    if (el.offsetParent === null && el.tagName !== 'BODY') {
+      var r0 = el.getBoundingClientRect();
+      if (r0.width === 0 && r0.height === 0) return false;
+    }
+    var r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  }
+
+  function label(el) {
+    var s = '';
+    try {
+      s = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '';
+    } catch (e) {}
+    return s.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  var WORDS = ['далее', 'дальше', 'продолжить', 'отправить', 'войти', 'вход', 'подтвердить',
+               'ok', 'okay', 'next', 'continue', 'submit', 'enter', 'send', 'sign in', 'login'];
+
+  function clickNear(force) {
+    var f = field();
+    var cands = [];
+    var scope = document;
+    // сначала ищем в пределах диалога/оверлея вокруг поля
+    if (f) {
+      var n = f;
+      for (var d = 0; d < 5 && n; d++) {
+        n = n.parentElement;
+        if (!n) break;
+        var bs = n.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
+        if (bs.length) { scope = n; break; }
+      }
+    }
+    var list = scope.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      if (!visible(el)) continue;
+      var t = label(el);
+      var rank = -1;
+      for (var w = 0; w < WORDS.length; w++) { if (t.indexOf(WORDS[w]) >= 0) { rank = WORDS.length - w; break; } }
+      if (rank > 0) cands.push({el: el, rank: rank, t: t});
+    }
+    if (!cands.length && force) {
+      // ничего по словам — берём последнюю видимую кнопку рядом с полем
+      for (var j = list.length - 1; j >= 0; j--) {
+        if (visible(list[j])) {
+          try { list[j].click(); return true; } catch (e) {}
         }
-        if (document.queryCommandSupported && document.queryCommandSupported('selectAll')) {
+      }
+      return false;
+    }
+    if (!cands.length) return false;
+    cands.sort(function(a, b) { return b.rank - a.rank; });
+    var target = cands[0].el;
+    try { target.focus(); } catch (e) {}
+    try { target.click(); } catch (e) { fire(target, 'click'); }
+    return true;
+  }
+
+  function submitForm() {
+    var f = field();
+    if (!f) return false;
+    var form = f.form || (f.closest ? f.closest('form') : null);
+    if (form) {
+      try {
+        if (form.requestSubmit) { form.requestSubmit(); return true; }
+        var sb = form.querySelector('button[type="submit"], input[type="submit"], button');
+        if (sb) { sb.click(); return true; }
+        form.submit();
+        return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  function nextFocusable(back) {
+    var all = document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]');
+    var list = [];
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.disabled || !visible(el)) continue;
+      if (el.type === 'hidden') continue;
+      list.push(el);
+    }
+    if (!list.length) return false;
+    var cur = document.activeElement;
+    var idx = list.indexOf(cur);
+    var nxt = back ? (idx <= 0 ? list.length - 1 : idx - 1) : (idx + 1) % list.length;
+    try { list[nxt].focus(); return true; } catch (e) { return false; }
+  }
+
+  function moveCaret(dir) {
+    var f = field();
+    if (!f) return false;
+    try {
+      var s = f.selectionStart, e2 = f.selectionEnd;
+      if (s === null || s === undefined) return false;
+      var p = s;
+      if (dir === 'left') p = Math.max(0, s - 1);
+      else if (dir === 'right') p = Math.min((f.value || '').length, e2 + 1);
+      else if (dir === 'up' || dir === 'down') {
+        fire(f, 'keydown', {key: dir === 'up' ? 'ArrowUp' : 'ArrowDown'});
+        return true;
+      }
+      f.selectionStart = f.selectionEnd = p;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function deleteBackward() {
+    var f = field();
+    if (f) {
+      try {
+        var s = f.selectionStart, e2 = f.selectionEnd;
+        if (s === null || s === undefined) { s = (f.value || '').length; e2 = s; }
+        if (s === e2) { if (s === 0) return true; s = s - 1; }
+        if (f.setRangeText) f.setRangeText('', s, e2, 'end');
+        else { f.value = (f.value || '').slice(0, s) + (f.value || '').slice(e2); try { f.selectionStart = f.selectionEnd = s; } catch (e) {} }
+        fire(f, 'input');
+        fire(f, 'change');
+        return true;
+      } catch (e) {}
+    }
+    try {
+      if (document.queryCommandSupported && document.queryCommandSupported('delete')) {
+        return document.execCommand('delete', false, null);
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  window.__omniInsert = function(txt) {
+    var f = field();
+    var ok = putText(f, txt);
+    if (f) {
+      fire(f, 'keydown', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
+      fire(f, 'keypress', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
+      fire(f, 'keyup', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
+    }
+    return ok;
+  };
+
+  window.__omniAct = function(name) {
+    var f = field();
+    switch (name) {
+      case 'space': return window.__omniInsert(' ');
+      case 'del': return deleteBackward();
+      case 'clear':
+        if (f) {
+          try {
+            f.value = '';
+            fire(f, 'input');
+            fire(f, 'change');
+            return true;
+          } catch (e) {}
+        }
+        try {
           document.execCommand('selectAll', false, null);
           document.execCommand('delete', false, null);
-        }
-      } catch (e) {}
-      return false;
-    };
-  }
-})();
-(function(){
-(function(){
-  if (window.__omniKeyFn) return;
-  window.__omniKeyFn = function(key, code, ch) {
-    try {
-      if (key === '__clear__') { document.activeElement && document.activeElement.blur && document.activeElement.blur(); return; }
-      var el = document.activeElement;
-      if (!el || el === document.body || el === document.documentElement) el = document.body;
-      var base = {key: key, code: code, bubbles: true, cancelable: true};
-      try { el.dispatchEvent(new KeyboardEvent('keydown', base)); } catch (e) {}
-      try { document.dispatchEvent(new KeyboardEvent('keydown', {key: key, code: code, bubbles: true, cancelable: true})); } catch (e) {}
-      if (ch) {
-        try {
-          if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
-            var s = el.selectionStart == null ? el.value.length : el.selectionStart;
-            var e2 = el.selectionEnd == null ? s : el.selectionEnd;
-            if (el.setRangeText) { el.setRangeText(ch, s, e2, 'end'); } else { el.value = (el.value || '') + ch; }
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            el.dispatchEvent(new Event('change', {bubbles: true}));
-          } else if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
-            document.execCommand('insertText', false, ch);
-          }
         } catch (e) {}
-        try { el.dispatchEvent(new KeyboardEvent('keypress', {key: key, code: code, charCode: ch.charCodeAt(0), which: ch.charCodeAt(0), bubbles: true, cancelable: true})); } catch (e) {}
-      }
-      try { el.dispatchEvent(new KeyboardEvent('keyup', base)); } catch (e) {}
-      try { document.dispatchEvent(new KeyboardEvent('keyup', {key: key, code: code, bubbles: true, cancelable: true})); } catch (e) {}
-    } catch (e) {}
+        return false;
+      case 'enter':
+        if (f) { fire(f, 'keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13}); }
+        if (submitForm()) return true;
+        return clickNear(true);
+      case 'submit': return clickNear(true);
+      case 'tab': return nextFocusable(false);
+      case 'esc':
+        if (f) { fire(f, 'keydown', {key: 'Escape', code: 'Escape', keyCode: 27}); fire(f, 'keyup', {key: 'Escape', code: 'Escape', keyCode: 27}); }
+        try { document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true})); } catch (e) {}
+        return true;
+      case 'left': case 'right': case 'up': case 'down': return moveCaret(name);
+      default: return false;
+    }
   };
 })();
 """
