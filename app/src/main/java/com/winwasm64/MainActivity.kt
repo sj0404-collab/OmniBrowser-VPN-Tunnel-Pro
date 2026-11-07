@@ -1,5 +1,6 @@
 package com.winwasm64
 
+import android.app.Activity
 import android.app.PendingIntent
 import android.app.PictureInPictureParams
 import android.app.RemoteAction
@@ -7,19 +8,21 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.drawable.Icon
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.winwasm64.ui.MediaState
 import com.winwasm64.ui.WindowsWasm64DesktopScreen
 import com.winwasm64.ui.theme.OmniTheme
 import com.winwasm64.vpn.BrowsecVpnService
+import com.winwasm64.vpn.ModernTls
 
 /** v4.4.0: адрес, пришедший в уже работающее приложение (onNewIntent) — экран браузера его подхватывает. */
 object ExternalIntents {
@@ -50,6 +53,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ModernTls.install(this)
         com.winwasm64.ui.MediaPositions.init(this)
         CrashCatcher.install(this)
         handleIncomingIntent(intent)
@@ -87,52 +91,18 @@ class MainActivity : ComponentActivity() {
             val q = intent.getStringExtra(android.app.SearchManager.QUERY)
             if (!q.isNullOrBlank()) ExternalIntents.pendingUrl = ExternalIntents.extractUrl(q)
         }
-        if (intent?.action == Intent.ACTION_PROCESS_TEXT && Build.VERSION.SDK_INT >= 23) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && intent?.action == Intent.ACTION_PROCESS_TEXT) {
             val q = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
             if (!q.isNullOrBlank()) ExternalIntents.pendingUrl = ExternalIntents.extractUrl(q)
         }
         if (intent?.getBooleanExtra("omni_open_apps", false) == true) ExternalIntents.openAppsRequest.intValue++
     }
 
-    // ===================== v4.2.0: картинка в картинке =====================
+    // ===================== v4.2.0: картинка в картинке (Android 8.0+, изолировано от ART Android 5–7) =====================
 
     private fun pipSupported(): Boolean =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
-
-    private fun pipParams(playing: Boolean): PictureInPictureParams {
-        val b = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9))
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            b.setActions(pipActions(playing))
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            b.setAutoEnterEnabled(playing)
-            b.setSeamlessResizeEnabled(true)
-        }
-        return b.build()
-    }
-
-    // v4.2.3: кнопки в окне PiP — «−10 с», «пауза/пуск», «+10 с» (как у нативных видеоплееров)
-    @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
-    private fun pipAction(code: Int, icon: Int, title: String, cmd: String): RemoteAction {
-        val intent = Intent(ACTION_PIP_CONTROL).setPackage(packageName).putExtra(EXTRA_PIP_CMD, cmd)
-        val pi = PendingIntent.getBroadcast(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return RemoteAction(Icon.createWithResource(this, icon), title, title, pi)
-    }
-
-    @androidx.annotation.RequiresApi(Build.VERSION_CODES.O)
-    private fun pipActions(playing: Boolean): List<RemoteAction> {
-        // v4.2.5: кнопка действует по фактическому состоянию видео в момент нажатия (значок может чуть отставать)
-        val toggle = if (playing) pipAction(2, R.drawable.ic_pip_pause, "Пауза", "toggle")
-        else pipAction(2, R.drawable.ic_pip_play, "Воспроизвести", "toggle")
-        val all = listOf(
-            pipAction(1, R.drawable.ic_pip_rewind, "Назад 10 с", "back"),
-            toggle,
-            pipAction(3, R.drawable.ic_pip_forward, "Вперёд 10 с", "fwd")
-        )
-        val max = try { maxNumPictureInPictureActions } catch (_: Exception) { 3 }
-        return if (max >= 3) all else listOf(toggle)
-    }
 
     private val pipReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -156,14 +126,17 @@ class MainActivity : ComponentActivity() {
 
     /** Вызывается экраном, когда меняется состояние воспроизведения в активной вкладке. */
     fun updatePipParams(playing: Boolean) {
-        if (!pipSupported()) return
-        try { setPictureInPictureParams(pipParams(playing)) } catch (_: Exception) {}
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && pipSupported()) {
+            Api26Pip.update(this, playing)
+        }
     }
 
     /** Свернуть в окно PiP вручную (кнопка в меню). */
     fun enterPipNow(): Boolean {
-        if (!pipSupported()) return false
-        return try { enterPictureInPictureMode(pipParams(true)) } catch (_: Exception) { false }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && pipSupported()) {
+            return Api26Pip.enter(this)
+        }
+        return false
     }
 
     override fun onUserLeaveHint() {
@@ -172,10 +145,57 @@ class MainActivity : ComponentActivity() {
         if (MediaState.activeMediaPlaying && !MediaState.inPip) enterPipNow()
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         MediaState.inPip = isInPictureInPictureMode
         if (isInPictureInPictureMode) updatePipParams(MediaState.activeMediaPlaying)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private object Api26Pip {
+        private fun pipAction(act: Activity, code: Int, icon: Int, title: String, cmd: String): RemoteAction {
+            val intent = Intent(ACTION_PIP_CONTROL).setPackage(act.packageName).putExtra(EXTRA_PIP_CMD, cmd)
+            val pi = PendingIntent.getBroadcast(act, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            return RemoteAction(Icon.createWithResource(act, icon), title, title, pi)
+        }
+
+        private fun pipActions(act: Activity, playing: Boolean): List<RemoteAction> {
+            val toggle = if (playing) pipAction(act, 2, R.drawable.ic_pip_pause, "Пауза", "toggle")
+            else pipAction(act, 2, R.drawable.ic_pip_play, "Воспроизвести", "toggle")
+            val all = listOf(
+                pipAction(act, 1, R.drawable.ic_pip_rewind, "Назад 10 с", "back"),
+                toggle,
+                pipAction(act, 3, R.drawable.ic_pip_forward, "Вперёд 10 с", "fwd")
+            )
+            val max = try { act.maxNumPictureInPictureActions } catch (_: Exception) { 3 }
+            return if (max >= 3) all else listOf(toggle)
+        }
+
+        private fun buildParams(act: Activity, playing: Boolean): PictureInPictureParams {
+            val b = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(16, 9))
+                .setActions(pipActions(act, playing))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                Api31Pip.configure(b, playing)
+            }
+            return b.build()
+        }
+
+        fun update(act: Activity, playing: Boolean) {
+            try { act.setPictureInPictureParams(buildParams(act, playing)) } catch (_: Throwable) {}
+        }
+
+        fun enter(act: Activity): Boolean =
+            try { act.enterPictureInPictureMode(buildParams(act, true)) } catch (_: Throwable) { false }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private object Api31Pip {
+        fun configure(b: PictureInPictureParams.Builder, playing: Boolean) {
+            b.setAutoEnterEnabled(playing)
+            b.setSeamlessResizeEnabled(true)
+        }
     }
 
     companion object {

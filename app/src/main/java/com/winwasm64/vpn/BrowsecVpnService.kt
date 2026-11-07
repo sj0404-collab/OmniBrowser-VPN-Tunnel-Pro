@@ -37,10 +37,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import javax.net.ssl.SNIHostName
-import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLSocketFactory
 import kotlin.concurrent.thread
 import kotlin.random.Random
 import org.json.JSONObject
@@ -1123,7 +1120,7 @@ object BrowserDirectRepeater {
                 if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
                     ProxyController.getInstance().clearProxyOverride({ r -> r.run() }, { onReady?.invoke() })
                 } else {
-                    onReady?.invoke()
+                    BrowsecVpnService.appContext?.let { LegacyWebViewProxy.clearProxy(it, onReady) } ?: onReady?.invoke()
                 }
             } catch (_: Exception) {
                 onReady?.invoke()
@@ -1158,7 +1155,13 @@ object BrowserDirectRepeater {
                 }
             } else {
                 appliedProxyKey = desiredKey
-                onReady?.invoke()
+                val ctx = BrowsecVpnService.appContext
+                if (ctx != null) {
+                    if (enabled) LegacyWebViewProxy.setProxy(ctx, "127.0.0.1", port, onReady)
+                    else LegacyWebViewProxy.clearProxy(ctx, onReady)
+                } else {
+                    onReady?.invoke()
+                }
             }
         } catch (_: Exception) {
             onReady?.invoke()
@@ -1835,11 +1838,9 @@ object BrowserDirectRepeater {
                 override fun isConnected(): Boolean = true
             }
 
-            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            val sslFactory = ModernTls.sslSocketFactory()
             val sslSock = sslFactory.createSocket(splitSocket, host, port, true) as SSLSocket
-            sslSock.sslParameters = SSLParameters().apply {
-                serverNames = listOf(SNIHostName(host))
-            }
+            ModernTls.configureSocket(sslSock, host)
             sslSock.soTimeout = 8_000
             sslSock.startHandshake()
 
@@ -1962,11 +1963,9 @@ object BrowserDirectRepeater {
                         override fun isConnected(): Boolean = true
                     }
 
-                    val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                    val sslFactory = ModernTls.sslSocketFactory()
                     val sslSock = sslFactory.createSocket(splitSocket, host, port, true) as SSLSocket
-                    sslSock.sslParameters = SSLParameters().apply {
-                        serverNames = listOf(SNIHostName(host))
-                    }
+                    ModernTls.configureSocket(sslSock, host)
                     sslSock.soTimeout = 8_000
                     sslSock.startHandshake()
 
@@ -2506,14 +2505,18 @@ object BrowsecLocalProxyServer {
 
     private val uidPackageCache = ConcurrentHashMap<Int, String>()
 
-    /** Профиль приложения-владельца TCP-соединения (Android 10+: getConnectionOwnerUid, доступно активному VPN). */
+    /** Профиль приложения-владельца TCP-соединения (Android 10+: getConnectionOwnerUid, Android 5–9: /proc/net/tcp). */
     fun profileForConnection(local: InetSocketAddress, remote: InetSocketAddress): AppTunnelProfile? {
         val routed = BrowsecVpnService.routedPackages
         val ctx = BrowsecVpnService.appContext
-        if (ctx != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (ctx != null) {
             try {
-                val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                val uid = cm?.getConnectionOwnerUid(OsConstants.IPPROTO_TCP, local, remote) ?: -1
+                val uid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val cm = ctx.getSystemService(ConnectivityManager::class.java)
+                    cm?.getConnectionOwnerUid(OsConstants.IPPROTO_TCP, local, remote) ?: -1
+                } else {
+                    ProcNetUidLookup.findTcpOwnerUid(local.port, remote.port)
+                }
                 if (uid >= 0) {
                     val pkg = uidPackageCache[uid] ?: run {
                         val pkgs = ctx.packageManager.getPackagesForUid(uid) ?: emptyArray()
@@ -2532,17 +2535,20 @@ object BrowsecLocalProxyServer {
         return null
     }
 
-    /** v4.10.7: пакет-владелец UDP-сокета приложения (Android 10+), для диагностики WebRTC в журнале. */
+    /** v4.10.7: пакет-владелец UDP-сокета приложения (Android 10+: getConnectionOwnerUid, Android 5–9: /proc/net/udp). */
     fun udpOwnerPackage(appPort: Int, remoteIp: Int, remotePort: Int): String? {
         val ctx = BrowsecVpnService.appContext ?: return null
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         return try {
-            val cm = ctx.getSystemService(ConnectivityManager::class.java)
-            val uid = cm?.getConnectionOwnerUid(
-                OsConstants.IPPROTO_UDP,
-                InetSocketAddress(TunPackets.ipToInet(TunPackets.TUN_IP), appPort),
-                InetSocketAddress(TunPackets.ipToInet(remoteIp), remotePort)
-            ) ?: -1
+            val uid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val cm = ctx.getSystemService(ConnectivityManager::class.java)
+                cm?.getConnectionOwnerUid(
+                    OsConstants.IPPROTO_UDP,
+                    InetSocketAddress(TunPackets.ipToInet(TunPackets.TUN_IP), appPort),
+                    InetSocketAddress(TunPackets.ipToInet(remoteIp), remotePort)
+                ) ?: -1
+            } else {
+                ProcNetUidLookup.findUdpOwnerUid(appPort)
+            }
             if (uid < 0) return null
             uidPackageCache[uid] ?: run {
                 val routed = BrowsecVpnService.routedPackages
@@ -3592,6 +3598,7 @@ class BrowsecVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        ModernTls.install(this)
         com.winwasm64.CrashCatcher.install(this)
         activeInstance = this
         appContext = applicationContext
@@ -3615,10 +3622,15 @@ class BrowsecVpnService : VpnService() {
                 if (android.os.SystemClock.elapsedRealtime() - PsiphonBackup.lastUsedAt > 600_000L) PsiphonBackup.stop()
                 isRunning = false
                 isPaused = false
-                AppsVpnTileService.refresh(this)
+                VpnTileRefresher.refresh(this)
                 BrowsecLocalProxyServer.useBrowsecTunnel = false
                 closeVpnInterface()
-                stopForeground( true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -3672,7 +3684,7 @@ class BrowsecVpnService : VpnService() {
                 }
                 isRunning = true
                 isPaused = false
-                AppsVpnTileService.refresh(this)
+                VpnTileRefresher.refresh(this)
                 transparentUnsupported = false // v4.1.0: каждое включение снова пробует прозрачный режим
                 BrowsecLocalProxyServer.useBrowsecTunnel = true
                 BrowsecLocalProxyServer.ensureRunning()
@@ -3910,7 +3922,7 @@ class BrowsecVpnService : VpnService() {
     override fun onDestroy() {
         isRunning = false
         isPaused = false
-        AppsVpnTileService.refresh(this)
+        VpnTileRefresher.refresh(this)
         closeVpnInterface()
         if (activeInstance === this) activeInstance = null
         super.onDestroy()
@@ -3942,12 +3954,15 @@ class BrowsecVpnService : VpnService() {
         val bNode = BrowserDirectRepeater.getNode(bSnap.activeCountry)
         val aNode = BrowsecLocalProxyServer.getServerNode(aSnap.activeCountry)
 
+        val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val contentPi = PendingIntent.getActivity(
             this, 0, openAppIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            piFlags
         )
 
         val pickServerIntent = Intent(this, MainActivity::class.java).apply {
@@ -3956,7 +3971,7 @@ class BrowsecVpnService : VpnService() {
         }
         val pickServerPi = PendingIntent.getActivity(
             this, 1, pickServerIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            piFlags
         )
 
         val syncIntent = Intent(this, BrowsecVpnService::class.java).apply {
@@ -3964,7 +3979,7 @@ class BrowsecVpnService : VpnService() {
         }
         val syncPi = PendingIntent.getService(
             this, 2, syncIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            piFlags
         )
 
         val stopIntent = Intent(this, BrowsecVpnService::class.java).apply {
@@ -3972,7 +3987,7 @@ class BrowsecVpnService : VpnService() {
         }
         val stopPi = PendingIntent.getService(
             this, 3, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            piFlags
         )
 
         // v4.11.0: в заголовке сразу видно, кого VPN касается — значок сам по себе больше ничего не обещает

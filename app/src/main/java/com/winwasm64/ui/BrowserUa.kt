@@ -70,7 +70,7 @@ object BrowserUa {
                 .setPlatform(if (desktop) "Windows" else "Android")
                 .setPlatformVersion(if (desktop) "15.0.0" else androidVer)
                 .setArchitecture(if (desktop) "x86" else "arm")
-                .setBitness(64)
+                .setBitness(if (desktop || android.os.Build.SUPPORTED_64_BIT_ABIS.isNotEmpty()) 64 else 32)
                 .setModel(if (desktop) "" else (android.os.Build.MODEL ?: ""))
                 .setWow64(false)
                 .build()

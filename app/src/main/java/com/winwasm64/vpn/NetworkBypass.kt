@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.os.Build
+import androidx.annotation.RequiresApi
 import java.net.HttpURLConnection
 import java.net.Socket
 import java.net.URL
@@ -15,9 +17,9 @@ import java.net.URL
  * уходят сначала в него, а потом уже в Browsec: два прыжка, «двойной» IP, а проверка IP показывает
  * не домашний адрес, а выход чужого VPN.
  *
- * Лечится так же, как это делает сам `VpnService.protect()`: сокет привязывается к ФИЗИЧЕСКОЙ сети
- * (Wi-Fi/мобильная) до `connect()`, и ядро ведёт его мимо VPN-интерфейса. Тот же приём для HTTP-проверки IP —
- * через `Network.openConnection()`.
+ * Совместимо с Android 5.0+ (API 21+):
+ *  - API 23+: `ConnectivityManager.bindProcessToNetwork(n)`
+ *  - API 21–22: `ConnectivityManager.setProcessDefaultNetwork(n)`
  */
 object NetworkBypass {
 
@@ -29,11 +31,6 @@ object NetworkBypass {
     @Volatile private var cachedNet: Network? = null
     @Volatile private var cachedAt: Long = 0L
 
-    /**
-     * v4.13.0: на многих прошивках `Network.bindSocket()` отвечает EPERM (Operation not permitted),
-     * и привязать отдельный сокет нельзя. Тогда работает другой путь: `bindProcessToNetwork` —
-     * он привязывает весь процесс к физической сети (то же самое делает сам Android для «обхода VPN»).
-     */
     @Volatile private var processBound = false
     @Volatile var lastBindError: String? = null
         private set
@@ -49,11 +46,12 @@ object NetworkBypass {
     }
 
     /** Сеть без VPN-транспорта: Wi-Fi или мобильная, с доступом в интернет. */
+    @Suppress("DEPRECATION")
     private fun pick(): Network? {
         val now = System.currentTimeMillis()
         cachedNet?.let { if (now - cachedAt < 30_000L) return it }
         val app = ctx ?: return null
-        val cm = try { app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager } catch (_: Exception) { null } ?: return null
+        val cm = try { app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager } catch (_: Throwable) { null } ?: return null
         var best: Network? = null
         try {
             for (n in cm.allNetworks) {
@@ -67,7 +65,7 @@ object NetworkBypass {
                 // предпочитаем Wi-Fi, иначе мобильную
                 if (best == null || c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) best = n
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         cachedNet = best
         cachedAt = now
@@ -78,7 +76,7 @@ object NetworkBypass {
         val app = ctx ?: return null
         return try {
             app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -91,33 +89,50 @@ object NetworkBypass {
             n.bindSocket(sock)
             method = "сокет"
             true
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             lastBindError = e.message ?: e.javaClass.simpleName
             false
         }
     }
 
     /** Весь процесс — на физическую сеть (работает там, где bindSocket даёт EPERM). */
+    @Suppress("DEPRECATION")
     fun bindProcess(): Boolean {
         if (!enabled) return false
         val manager = cm() ?: return false
         val n = pick() ?: return false
         return try {
-            val ok = manager.bindProcessToNetwork(n)
+            val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Api23Net.bindProcess(manager, n)
+            } else {
+                ConnectivityManager.setProcessDefaultNetwork(n)
+            }
             processBound = ok
             if (ok) method = "процесс"
-            VpnLogBypass.log(if (ok) "обход чужого VPN: процесс привязан к физической сети (bindProcessToNetwork)" else "обход чужого VPN: bindProcessToNetwork вернул false")
+            VpnLogBypass.log(if (ok) "обход чужого VPN: процесс привязан к физической сети" else "обход чужого VPN: привязка процесса вернула false")
             ok
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             lastBindError = e.message ?: e.javaClass.simpleName
             unsupported = (lastBindError?.contains("EPERM", true) == true)
             false
         }
     }
 
+    @Suppress("DEPRECATION")
     fun unbindProcess() {
-        try { cm()?.bindProcessToNetwork(null) } catch (_: Exception) {}
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                cm()?.let { Api23Net.bindProcess(it, null) }
+            } else {
+                ConnectivityManager.setProcessDefaultNetwork(null)
+            }
+        } catch (_: Throwable) {}
         processBound = false
+    }
+
+    @RequiresApi(Build.VERSION_CODES.M)
+    private object Api23Net {
+        fun bindProcess(cm: ConnectivityManager, n: Network?): Boolean = cm.bindProcessToNetwork(n)
     }
 
     /** Держим обход включённым: сокет-привязка → при EPERM привязка процесса. */
@@ -129,7 +144,6 @@ object NetworkBypass {
         }
         if (processBound) return method
         val n = pick() ?: return "нет физической сети".also { method = it }
-        // пробуем привязать процесс — это надёжнее на прошивках с EPERM
         if (bindProcess()) return method
         method = "сокет"
         return method
@@ -140,8 +154,10 @@ object NetworkBypass {
         if (!enabled) return null
         val n = pick() ?: return null
         return try {
-            n.openConnection(URL(url)) as? HttpURLConnection
-        } catch (e: Exception) {
+            val conn = n.openConnection(URL(url)) as? HttpURLConnection ?: return null
+            ModernTls.applyTo(conn)
+            conn
+        } catch (e: Throwable) {
             lastBindError = e.message ?: e.javaClass.simpleName
             null
         }
@@ -157,8 +173,8 @@ object NetworkBypass {
         if (unsupported) return "обход чужого VPN: эта прошивка не разрешает привязку (EPERM) — работаем изолированно, каждый VPN сам по себе"
         val n = pick() ?: return "обход чужого VPN: включён, но физической сети не нашлось — идём через VPN-интерфейс"
         val app = ctx ?: return "обход чужого VPN: включён"
-        val cm = try { app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager } catch (_: Exception) { null }
-        val c = try { cm?.getNetworkCapabilities(n) } catch (_: Exception) { null }
+        val cm = try { app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager } catch (_: Throwable) { null }
+        val c = try { cm?.getNetworkCapabilities(n) } catch (_: Throwable) { null }
         val kind = when {
             c == null -> "физическая сеть"
             c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
@@ -167,7 +183,7 @@ object NetworkBypass {
             else -> "физическая сеть"
         }
         val how = when (method) {
-            "процесс" -> "весь процесс привязан к $kind (bindProcessToNetwork)"
+            "процесс" -> "весь процесс привязан к $kind"
             "сокет" -> "наши сокеты привязаны к $kind"
             else -> "способ привязки ещё не выбран"
         }

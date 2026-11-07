@@ -92,6 +92,8 @@ window.__omniSolve = function(id, key, ns, sigs){
         w.addJavascriptInterface(Bridge, "OmniSolver")
         w.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
+            @Deprecated("Deprecated in Java")
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = true
             override fun onPageFinished(view: WebView?, url: String?) {
                 if (ready) return
                 val lib = readAsset(app, "ytsolver/yt.solver.lib.min.js")

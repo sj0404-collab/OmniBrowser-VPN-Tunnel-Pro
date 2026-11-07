@@ -40,8 +40,9 @@ class TunnelHttp(@Volatile var serverKey: String? = null) {
     }
 
     private fun tls(raw: Socket, host: String, port: Int): SSLSocket {
-        val f = SSLSocketFactory.getDefault() as SSLSocketFactory
+        val f = com.winwasm64.vpn.ModernTls.sslSocketFactory()
         val s = f.createSocket(raw, host, port, true) as SSLSocket
+        com.winwasm64.vpn.ModernTls.configureSocket(s, host)
         s.soTimeout = 25_000
         s.startHandshake()
         if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, s.session)) {

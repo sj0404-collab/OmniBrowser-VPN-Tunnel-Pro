@@ -320,12 +320,18 @@ class NativeAppsManager(private val context: Context) {
             return Result.failure(IllegalArgumentException("Файл не найден: ${file.absolutePath}"))
         }
         return try {
-            val uri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                file
-            )
             val ext = file.extension.lowercase()
+            // На Android 5.0–6.0 (API 21–23) системный установщик пакетов принимает только file:// URI,
+            // тогда как начиная с Android 7.0 (API 24+) обязателен FileProvider content:// URI.
+            val uri = if (ext == "apk" && android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) {
+                Uri.fromFile(file)
+            } else {
+                FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file
+                )
+            }
             val mime = when (ext) {
                 "apk" -> "application/vnd.android.package-archive"
                 "mp4", "m4v" -> "video/mp4"

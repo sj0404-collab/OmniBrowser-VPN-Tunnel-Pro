@@ -55,10 +55,12 @@
         </service>
         <service
             android:name=".vpn.AppsVpnTileService"
+            android:enabled="@bool/enable_qs_tile"
             android:exported="true"
             android:icon="@android:drawable/ic_lock_lock"
             android:label="VPN приложений"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            tools:targetApi="24">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>

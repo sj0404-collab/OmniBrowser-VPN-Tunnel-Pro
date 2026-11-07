@@ -1249,7 +1249,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     try {
                         val granted = request.resources.filter { r ->
                             when (r) {
-                                android.webkit.PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID, android.webkit.PermissionRequest.RESOURCE_MIDI_SYSEX -> true
+                                android.webkit.PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID, "android.webkit.resource.MIDI_SYSEX" -> true
                                 android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE -> androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
                                 android.webkit.PermissionRequest.RESOURCE_VIDEO_CAPTURE -> androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
                                 else -> false
@@ -1306,11 +1306,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                override fun shouldOverrideUrlLoading(
+                private fun handleUrlOverride(
                     view: WebView?,
-                    request: WebResourceRequest?
+                    nextUrl: String,
+                    isMainFrame: Boolean
                 ): Boolean {
-                    val nextUrl = request?.url?.toString() ?: return false
                     if (nextUrl.startsWith("magnet:", ignoreCase = true)) {
                         torrentEngine.startFromMagnetOrUrl(nextUrl)
                         currentSection = 1
@@ -1337,7 +1337,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         nativeAppsManager.openUrlInNativeApp(nextUrl)
                         return true
                     }
-                    if (view != null && request.isForMainFrame) {
+                    if (view != null && isMainFrame) {
                         val wantDesktop = uaFor(nextUrl, tab) == ExtensionStore.DESKTOP_UA
                         val isDesktop = view.settings.userAgentString == ExtensionStore.DESKTOP_UA
                         if (wantDesktop != isDesktop) {
@@ -1347,6 +1347,20 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         }
                     }
                     return false
+                }
+
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): Boolean {
+                    val nextUrl = request?.url?.toString() ?: return false
+                    return handleUrlOverride(view, nextUrl, request.isForMainFrame)
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                    val nextUrl = url ?: return false
+                    return handleUrlOverride(view, nextUrl, true)
                 }
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
@@ -1414,6 +1428,74 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     persistBrowserSettings()
                 }
 
+                private fun handleMainFrameError(
+                    view: WebView?,
+                    desc: String,
+                    failingUrl: String
+                ) {
+                    // v4.0.2: локальный прокси перестал принимать соединения → перезапускаем его и сразу повторяем
+                    // (сервер и настройки не меняются, страница перезагружается для проверки)
+                    if (desc.contains("ERR_PROXY_CONNECTION_FAILED") && tab.proxyRepairCount < 2 && view != null) {
+                        tab.proxyRepairCount++
+                        tab.lastErrorText = null
+                        tab.loadingStatusText = "Перезапуск локального прокси и повтор загрузки…"
+                        Thread {
+                            if (ExtensionProxy.isActive) {
+                                // v4.1.1: в журнал — почему WebView не достучался до локального прокси
+                                com.winwasm64.vpn.VpnLog.w("Браузер", "ERR_PROXY_CONNECTION_FAILED (${Uri.parse(failingUrl).host}): ${ExtensionProxy.diagnose()}")
+                                ExtensionProxy.repairNow { view.postDelayed({ view.loadUrl(failingUrl) }, 300) }
+                            } else {
+                                BrowserDirectRepeater.healthCheckAndRepair(force = true)
+                                view.postDelayed({ view.loadUrl(failingUrl) }, 700)
+                            }
+                        }.start()
+                        return
+                    }
+                    // 1. Как в v3.6.0: мгновенно загружаем страницу через десинхронизированный сокет Репитера №1
+                    // (с перебором чистых Anycast IP), чтобы экран net::ERR_CONNECTION_CLOSED никогда не оставался!
+                    if (browserVpnEnabled && !ExtensionProxy.isActive && tab.autoRetryCount < 4 && view != null) {
+                        tab.autoRetryCount++
+                        tab.lastErrorText = null
+                        val ua = view.settings.userAgentString
+                        tab.loadingStatusText = "⚡ Прямой обход DPI через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)..."
+                        Thread {
+                            val html = BrowserDirectRepeater.fetchUnblockedHtml(failingUrl, ua)
+                            if (!html.isNullOrBlank()) {
+                                view.post {
+                                    tab.isLoading = false
+                                    tab.loadingProgress = 100
+                                    tab.lastErrorText = null
+                                    tab.loadingStatusText = "✓ Загружено через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)"
+                                    view.loadDataWithBaseURL(
+                                        failingUrl,
+                                        html,
+                                        "text/html",
+                                        "UTF-8",
+                                        failingUrl
+                                    )
+                                }
+                            } else if (autoHealEnabled) {
+                                val healMsg = BrowserDirectRepeater.triggerAutoHealOrFailover()
+                                view.post {
+                                    browserVpnCountry = BrowserDirectRepeater.countryCode
+                                    tab.loadingStatusText = healMsg
+                                    view.loadUrl(failingUrl)
+                                }
+                            } else {
+                                view.post {
+                                    view.loadUrl(failingUrl)
+                                }
+                            }
+                        }.start()
+                        return
+                    }
+                    tab.isLoading = false
+                    tab.loadingProgress = 0
+                    tab.lastErrorText = "$desc ($failingUrl)"
+                    tab.loadingStatusText = "⚠️ Ошибка соединения: $desc"
+                }
+
+                @androidx.annotation.RequiresApi(Build.VERSION_CODES.M)
                 override fun onReceivedError(
                     view: WebView?,
                     request: WebResourceRequest?,
@@ -1423,67 +1505,57 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (request?.isForMainFrame == true) {
                         val desc = error?.description?.toString() ?: "ERR_TIMED_OUT"
                         val failingUrl = request.url?.toString() ?: tab.url
-                        // v4.0.2: локальный прокси перестал принимать соединения → перезапускаем его и сразу повторяем
-                        // (сервер и настройки не меняются, страница перезагружается для проверки)
-                        if (desc.contains("ERR_PROXY_CONNECTION_FAILED") && tab.proxyRepairCount < 2 && view != null) {
-                            tab.proxyRepairCount++
-                            tab.lastErrorText = null
-                            tab.loadingStatusText = "Перезапуск локального прокси и повтор загрузки…"
-                            Thread {
-                                if (ExtensionProxy.isActive) {
-                                    // v4.1.1: в журнал — почему WebView не достучался до локального прокси
-                                    com.winwasm64.vpn.VpnLog.w("Браузер", "ERR_PROXY_CONNECTION_FAILED (${Uri.parse(failingUrl).host}): ${ExtensionProxy.diagnose()}")
-                                    ExtensionProxy.repairNow { view.postDelayed({ view.loadUrl(failingUrl) }, 300) }
-                                } else {
-                                    BrowserDirectRepeater.healthCheckAndRepair(force = true)
-                                    view.postDelayed({ view.loadUrl(failingUrl) }, 700)
-                                }
-                            }.start()
-                            return
-                        }
-                        // 1. Как в v3.6.0: мгновенно загружаем страницу через десинхронизированный сокет Репитера №1
-                        // (с перебором чистых Anycast IP), чтобы экран net::ERR_CONNECTION_CLOSED никогда не оставался!
-                        if (browserVpnEnabled && !ExtensionProxy.isActive && tab.autoRetryCount < 4 && view != null) {
-                            tab.autoRetryCount++
-                            tab.lastErrorText = null
-                            val ua = view.settings.userAgentString
-                            tab.loadingStatusText = "⚡ Прямой обход DPI через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)..."
-                            Thread {
-                                val html = BrowserDirectRepeater.fetchUnblockedHtml(failingUrl, ua)
-                                if (!html.isNullOrBlank()) {
-                                    view.post {
-                                        tab.isLoading = false
-                                        tab.loadingProgress = 100
-                                        tab.lastErrorText = null
-                                        tab.loadingStatusText = "✓ Загружено через Репитер №1 ($browserVpnCountry • ${browserTrafficSnapshot.pingMs} мс)"
-                                        view.loadDataWithBaseURL(
-                                            failingUrl,
-                                            html,
-                                            "text/html",
-                                            "UTF-8",
-                                            failingUrl
-                                        )
-                                    }
-                                } else if (autoHealEnabled) {
-                                    val healMsg = BrowserDirectRepeater.triggerAutoHealOrFailover()
-                                    view.post {
-                                        browserVpnCountry = BrowserDirectRepeater.countryCode
-                                        tab.loadingStatusText = healMsg
-                                        view.loadUrl(failingUrl)
-                                    }
-                                } else {
-                                    view.post {
-                                        view.loadUrl(failingUrl)
-                                    }
-                                }
-                            }.start()
-                            return
-                        }
-                        tab.isLoading = false
-                        tab.loadingProgress = 0
-                        tab.lastErrorText = "$desc ($failingUrl)"
-                        tab.loadingStatusText = "⚠️ Ошибка соединения: $desc"
+                        handleMainFrameError(view, desc, failingUrl)
                     }
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onReceivedError(
+                    view: WebView?,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String?
+                ) {
+                    @Suppress("DEPRECATION")
+                    super.onReceivedError(view, errorCode, description, failingUrl)
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                        handleMainFrameError(view, description ?: "ERR_$errorCode", failingUrl ?: tab.url)
+                    }
+                }
+
+                override fun onReceivedSslError(
+                    view: WebView?,
+                    handler: android.webkit.SslErrorHandler?,
+                    error: android.net.http.SslError?
+                ) {
+                    if (handler == null || error == null) return
+                    // На Android 5.0–7.1 (API 21–25) в системном хранилище отсутствуют ISRG Root X1 (Let's Encrypt) и GTS Root.
+                    // Строго перепроверяем цепочку сертификатов и имя хоста через ModernTls перед тем как разрешить загрузку.
+                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.N_MR1 &&
+                        error.primaryError == android.net.http.SslError.SSL_UNTRUSTED
+                    ) {
+                        val parsed = try { Uri.parse(error.url) } catch (_: Exception) { null }
+                        val host = parsed?.host
+                        val port = parsed?.port?.takeIf { it > 0 } ?: 443
+                        if (!host.isNullOrBlank()) {
+                            val localProxy = when {
+                                ExtensionProxy.isActive -> ExtensionProxy.webViewPort()
+                                browserVpnEnabled -> BrowserDirectRepeater.localProxyPort
+                                else -> -1
+                            }
+                            Thread {
+                                val trusted = com.winwasm64.vpn.ModernTls.verifyWebViewUntrustedHost(host, port, localProxy)
+                                val deliver = Runnable {
+                                    try {
+                                        if (trusted) handler.proceed() else handler.cancel()
+                                    } catch (_: Exception) {}
+                                }
+                                if (view != null) view.post(deliver) else deliver.run()
+                            }.start()
+                            return
+                        }
+                    }
+                    handler.cancel()
                 }
             }
         }

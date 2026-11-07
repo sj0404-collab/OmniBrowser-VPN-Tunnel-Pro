@@ -62,8 +62,12 @@ object DownloadSaver {
             return "Загрузки/$name"
         }
         @Suppress("DEPRECATION")
-        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        if (!dir.exists() && !dir.mkdirs()) throw IOException("Нет доступа к папке «Загрузки»")
+        var dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if ((!dir.exists() && !dir.mkdirs()) || !dir.canWrite()) {
+            dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: File(context.filesDir, "Downloads").apply { mkdirs() }
+            if (!dir.exists() && !dir.mkdirs()) throw IOException("Нет доступа к папке «Загрузки»")
+        }
         var file = File(dir, name)
         var n = 1
         val base = name.substringBeforeLast('.', name)

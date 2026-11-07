@@ -129,9 +129,14 @@ object VpnLog {
                 ctx.contentResolver.openOutputStream(uri)?.use { it.write(data) } ?: return null
             } else {
                 @Suppress("DEPRECATION")
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "OmniBrowser-logs")
-                dir.mkdirs()
-                File(dir, name).writeBytes(data)
+                var dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "OmniBrowser-logs")
+                if ((!dir.exists() && !dir.mkdirs()) || !dir.canWrite()) {
+                    dir = File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir, "OmniBrowser-logs")
+                    dir.mkdirs()
+                }
+                val out = File(dir, name)
+                out.writeBytes(data)
+                return out.absolutePath
             }
             "Загрузки/OmniBrowser-logs/$name"
         } catch (_: Exception) {

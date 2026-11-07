@@ -1,6 +1,7 @@
 package com.winwasm64.vpn
 
 import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.Icon
@@ -11,19 +12,33 @@ import android.service.quicksettings.TileService
 import androidx.annotation.RequiresApi
 
 /**
+ * Безопасная обёртка для обновления плитки быстрых настроек: на Android 5.0–6.0 (API 21–23) класс
+ * `TileService` не существует в системе, поэтому обращаться к `AppsVpnTileService` напрямую нельзя
+ * (иначе ART бросит `NoClassDefFoundError` при загрузке суперкласса `TileService`).
+ */
+object VpnTileRefresher {
+    fun refresh(ctx: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        Api24Tile.requestRefresh(ctx)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private object Api24Tile {
+        fun requestRefresh(ctx: Context) {
+            try {
+                TileService.requestListeningState(ctx, ComponentName(ctx, AppsVpnTileService::class.java))
+            } catch (_: Throwable) {
+            }
+        }
+    }
+}
+
+/**
  * v4.5.0: плитка быстрых настроек «VPN приложений» — включить/выключить туннель для списка приложений из шторки,
- * не открывая браузер. Список приложений и страна берутся из сохранённых настроек.
+ * не открывая браузер. Доступна на Android 7.0+ (API 24+).
  */
 @RequiresApi(Build.VERSION_CODES.N)
 class AppsVpnTileService : TileService() {
-
-    companion object {
-        /** Дёргать при смене состояния VPN, чтобы плитка обновилась, пока шторка открыта. */
-        fun refresh(ctx: Context) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-            try { requestListeningState(ctx, android.content.ComponentName(ctx, AppsVpnTileService::class.java)) } catch (_: Exception) {}
-        }
-    }
 
     override fun onStartListening() {
         super.onStartListening()

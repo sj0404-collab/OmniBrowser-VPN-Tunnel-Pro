@@ -51,6 +51,7 @@ class VpnLogActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ModernTls.install(this)
         VpnLog.init(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

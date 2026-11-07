@@ -82,9 +82,39 @@ object UpdateChecker {
                 var apk = ""
                 var size = 0L
                 val assets = o.optJSONArray("assets")
-                if (assets != null) for (i in 0 until assets.length()) {
-                    val a = assets.getJSONObject(i)
-                    if (a.optString("name").endsWith(".apk")) { apk = a.optString("browser_download_url"); size = a.optLong("size"); break }
+                if (assets != null) {
+                    val supportedAbis = Build.SUPPORTED_ABIS.map { it.lowercase() }
+                    val hasArm64 = supportedAbis.any { it.contains("arm64") }
+                    val hasArm32 = supportedAbis.any { it.contains("armeabi") }
+                    val isLegacyOs = Build.VERSION.SDK_INT < Build.VERSION_CODES.N
+                    data class ApkCandidate(val name: String, val url: String, val size: Long, val score: Int)
+                    val candidates = ArrayList<ApkCandidate>()
+                    for (i in 0 until assets.length()) {
+                        val a = assets.getJSONObject(i)
+                        val name = a.optString("name")
+                        if (!name.endsWith(".apk", ignoreCase = true)) continue
+                        val lower = name.lowercase()
+                        val isArm64Only = lower.contains("arm64") && !lower.contains("universal")
+                        val isArm32Only = (lower.contains("armeabi") || lower.contains("arm-v7") || lower.contains("armv7")) && !lower.contains("universal")
+                        val isUniversal = lower.contains("universal")
+                        val isAndroid5Tag = lower.contains("android5") || lower.contains("android-5") || lower.contains("legacy")
+                        if (isArm64Only && !hasArm64) continue
+                        if (isArm32Only && !hasArm32) continue
+                        // На Android 5–6 обычные релизы из main (minSdk 24) не установятся — берём только совместимые APK
+                        if (isLegacyOs && !isAndroid5Tag && !isUniversal && !isArm32Only) continue
+                        val score = (if (isAndroid5Tag) 20 else 0) + when {
+                            hasArm64 && isArm64Only -> 10
+                            !hasArm64 && hasArm32 && isArm32Only -> 10
+                            isUniversal -> 8
+                            else -> 5
+                        }
+                        candidates += ApkCandidate(name, a.optString("browser_download_url"), a.optLong("size"), score)
+                    }
+                    val best = candidates.maxByOrNull { it.score }
+                    if (best != null) {
+                        apk = best.url
+                        size = best.size
+                    }
                 }
                 val notes = o.optString("body").take(1500)
                 val cur = currentVersion(app)
@@ -139,7 +169,9 @@ object UpdateChecker {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 nm.createNotificationChannel(NotificationChannel(CHANNEL, "Обновления приложения", NotificationManager.IMPORTANCE_DEFAULT))
             }
-            val pi = PendingIntent.getActivity(ctx, 7778, downloadIntent(ctx, info), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+                (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+            val pi = PendingIntent.getActivity(ctx, 7778, downloadIntent(ctx, info), piFlags)
             val n: Notification = NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setContentTitle("Доступна версия ${info.version}")

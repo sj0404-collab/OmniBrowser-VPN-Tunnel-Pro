@@ -142,13 +142,31 @@ object ExtensionProxy {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun activeNetworkSafe(cm: android.net.ConnectivityManager): android.net.Network? {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            return cm.activeNetwork
+        }
+        return try {
+            cm.allNetworks.firstOrNull { n ->
+                val c = cm.getNetworkCapabilities(n)
+                c != null && c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    !c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+            } ?: cm.allNetworks.firstOrNull { n ->
+                cm.getNetworkCapabilities(n)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun registerNetworkWatch() {
         if (netWatchRegistered) return
         netWatchRegistered = true
         try {
             val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-            lastNetId = cm.activeNetwork?.toString()
-            cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+            lastNetId = activeNetworkSafe(cm)?.toString()
+            val callback = object : android.net.ConnectivityManager.NetworkCallback() {
                 private fun isVpn(network: android.net.Network): Boolean = try {
                     cm.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
                 } catch (_: Exception) { false }
@@ -170,11 +188,23 @@ object ExtensionProxy {
                 }
                 override fun onCapabilitiesChanged(network: android.net.Network, caps: android.net.NetworkCapabilities) {
                     if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) return
-                    val v = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    val v = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    } else {
+                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    }
                     if (v && !netValidated) onNetworkChanged("интернет в сети снова доступен (${describeNet(cm, network)})")
                     netValidated = v
                 }
-            })
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                cm.registerDefaultNetworkCallback(callback)
+            } else {
+                val req = android.net.NetworkRequest.Builder()
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                cm.registerNetworkCallback(req, callback)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "network watch", e)
         }
@@ -183,9 +213,14 @@ object ExtensionProxy {
     /** Есть ли сейчас сеть с интернетом (по данным системы). */
     fun networkUp(): Boolean = try {
         val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val n = cm.activeNetwork
-        n != null && (cm.getNetworkCapabilities(n)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
-    } catch (_: Exception) { true }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            val n = cm.activeNetwork
+            n != null && (cm.getNetworkCapabilities(n)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+        } else {
+            @Suppress("DEPRECATION")
+            cm.activeNetworkInfo?.isConnected == true || activeNetworkSafe(cm) != null
+        }
+    } catch (_: Throwable) { true }
 
     /** Ошибка вызвана нашей сетью (Wi-Fi выключен/переключается, нет маршрута, DNS не отвечает), а не сервером Browsec. */
     private fun localNetFault(e: Throwable): Boolean {
@@ -382,13 +417,18 @@ object ExtensionProxy {
         // Репитер передаёт CONNECT сюда, пока прокси расширения активен. Смена режима больше не меняет настройку
         // прокси WebView и не рвёт его соединения.
         val p = webViewPort()
-        if (p <= 0 || !WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+        if (p <= 0) {
             onReady?.invoke()
             return
         }
         val key = "EXT:$p"
         if (appliedKey == key) {
             onReady?.invoke()
+            return
+        }
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            appliedKey = key
+            com.winwasm64.vpn.LegacyWebViewProxy.setProxy(appContext, "127.0.0.1", p, onReady)
             return
         }
         try {
@@ -1197,7 +1237,8 @@ function alert(){}
         raw.tcpNoDelay = true
         if (up.type != "HTTPS") return raw
         try {
-            val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, up.host, up.port, true) as SSLSocket
+            val ssl = com.winwasm64.vpn.ModernTls.sslSocketFactory().createSocket(raw, up.host, up.port, true) as SSLSocket
+            com.winwasm64.vpn.ModernTls.configureSocket(ssl, up.host)
             ssl.startHandshake()
             if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(up.host, ssl.session)) {
                 closeQuietly(ssl)
@@ -2411,7 +2452,8 @@ function alert(){}
         var ssl: SSLSocket? = null
         try {
             t.first.soTimeout = 5_000
-            ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(t.first, "dns.google", 443, true) as SSLSocket
+            ssl = com.winwasm64.vpn.ModernTls.sslSocketFactory().createSocket(t.first, "dns.google", 443, true) as SSLSocket
+            com.winwasm64.vpn.ModernTls.configureSocket(ssl, "dns.google")
             ssl.startHandshake()
             val path = "/resolve?name=" + java.net.URLEncoder.encode(name, "UTF-8") + "&type=A" +
                 (if (!ecsSubnet.isNullOrBlank()) "&edns_client_subnet=" + java.net.URLEncoder.encode(ecsSubnet, "UTF-8") else "")

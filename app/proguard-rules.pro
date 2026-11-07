@@ -7,7 +7,8 @@
 -keepattributes JavascriptInterface
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# Предупреждения о необязательных TLS-провайдерах
+# Предупреждения о необязательных TLS-провайдерах + сохранение JNI-классов Conscrypt (Android 5–9 TLS 1.3)
+-keep class org.conscrypt.** { *; }
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**

@@ -106,6 +106,7 @@ class MediaDownloadService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        com.winwasm64.vpn.ModernTls.install(this)
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(CHANNEL_ID, "Загрузки видео и аудио", NotificationManager.IMPORTANCE_LOW).apply {
@@ -184,7 +185,14 @@ class MediaDownloadService : Service() {
 
     private fun stopIfIdle() {
         if (current == null && queue.isEmpty()) {
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+            } catch (_: Exception) {}
             stopSelf()
         }
     }
@@ -421,7 +429,10 @@ class MediaDownloadService : Service() {
             return "$rel/$name"
         }
         @Suppress("DEPRECATION")
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "OmniBrowser").apply { mkdirs() }
+        var dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "OmniBrowser")
+        if ((!dir.exists() && !dir.mkdirs()) || !dir.canWrite()) {
+            dir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: filesDir, "OmniBrowser").apply { mkdirs() }
+        }
         val f = File(dir, name)
         f.writeBytes(bytes)
         MediaScannerConnection.scanFile(this, arrayOf(f.absolutePath), arrayOf("image/jpeg"), null)

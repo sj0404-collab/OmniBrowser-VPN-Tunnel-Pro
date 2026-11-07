@@ -1,3 +1,20 @@
+## 4.15.0-android5 — Сборка для Android 5.0 и выше (API 21+, 32-бит и 64-бит ARM)
+
+Специальная ветка `android-5` с полной поддержкой устройств на **Android 5.0 Lollipop, 5.1, 6.0 Marshmallow, 7.0/7.1 Nougat и новее (API 21–35)**:
+
+- **Минимальная версия снижена до Android 5.0 (`minSdk = 21`)** + включён `coreLibraryDesugaring` для коллекций и стандартной библиотеки Java 8+/11+ на API 21–23.
+- **Поддержка 32-битных и 64-битных процессоров:** большинство устройств на Android 5–7 работает в 32-битном режиме `armeabi-v7a` (на них прежний `arm64`-APK не устанавливался с ошибкой `INSTALL_FAILED_NO_MATCHING_ABIS`). Теперь собираются три варианта с единой подписью:
+  - `universal` — универсальный APK (`armeabi-v7a` + `arm64-v8a`), ставится на любой телефон, планшет или ТВ-приставку с Android 5.0+;
+  - `armeabi-v7a` — облегчённый (~14 МБ) APK для 32-битных устройств;
+  - `arm64-v8a` — облегчённый (~14 МБ) APK для 64-битных устройств.
+- **Двойная подпись APK Signature Scheme v1 + v2:** схема v1 (JAR) обязательна для установки на Android 5.0–6.0, схема v2 ускоряет установку на Android 7.0+. Ключ подписи единый.
+- **Современный TLS 1.3 + корневые сертификаты 2026 года (`ModernTls` + `Conscrypt`):** на Android 5.0–7.1 в системном хранилище отсутствуют корневые сертификаты `ISRG Root X1/X2` (Let's Encrypt) и `GTS Root R1–R4` (Google Trust Services), из-за чего без этого модуля не работали HTTPS-сайты, серверы Browsec и DoH. Добавлены актуальные корневые сертификаты + BoringSSL TLS 1.2/1.3 и строгая криптографическая перепроверка `SSL_UNTRUSTED` в WebView на Android 5–7.
+- **Полная адаптация системных вызовов под API 21–23:**
+  - привязка к физической сети (`setProcessDefaultNetwork` на API 21–22 и `bindProcessToNetwork` на API 23+), подписка на смену сети (`registerNetworkCallback` на API 21–23);
+  - определение приложения-владельца сокетов в per-app VPN через `/proc/net/tcp[6]` и `/proc/net/udp[6]` на Android 5–9;
+  - резервная настройка прокси для старых не обновлённых системных WebView без `PROXY_OVERRIDE` (`LegacyWebViewProxy`);
+  - обратная совместимость `WebViewClient` (`shouldOverrideUrlLoading(WebView, String)` и `onReceivedError` для API 21–23), установка `.apk` через `file://` на Android 5–6, изоляция `TileService` (API 24+) и `PictureInPictureParams` (API 26+) от верификатора классов ART.
+
 ## 4.15.0 — Psiphon: почему он «накрывался» и что исправлено
 
 Вопрос был прямой: «сам Psiphon хоть работает?» Проверил по фактам, а не на глаз:

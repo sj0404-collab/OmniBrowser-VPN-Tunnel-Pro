@@ -897,8 +897,7 @@ object ExtensionRuntime {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                 interceptHostRequest(host, request)
 
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val u = request.url
+            private fun handleExtOverride(u: Uri): Boolean {
                 if (u.host?.lowercase() == ownHost) return false
                 val s = u.toString()
                 if (kind != "bg" && (s.startsWith("http://") || s.startsWith("https://"))) {
@@ -907,6 +906,13 @@ object ExtensionRuntime {
                 }
                 return true
             }
+
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+                handleExtOverride(request.url)
+
+            @Deprecated("Deprecated in Java")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+                handleExtOverride(Uri.parse(url))
         }
         wv.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {

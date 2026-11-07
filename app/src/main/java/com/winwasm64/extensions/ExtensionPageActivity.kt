@@ -54,6 +54,7 @@ class ExtensionPageActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.winwasm64.vpn.ModernTls.install(this)
         val extId = intent.getStringExtra(EXTRA_EXT)
         if (extId.isNullOrBlank()) {
             finish()
