@@ -1236,7 +1236,7 @@ object MediaGrabber {
         // --- видео: по одному варианту на высоту; mp4 (avc1/av01) предпочтительнее — склеивается в mp4
         val videoOnly = formats.filter { it.isVideo && !it.muxed && it.h > 0 }
         val muxed = formats.filter { it.isVideo && it.muxed && it.h > 0 }
-        val heights = (videoOnly.map { it.h } + muxed.map { it.h }).toSortedSet().reversed()
+        val heights = (videoOnly.map { it.h } + muxed.map { it.h }).distinct().sortedDescending()
         for (h in heights) {
             val mp4v = videoOnly.filter { it.h == h && it.container == "mp4" }.sortedWith(compareBy<YtFormat> { if (it.codec.startsWith("avc1")) 0 else 1 }.thenByDescending { it.fps }.thenByDescending { it.br }).firstOrNull()
             val webmv = videoOnly.filter { it.h == h && it.container == "webm" }.maxByOrNull { it.br }

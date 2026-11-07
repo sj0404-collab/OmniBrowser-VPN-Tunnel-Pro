@@ -108,6 +108,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
+private val APP_START_ELAPSED_REALTIME_MS: Long = android.os.SystemClock.elapsedRealtime()
+
+private fun processStartElapsedRealtimeMs(): Long =
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+        android.os.Process.getStartElapsedRealtime()
+    } else {
+        APP_START_ELAPSED_REALTIME_MS
+    }
+
 private fun playNativeAudioChime(freqHz: Double = 523.25, durationMs: Int = 110) {
     thread(isDaemon = true) {
         try {
@@ -118,23 +127,31 @@ private fun playNativeAudioChime(freqHz: Double = 523.25, durationMs: Int = 110)
                 val env = 1.0 - (i.toDouble() / count.toDouble())
                 samples[i] = (sin(2.0 * Math.PI * i * freqHz / sampleRate) * 14000 * env).toInt().toShort()
             }
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(samples.size * 2)
-                .setTransferMode(AudioTrack.MODE_STATIC)
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+            val track = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                AudioTrack.Builder()
+                    .setAudioAttributes(attrs)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(samples.size * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .build()
+            } else {
+                AudioTrack(
+                    attrs,
+                    format,
+                    samples.size * 2,
+                    AudioTrack.MODE_STATIC,
+                    android.media.AudioManager.AUDIO_SESSION_ID_GENERATE
+                )
+            }
             track.write(samples, 0, samples.size)
             track.play()
             Thread.sleep(durationMs.toLong() + 40L)
@@ -953,7 +970,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         // v4.2.10: при старте приложения расширение-прокси (Browsec) поднимается ~1–3 с; первая страница раньше
         // уходила напрямую (без VPN) и «расширение включалось» только после обновления. Ждём его готовности (до 6 с).
         val waitExt = com.winwasm64.extensions.ExtensionProxy.control == null && !target.startsWith("about:") && !target.startsWith("file:") &&
-            android.os.SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime() < 25_000L &&
+            android.os.SystemClock.elapsedRealtime() - processStartElapsedRealtimeMs() < 25_000L &&
             try { com.winwasm64.extensions.ExtensionStore.enabledExtensions().any { "proxy" in it.manifest.permissions } } catch (_: Exception) { false }
         val doLoad = {
             BrowserDirectRepeater.ensureDirectBrowserMode {

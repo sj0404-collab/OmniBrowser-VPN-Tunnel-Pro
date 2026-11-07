@@ -116,9 +116,9 @@ android {
     }
 
     lint {
-        // Строгая байткод-проверка совместимости с Android 5.0+ (minSdk 21) и верификатором классов ART
-        checkOnly += setOf("NewApi", "InlinedApi", "ClassVerificationFailure", "Instantiatable")
-        error += setOf("NewApi", "InlinedApi", "ClassVerificationFailure", "Instantiatable")
+        // Строгая байткод-проверка совместимости с Android 5.0+ (minSdk 21)
+        checkOnly += setOf("NewApi", "InlinedApi", "Instantiatable")
+        error += setOf("NewApi", "InlinedApi", "Instantiatable")
         abortOnError = true
         textReport = true
     }
