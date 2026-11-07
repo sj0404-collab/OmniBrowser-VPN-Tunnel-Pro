@@ -36,6 +36,8 @@ jobs:
           VER=$(grep -h -m1 -oE 'versionName *=? *"[^"]+"' app/build.gradle* | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             TAG_PART="${GITHUB_REF_NAME}"
+          elif [[ "$VER" == *-android5* ]]; then
+            TAG_PART="v${VER}"
           else
             TAG_PART="v${VER}-android5"
           fi

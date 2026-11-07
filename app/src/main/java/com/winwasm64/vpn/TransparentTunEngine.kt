@@ -206,11 +206,18 @@ class TransparentTunEngine(
             onDnsQuery(buf.copyOf(total), total, ihl, tunOut)
             return
         }
-        if (dport == 443 || dport == 80) {
-            // QUIC / HTTP3 → «порт недоступен»: приложение сразу берёт TCP/TLS (идёт через обход DPI)
-            val icmp = TunPackets.buildIcmpPortUnreachable(buf, ihl, total)
-            writePacket(icmp, 0, icmp.size)
-            return
+        if ((dport == 443 || dport == 80) && !udpFlows.containsKey(UdpKey(sport, dst, dport))) {
+            // v4.16.0: «порт недоступен» отвечаем ТОЛЬКО на настоящий QUIC — сайт сразу берёт TCP
+            // через обход DPI. Игры и звонки (GeForce NOW, Discord, WhatsApp, WebRTC) ходят в UDP 443
+            // пакетами DTLS/STUN/RTP: на ICMP они на TCP не переходят и просто не соединяются.
+            // Им нужен релей — он ниже.
+            val kind = UdpClassifier.kind(buf, payloadOff, payloadLen)
+            if (kind == UdpClassifier.QUIC) {
+                val icmp = TunPackets.buildIcmpPortUnreachable(buf, ihl, total)
+                writePacket(icmp, 0, icmp.size)
+                try { VpnLog.udpOnce(dst, dport, "UDP $dport → " + TunPackets.ipToInet(dst).hostAddress + ": " + UdpClassifier.title(kind)) } catch (_: Throwable) {}
+                return
+            }
         }
         val k = UdpKey(sport, dst, dport)
         var flow = udpFlows[k]
@@ -231,6 +238,23 @@ class TransparentTunEngine(
                 flow = prev
             } else {
                 flow = created
+                if (dport == 443 || dport == 80) {
+                    try {
+                        VpnLog.i("Туннель", "UDP " + sport + " → " + TunPackets.ipToInet(dst).hostAddress + ":" + dport +
+                            " — " + UdpClassifier.title(UdpClassifier.kind(buf, payloadOff, payloadLen)) +
+                            " (игры и звонки теперь идут через релей, а не «порт недоступен»)")
+                    } catch (_: Throwable) {
+                    }
+                }
+                try {
+                    // v4.17.0: UDP-поток в журнале соединений — кто, куда, что за пакеты
+                    ConnTrace.udp(
+                        who = VpnLog.label(udpOwner(sport, dst, dport)),
+                        target = TunPackets.ipToInet(dst).hostAddress + ":" + dport,
+                        kind = UdpClassifier.title(UdpClassifier.kind(buf, payloadOff, payloadLen))
+                    )
+                } catch (_: Throwable) {
+                }
                 startUdpReceiver(k, created)
             }
         }
@@ -259,6 +283,12 @@ class TransparentTunEngine(
                     flow.lastActive = System.currentTimeMillis()
                     val fromIp = TunPackets.inetToIp(pkt.address)
                     if (fromIp == 0) continue
+                    // v4.16.0: датаграмма больше MTU туннеля не влезет в один IP-пакет (фрагментацию
+                    // не делаем) — такие отбрасываем и говорим об этом один раз, а не молча
+                    if (pkt.length > 1400) {
+                        try { VpnLog.udpOnce(k.remoteIp, k.remotePort, "UDP-ответ " + pkt.length + " Б больше MTU туннеля — отброшен (фрагментация не поддерживается)") } catch (_: Throwable) {}
+                        continue
+                    }
                     try { flow.probe.onRx(rbuf, 0, pkt.length); flow.probe.tick() } catch (_: Throwable) {}
                     val out = TunPackets.buildUdpV4(fromIp, pkt.port, TunPackets.TUN_IP, k.appPort, rbuf, 0, pkt.length)
                     writePacket(out, 0, out.size)

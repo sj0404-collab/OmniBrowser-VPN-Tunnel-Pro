@@ -991,11 +991,45 @@ function alert(){}
                 val route = if (forcedDirect) listOf(DIRECT) else (pacLookup(url, hp.first) ?: listOf(DIRECT))
                 // v4.1.1: ступенчатая гонка вместо последовательного перебора — ответ на CONNECT всегда укладывается в ~8 с
                 // v4.3.8: закреплённый за хостом сервер (загрузка видео, привязанного к IP) имеет приоритет
+                val traceStart = System.currentTimeMillis()
                 val up = (if (forcedDirect) null else pinnedConnect(hp.first, hp.second)) ?: raceConnect(route, hp.first, hp.second, url)
                 if (up == null) {
                     com.winwasm64.vpn.VpnLog.e("Браузер", "не удалось открыть ${hp.first}:${hp.second}")
+                    // v4.17.0: журнал соединений — неудачное соединение браузера с указанием маршрута
+                    try {
+                        com.winwasm64.vpn.ConnTrace.connect(
+                            who = "Браузер",
+                            host = hp.first,
+                            port = hp.second,
+                            route = if (forcedDirect) "напрямую (обход DPI, IP не меняется)" else (stickyUp?.let { if (isPsiphonKey(it.key)) "Psiphon" else "Browsec " + shortName(it.key) } ?: "маршрут расширения"),
+                            ms = System.currentTimeMillis() - traceStart,
+                            ok = false,
+                            err = "маршрут не ответил"
+                        )
+                    } catch (_: Throwable) {
+                    }
                     respond(client, 502, "Proxy Error")
                     return
+                }
+                // v4.17.0: маршрут, которым реально открылось соединение — в журнал соединений
+                try {
+                    // v4.17.0: честно — Psiphon здесь не угадываем: если он и участвовал, то как
+                    // автотуннель, и это уже отражено в профиле сервера ниже
+                    val routeTitle = when {
+                        forcedDirect -> "напрямую (обход DPI, IP не меняется)"
+                        stickyUp == null -> "маршрут расширения"
+                        isPsiphonKey(stickyUp!!.key) -> "Psiphon"
+                        else -> "Browsec " + shortName(stickyUp!!.key)
+                    }
+                    com.winwasm64.vpn.ConnTrace.connect(
+                        who = "Браузер",
+                        host = hp.first,
+                        port = hp.second,
+                        route = routeTitle,
+                        ms = System.currentTimeMillis() - traceStart,
+                        ok = true
+                    )
+                } catch (_: Throwable) {
                 }
                 try {
                     val out = client.getOutputStream()

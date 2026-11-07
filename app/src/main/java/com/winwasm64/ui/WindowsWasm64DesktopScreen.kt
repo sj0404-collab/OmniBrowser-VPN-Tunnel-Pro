@@ -1301,6 +1301,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 ): WebResourceResponse? {
                     val reqUrl = request?.url?.toString()?.lowercase() ?: return null
                     BrowserDirectRepeater.recordWebViewActivity(txEstimate = 420L, rxEstimate = 3200L)
+                    // v4.17.0: журнал соединений — кто вызвал (страница), куда, по какому протоколу и зачем
+                    try {
+                        val rh = request?.url?.host.orEmpty()
+                        if (rh.isNotEmpty()) {
+                            val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
+                            val rport = if ((request?.url?.port ?: -1) > 0) request!!.url.port
+                            else if (reqUrl.startsWith("http://")) 80 else 443
+                            com.winwasm64.vpn.ConnTrace.request(
+                                initiator = pageHost,
+                                host = rh,
+                                port = rport,
+                                purpose = requestPurpose(request, reqUrl),
+                                blocked = false
+                            )
+                        }
+                    } catch (_: Throwable) {
+                    }
                     if (!tab.isIncognito) {
                         ExtensionRuntime.interceptTabRequest(tab.numericId, request)?.let { return it }
                     }
@@ -1313,6 +1330,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             reqUrl.contains("googleads.")
                         if (blocked) {
                             adBlockedCount++
+                            try {
+                                val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
+                                com.winwasm64.vpn.ConnTrace.request(pageHost, host, if ((request.url.port) > 0) request.url.port else 443, "реклама/трекер — отсечено", true)
+                            } catch (_: Throwable) {
+                            }
                             return WebResourceResponse(
                                 "text/plain",
                                 "UTF-8",
@@ -1892,6 +1914,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             ctrl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             ctrl.hide(WindowInsetsCompat.Type.systemBars())
             act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            // v4.16.0: страница в полноэкранном режиме должна получать ввод — иначе запрос клавиатуры
+            // из оверлея игры уходит в никуда и клавиатура тут же закрывается
+            try { activeTab.webView?.requestFocus() } catch (_: Exception) {}
             try { win.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {} // v4.10.0: экран не гаснет в полноэкранной игре/видео
         }
         onDispose {
@@ -3031,16 +3056,26 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         },
                         modifier = Modifier.fillMaxSize()
                     )
-                    if (!inPip) Button(
-                        onClick = {
-                            fullscreenCustomView = null
-                            fullscreenCallback?.onCustomViewHidden()
-                            fullscreenCallback = null
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
-                        modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
-                    ) {
-                        Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                    if (!inPip) Row(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) {
+                        // v4.16.0: в полноэкранной игре (GeForce NOW и подобные) клавиатура, которую просит
+                        // страница, могла не открыться — даём кнопку, которая показывает её принудительно.
+                        Button(
+                            onClick = { forceShowKeyboard(context, activeTab.webView) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text("⌨ Клавиатура", fontSize = 11.sp, color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                fullscreenCustomView = null
+                                fullscreenCallback?.onCustomViewHidden()
+                                fullscreenCallback = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f))
+                        ) {
+                            Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                        }
                     }
                 }
             }
@@ -5057,3 +5092,49 @@ private fun omniAudioBoostJs(gain: Double): String = """
   } catch (e) { return 'err:' + e.message; }
 })($gain);
 """
+
+/**
+ * v4.16.0: принудительно показать экранную клавиатуру для страницы в полноэкранном режиме.
+ *
+ * Зачем: в оверлее GeForce NOW (и других игр) клавиатура открывалась и сразу закрывалась.
+ * До этой версии приложение вообще не трогало IME — то есть показать её повторно было нечем.
+ * Теперь есть кнопка «⌨ Клавиатура»: она отдаёт фокус WebView и просит IME показать клавиатуру
+ * с режимом SHOW_IMPLICIT — тот же, которым пользуется сама страница.
+ */
+private fun forceShowKeyboard(ctx: android.content.Context, wv: android.webkit.WebView?) {
+    try {
+        if (wv == null) return
+        wv.requestFocus()
+        val imm = ctx.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+            as? android.view.inputmethod.InputMethodManager ?: return
+        imm.showSoftInput(wv, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        com.winwasm64.vpn.VpnLog.i("Браузер", "полный экран: клавиатура запрошена вручную (кнопка ⌨)")
+    } catch (e: Throwable) {
+        com.winwasm64.vpn.VpnLog.w("Браузер", "клавиатуру показать не удалось: ${e.message ?: e.javaClass.simpleName}")
+    }
+}
+
+/**
+ * v4.17.0: «зачем» для журнала соединений — по адресу запроса и его типу.
+ * Нужен, чтобы в журнале было не просто «куда», но и что это за запрос:
+ * страница, скрипт, картинка, медиа, API или реклама.
+ */
+private fun requestPurpose(request: android.webkit.WebResourceRequest?, reqUrl: String): String {
+    try {
+        if (request?.isForMainFrame == true) return "страница (переход)"
+    } catch (_: Throwable) {
+    }
+    val path = reqUrl.substringBefore('?')
+    return when {
+        reqUrl.contains("googlevideo.com") || path.endsWith(".m3u8") || path.endsWith(".mpd") ||
+            path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".ts") -> "медиа (видео/аудио)"
+        path.endsWith(".js") || path.endsWith(".mjs") -> "скрипт"
+        path.endsWith(".css") -> "стиль"
+        path.endsWith(".png") || path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+            path.endsWith(".webp") || path.endsWith(".svg") || path.endsWith(".gif") || path.endsWith(".ico") -> "картинка"
+        path.endsWith(".woff2") || path.endsWith(".woff") || path.endsWith(".ttf") -> "шрифт"
+        reqUrl.contains("/api") || reqUrl.contains("/graphql") || path.endsWith(".json") ||
+            reqUrl.contains("i/v1/") || reqUrl.contains("/ajax") -> "API/данные"
+        else -> "подресурс"
+    }
+}

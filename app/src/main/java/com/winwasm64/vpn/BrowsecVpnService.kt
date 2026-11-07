@@ -2980,7 +2980,24 @@ object BrowsecLocalProxyServer {
                     throw e
                 } finally {
                     if (appProfile != null) {
+                        val routeTitle = viaKey?.let { if (com.winwasm64.extensions.ExtensionProxy.isPsiphonKey(it)) "Psiphon" else "Browsec " + com.winwasm64.extensions.ExtensionProxy.shortName(it) }
+                            ?: "обход DPI (IP не меняется)"
                         VpnLog.conn(appProfile.packageName, host, port, (viaKey?.let { if (com.winwasm64.extensions.ExtensionProxy.isPsiphonKey(it)) "Psiphon" else "Browsec $it" } ?: effectiveCountry) + " · системный прокси", System.currentTimeMillis() - logStart, logErr, rxConn)
+                        // v4.17.0: журнал соединений — приложение, адресат, протокол, маршрут, зачем, объём
+                        try {
+                            com.winwasm64.vpn.ConnTrace.connect(
+                                who = VpnLog.label(appProfile.packageName),
+                                host = host,
+                                port = port,
+                                route = routeTitle + " · системный прокси",
+                                ms = System.currentTimeMillis() - logStart,
+                                ok = logErr == null,
+                                downBytes = rxConn,
+                                err = logErr,
+                                purpose = "приложение → сайт (CONNECT)"
+                            )
+                        } catch (_: Throwable) {
+                        }
                         appProfile.noteConn(logErr == null, st.pingMs.toLong(), viaKey, logErr)
                     }
                 }
@@ -3881,6 +3898,8 @@ class BrowsecVpnService : VpnService() {
                             onTraffic = { tx, rx -> st.recordTx(tx); st.recordRx(rx) }
                         )
                         if (FastMultiDnsResolver.isIpv4Literal(ip)) {
+                            // v4.17.0: в журнал соединений видно, как имя превратилось в адрес и через что
+                            try { com.winwasm64.vpn.ConnTrace.dns(q.name, ip, if (viaTunnel != null) "DoH через туннель Browsec" else "DoH профиля") } catch (_: Throwable) {}
                             reply(DnsPackets.buildResponse(dnsQuery, q, listOf(ip)))
                             return
                         }

@@ -91,6 +91,22 @@ object VpnLog {
         return if (pkgs.size > 6) "$shown и ещё ${pkgs.size - 6}" else shown
     }
 
+    private val udpOnceAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * v4.16.0: сообщение про UDP-поток — один раз в 5 минут на получателя,
+     * иначе журнал забивается одинаковыми строками от игр и звонков.
+     */
+    fun udpOnce(ip: Int, port: Int, msg: String) {
+        val key = (ip.toString() + ":" + port)
+        val now = System.currentTimeMillis()
+        val prev = udpOnceAt.putIfAbsent(key, now)
+        if (prev == null || now - prev > 300_000L) {
+            udpOnceAt[key] = now
+            i("Туннель", msg)
+        }
+    }
+
     @Synchronized
     private fun add(level: String, tag: String, msg: String) {
         lines.addLast("${fmt.format(Date())} $level [$tag] $msg")
@@ -115,9 +131,12 @@ object VpnLog {
     fun text(filter: String?): String = snapshot(filter).joinToString("\n")
 
     /** Сохраняет журнал в «Загрузки/OmniBrowser-logs». Возвращает путь для показа или null. */
-    fun saveToDownloads(ctx: Context): String? {
+    fun saveToDownloads(ctx: Context, extra: String = ""): String? {
         val name = "omnibrowser_vpn_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".txt"
-        val data = ("OmniBrowser VPN — журнал\n" + text(null) + "\n").toByteArray(Charsets.UTF_8)
+        // v4.17.0: в файл попадают оба журнала — события VPN и соединения (кто, куда, протокол, маршрут, зачем)
+        val body = "OmniBrowser VPN — журнал\n" + text(null) + "\n" +
+            (if (extra.isBlank()) "" else "\n===== Соединения =====\n" + extra + "\n")
+        val data = body.toByteArray(Charsets.UTF_8)
         return try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val values = ContentValues().apply {
