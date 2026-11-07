@@ -549,13 +549,17 @@ const val OMNI_KEY_JS = """
 
   // Документы, до которых можем дотянуться: свой и вложенные того же происхождения.
   function docs() {
-    var out = [document];
-    try {
-      var fr = document.querySelectorAll('iframe, frame');
+    var out = [];
+    function walk(doc, depth) {
+      if (!doc || depth > 4) return;
+      out.push(doc);
+      var fr;
+      try { fr = doc.querySelectorAll('iframe, frame'); } catch (e) { return; }
       for (var i = 0; i < fr.length; i++) {
-        try { var d = fr[i].contentDocument; if (d) out.push(d); } catch (e) {}
+        try { var d = fr[i].contentDocument; if (d) walk(d, depth + 1); } catch (e) {}
       }
-    } catch (e) {}
+    }
+    walk(document, 0);
     return out;
   }
 
@@ -585,19 +589,42 @@ const val OMNI_KEY_JS = """
     } catch (e) { return null; }
   }
 
+  /**
+   * v4.27.0: обходим ВСЁ дерево, включая Shadow DOM.
+   * Диалог GeForce NOW рисуется веб-компонентом: его поле ввода лежит в shadowRoot, а обычный
+   * document.querySelectorAll его не видит — поэтому раньше находилось только пустое служебное поле.
+   */
+  function collect(root, out, depth) {
+    if (!root || depth > 8 || out.length > 4000) return;
+    var nodes;
+    try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (textish(el) && !el.disabled && !el.readOnly) out.push(el);
+      var sr = null;
+      try { sr = el.shadowRoot; } catch (e) {}
+      if (sr) collect(sr, out, depth + 1);
+    }
+  }
+
   function allCandidates() {
     var out = [];
     var ds = docs();
-    for (var k = 0; k < ds.length; k++) {
-      var list;
-      try { list = ds[k].querySelectorAll('input, textarea, [contenteditable="true"]'); } catch (e) { continue; }
-      for (var i = 0; i < list.length; i++) {
-        var el = list[i];
-        if (!textish(el) || el.disabled || el.readOnly) continue;
-        out.push(el);
-      }
-    }
+    for (var k = 0; k < ds.length; k++) collect(ds[k], out, 0);
     return out;
+  }
+
+  /** Активный элемент с проваливанием внутрь shadowRoot. */
+  function deepActive() {
+    var el = document.activeElement;
+    var guard = 0;
+    while (el && guard++ < 10) {
+      var sr = null;
+      try { sr = el.shadowRoot; } catch (e) {}
+      if (sr && sr.activeElement) { el = sr.activeElement; continue; }
+      break;
+    }
+    return el;
   }
 
   function diag() {
@@ -611,7 +638,7 @@ const val OMNI_KEY_JS = """
 
   /** Кандидат, который реально принимает фокус и самый заметный. */
   function focusTarget() {
-    var ae = document.activeElement;
+    var ae = deepActive();
     if (textish(ae)) return ae;
     var cs = allCandidates();
     var best = null, bestScore = -1;
@@ -688,7 +715,24 @@ const val OMNI_KEY_JS = """
     var el = document.elementFromPoint(p.x, p.y);
     if (!el) return 'под курсором пусто';
     var target = el;
-    while (target && !textish(target)) target = target.parentElement;
+    // проваливаемся внутрь shadowRoot, если компонент его использует
+    var guard = 0;
+    while (target && guard++ < 10) {
+      var deep = null;
+      try { deep = target.shadowRoot && target.shadowRoot.elementFromPoint ? target.shadowRoot.elementFromPoint(p.x, p.y) : null; } catch (e) {}
+      if (!deep || deep === target) break;
+      target = deep;
+    }
+    var guard2 = 0;
+    while (target && !textish(target) && guard2++ < 12) {
+      var next = target.parentElement || null;
+      if (!next && target.getRootNode) {
+        var root = null;
+        try { root = target.getRootNode(); } catch (e) {}
+        if (root && root.host) next = root.host;
+      }
+      target = next;
+    }
     if (!target) {
       if (el.tagName === 'IFRAME') {
         try {
@@ -802,7 +846,7 @@ const val OMNI_KEY_JS = """
 
   window.__omniBlur = function() {
     try {
-      var el = document.activeElement;
+      var el = deepActive();
       if (el && el.blur && (textish(el) || el.isContentEditable)) el.blur();
     } catch (e) {}
     return 'blur';
