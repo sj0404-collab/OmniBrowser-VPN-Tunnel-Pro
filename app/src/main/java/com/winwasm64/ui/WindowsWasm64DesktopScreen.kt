@@ -76,6 +76,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -304,6 +305,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var textZoomPercent by remember { mutableIntStateOf(prefs.getInt("text_zoom_pct", 100)) }
     var dohServer by remember { mutableStateOf(prefs.getString("doh_server", "1.1.1.1") ?: "1.1.1.1") }
     var blockThirdPartyCookies by remember { mutableStateOf(prefs.getBoolean("block_3p_cookies", false)) }
+    // v4.10.9: плавающая кнопка «Скачать видео» перекрывала поле ввода на сайтах без видео — её можно выключить
+    var hideMediaButton by remember { mutableStateOf(prefs.getBoolean("hide_media_button", false)) }
     var webrtcTcpAll by remember { mutableStateOf(prefs.getBoolean("webrtc_tcp_all", false)) }
     var autoNextVideo by remember { mutableStateOf(prefs.getBoolean("auto_next_video", true)) }
     var doNotTrackEnabled by remember { mutableStateOf(prefs.getBoolean("dnt_enabled", true)) }
@@ -781,8 +784,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
         val target = normalizeInputToUrl(rawInput)
-        if (target.startsWith("magnet:", ignoreCase = true) || target.endsWith(".torrent", ignoreCase = true)) {
-            torrentEngine.startFromMagnetOrUrl(target)
+        if (isTorrentLink(target, null, null)) {
+            // v4.10.9: `.torrent?token=…` и ссылки download.php?id=… тоже идут в торрент-движок
+            startTorrentFromUrl(tab, target, null, null, null)
             currentSection = 1
             Toast.makeText(context, "🧲 Торрент добавлен в загрузчик!", Toast.LENGTH_SHORT).show()
             return
@@ -957,6 +961,68 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
     }
 
+    /**
+     * v4.10.9: «скачивался сам .torrent-файл вместо содержимого» — сайты отдают торрент ссылкой
+     * `download.php?id=...`, с `Content-Disposition: attachment; filename="x.torrent"` или типом
+     * `application/octet-stream`. Проверяем не только конец URL, но и имя файла из заголовка.
+     */
+    fun isTorrentLink(url: String, mimeType: String?, contentDisposition: String?): Boolean {
+        val u = url.trim()
+        if (u.startsWith("magnet:", ignoreCase = true)) return true
+        val mime = (mimeType ?: "").lowercase()
+        if (mime.contains("bittorrent")) return true
+        val cd = (contentDisposition ?: "").lowercase()
+        if (cd.contains(".torrent")) return true
+        val path = u.substringBefore('#').substringBefore('?').lowercase()
+        return path.endsWith(".torrent") || path.contains(".torrent/")
+    }
+
+    /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
+    fun looksLikeTorrentBytes(b: ByteArray): Boolean {
+        if (b.size < 32) return false
+        val head = String(b, 0, minOf(b.size, 4096), Charsets.ISO_8859_1)
+        return head.startsWith("d") && (head.contains("8:announce") || head.contains("4:info"))
+    }
+
+    /**
+     * Скачивает .torrent по ссылке и отдаёт его торрент-движку (а не в «Загрузки»).
+     * Если по ссылке пришёл не торрент — откатываемся на обычную загрузку файла.
+     */
+    fun startTorrentFromUrl(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        Toast.makeText(context, "🧲 Читаю .torrent и запускаю загрузку…", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val headers = LinkedHashMap<String, String>()
+                headers["Referer"] = tab.webView?.url ?: url
+                if (!userAgent.isNullOrBlank()) headers["User-Agent"] = userAgent
+                if (!tab.isIncognito) CookieManager.getInstance().getCookie(url)?.let { headers["Cookie"] = it }
+                val bytes = try {
+                    val c = com.winwasm64.ui.browser.MediaGrabber.open(url, headers)
+                    try {
+                        if (c.responseCode !in 200..299) throw java.io.IOException("HTTP ${c.responseCode}")
+                        com.winwasm64.ui.browser.MediaGrabber.readAll(c.inputStream, 16 * 1024 * 1024)
+                    } finally {
+                        c.disconnect()
+                    }
+                }
+                if (!looksLikeTorrentBytes(bytes)) throw java.io.IOException("по ссылке не .torrent (${bytes.size} Б)")
+                val fallbackName = URLUtil.guessFileName(url, contentDisposition, mimeType).ifBlank { "link.torrent" }
+                val id = torrentEngine.startFromTorrentBytes(bytes, fallbackName)
+                val hostLabel = try { java.net.URI(url).host ?: "сайт" } catch (_: Exception) { "сайт" }
+                com.winwasm64.vpn.VpnLog.i("Торрент", "по ссылке $hostLabel: разобран .torrent (${bytes.size} Б), задача $id")
+                Handler(Looper.getMainLooper()).post {
+                    currentSection = 1
+                    Toast.makeText(context, "🧲 Торрент запущен: ${id.take(8)}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось прочитать .torrent по ссылке: ${e.message} — сохраняю как файл")
+                Handler(Looper.getMainLooper()).post {
+                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
+                }
+            }
+        }.start()
+    }
+
     fun startWebDownload(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
         val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
         when {
@@ -1073,15 +1139,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                if (url.startsWith("magnet:", ignoreCase = true) ||
-                    url.endsWith(".torrent", ignoreCase = true) ||
-                    mimeType == "application/x-bittorrent"
-                ) {
-                    torrentEngine.startFromMagnetOrUrl(url)
-                    currentSection = 1
-                    Toast.makeText(context, "Торрент добавлен в загрузчик", Toast.LENGTH_LONG).show()
-                } else {
-                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
+                when {
+                    url.startsWith("magnet:", ignoreCase = true) -> {
+                        torrentEngine.startFromMagnetOrUrl(url)
+                        currentSection = 1
+                        Toast.makeText(context, "🧲 Magnet добавлен в загрузчик", Toast.LENGTH_LONG).show()
+                    }
+                    // v4.10.9: торрент может прийти ссылкой download.php?id=… с именем файла в заголовке
+                    isTorrentLink(url, mimeType, contentDisposition) ->
+                        startTorrentFromUrl(tab, url, userAgent, contentDisposition, mimeType)
+                    else -> startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
                 }
             }
 
@@ -1215,12 +1282,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     request: WebResourceRequest?
                 ): Boolean {
                     val nextUrl = request?.url?.toString() ?: return false
-                    if (nextUrl.startsWith("magnet:", ignoreCase = true) ||
-                        nextUrl.endsWith(".torrent", ignoreCase = true)
-                    ) {
+                    if (nextUrl.startsWith("magnet:", ignoreCase = true)) {
                         torrentEngine.startFromMagnetOrUrl(nextUrl)
                         currentSection = 1
-                        Toast.makeText(context, "🧲 Magnet/Торрент перехвачен и запущен!", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "🧲 Magnet перехвачен и запущен!", Toast.LENGTH_LONG).show()
+                        return true
+                    }
+                    // v4.10.9: `…/x.torrent?token=…` раньше не ловился (проверялось окончание всего URL)
+                    if (isTorrentLink(nextUrl, null, null)) {
+                        startTorrentFromUrl(tab, nextUrl, null, null, null)
+                        currentSection = 1
                         return true
                     }
                     if (nextUrl.startsWith("intent://", ignoreCase = true)) {
@@ -1506,7 +1577,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         val u = pendingExternal ?: return@LaunchedEffect
         com.winwasm64.ExternalIntents.pendingUrl = null
         if (u == initialIntentUri) return@LaunchedEffect
-        if (u.startsWith("magnet:", ignoreCase = true) || u.endsWith(".torrent", ignoreCase = true)) {
+        if (u.startsWith("magnet:", ignoreCase = true) || isTorrentLink(u, null, null)) {
             torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
         } else if (u.startsWith("http", ignoreCase = true) || u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) {
             openNewTab(u); currentSection = 0
@@ -1525,7 +1596,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     LaunchedEffect(initialIntentUri) {
         if (!initialIntentUri.isNullOrBlank()) {
             if (initialIntentUri.startsWith("magnet:", ignoreCase = true) ||
-                initialIntentUri.endsWith(".torrent", ignoreCase = true)
+                isTorrentLink(initialIntentUri, null, null)
             ) {
                 torrentEngine.startFromMagnetOrUrl(initialIntentUri)
                 currentSection = 1
@@ -2552,6 +2623,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }) { Text("Скачать ${latestUpdate.version}", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
                                         if (updateStatus.isNotBlank()) Text(updateStatus, color = Omni.TextDim, fontSize = 11.sp)
                                     }
+                                    // v4.10.9: кнопка «Скачать видео» мешала на сайтах без видео (перекрывала поле ввода)
+                                    SettingSwitchRow(
+                                        "Скрыть кнопку «Скачать видео»",
+                                        "Не показывать плавающую кнопку на страницах (кнопка и так прячется, пока открыта клавиатура)",
+                                        hideMediaButton
+                                    ) { v ->
+                                        hideMediaButton = v
+                                        prefs.edit().putBoolean("hide_media_button", v).apply()
+                                    }
                                     // v4.4.0: экспорт / импорт настроек
                                     var backupStatus by remember { mutableStateOf("") }
                                     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -2846,7 +2926,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
                 // v4.3.0: плавающая кнопка «Скачать видео» (появляется, когда страница запросила медиа)
                 val grabTab = tabs.getOrNull(activeTabIndex)
-                if (!inPip && grabTab != null && grabTab.hasMedia && currentSection == 0) {
+                // v4.10.9: клавиатура открыта (человек пишет сообщение/логин) — кнопка не закрывает поле ввода
+                val typingNow = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+                if (!inPip && grabTab != null && grabTab.hasMedia && currentSection == 0 && !typingNow && !hideMediaButton) {
                     SmallFloatingActionButton(
                         onClick = { openMediaGrabber(grabTab) },
                         containerColor = Omni.Accent,
