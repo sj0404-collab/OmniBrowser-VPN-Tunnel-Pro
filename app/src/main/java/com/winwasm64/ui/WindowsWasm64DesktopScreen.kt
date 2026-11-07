@@ -3941,6 +3941,8 @@ private fun NativeAppsWithBrowsecSection(
     var ipChecking by remember { mutableStateOf(false) }
     var realServers by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var realServersTotal by remember { mutableIntStateOf(0) }
+    var telegramStatus by remember { mutableStateOf("") }
+    var telegramChecking by remember { mutableStateOf(false) }
     LaunchedEffect(refreshTick / 4) {
         if (realServers.isEmpty()) {
             withContext(Dispatchers.IO) {
@@ -4110,8 +4112,11 @@ private fun NativeAppsWithBrowsecSection(
                                                     if (d.hosting) append(
                                                         "\n⚠ «домашний» IP принадлежит хостингу (${d.org}), а не мобильному оператору — значит на телефоне или на роутере работает ЕЩЁ ОДИН VPN (не OmniBrowser)."
                                                     )
-                                                    if (d.hosting && !bypassOk) append(
+                                                    if (d.hosting && !bypassOk && !com.winwasm64.vpn.NetworkBypass.unsupported) append(
                                                         "\n⚠ обход чужого VPN не сработал — чужой VPN, скорее всего, стоит на роутере или включён режим «блокировать соединения без VPN»."
+                                                    )
+                                                    if (com.winwasm64.vpn.NetworkBypass.unsupported) append(
+                                                        "\nℹ эта прошивка не разрешает обход (EPERM) — работаем изолированно: ваш VPN, VPN браузера и VPN приложений не мешают друг другу."
                                                     )
                                                 }
                                                 val line = com.winwasm64.vpn.VpnScope.ipCompare(d.ip, v.ip) +
@@ -4144,6 +4149,45 @@ private fun NativeAppsWithBrowsecSection(
                                     ipCheckLine,
                                     color = Omni.Accent, fontSize = 10.sp, fontFamily = FontFamily.Monospace
                                 )
+                            }
+                            // v4.14.0: Telegram — перебор прокси с реальной проверкой DC, а не «включили и надеемся»
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Button(
+                                    onClick = {
+                                        if (!telegramChecking) {
+                                            telegramChecking = true
+                                            telegramStatus = "Проверяю серверы для Telegram…"
+                                            val tgPkg = installedApps.firstOrNull { it.packageName.contains("telegram", true) || it.packageName.contains("ayu", true) }?.packageName
+                                                ?: "org.telegram.messenger"
+                                            Thread {
+                                                val res = try { nativeAppsManager.connectTelegramWithRotation(tgPkg) } catch (e: Exception) { "ошибка: ${e.message}" }
+                                                Handler(Looper.getMainLooper()).post {
+                                                    telegramStatus = res
+                                                    telegramChecking = false
+                                                }
+                                            }.start()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(34.dp)
+                                ) {
+                                    Text(
+                                        if (telegramChecking) "Проверяю…" else "Telegram: перебор прокси",
+                                        fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White
+                                    )
+                                }
+                                Text(
+                                    "проверит серверы по очереди и предложит прокси внутри Telegram",
+                                    color = Omni.TextDim, fontSize = 10.sp
+                                )
+                            }
+                            if (telegramStatus.isNotBlank()) {
+                                Text(telegramStatus, color = Omni.Accent, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                             }
                             if (showVpnDetails) {
                             Text(

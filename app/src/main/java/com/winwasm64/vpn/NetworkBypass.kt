@@ -40,6 +40,10 @@ object NetworkBypass {
     @Volatile var method: String = "нет"
         private set
 
+    /** v4.13.1: прошивка запретила и сокет, и процесс — больше не пытаемся, пишем честно один раз. */
+    @Volatile var unsupported: Boolean = false
+        private set
+
     fun init(context: Context) {
         ctx = context.applicationContext
     }
@@ -106,6 +110,7 @@ object NetworkBypass {
             ok
         } catch (e: Exception) {
             lastBindError = e.message ?: e.javaClass.simpleName
+            unsupported = (lastBindError?.contains("EPERM", true) == true)
             false
         }
     }
@@ -149,6 +154,7 @@ object NetworkBypass {
     /** Для журнала и интерфейса: что сейчас с обходом. */
     fun statusLine(): String {
         if (!enabled) return "обход чужого VPN: ВЫКЛ (наш трафик идёт так же, как весь остальной)"
+        if (unsupported) return "обход чужого VPN: эта прошивка не разрешает привязку (EPERM) — работаем изолированно, каждый VPN сам по себе"
         val n = pick() ?: return "обход чужого VPN: включён, но физической сети не нашлось — идём через VPN-интерфейс"
         val app = ctx ?: return "обход чужого VPN: включён"
         val cm = try { app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager } catch (_: Exception) { null }

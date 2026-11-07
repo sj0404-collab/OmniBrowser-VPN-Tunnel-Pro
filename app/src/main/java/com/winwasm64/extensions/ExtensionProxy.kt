@@ -1923,6 +1923,25 @@ function alert(){}
 
     fun clearAffinity(pkg: String?) { if (pkg != null) appAffinity.remove(pkg) }
 
+    /** v4.14.0: закрепить приложение за конкретным сервером (например, за тем, что прошёл проверку для Telegram). */
+    fun pinAppToServer(pkg: String, serverKey: String, reason: String = "проверка соединения") {
+        setAffinity(pkg, serverKey, reason)
+    }
+
+    /** v4.14.0: жив ли сервер — один CONNECT к указанному адресу через конкретный сервер. */
+    fun probeServer(serverKey: String, host: String, port: Int, timeoutMs: Int = 6_000): Long? {
+        if (tunnelServers.isEmpty()) refreshAutoTunnel(control?.pacText)
+        val up = upstreamByKey(serverKey) ?: return null
+        val t0 = SystemClock.elapsedRealtime()
+        return try {
+            val r = viaHttpProxy(up, host, port, "https://$host/", readTimeoutMs = timeoutMs)
+            closeQuietly(r.first)
+            SystemClock.elapsedRealtime() - t0
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     // ===================== v4.4.1: индикатор перегрузки пула =====================
     @Volatile private var overloadLoggedAt = 0L
     /** Сводка состояния пула: (серверов отвечает, всего измерено, лучший CONNECT мс). */

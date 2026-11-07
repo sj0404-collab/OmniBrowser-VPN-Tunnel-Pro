@@ -253,6 +253,20 @@ class NativeAppsManager(private val context: Context) {
         return port
     }
 
+    /**
+     * v4.14.0: «перебор прокси» для Telegram.
+     * Сначала реальная проверка серверов (CONNECT к DC Telegram), закрепление за рабочим,
+     * и только потом предлагается встроенный прокси `tg://socks`. Все шаги — в журнал.
+     * Блокирующий вызов: запускать из фонового потока.
+     */
+    fun connectTelegramWithRotation(packageName: String): String {
+        com.winwasm64.vpn.BrowsecLocalProxyServer.ensureRunning()
+        val (steps, winner) = com.winwasm64.vpn.TelegramProxy.probeAndPin(packageName)
+        val port = try { connectTelegramBuiltInProxy(packageName) } catch (_: Exception) { 0 }
+        val base = com.winwasm64.vpn.TelegramProxy.summary(steps, winner)
+        return if (port > 0) base + " · прокси 127.0.0.1:$port предложен Telegram" else base + " · не удалось открыть настройки прокси Telegram"
+    }
+
     fun launchApp(packageName: String, useVpnTunnel: Boolean = false): Boolean {
         return try {
             val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
