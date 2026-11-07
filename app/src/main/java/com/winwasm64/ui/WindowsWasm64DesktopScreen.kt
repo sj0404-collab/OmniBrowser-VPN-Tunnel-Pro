@@ -1803,6 +1803,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             ctrl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             ctrl.hide(WindowInsetsCompat.Type.systemBars())
             act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            // v4.16.0: страница в полноэкранном режиме должна получать ввод — иначе запрос клавиатуры
+            // из оверлея игры уходит в никуда и клавиатура тут же закрывается
+            try { activeTab.webView?.requestFocus() } catch (_: Exception) {}
             try { win.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {} // v4.10.0: экран не гаснет в полноэкранной игре/видео
         }
         onDispose {
@@ -2942,16 +2945,26 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         },
                         modifier = Modifier.fillMaxSize()
                     )
-                    if (!inPip) Button(
-                        onClick = {
-                            fullscreenCustomView = null
-                            fullscreenCallback?.onCustomViewHidden()
-                            fullscreenCallback = null
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
-                        modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
-                    ) {
-                        Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                    if (!inPip) Row(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) {
+                        // v4.16.0: в полноэкранной игре (GeForce NOW и подобные) клавиатура, которую просит
+                        // страница, могла не открыться — даём кнопку, которая показывает её принудительно.
+                        Button(
+                            onClick = { forceShowKeyboard(context, activeTab.webView) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text("⌨ Клавиатура", fontSize = 11.sp, color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                fullscreenCustomView = null
+                                fullscreenCallback?.onCustomViewHidden()
+                                fullscreenCallback = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f))
+                        ) {
+                            Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                        }
                     }
                 }
             }
@@ -4968,3 +4981,24 @@ private fun omniAudioBoostJs(gain: Double): String = """
   } catch (e) { return 'err:' + e.message; }
 })($gain);
 """
+
+/**
+ * v4.16.0: принудительно показать экранную клавиатуру для страницы в полноэкранном режиме.
+ *
+ * Зачем: в оверлее GeForce NOW (и других игр) клавиатура открывалась и сразу закрывалась.
+ * До этой версии приложение вообще не трогало IME — то есть показать её повторно было нечем.
+ * Теперь есть кнопка «⌨ Клавиатура»: она отдаёт фокус WebView и просит IME показать клавиатуру
+ * с режимом SHOW_IMPLICIT — тот же, которым пользуется сама страница.
+ */
+private fun forceShowKeyboard(ctx: android.content.Context, wv: android.webkit.WebView?) {
+    try {
+        if (wv == null) return
+        wv.requestFocus()
+        val imm = ctx.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+            as? android.view.inputmethod.InputMethodManager ?: return
+        imm.showSoftInput(wv, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        com.winwasm64.vpn.VpnLog.i("Браузер", "полный экран: клавиатура запрошена вручную (кнопка ⌨)")
+    } catch (e: Throwable) {
+        com.winwasm64.vpn.VpnLog.w("Браузер", "клавиатуру показать не удалось: ${e.message ?: e.javaClass.simpleName}")
+    }
+}

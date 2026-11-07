@@ -91,6 +91,22 @@ object VpnLog {
         return if (pkgs.size > 6) "$shown и ещё ${pkgs.size - 6}" else shown
     }
 
+    private val udpOnceAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * v4.16.0: сообщение про UDP-поток — один раз в 5 минут на получателя,
+     * иначе журнал забивается одинаковыми строками от игр и звонков.
+     */
+    fun udpOnce(ip: Int, port: Int, msg: String) {
+        val key = (ip.toString() + ":" + port)
+        val now = System.currentTimeMillis()
+        val prev = udpOnceAt.putIfAbsent(key, now)
+        if (prev == null || now - prev > 300_000L) {
+            udpOnceAt[key] = now
+            i("Туннель", msg)
+        }
+    }
+
     @Synchronized
     private fun add(level: String, tag: String, msg: String) {
         lines.addLast("${fmt.format(Date())} $level [$tag] $msg")
