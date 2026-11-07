@@ -36,6 +36,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     var compact: Boolean = true
     private val tvBrowser = TextView(context)
     private val tvApps = TextView(context)
+    private val tvDns = TextView(context)
     private val tvHint = TextView(context)
     private val btnAdd = TextView(context)
     private val btnTunnel = TextView(context)
@@ -91,7 +92,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         styleText(tvApps, 13f, 0xFFECECEC.toInt())
         addView(tvApps)
         styleText(tvHint, 11.5f, 0xFF9AA0A6.toInt())
-        addView(tvHint)
+        styleText(tvDns, 11.5f, 0xFF9AA0A6.toInt())
         val row = LinearLayout(context).apply { orientation = HORIZONTAL }
         row.addView(pill(TextView(context), "📜 Журнал VPN") {
             context.startActivity(Intent(context, VpnLogActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -127,6 +128,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             refresh()
         }
         addView(btnPsiphon, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        addView(tvDns, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        addView(tvHint, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
         refresh()
     }
 
@@ -142,6 +145,23 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         }
     }
 
+    private val dnsIpCache = HashMap<String, Pair<String?, Long>>()
+
+    /** IP названного сервера Browsec (кэш 5 мин) — чтобы не путать «один IP у двух имён» с подменой сервера. */
+    private fun namedIpCached(upstream: String?): String? {
+        if (upstream.isNullOrBlank()) return null
+        val now = System.currentTimeMillis()
+        dnsIpCache[upstream]?.let { (ip, at) -> if (now - at < 300_000L) return ip }
+        val ip = try {
+            val host = upstream.substringBefore(':')
+            java.net.InetAddress.getByName(host).hostAddress
+        } catch (_: Exception) {
+            null
+        }
+        dnsIpCache[upstream] = ip to now
+        return ip
+    }
+
     fun refresh() {
         tvBrowser.text = try {
             when {
@@ -150,10 +170,17 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
                 ExtensionProxy.isActive -> {
                     val named = ExtensionProxy.lastWorkingUpstream
                     val exit = com.winwasm64.ui.browser.EgressCheck.cachedVpnIp()
-                    // v4.11.1: показываем ФАКТИЧЕСКИЙ выход, а не только «последний рабочий сервер»:
-                    // именно из-за этого расхождения непонятно, какой VPN сейчас работает
+                    // v4.11.1: показываем ФАКТИЧЕСКИЙ выход, а не только «последний рабочий сервер»
                     val real = exit?.takeIf { it.ok }?.let { " · реальный выход: ${it.ip} (${it.where})" } ?: ""
-                    val mismatch = if (exit?.ok == true && named != null) " · ⚠ сервер меняется: имя «$named», IP выхода ${exit.ip}" else ""
+                    // v4.11.2: предупреждаем о смене сервера ТОЛЬКО если IP выхода не принадлежит названному серверу
+                    // (разные имена Browsec часто указывают на один и тот же IP — это не «подмена»)
+                    val namedIp = namedIpCached(named)
+                    val mismatch = when {
+                        exit?.ok != true || named == null -> ""
+                        namedIp == null -> ""
+                        namedIp == exit.ip -> ""
+                        else -> " · ⚠ сервер меняется: имя «$named» ($namedIp), IP выхода ${exit.ip}"
+                    }
                     "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»" +
                         (named?.let { " — работает (сервер $it)." } ?: ".") + real + mismatch
                 }
@@ -185,6 +212,10 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         btnPsiphon.alpha = if (PsiphonBackup.mode == PsiphonBackup.MODE_OFF) 0.6f else 1f
         tvApps.setTextColor(if (BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && routed.isEmpty()) 0xFFFDD663.toInt() else 0xFFECECEC.toInt())
         tvHint.visibility = if (compact) GONE else VISIBLE
+        tvDns.visibility = VISIBLE
+        tvDns.text = "🔎 DNS: браузер — имя сайта разрешает сам сервер Browsec (ваш DNS не участвует); " +
+            "приложения — DoH 1.1.1.1/8.8.8.8 внутри туннеля, только пока включён «VPN приложений»" +
+            (if (BrowsecVpnService.isRunning && BrowsecVpnService.routedPackages.isNotEmpty()) " (сейчас включён)." else " (сейчас ВЫКЛЮЧЕН — приложения резолвят вашим обычным DNS).")
         tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Настоящую смену IP дают серверы Browsec: для браузера — через расширение, для приложений — кнопкой ниже. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
         val missing = missingPopular()
         btnAdd.visibility = if (missing.isEmpty()) GONE else VISIBLE
