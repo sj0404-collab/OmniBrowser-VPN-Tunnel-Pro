@@ -70,7 +70,23 @@ object PsiphonBackup {
         mode = m
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("mode", m).apply()
         VpnLog.i(TAG, "режим: " + modeTitle(m))
-        if (m == MODE_OFF) stop() else if (BrowsecVpnService.isRunning) ensureStarted(ctx, "смена режима")
+        // v4.15.0: раньше Psiphon запускался только если уже работал «VPN приложений». Когда его нет
+        // (или его не даёт поднять чужой VPN, занявший единственный слот VPN в системе), кнопка
+        // меняла режим и НИЧЕГО не запускала — со стороны это выглядело как «Psiphon накрылся».
+        if (m == MODE_OFF) stop() else { pausedUntil = 0L; ensureStarted(ctx, "смена режима") }
+    }
+
+    /**
+     * v4.15.0: явный запуск по кнопке. Psiphon — обычная библиотека с локальным прокси,
+     * ему НЕ нужен наш VpnService, поэтому стартуем независимо от «VPN приложений»
+     * и снимаем паузу после неудачных попыток (пользователь попросил — значит пробуем снова).
+     */
+    fun startNow(ctx: Context, why: String) {
+        load(ctx)
+        if (mode == MODE_OFF) setMode(ctx, MODE_AUTO)
+        pausedUntil = 0L
+        lastError = ""
+        ensureStarted(ctx, why)
     }
 
     fun setRegion(ctx: Context, r: String) {
@@ -80,6 +96,9 @@ object PsiphonBackup {
         VpnLog.i(TAG, "регион выхода: " + (if (r.isBlank()) "любой (быстрейший)" else r))
         if (tunnel != null) restart()
     }
+
+    /** v4.15.0: пригодные записи встроенного списка — см. [PsiphonEntries]. */
+    fun countEntries(embedded: String): Int = PsiphonEntries.count(embedded)
 
     fun modeTitle(m: String = mode): String = when (m) {
         MODE_ALWAYS -> "всегда (все соединения через Psiphon)"
@@ -98,7 +117,7 @@ object PsiphonBackup {
             (if (mode == MODE_ALWAYS) " · основной канал" else " · резерв")
         starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с, попыток $connectAttempts)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "") + (if (lastError.isNotBlank()) " · $lastError" else "")
         SystemClock.elapsedRealtime() < pausedUntil -> "Psiphon: пауза ${(pausedUntil - SystemClock.elapsedRealtime()) / 60_000 + 1} мин — не подключился за ${GIVE_UP_MS / 60_000} мин (сеть фильтрует)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "")
-        else -> "Psiphon: не запущен (${modeTitle()})"
+        else -> "Psiphon: не запущен — нажмите, чтобы подключить (${modeTitle()})"
     }
 
     private object MediaFmt {
@@ -143,8 +162,8 @@ object PsiphonBackup {
                     // v4.4.5: встроенный список серверов (429 записей из публичного списка Psiphon) — первое подключение
                     // не зависит от того, доступен ли s3.amazonaws.com на сети пользователя
                     val embedded = try { ctx.assets.open("psiphon/servers.txt").bufferedReader().use { it.readText() } } catch (e: Exception) { VpnLog.w(TAG, "встроенный список серверов не прочитан: ${e.message}"); "" }
-                    embeddedCount = embedded.count { it == '\n' }
-                    VpnLog.i(TAG, "встроенных серверов: $embeddedCount, удалённый список подтянется сам")
+                    embeddedCount = PsiphonBackup.countEntries(embedded)
+                    VpnLog.i(TAG, "встроенных серверов: $embeddedCount (записей в assets/psiphon/servers.txt), удалённый список подтянется сам")
                     t.startTunneling(embedded)
                     // сторож: не подключились за GIVE_UP_MS — пауза
                     Thread({
@@ -212,7 +231,7 @@ object PsiphonBackup {
         // больше параллельных попыток (на враждебной сети каждая попытка — 10–20 с таймаута)
         o.put("ConnectionWorkerPoolSize", 20)
         // сначала протоколы, которые труднее отличить от обычного трафика (TLS/QUIC/meek), потом всё остальное
-        o.put("InitialLimitTunnelProtocols", org.json.JSONArray(listOf("TLS-OSSH", "QUIC-OSSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH", "FRONTED-MEEK-QUIC-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "SHADOWSOCKS-OSSH")))
+        o.put("InitialLimitTunnelProtocols", org.json.JSONArray(listOf("TLS-OSSH", "QUIC-OSSH", "OSSH", "SSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH", "FRONTED-MEEK-QUIC-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "SHADOWSOCKS-OSSH")))
         o.put("InitialLimitTunnelProtocolsCandidateCount", 60)
         o.put("TunnelPoolSize", 1)
         o.put("PortForwardFailureThreshold", 10)

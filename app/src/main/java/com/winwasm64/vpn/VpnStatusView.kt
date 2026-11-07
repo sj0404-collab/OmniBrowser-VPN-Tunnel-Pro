@@ -121,12 +121,27 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         }
         addView(btnTunnel, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
         // v4.4.3: запасной канал Psiphon — авто / всегда / выкл
+        // v4.15.0: нажатие = запустить/остановить (раньше кнопка только меняла режим и, если «VPN приложений»
+        // не работал, вообще ничего не запускала — Psiphon выглядел «накрывшимся»); удержание = сменить режим.
         pill(btnPsiphon, "") {
+            PsiphonBackup.load(context)
+            if (PsiphonBackup.ready() || PsiphonBackup.starting) {
+                PsiphonBackup.stop()
+                Toast.makeText(context, "Psiphon: остановлен (журнал «Psiphon»)", Toast.LENGTH_SHORT).show()
+            } else {
+                PsiphonBackup.startNow(context, "кнопка Psiphon")
+                Toast.makeText(context, "Psiphon: запускаю — статус обновится здесь, подробности в журнале «Psiphon»", Toast.LENGTH_LONG).show()
+            }
+            refresh()
+            handler.postDelayed({ refresh() }, 1200)
+        }
+        btnPsiphon.setOnLongClickListener {
             PsiphonBackup.load(context)
             val next = when (PsiphonBackup.mode) { PsiphonBackup.MODE_AUTO -> PsiphonBackup.MODE_ALWAYS; PsiphonBackup.MODE_ALWAYS -> PsiphonBackup.MODE_OFF; else -> PsiphonBackup.MODE_AUTO }
             PsiphonBackup.setMode(context, next)
-            Toast.makeText(context, "Psiphon: " + PsiphonBackup.modeTitle(next), Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Psiphon: режим «" + PsiphonBackup.modeTitle(next) + "»", Toast.LENGTH_SHORT).show()
             refresh()
+            true
         }
         addView(btnPsiphon, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
         addView(tvDns, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
@@ -209,7 +224,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         btnTunnel.text = if (BrowsecVpnService.appsViaBrowsecTunnel) "🌍 Приложения через серверы Browsec: ВКЛ" else "🌍 Приложения через серверы Browsec: ВЫКЛ (обход DPI)"
         btnTunnel.alpha = if (BrowsecVpnService.appsViaBrowsecTunnel && !ExtensionProxy.appTunnelAvailable()) 0.7f else 1f
         PsiphonBackup.load(context)
-        btnPsiphon.text = "🛡 " + PsiphonBackup.statusLine() + " · режим: " + when (PsiphonBackup.mode) { PsiphonBackup.MODE_ALWAYS -> "ВСЕГДА"; PsiphonBackup.MODE_OFF -> "ВЫКЛ"; else -> "АВТО" } + " (нажмите — сменить)"
+        btnPsiphon.text = "🛡 " + PsiphonBackup.statusLine() + " · режим: " + when (PsiphonBackup.mode) { PsiphonBackup.MODE_ALWAYS -> "ВСЕГДА"; PsiphonBackup.MODE_OFF -> "ВЫКЛ"; else -> "АВТО" } + " (нажатие — " + (if (PsiphonBackup.ready() || PsiphonBackup.starting) "остановить" else "подключить") + ", удержание — режим)"
         btnPsiphon.alpha = if (PsiphonBackup.mode == PsiphonBackup.MODE_OFF) 0.6f else 1f
         tvApps.setTextColor(if (BrowsecVpnService.isRunning && !BrowsecVpnService.isPaused && routed.isEmpty()) 0xFFFDD663.toInt() else 0xFFECECEC.toInt())
         tvHint.visibility = if (compact) GONE else VISIBLE
@@ -226,6 +241,15 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        // v4.15.0: панель открыли — если Psiphon включён по режиму, но не запущен, поднимаем сразу,
+        // иначе строка «не запущен» висела без объяснения, как его запустить.
+        try {
+            PsiphonBackup.load(context)
+            if (PsiphonBackup.mode != PsiphonBackup.MODE_OFF && !PsiphonBackup.ready() && !PsiphonBackup.starting) {
+                PsiphonBackup.startNow(context.applicationContext, "открыта панель VPN")
+            }
+        } catch (_: Throwable) {
+        }
         handler.post(ticker)
     }
 
