@@ -3,7 +3,9 @@ package com.winwasm64.ui.browser
 import android.content.Context
 import android.content.res.Configuration
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
@@ -40,11 +42,12 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
- * Общее состояние виртуального курсора: панель его двигает, а оверлей полного экрана —
- * рисует. В странице курсор не видно: клиент GeForce NOW занимает экран через HTML-fullscreen,
- * и всё, что мы вставляем в документ, остаётся под этим слоем.
+ * Общее состояние виртуального курсора: панель его двигает, а оверлей полного экрана — рисует.
+ * В самой странице курсор не видно: клиент GeForce NOW занимает экран через HTML-fullscreen.
  */
 object OmniCursor {
     var active by mutableStateOf(false)
@@ -53,28 +56,31 @@ object OmniCursor {
 }
 
 /**
- * v4.24.0: панель сама ведёт текст страницы, а мышь стала тачпадом как в Winlator.
+ * v4.25.0: правка текста родными средствами браузера, мышь — настоящими MotionEvent,
+ * строка ввода — зеркало поля на экране.
  *
- * Что было сломано на устройстве (4.22.0) и почему:
+ * Что показали статусы 4.24.0:
  *
- *  1. «⌫ пишет начало чего-то / не найдено». Мы удаляли символ по позиции курсора, а страница
- *     (оверлей GeForce NOW) держит курсор в позиции 0. Теперь панель НЕ доверяет курсору:
- *     читает значение поля из страницы, убирает последний символ и записывает значение обратно.
- *     Удаление становится предсказуемым: `удалено, осталось N`.
+ *  1. `вставка: не удалось записать в поле` — мы писали в `.value` и надеялись, что страница
+ *     это примет. Оверлей GeForce NOW написан на React: он держит своё состояние и откатывает
+ *     нашу запись. Теперь текст вводится так же, как это делает человек: фокусируем поле,
+ *     ставим курсор в конец и вызываем `document.execCommand('insertText')` — браузер сам
+ *     генерирует честное событие ввода, которое React принимает. Удаление — выделяем последний
+ *     символ и `execCommand('delete')`. Прямая запись осталась запасным путём.
  *
- *  2. «на каждое нажатие открывается системная клавиатура и сразу закрывается». Виноват был
- *     `WebView.requestFocus()` перед отправкой клавиши: WebView получал фокус, страница открывала
- *     свою клавиатуру, а мы тут же возвращали фокус обратно. Теперь фокус не трогаем вообще,
- *     а системную клавиатуру дополнительно прячем после каждого нажатия.
+ *  2. `ЛКМ: нажато: VIDEO` — клик отправлялся синтетическим DOM-событием, а игра (и её движок)
+ *     такие события игнорирует, потому что они недоверенные. Теперь мышь двигается и щёлкает
+ *     **настоящими** `MotionEvent` с `source = SOURCE_MOUSE` прямо в WebView: движение —
+ *     `ACTION_HOVER_MOVE`, клик — `ACTION_DOWN/UP`, правая — с `BUTTON_SECONDARY`. Плюс
+ *     DOM-событие как запасной путь для кнопок веб-интерфейса.
  *
- *  3. «тачпад не видно, курсор не видно». Площадка рисовалась прозрачной плашкой в оверлее,
- *     а курсор вообще не отображался. Теперь мышь — это настоящий тачпад: тянем по площадке —
- *     курсор едет по странице (относительное движение, чувствительность 2.4), тап — клик левой,
- *     долгое нажатие — правой. Сам курсор рисуется В САМОЙ СТРАНИЦЕ (жёлтое кольцо поверх игры),
- *     поэтому его видно всегда, и по нему же бьёт клик (`elementFromPoint`).
+ *  3. Строка ввода была «пустышкой»: в ней копился наш текст, а не то, что реально в поле
+ *     страницы. Теперь после каждого действия строка **перечитывает значение из поля** и
+ *     показывает его (кнопка «⟳» — перечитать вручную). В статусе видно `в поле: N символов`.
  *
- * Кнопки: «ЛКМ», «ПКМ», «↑/↓» — прокрутка, «—» — свернуть мышь, «⌨» — своя клавиатура,
- * «сист» — системная, «✕» — закрыть. По умолчанию видна только полупрозрачная строка ввода.
+ *  4. `Enter: кнопка не найдена` — искали кнопку только рядом с полем. Теперь «Далее/Продолжить/
+ *     Отправить/Войти/OK» ищется по всей странице, берётся самый «глубокий» подходящий элемент
+ *     (в том числе обычный div с обработчиком) и по нему выполняется `click()`.
  */
 @Composable
 fun OmniKeyPanel(
@@ -89,10 +95,20 @@ fun OmniKeyPanel(
     var ru by remember { mutableStateOf(true) }
     var shift by remember { mutableStateOf(false) }
     var digits by remember { mutableStateOf(false) }
+    var curFx by remember { mutableStateOf(0.5f) }
+    var curFy by remember { mutableStateOf(0.5f) }
     val focus = remember { FocusRequester() }
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
     val view = LocalView.current
+
+    fun hideIme() {
+        try {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(view.windowToken, 0)
+        } catch (_: Throwable) {
+        }
+    }
 
     fun showSystemKeyboard() {
         try {
@@ -104,74 +120,50 @@ fun OmniKeyPanel(
         }
     }
 
-    fun hideIme() {
-        try {
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-            imm?.hideSoftInputFromWindow(view.windowToken, 0)
-        } catch (_: Throwable) {
-        }
-    }
-
-    fun js(code: String, tag: String, delay: Long = 0) {
-        val wv = webView ?: return
-        val run = Runnable {
-            try {
-                wv.evaluateJavascript("try{$code}catch(e){'err:'+e}") { r ->
-                    val res = (r ?: "").trim().trim('"')
-                    if (res.isNotEmpty() && res != "null") status = "$tag: $res"
-                }
-            } catch (_: Throwable) {
-            }
-        }
-        if (delay > 0) wv.postDelayed(run, delay) else run.run()
-    }
-
-    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка")
-
-    fun back() {
+    /** Вызов JS и разбор ответа. `onValue` получает распакованную строку ответа. */
+    fun js(code: String, tag: String, onValue: ((String) -> Unit)? = null) {
         val wv = webView ?: return
         try {
-            wv.evaluateJavascript("try{window.__omniBack?window.__omniBack():'нет функций'}catch(e){'err:'+e}") { r ->
-                val res = (r ?: "").trim().trim('"')
-                status = "⌫: $res"
-                com.winwasm64.vpn.VpnLog.i("Браузер", "ввод: ⌫ → $res")
-                if (res.contains("поле не найдено")) {
-                    // запасной путь: настоящая клавиша Delete внутрь WebView
-                    try {
-                        val t = SystemClock.uptimeMillis()
-                        wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL, 0))
-                        wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL, 0))
-                        status = "⌫: системная клавиша"
+            wv.evaluateJavascript("try{$code}catch(e){'err:'+e}") { raw ->
+                var text = (raw ?: "").trim()
+                if (text.startsWith("\"")) {
+                    text = try {
+                        (JSONTokener(text).nextValue() as? String) ?: text.trim('"')
                     } catch (_: Throwable) {
+                        text.trim('"')
                     }
                 }
-                hideIme()
+                if (text.isNotEmpty() && text != "null") status = "$tag: $text"
+                onValue?.invoke(text)
             }
         } catch (_: Throwable) {
         }
     }
 
-    fun enter() {
-        val wv = webView ?: return
-        try {
-            wv.evaluateJavascript("try{window.__omniAct?window.__omniAct('enter'):'нет функций'}catch(e){'err:'+e}") { r ->
-                val res = (r ?: "").trim().trim('"')
-                status = "Enter: $res"
-                com.winwasm64.vpn.VpnLog.i("Браузер", "ввод: Enter → $res")
-                hideIme()
+    /** Перечитать значение из поля страницы в нашу строку — чтобы строка не была «пустышкой». */
+    fun refreshValue() {
+        js("window.__omniRead?window.__omniRead():''", "поле") { text ->
+            try {
+                val json = JSONObject(text)
+                val v = json.optString("v")
+                val tag = json.optString("tag")
+                proxy = v.takeLast(400)
+                status = if (json.optBoolean("ok")) {
+                    "в поле «$tag»: ${json.optInt("n")} симв. — $v".take(90)
+                } else {
+                    "поле страницы не найдено"
+                }
+            } catch (_: Throwable) {
+                // ответ не JSON — ничего не делаем
             }
-        } catch (_: Throwable) {
         }
     }
 
-    /**
-     * Клавиша «как есть» внутрь WebView.
-     *
-     * Такие события доходят до страницы только когда фокус у WebView — именно поэтому Tab
-     * раньше открывал верхний оверлей GeForce NOW. Но при передаче фокуса страница открывает
-     * свою клавиатуру. Поэтому перед нажатием снимаем фокус с поля страницы (`__omniBlur`),
-     * а после — сразу прячем клавиатуру.
-     */
+    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { refreshValue() }
+    fun back() = js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { refreshValue() }
+    fun enter() = js("window.__omniAct?window.__omniAct('enter'):'нет функций'", "Enter") { refreshValue() }
+
+    /** Клавиша внутрь WebView: доходит только при фокусе у WebView, поэтому фокус даём, а IME гасим. */
     fun nativeKey(keyCode: Int, tag: String) {
         val wv = webView ?: return
         val prev: View? = try { view.rootView.findFocus() } catch (_: Throwable) { null }
@@ -199,6 +191,38 @@ fun OmniKeyPanel(
         }
     }
 
+    /** Настоящее событие мыши внутрь WebView (доверенное, игра его видит). */
+    fun mouseNative(action: Int, hover: Boolean, buttons: Int) {
+        val wv = webView ?: return
+        try {
+            val x = curFx * wv.width
+            val y = curFy * wv.height
+            val t = SystemClock.uptimeMillis()
+            val ev = MotionEvent.obtain(t, t, action, x, y, 0)
+            ev.source = InputDevice.SOURCE_MOUSE
+            if (buttons != 0) {
+                try {
+                    val m = MotionEvent::class.java.getMethod("setButtonState", Integer.TYPE)
+                    m.invoke(ev, buttons)
+                } catch (_: Throwable) {
+                }
+            }
+            if (hover) wv.dispatchGenericMotionEvent(ev) else wv.dispatchTouchEvent(ev)
+            ev.recycle()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun click(right: Boolean) {
+        mouseNative(MotionEvent.ACTION_DOWN, false, if (right) 2 else 1)
+        mouseNative(MotionEvent.ACTION_UP, false, 0)
+        // для кнопок веб-интерфейса (DOM) — ещё и событие страницы
+        js(
+            "window.__omniClick?window.__omniClick('${if (right) "right" else "left"}'):''",
+            if (right) "ПКМ" else "ЛКМ"
+        ) { refreshValue() }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -215,8 +239,9 @@ fun OmniKeyPanel(
                         try {
                             wv.evaluateJavascript(
                                 "try{window.__omniMouseMove?window.__omniMouseMove(${dx.toInt()},${dy.toInt()}):''}catch(e){}"
-                            ) { r ->
-                                val parts = (r ?: "").trim().trim('"').split(",")
+                            ) { raw ->
+                                val text = ((raw ?: "").trim()).trim('"')
+                                val parts = text.split(",")
                                 if (parts.size >= 4) {
                                     val fx = parts[2].toFloatOrNull()
                                     val fy = parts[3].toFloatOrNull()
@@ -224,27 +249,24 @@ fun OmniKeyPanel(
                                         OmniCursor.active = true
                                         OmniCursor.fx = fx.coerceIn(0f, 1f)
                                         OmniCursor.fy = fy.coerceIn(0f, 1f)
+                                        curFx = OmniCursor.fx
+                                        curFy = OmniCursor.fy
+                                        // настоящее движение мыши: видят и игра, и страница
+                                        mouseNative(MotionEvent.ACTION_HOVER_MOVE, true, 0)
+                                        status = "курсор ${(curFx * 100).toInt()}% × ${(curFy * 100).toInt()}%"
                                     }
-                                    status = "курсор ${parts[0]},${parts[1]} (${(OmniCursor.fx * 100).toInt()}%, ${(OmniCursor.fy * 100).toInt()}%)"
                                 }
                             }
                         } catch (_: Throwable) {
                         }
                     }
                 },
-                onClick = { right ->
-                    js(
-                        "window.__omniClick?window.__omniClick('${if (right) "right" else "left"}'):''",
-                        if (right) "ПКМ" else "ЛКМ"
-                    )
-                },
-                onWheel = { dy ->
-                    js("window.__omniWheel?window.__omniWheel(${dy.toInt()}):''", "прокрутка")
-                },
+                onClick = { right -> click(right) },
+                onWheel = { dy -> js("window.__omniWheel?window.__omniWheel(${dy.toInt()}):''", "прокрутка") },
                 onCollapse = {
                     mouseOpen = false
                     OmniCursor.active = false
-                    js("window.__omniMouseShow?window.__omniMouseShow(false):''", "курсор")
+                    js("window.__omniMouseShow?window.__omniMouseShow(0):''", "курсор")
                 }
             )
         }
@@ -253,7 +275,6 @@ fun OmniKeyPanel(
                 ru = ru,
                 shift = shift,
                 digits = digits,
-                compact = landscape,
                 onInsert = { ch -> insert(ch) },
                 onKey = { code, tag -> handleKey(code, tag) },
                 onToggleLang = { ru = !ru },
@@ -277,18 +298,20 @@ fun OmniKeyPanel(
             onToggleKeys = {
                 keysOpen = !keysOpen
                 if (keysOpen) hideIme()
+                refreshValue()
             },
             mouseOpen = mouseOpen,
             onToggleMouse = {
                 mouseOpen = !mouseOpen
                 if (mouseOpen) {
                     OmniCursor.active = true
-                    status = "мышь: тяни по площадке — курсор едет по экрану"
+                    status = "мышь: тяни по площадке — курсор едет; тап — клик"
                 } else {
                     OmniCursor.active = false
-                    js("window.__omniMouseShow?window.__omniMouseShow(false):''", "курсор")
+                    js("window.__omniMouseShow?window.__omniMouseShow(0):''", "курсор")
                 }
             },
+            onRefresh = { refreshValue() },
             onShowSystemKeyboard = { showSystemKeyboard() },
             onClose = onClose
         )
@@ -315,6 +338,7 @@ private fun InputLine(
     onToggleKeys: () -> Unit,
     mouseOpen: Boolean,
     onToggleMouse: () -> Unit,
+    onRefresh: () -> Unit,
     onShowSystemKeyboard: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -335,10 +359,11 @@ private fun InputLine(
                 .focusRequester(focus)
         ) { inner ->
             if (value.isEmpty()) {
-                Text("печать сюда →", fontSize = 12.sp, color = Color(0x99AAB0BC))
+                Text("строка зеркалит поле игры — ⟳ перечитать", fontSize = 11.sp, color = Color(0x99AAB0BC))
             }
             inner()
         }
+        SmallChip("⟳") { onRefresh() }
         SmallChip(if (keysOpen) "⌨▾" else "⌨", active = keysOpen) { onToggleKeys() }
         SmallChip(if (mouseOpen) "🖱▾" else "🖱", active = mouseOpen) { onToggleMouse() }
         SmallChip("сист") { onShowSystemKeyboard() }
@@ -402,11 +427,7 @@ private fun MousePad(
                 },
             contentAlignment = Alignment.Center
         ) {
-            Text(
-                "ТАЧПАД\nтяни — курсор, тап — клик",
-                fontSize = 10.sp,
-                color = Color(0x88FFFFFF)
-            )
+            Text("ТАЧПАД\nтяни — курсор, тап — клик", fontSize = 10.sp, color = Color(0x88FFFFFF))
         }
     }
 }
@@ -423,7 +444,6 @@ private fun SoftKeyboard(
     ru: Boolean,
     shift: Boolean,
     digits: Boolean,
-    compact: Boolean,
     onInsert: (String) -> Unit,
     onKey: (Int, String) -> Unit,
     onToggleLang: () -> Unit,
@@ -506,8 +526,6 @@ const val OMNI_KEY_JS = """
 (function(){
   if (window.__omniAct) return;
 
-  // v4.24.0: привязываемся к тому полю, в которое реально пишем.
-  // Раньше брали первое видимое — и удаление уходило в пустое поле, а на экране текст оставался.
   window.__omniBound = null;
   window.__omniCursorPos = {x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2)};
 
@@ -517,22 +535,16 @@ const val OMNI_KEY_JS = """
     if (el.tagName === 'TEXTAREA') return true;
     if (el.tagName !== 'INPUT') return false;
     var t = (el.type || 'text').toLowerCase();
-    return t === 'text' || t === 'search' || t === 'email' || t === 'tel' || t === 'url' || t === 'password' || t === 'number' || t === '';
+    return t === 'text' || t === 'search' || t === 'email' || t === 'tel' || t === 'url' ||
+           t === 'password' || t === 'number' || t === '';
   }
 
-  function box(el) {
-    try { return el.getBoundingClientRect(); } catch (e) { return null; }
-  }
+  function box(el) { try { return el.getBoundingClientRect(); } catch (e) { return null; } }
 
   function visible(el) {
     if (!el) return false;
     var r = box(el);
     return !!r && r.width > 1 && r.height > 1;
-  }
-
-  function area(el) {
-    var r = box(el);
-    return r ? r.width * r.height : 0;
   }
 
   function pick() {
@@ -545,7 +557,8 @@ const val OMNI_KEY_JS = """
       var el = all[i];
       if (!textish(el) || el.disabled || el.readOnly) continue;
       if (!visible(el)) continue;
-      var a = area(el);
+      var r = box(el);
+      var a = r.width * r.height;
       if (a > bestArea) { bestArea = a; best = el; }
     }
     if (!best) {
@@ -554,6 +567,12 @@ const val OMNI_KEY_JS = """
     }
     if (best) window.__omniBound = best;
     return best;
+  }
+
+  function readOf(el) {
+    if (!el) return null;
+    if (el.isContentEditable) return (el.innerText || '');
+    return el.value == null ? '' : String(el.value);
   }
 
   function setNativeValue(el, v) {
@@ -577,67 +596,89 @@ const val OMNI_KEY_JS = """
     } catch (e) {}
   }
 
-  function readOf(el) {
-    if (!el) return null;
-    if (el.isContentEditable) return (el.innerText || '');
-    return el.value == null ? '' : String(el.value);
+  // ── Вставка «как человек»: фокус, курсор в конец, родная команда браузера ──────────────
+  // Так страница на React получает честное событие ввода и не откатывает значение.
+  function nativeInsert(el, txt) {
+    try {
+      el.focus();
+      var len = readOf(el).length;
+      if (el.setSelectionRange) { el.setSelectionRange(len, len); }
+      var ok = document.execCommand('insertText', false, txt);
+      return ok && readOf(el).length === len + txt.length;
+    } catch (e) { return false; }
   }
 
-  function writeTo(el, v) {
-    if (!el) return false;
-    if (el.isContentEditable) {
-      try {
-        el.focus();
-        document.execCommand('selectAll', false, null);
-        document.execCommand('insertText', false, v);
-        fire(el, 'input');
-        return true;
-      } catch (e) { return false; }
-    }
-    setNativeValue(el, v);
-    fire(el, 'input');
-    fire(el, 'change');
-    try { el.selectionStart = el.selectionEnd = v.length; } catch (e) {}
-    return readOf(el) === v;
+  function nativeDeleteLast(el) {
+    try {
+      el.focus();
+      var v = readOf(el);
+      if (!v.length) return false;
+      if (el.setSelectionRange) { el.setSelectionRange(v.length - 1, v.length); }
+      var ok = document.execCommand('delete', false, null);
+      return ok && readOf(el).length === v.length - 1;
+    } catch (e) { return false; }
   }
+
+  window.__omniRead = function() {
+    var el = pick();
+    if (!el) return JSON.stringify({ok: false, v: '', n: 0, tag: '—'});
+    var v = readOf(el) || '';
+    return JSON.stringify({ok: true, v: v.slice(-200), n: v.length, tag: el.tagName || '?'});
+  };
 
   window.__omniInsert = function(txt) {
     var el = pick();
-    if (!el) {
-      try {
-        if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
-          return document.execCommand('insertText', false, txt) ? 'ok (по фокусу)' : 'поле не найдено';
-        }
-      } catch (e) {}
-      return 'поле не найдено';
+    if (!el) return 'поле не найдено';
+    var before = readOf(el);
+    if (nativeInsert(el, txt)) {
+      try { el.blur(); } catch (e) {}
+      return 'ок, в поле ' + (before.length + txt.length) + ' символов';
     }
-    var v = readOf(el);
-    var nv = v + txt;
-    if (!writeTo(el, nv)) return 'не удалось записать в поле';
-    fire(el, 'keydown', {key: txt, keyCode: txt.charCodeAt(0)});
-    fire(el, 'keyup', {key: txt, keyCode: txt.charCodeAt(0)});
-    return 'ок, в поле ' + nv.length + ' символов';
+    // запасной путь: прямая запись значения
+    var v = before + txt;
+    setNativeValue(el, v);
+    fire(el, 'input');
+    fire(el, 'change');
+    try { el.blur(); } catch (e) {}
+    return readOf(el) === v ? ('ок (запись), ' + v.length + ' символов') : 'не удалось записать в поле';
   };
 
   window.__omniBack = function() {
     var el = pick();
     if (!el) return 'поле не найдено';
-    var v = readOf(el);
-    if (!v || !v.length) return 'поле пустое (' + (el.tagName || '?') + ')';
+    var v = readOf(el) || '';
+    if (!v.length) return 'поле пустое (' + (el.tagName || '?') + ')';
+    if (nativeDeleteLast(el)) {
+      try { el.blur(); } catch (e) {}
+      return 'было ' + v.length + ' → стало ' + readOf(el).length;
+    }
     var nv = v.slice(0, v.length - 1);
-    if (!writeTo(el, nv)) return 'не удалось записать в поле';
-    return 'было ' + v.length + ' → стало ' + nv.length;
+    setNativeValue(el, nv);
+    fire(el, 'input');
+    fire(el, 'change');
+    try { el.blur(); } catch (e) {}
+    return readOf(el) === nv ? ('было ' + v.length + ' → стало ' + nv.length + ' (запись)') : 'не удалось удалить';
   };
 
   window.__omniClear = function() {
     var el = pick();
     if (!el) return 'поле не найдено';
-    var v = readOf(el);
-    if (!writeTo(el, '')) return 'не удалось записать в поле';
-    return 'очищено (было ' + v.length + ')';
+    var v = readOf(el) || '';
+    try {
+      el.focus();
+      if (el.setSelectionRange) el.setSelectionRange(0, v.length);
+      if (document.execCommand('delete', false, null) && readOf(el).length === 0) {
+        try { el.blur(); } catch (e) {}
+        return 'очищено (было ' + v.length + ')';
+      }
+    } catch (e) {}
+    setNativeValue(el, '');
+    fire(el, 'input');
+    fire(el, 'change');
+    try { el.blur(); } catch (e) {}
+    return readOf(el).length === 0 ? ('очищено (было ' + v.length + ')') : 'не удалось очистить';
   };
 
-  // Снять фокус с поля страницы: иначе при передаче фокуса WebView всплывает системная клавиатура
   window.__omniBlur = function() {
     try {
       var el = document.activeElement;
@@ -646,39 +687,46 @@ const val OMNI_KEY_JS = """
     return 'blur';
   };
 
+  // ── Поиск и нажатие кнопки по всей странице ───────────────────────────────────────────
   var WORDS = ['далее', 'дальше', 'продолжить', 'отправить', 'войти', 'вход', 'подтвердить',
                'ok', 'okay', 'next', 'continue', 'submit', 'send', 'sign in', 'login'];
 
+  function textOf(el) {
+    var t = '';
+    try {
+      t = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '';
+    } catch (e) {}
+    return t.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
   window.__omniClickButton = function() {
-    var f = pick();
-    var scope = document;
-    if (f) {
-      var n = f;
-      for (var d = 0; d < 6 && n; d++) {
-        n = n.parentElement;
-        if (!n) break;
-        var probe = n.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
-        if (probe.length) { scope = n; break; }
-      }
-    }
-    var list = scope.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
-    var found = null, best = 0, bestText = '';
-    for (var i = 0; i < list.length; i++) {
-      var el = list[i];
-      if (!visible(el)) continue;
-      var t = '';
-      try { t = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase(); } catch (e) {}
+    var all = document.querySelectorAll('*');
+    var best = null, bestDepth = -1, bestText = '';
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      var t = textOf(el);
+      if (!t || t.length > 40) continue;
+      var rank = 0;
       for (var w = 0; w < WORDS.length; w++) {
-        if (t.indexOf(WORDS[w]) >= 0) {
-          var rank = WORDS.length - w;
-          if (rank > best) { best = rank; found = el; bestText = t; }
-          break;
-        }
+        if (t.indexOf(WORDS[w]) >= 0) { rank = WORDS.length - w; break; }
       }
+      if (!rank) continue;
+      if (!visible(el)) continue;
+      var depth = 0, n = el;
+      while (n) { depth++; n = n.parentElement; }
+      if (depth > bestDepth) { bestDepth = depth; best = el; bestText = t; }
     }
-    if (!found) return 'кнопка не найдена';
-    try { found.focus(); } catch (e) {}
-    try { found.click(); return 'нажато: ' + bestText; } catch (e) { return 'err:' + e; }
+    if (!best) return 'кнопка не найдена';
+    try { best.scrollIntoView({block: 'center'}); } catch (e) {}
+    try { best.click(); return 'нажато: ' + bestText.slice(0, 24); } catch (e) {}
+    try {
+      var r = best.getBoundingClientRect();
+      var o = {bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, view: window};
+      best.dispatchEvent(new MouseEvent('mousedown', o));
+      best.dispatchEvent(new MouseEvent('mouseup', o));
+      best.dispatchEvent(new MouseEvent('click', o));
+      return 'нажато событием: ' + bestText.slice(0, 24);
+    } catch (e) { return 'err:' + e; }
   };
 
   window.__omniSubmitForm = function() {
@@ -695,41 +743,13 @@ const val OMNI_KEY_JS = """
     } catch (e) { return 'err:' + e; }
   };
 
-  function cursorEl() {
-    var d = document.getElementById('__omni_cursor');
-    if (!d) {
-      d = document.createElement('div');
-      d.id = '__omni_cursor';
-      d.style.cssText = 'position:fixed;left:0;top:0;width:18px;height:18px;margin:-9px 0 0 -9px;' +
-        'border:2px solid #FFC857;border-radius:50%;background:rgba(255,200,87,0.25);' +
-        'pointer-events:none;z-index:2147483647;';
-      (document.body || document.documentElement).appendChild(d);
-    }
-    return d;
-  }
+  // ── Курсор (в оверлее приложения) и мышь ──────────────────────────────────────────────
+  window.__omniMouseShow = function(show) { return 'ок'; };
 
-  function placeCursor() {
-    var d = cursorEl();
-    d.style.left = window.__omniCursorPos.x + 'px';
-    d.style.top = window.__omniCursorPos.y + 'px';
-  }
-
-  window.__omniMouseShow = function(show) {
-    try {
-      var d = cursorEl();
-      d.style.display = show ? 'block' : 'none';
-      placeCursor();
-    } catch (e) {}
-    return 'ок';
-  };
-
-  // Относительное движение, как тачпад в Winlator. Возвращаем ещё и доли экрана:
-  // по ним оверлей рисует курсор поверх игры (в самой странице его перекрывает fullscreen-слой).
   window.__omniMouseMove = function(dx, dy) {
     var p = window.__omniCursorPos;
     p.x = Math.max(0, Math.min(window.innerWidth - 1, Math.round(p.x + dx)));
     p.y = Math.max(0, Math.min(window.innerHeight - 1, Math.round(p.y + dy)));
-    try { placeCursor(); } catch (e) {}
     try {
       var el = document.elementFromPoint(p.x, p.y);
       if (el) {
@@ -755,11 +775,8 @@ const val OMNI_KEY_JS = """
       try { el.dispatchEvent(new MouseEvent('contextmenu', o)); } catch (e) {}
     } else {
       try { el.dispatchEvent(new MouseEvent('click', o)); } catch (e) {}
-      try { if (el.click) el.click(); } catch (e) {}
     }
-    var t = '';
-    try { t = (el.innerText || el.value || el.tagName || '').replace(/\s+/g, ' ').trim().slice(0, 28); } catch (e) {}
-    return 'нажато: ' + t;
+    return 'под курсором: ' + (el.tagName || '?');
   };
 
   window.__omniWheel = function(dy) {
