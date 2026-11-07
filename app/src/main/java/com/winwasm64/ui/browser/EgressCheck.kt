@@ -15,7 +15,7 @@ import java.net.URL
  */
 object EgressCheck {
 
-    data class Info(val ip: String = "", val where: String = "", val org: String = "", val error: String? = null) {
+    data class Info(val ip: String = "", val where: String = "", val org: String = "", val error: String? = null, val hosting: Boolean = false) {
         val ok: Boolean get() = ip.isNotBlank()
         fun label(): String = when {
             !ok -> error ?: "нет ответа"
@@ -81,10 +81,67 @@ object EgressCheck {
         val ip = o.optString("ip").trim()
         if (ip.isBlank()) null else Info(
             ip = ip,
-            where = o.optString("country").trim().ifBlank { o.optString("region").trim() },
-            org = o.optString("org").trim()
+            where = countryRu(o.optString("country").trim().ifBlank { o.optString("region").trim() }),
+            org = cleanOrg(o.optString("org").trim()),
+            hosting = looksLikeHosting(o.optString("org") + " " + o.optString("hostname"))
         )
     } catch (_: Exception) {
         null
+    }
+
+    /** «Sabiedrība ar ierobežotu atbildību DELSKA Latvia» → «DELSKA». */
+    private fun cleanOrg(raw: String): String {
+        var s = raw
+        for (junk in listOf(
+            "Sabiedrība ar ierobežotu atbildību", "Sabiedriba ar ierobezotu atbildibu",
+            "SIA ", "LLC ", "Ltd ", "GmbH ", "Inc. ", "Inc "
+        )) s = s.replace(junk, " ")
+        s = s.replace(Regex("\\bAS\\d{3,8}\\b"), " ")
+        s = s.replace(Regex("\\bAS\\d{3,8}\\b"), " ").replace(Regex("\\s+"), " ").trim()
+        return s
+    }
+
+    /** Коды стран → по-русски (частые у серверов Browsec). */
+    private fun countryRu(code: String): String = when (code.uppercase()) {
+        "LV" -> "Латвия"; "LT" -> "Литва"; "EE" -> "Эстония"; "DE" -> "Германия"; "NL" -> "Нидерланды"
+        "FR" -> "Франция"; "GB", "UK" -> "Британия"; "US" -> "США"; "SE" -> "Швеция"; "FI" -> "Финляндия"
+        "PL" -> "Польша"; "CH" -> "Швейцария"; "SG" -> "Сингапур"; "JP" -> "Япония"; "CA" -> "Канада"
+        "IT" -> "Италия"; "ES" -> "Испания"; "TR" -> "Турция"; "RO" -> "Румыния"; "CZ" -> "Чехия"
+        "UA" -> "Украина"; "KZ" -> "Казахстан"; else -> code
+    }
+
+    /**
+     * Похоже на дата-центр/хостинг, а не на мобильного оператора. Если «домашний» IP такой —
+     * значит на телефоне включён ЕЩЁ ОДИН VPN (не OmniBrowser), и путаница «какой VPN сейчас работает» идёт оттуда.
+     */
+    fun looksLikeHosting(text: String): Boolean {
+        val t = text.lowercase()
+        return listOf(
+            "host", "vpn", "cloud", "server", "datacenter", "data center", "colo", "vps", "dedicated",
+            "gthost", "vultr", "digitalocean", "hetzner", "ovh", "m247", "datacamp", "choopa", "leaseweb",
+            "contabo", "linode", "amazon", "google", "microsoft", "azure", "oracle", "aeza", "timeweb"
+        ).any { t.contains(it) }
+    }
+
+    // ---- кэш «IP через VPN» для строки состояния (без запроса на каждый кадр) ----
+
+    @Volatile private var cachedVpn: Info? = null
+    @Volatile private var cachedVpnAt: Long = 0L
+    private val refreshing = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Последний известный IP через VPN; если данных нет/устарели — обновляет в фоне. */
+    fun cachedVpnIp(): Info? {
+        if (System.currentTimeMillis() - cachedVpnAt > 120_000L && refreshing.compareAndSet(false, true)) {
+            Thread({
+                try {
+                    cachedVpn = viaBrowserProxy()
+                } catch (_: Exception) {
+                } finally {
+                    cachedVpnAt = System.currentTimeMillis()
+                    refreshing.set(false)
+                }
+            }, "egress-cache").apply { isDaemon = true; start() }
+        }
+        return cachedVpn
     }
 }

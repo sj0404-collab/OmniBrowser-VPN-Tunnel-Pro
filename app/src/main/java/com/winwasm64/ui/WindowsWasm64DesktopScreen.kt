@@ -3912,6 +3912,7 @@ private fun NativeAppsWithBrowsecSection(
     var ipCheckLine by remember { mutableStateOf("") }
     var ipChecking by remember { mutableStateOf(false) }
     var realServers by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    var realServersTotal by remember { mutableIntStateOf(0) }
     LaunchedEffect(refreshTick / 4) {
         if (realServers.isEmpty()) {
             withContext(Dispatchers.IO) {
@@ -3920,7 +3921,10 @@ private fun NativeAppsWithBrowsecSection(
                     val ip = try { MediaGrabber.egressIp(k) } catch (_: Exception) { null }
                     k to (ip ?: "IP не проверить")
                 }
-                withContext(Dispatchers.Main) { realServers = rows }
+                withContext(Dispatchers.Main) {
+                    realServers = rows
+                    realServersTotal = keys.size
+                }
             }
         }
     }
@@ -4034,7 +4038,7 @@ private fun NativeAppsWithBrowsecSection(
 
                             // ===== v4.11.0: реальные серверы (меняют IP) против профилей обхода (не меняют) =====
                             Text(
-                                "Серверы Browsec — меняют ваш IP (${realServers.size} из пула расширения)",
+                                "Серверы Browsec — меняют ваш IP (показано ${realServers.size} из ${realServersTotal.coerceAtLeast(realServers.size)} из пула расширения)",
                                 color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold
                             )
                             if (realServers.isEmpty()) {
@@ -4069,8 +4073,12 @@ private fun NativeAppsWithBrowsecSection(
                                             Thread {
                                                 val d = EgressCheck.direct()
                                                 val v = EgressCheck.viaBrowserProxy()
+                                                val extra = if (d.hosting)
+                                                    "\n⚠ «домашний» IP принадлежит хостингу (${d.org}), а не мобильному оператору — значит на телефоне работает ЕЩЁ ОДИН VPN (не OmniBrowser), и оба VPN складываются."
+                                                else ""
                                                 val line = com.winwasm64.vpn.VpnScope.ipCompare(d.ip, v.ip) +
-                                                    " · напрямую: ${d.label()} · через VPN: ${v.label()}"
+                                                    "\nбез VPN: ${d.ip.ifBlank { "?" }} · ${d.where} · ${d.org.ifBlank { "—" }}" +
+                                                    "\nчерез VPN: ${v.ip.ifBlank { "?" }} · ${v.where} · ${v.org.ifBlank { "—" }}" + extra
                                                 com.winwasm64.vpn.VpnLog.i("IP", line)
                                                 Handler(Looper.getMainLooper()).post {
                                                     ipCheckLine = line

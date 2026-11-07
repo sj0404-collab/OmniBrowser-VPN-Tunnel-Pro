@@ -147,8 +147,16 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             when {
                 ExtensionProxy.isActive && ExtensionProxy.isExtensionProxyDown() -> "🌐 Браузер: прокси расширения «${ExtensionProxy.ownerName ?: "?"}» не отвечает — " +
                     (if (ExtensionProxy.autoTunnelRecent()) "автотуннель через Browsec ${ExtensionProxy.lastAutoTunnel ?: ""}." else "сайты идут через встроенный обход DPI.")
-                ExtensionProxy.isActive -> "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»" +
-                    (ExtensionProxy.lastWorkingUpstream?.let { " — работает (сервер $it)." } ?: ".")
+                ExtensionProxy.isActive -> {
+                    val named = ExtensionProxy.lastWorkingUpstream
+                    val exit = com.winwasm64.ui.browser.EgressCheck.cachedVpnIp()
+                    // v4.11.1: показываем ФАКТИЧЕСКИЙ выход, а не только «последний рабочий сервер»:
+                    // именно из-за этого расхождения непонятно, какой VPN сейчас работает
+                    val real = exit?.takeIf { it.ok }?.let { " · реальный выход: ${it.ip} (${it.where})" } ?: ""
+                    val mismatch = if (exit?.ok == true && named != null) " · ⚠ сервер меняется: имя «$named», IP выхода ${exit.ip}" else ""
+                    "🌐 Браузер: через прокси расширения «${ExtensionProxy.ownerName ?: "?"}»" +
+                        (named?.let { " — работает (сервер $it)." } ?: ".") + real + mismatch
+                }
                 BrowserDirectRepeater.enabled -> "🌐 Браузер: VPN включён — обход DPI, профиль ${BrowserDirectRepeater.sampleBrowserTraffic().activeCountry}. IP не меняется."
                 else -> "🌐 Браузер: напрямую (VPN браузера выключен)."
             }
