@@ -1,17 +1,21 @@
 package com.winwasm64.ui.browser
 
+import android.content.res.Configuration
+import android.os.SystemClock
+import android.view.KeyEvent
+import android.view.View
 import android.webkit.WebView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -24,33 +28,30 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * v4.20.0: панель ввода, которая делает в странице настоящую работу.
+ * v4.21.0: ввод в страницу — теперь настоящими (доверенными) событиями клавиш.
  *
- * История: в полноэкранной игре (GeForce NOW) клавиатура открывалась, но нажатия до игры
- * не доходили — приходилось выходить из полного экрана и заходить снова.
+ * Что показало устройство:
+ *  • 4.19.0 — печать символов работает, кнопки нет;
+ *  • 4.20.0 — «Пробел» работает (это вставка текста в поле), а Enter, ⌫, Tab и «Далее» — нет.
  *
- * Что выяснилось на устройстве (4.19.0):
- *  • печать символов работает — текст вставляется в активное поле страницы;
- *  • кнопки не работали, потому что они отправляли синтетические события клавиш
- *    (`keydown`/`keypress`/`keyup`). Игра их игнорирует: браузер помечает такие события
- *    `isTrusted = false`, и всё, что не является вставкой текста, отбрасывается.
+ * Вывод: страница принимает только то, что пришло от системы. Подделанные нами события браузер
+ * помечает `isTrusted = false`, и игра их выбрасывает — вставку текста она видит (значение поля
+ * изменилось), а «нажатие клавиши» нет. Родная сенсорная клавиатура GeForce NOW по той же причине
+ * не работает: она тоже шлёт синтетику.
  *
- * Поэтому здесь кнопки не «изображают» нажатия, а меняют страницу по-настоящему:
- *  • текст и пробел — вставка в значение поля (`setRangeText` / `execCommand('insertText')`);
- *  • ⌫ — удаление символа перед курсором правкой значения, а не событием Backspace;
- *  • Enter — сначала настоящая отправка формы (`requestSubmit`/submit-кнопка), если не вышло —
- *    нажатие (`click()`) ближайшей видимой кнопки «Далее/OK/Отправить/Войти/Продолжить»;
- *  • «Далее» — то же нажатие, но без попытки отправки формы (на случай, когда форма не находится);
- *  • Tab — передача фокуса следующему элементу страницы;
- *  • стрелки — перемещение курсора внутри поля (и события клавиш для тех, кто их слушает);
- *  • «Стереть всё» — очистка поля страницы.
+ * Настоящий путь — отдать клавишу через сам WebView: `WebView.dispatchKeyEvent(KeyEvent(...))`.
+ * Он идёт внутрь Chromium как системная, с `isTrusted = true`, и страница обязана её увидеть.
+ * Поэтому Enter, Tab, ⌫, Esc и стрелки теперь отправляются так, а хитрости из 4.20.0 (правка
+ * значения поля, отправка формы, click() ближайшей кнопки) остаются запасным путём.
  *
- * Каждое нажатие пишется в журнал (`панель ввода: …`) — так видно, доходит ли нажатие до нас.
+ * Ещё: в альбомном режиме панель сжимается в одну строку, чтобы не закрывать игру.
  */
 @Composable
 fun OmniKeyPanel(
@@ -59,113 +60,157 @@ fun OmniKeyPanel(
     onShowSystemKeyboard: () -> Unit
 ) {
     var proxy by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val root = LocalView.current.rootView
 
     LaunchedEffect(Unit) {
         try { focus.requestFocus() } catch (_: Throwable) {}
-        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта: текст, удаление и кнопки действуют прямо в странице")
+        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта (4.21.0): Enter/Tab/⌫/стрелки идут доверенными событиями WebView")
     }
 
-    fun run(name: String) {
+    /** Настоящее нажатие клавиши внутрь WebView: страница видит его как системное. */
+    fun nativeKey(keyCode: Int, tag: String) {
         val wv = webView ?: return
-        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода: «$name»")
+        val prev: View? = try { root.findFocus() } catch (_: Throwable) { null }
         try {
-            wv.evaluateJavascript(
-                "try{window.__omniAct&&window.__omniAct('${esc(name)}')}catch(e){}",
-                null
-            )
-        } catch (_: Throwable) {
+            val t = SystemClock.uptimeMillis()
+            if (!wv.hasFocus()) wv.requestFocus()
+            wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
+            wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
+            status = "$tag: системная клавиша отправлена"
+            com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода: $tag → KeyEvent($keyCode)")
+        } catch (e: Throwable) {
+            status = "$tag: сбой — ${e.message}"
+        } finally {
+            try { if (prev != null && prev !== wv) prev.requestFocus() } catch (_: Throwable) {}
         }
     }
 
-    fun insertChar(ch: String) {
+    /** Свой JS — запасной путь и вставка текста. */
+    fun js(code: String, tag: String, delay: Long = 0) {
         val wv = webView ?: return
-        try {
-            wv.evaluateJavascript(
-                "try{window.__omniInsert&&window.__omniInsert('${esc(ch)}')}catch(e){}",
-                null
-            )
-        } catch (_: Throwable) {
+        val run = Runnable {
+            try {
+                wv.evaluateJavascript("try{$code}catch(e){'err:'+e}") { r ->
+                    val res = (r ?: "").trim().trim('"')
+                    if (res.isNotEmpty() && res != "null") status = "$tag: $res"
+                }
+            } catch (_: Throwable) {
+            }
         }
+        if (delay > 0) wv.postDelayed(run, delay) else run.run()
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xF21A1B20))
-            .padding(10.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "⌨ Ввод в страницу (работает и когда клавиатура сайта не реагирует)",
-                fontSize = 11.sp,
-                color = Color(0xFFECECEC),
-                modifier = Modifier.weight(1f)
-            )
-            Button(
-                onClick = onShowSystemKeyboard,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF)),
-                modifier = Modifier.padding(end = 6.dp)
-            ) { Text("системная", fontSize = 10.sp, color = Color.White) }
-            Button(
-                onClick = onClose,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))
-            ) { Text("✕", fontSize = 11.sp, color = Color.White) }
-        }
+    fun insertChar(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка")
+    fun del() {
+        nativeKey(KeyEvent.KEYCODE_DEL, "⌫")
+        js("window.__omniAct&&window.__omniAct('del')", "⌫ (запасной путь)", 160)
+    }
+    fun enter() {
+        nativeKey(KeyEvent.KEYCODE_ENTER, "Enter")
+        js("window.__omniAct&&window.__omniAct('enter')", "Enter (запасной путь)", 200)
+    }
+
+    @Composable
+    fun chip(title: String, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .background(Color(0x40FFFFFF))
+                .clickable {
+                    onClick()
+                    try { focus.requestFocus() } catch (_: Throwable) {}
+                }
+                .padding(horizontal = 10.dp, vertical = if (landscape) 4.dp else 8.dp)
+        ) { Text(title, fontSize = if (landscape) 11.sp else 12.sp, color = Color.White) }
+    }
+
+    @Composable
+    fun fieldInput(mod: Modifier) {
         BasicTextField(
             value = proxy,
             onValueChange = { next ->
                 if (next.length > proxy.length) {
                     next.substring(proxy.length).forEach { ch -> insertChar(ch.toString()) }
                 } else if (next.length < proxy.length) {
-                    repeat(proxy.length - next.length) { run("del") }
+                    repeat(proxy.length - next.length) { js("window.__omniAct&&window.__omniAct('del')", "⌫") }
                 }
                 proxy = if (next.length > 400) next.takeLast(400) else next
             },
             singleLine = true,
-            textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
+            textStyle = TextStyle(color = Color.White, fontSize = if (landscape) 13.sp else 15.sp),
+            modifier = mod
                 .background(Color(0xFF26282F))
-                .padding(10.dp)
+                .padding(horizontal = 8.dp, vertical = if (landscape) 6.dp else 10.dp)
                 .focusRequester(focus)
         ) { inner ->
             if (proxy.isEmpty()) {
-                Text("Печатайте здесь — символы уйдут в игру", fontSize = 13.sp, color = Color(0xFF8A8F99))
+                Text("Печатайте здесь", fontSize = 12.sp, color = Color(0xFF8A8F99))
             }
             inner()
         }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            @Composable
-            fun keyButton(title: String, action: String) {
-                Button(
-                    onClick = {
-                        run(action)
-                        // возвращаем фокус своему полю, чтобы клавиатура не захлопнулась
-                        try { focus.requestFocus() } catch (_: Throwable) {}
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))
-                ) { Text(title, fontSize = 11.sp, color = Color.White) }
-            }
+    }
 
-            keyButton("Пробел", "space")
-            keyButton("Enter", "enter")
-            keyButton("Далее", "submit")
-            keyButton("⌫", "del")
-            keyButton("Tab", "tab")
-            keyButton("Esc", "esc")
-            keyButton("←", "left")
-            keyButton("↑", "up")
-            keyButton("↓", "down")
-            keyButton("→", "right")
-            keyButton("Стереть всё", "clear")
+    @Composable
+    fun keyRow() {
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(if (landscape) 4.dp else 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            chip("Пробел") { js("window.__omniInsert&&window.__omniInsert(' ')", "Пробел") }
+            chip("Enter") { enter() }
+            chip("Далее") { js("window.__omniAct&&window.__omniAct('submit')", "Далее") }
+            chip("⌫") { del() }
+            chip("Tab") { nativeKey(KeyEvent.KEYCODE_TAB, "Tab") }
+            chip("Esc") { nativeKey(KeyEvent.KEYCODE_ESCAPE, "Esc") }
+            chip("←") { nativeKey(KeyEvent.KEYCODE_DPAD_LEFT, "←") }
+            chip("↑") { nativeKey(KeyEvent.KEYCODE_DPAD_UP, "↑") }
+            chip("↓") { nativeKey(KeyEvent.KEYCODE_DPAD_DOWN, "↓") }
+            chip("→") { nativeKey(KeyEvent.KEYCODE_DPAD_RIGHT, "→") }
+            chip("Стереть всё") {
+                js("window.__omniAct&&window.__omniAct('clear')", "очистка")
+                proxy = ""
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xE6141519))
+            .padding(if (landscape) 4.dp else 8.dp)
+    ) {
+        if (landscape) {
+            // Альбомный режим: всё в одну строку, максимум места игре
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                fieldInput(Modifier.weight(1f))
+                keyRow()
+                chip("⌨") { onShowSystemKeyboard() }
+                chip("✕") { onClose() }
+            }
+            if (status.isNotEmpty()) {
+                Text(status, fontSize = 9.sp, color = Color(0xFF9AA0AA), modifier = Modifier.padding(top = 2.dp))
+            }
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "⌨ Ввод в страницу",
+                    fontSize = 11.sp,
+                    color = Color(0xFFECECEC),
+                    modifier = Modifier.weight(1f)
+                )
+                chip("системная") { onShowSystemKeyboard() }
+                Box(Modifier.padding(start = 6.dp)) { chip("✕") { onClose() } }
+            }
+            Box(Modifier.fillMaxWidth().padding(top = 6.dp)) {
+                Row(Modifier.fillMaxWidth()) { fieldInput(Modifier.weight(1f)) }
+            }
+            Box(Modifier.fillMaxWidth().padding(top = 6.dp)) { keyRow() }
+            if (status.isNotEmpty()) {
+                Text(status, fontSize = 10.sp, color = Color(0xFF9AA0AA), modifier = Modifier.padding(top = 4.dp))
+            }
         }
     }
 }
@@ -179,28 +224,51 @@ private fun esc(s: String): String = s
     .replace("\t", "\\t")
 
 /**
- * Приёмник ввода. Ставится один раз на страницу (idempotent), вызывается из Kotlin:
- *   __omniInsert('символ')  — вставить символ
- *   __omniAct('space'|'enter'|'submit'|'del'|'tab'|'esc'|'left'|'up'|'down'|'right'|'clear')
+ * Приёмник ввода в странице. Ставится один раз (idempotent), вызывается из Kotlin:
+ *   __omniInsert('символ')  — вставить символ (это работает всегда: это правка значения поля)
+ *   __omniAct('space'|'del'|'clear'|'enter'|'submit'|'tab'|'esc'|'left'|'right'|'up'|'down')
  *
- * Ключевая мысль: событие клавиши от нас страница считает поддельным (isTrusted = false),
- * поэтому всё, что можно, делаем правкой DOM: вставляем и удаляем текст, отправляем форму,
- * нажимаем кнопку через click(), двигаем фокус. События клавиш всё равно дублируем — тем,
- * кто их слушает, это не мешает.
+ * Кнопки-клавиши в основном идут доверенными событиями через WebView.dispatchKeyEvent;
+ * здесь — запасной путь: если страница всё равно ничего не сделала, мы правим DOM напрямую:
+ * отправляем форму, нажимаем ближайшую кнопку «Далее», двигаем фокус, чистим поле.
+ *
+ * Важная деталь: значение поля меняем через родной сеттер (`HTMLInputElement.prototype.value`),
+ * иначе React-подобные страницы не замечают изменения — они сравнивают значение со своим
+ * «следящим» и молча игнорируют прямую запись.
  */
 const val OMNI_KEY_JS = """
 (function(){
-  if (window.__omniInsert) return;
+  if (window.__omniAct) return;
 
-  function field() {
+  window.__omniLastEl = null;
+
+  function isField(el) {
+    return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+  }
+
+  function visible(el) {
+    if (!el) return false;
+    try {
+      var r = el.getBoundingClientRect();
+      return r.width > 1 && r.height > 1;
+    } catch (e) { return false; }
+  }
+
+  function target() {
     var el = document.activeElement;
-    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return el;
+    if (isField(el)) { window.__omniLastEl = el; return el; }
+    var last = window.__omniLastEl;
+    if (last && last.isConnected) {
+      try { last.focus(); } catch (e) {}
+      return last;
+    }
     var all = document.querySelectorAll('input, textarea');
     for (var i = 0; i < all.length; i++) {
       var c = all[i];
-      if (c.offsetParent === null) continue;
       var t = (c.type || 'text').toLowerCase();
-      if (t === 'hidden' || t === 'checkbox' || t === 'radio' || c.disabled || c.readOnly) continue;
+      if (t === 'hidden' || t === 'checkbox' || t === 'radio' || t === 'submit' || c.disabled || c.readOnly) continue;
+      if (!visible(c)) continue;
+      window.__omniLastEl = c;
       return c;
     }
     return null;
@@ -208,44 +276,80 @@ const val OMNI_KEY_JS = """
 
   function fire(el, type, extra) {
     try {
-      var o = {bubbles: true, cancelable: true};
-      if (extra) for (var k in extra) o[k] = extra[k];
-      el.dispatchEvent(new Event(type, {bubbles: true}));
-      if (type === 'keydown' || type === 'keyup') el.dispatchEvent(new KeyboardEvent(type, o));
-      if (type === 'keypress') el.dispatchEvent(new KeyboardEvent(type, o));
+      if (type === 'keydown' || type === 'keypress' || type === 'keyup') {
+        var o = {bubbles: true, cancelable: true};
+        if (extra) for (var k in extra) o[k] = extra[k];
+        el.dispatchEvent(new KeyboardEvent(type, o));
+      } else {
+        el.dispatchEvent(new Event(type, {bubbles: true}));
+      }
     } catch (e) {}
+  }
+
+  function setNativeValue(el, v) {
+    try {
+      var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      var d = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (d && d.set) { d.set.call(el, v); return true; }
+    } catch (e) {}
+    try { el.value = v; return true; } catch (e) { return false; }
   }
 
   function putText(el, txt) {
     if (!el) {
-      if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
-        try { document.execCommand('insertText', false, txt); return true; } catch (e) {}
-      }
-      return false;
+      try {
+        if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
+          return document.execCommand('insertText', false, txt) ? 'ok (insertText)' : 'no-field';
+        }
+      } catch (e) {}
+      return 'no-field';
+    }
+    try { el.focus(); } catch (e) {}
+    if (el.isContentEditable) {
+      try {
+        var okC = document.execCommand('insertText', false, txt);
+        fire(el, 'input');
+        return okC ? 'ok (contenteditable)' : 'no-field';
+      } catch (e) { return 'no-field'; }
     }
     try {
       var s = el.selectionStart, e2 = el.selectionEnd;
-      if (s === null || s === undefined) { s = el.value.length; e2 = s; }
+      if (s === null || s === undefined) { s = (el.value || '').length; e2 = s; }
       if (el.setRangeText) {
         el.setRangeText(txt, s, e2, 'end');
       } else {
-        el.value = el.value.slice(0, s) + txt + el.value.slice(e2);
+        var nv = (el.value || '').slice(0, s) + txt + (el.value || '').slice(e2);
+        setNativeValue(el, nv);
         try { el.selectionStart = el.selectionEnd = s + txt.length; } catch (e) {}
       }
       fire(el, 'input');
       fire(el, 'change');
-      return true;
-    } catch (e) { return false; }
+      return 'ok';
+    } catch (e) { return 'err:' + e; }
   }
 
-  function visible(el) {
-    if (!el) return false;
-    if (el.offsetParent === null && el.tagName !== 'BODY') {
-      var r0 = el.getBoundingClientRect();
-      if (r0.width === 0 && r0.height === 0) return false;
+  function deleteBackward() {
+    var el = target();
+    if (!el) return 'no-field';
+    if (el.isContentEditable) {
+      try {
+        var ok = document.execCommand('delete', false, null);
+        fire(el, 'input');
+        return ok ? 'ok (contenteditable)' : 'no-field';
+      } catch (e) {}
+      return 'no-field';
     }
-    var r = el.getBoundingClientRect();
-    return r.width > 1 && r.height > 1;
+    try { el.focus(); } catch (e) {}
+    var v = (el.value || '');
+    var s = el.selectionStart, e2 = el.selectionEnd;
+    if (s === null || s === undefined) { s = v.length; e2 = s; }
+    if (s === e2) { if (s === 0) return 'в начале поля'; s = s - 1; }
+    var nv = v.slice(0, s) + v.slice(e2);
+    setNativeValue(el, nv);
+    try { el.selectionStart = el.selectionEnd = s; } catch (e) {}
+    fire(el, 'input');
+    fire(el, 'change');
+    return 'ok (' + v.length + '→' + nv.length + ')';
   }
 
   function label(el) {
@@ -257,62 +361,51 @@ const val OMNI_KEY_JS = """
   }
 
   var WORDS = ['далее', 'дальше', 'продолжить', 'отправить', 'войти', 'вход', 'подтвердить',
-               'ok', 'okay', 'next', 'continue', 'submit', 'enter', 'send', 'sign in', 'login'];
+               'ok', 'okay', 'next', 'continue', 'submit', 'send', 'sign in', 'login'];
 
-  function clickNear(force) {
-    var f = field();
-    var cands = [];
+  function clickNear() {
+    var f = target();
     var scope = document;
-    // сначала ищем в пределах диалога/оверлея вокруг поля
     if (f) {
       var n = f;
-      for (var d = 0; d < 5 && n; d++) {
+      for (var d = 0; d < 6 && n; d++) {
         n = n.parentElement;
         if (!n) break;
-        var bs = n.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
-        if (bs.length) { scope = n; break; }
+        var probe = n.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
+        if (probe.length) { scope = n; break; }
       }
     }
     var list = scope.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a');
+    var found = null, best = 0, bestText = '';
     for (var i = 0; i < list.length; i++) {
       var el = list[i];
       if (!visible(el)) continue;
       var t = label(el);
-      var rank = -1;
-      for (var w = 0; w < WORDS.length; w++) { if (t.indexOf(WORDS[w]) >= 0) { rank = WORDS.length - w; break; } }
-      if (rank > 0) cands.push({el: el, rank: rank, t: t});
-    }
-    if (!cands.length && force) {
-      // ничего по словам — берём последнюю видимую кнопку рядом с полем
-      for (var j = list.length - 1; j >= 0; j--) {
-        if (visible(list[j])) {
-          try { list[j].click(); return true; } catch (e) {}
+      for (var w = 0; w < WORDS.length; w++) {
+        if (t.indexOf(WORDS[w]) >= 0) {
+          var rank = WORDS.length - w;
+          if (rank > best) { best = rank; found = el; bestText = t; }
+          break;
         }
       }
-      return false;
     }
-    if (!cands.length) return false;
-    cands.sort(function(a, b) { return b.rank - a.rank; });
-    var target = cands[0].el;
-    try { target.focus(); } catch (e) {}
-    try { target.click(); } catch (e) { fire(target, 'click'); }
-    return true;
+    if (!found) return 'кнопка не найдена';
+    try { found.focus(); } catch (e) {}
+    try { found.click(); return 'нажато: ' + bestText; } catch (e) { return 'err:' + e; }
   }
 
   function submitForm() {
-    var f = field();
+    var f = target();
     if (!f) return false;
     var form = f.form || (f.closest ? f.closest('form') : null);
-    if (form) {
-      try {
-        if (form.requestSubmit) { form.requestSubmit(); return true; }
-        var sb = form.querySelector('button[type="submit"], input[type="submit"], button');
-        if (sb) { sb.click(); return true; }
-        form.submit();
-        return true;
-      } catch (e) {}
-    }
-    return false;
+    if (!form) return false;
+    try {
+      if (form.requestSubmit) { form.requestSubmit(); return true; }
+      var sb = form.querySelector('button[type="submit"], input[type="submit"], button');
+      if (sb) { sb.click(); return true; }
+      form.submit();
+      return true;
+    } catch (e) { return false; }
   }
 
   function nextFocusable(back) {
@@ -320,99 +413,72 @@ const val OMNI_KEY_JS = """
     var list = [];
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
-      if (el.disabled || !visible(el)) continue;
-      if (el.type === 'hidden') continue;
+      if (el.disabled || !visible(el) || el.type === 'hidden') continue;
       list.push(el);
     }
-    if (!list.length) return false;
-    var cur = document.activeElement;
-    var idx = list.indexOf(cur);
+    if (!list.length) return 'нет элементов';
+    var idx = list.indexOf(document.activeElement);
     var nxt = back ? (idx <= 0 ? list.length - 1 : idx - 1) : (idx + 1) % list.length;
-    try { list[nxt].focus(); return true; } catch (e) { return false; }
+    try { list[nxt].focus(); return 'фокус передан'; } catch (e) { return 'err:' + e; }
   }
 
   function moveCaret(dir) {
-    var f = field();
-    if (!f) return false;
+    var el = target();
+    if (!el || el.selectionStart === null || el.selectionStart === undefined) return 'нет поля';
     try {
-      var s = f.selectionStart, e2 = f.selectionEnd;
-      if (s === null || s === undefined) return false;
-      var p = s;
+      var len = (el.value || '').length;
+      var s = el.selectionStart, e2 = el.selectionEnd, p = s;
       if (dir === 'left') p = Math.max(0, s - 1);
-      else if (dir === 'right') p = Math.min((f.value || '').length, e2 + 1);
-      else if (dir === 'up' || dir === 'down') {
-        fire(f, 'keydown', {key: dir === 'up' ? 'ArrowUp' : 'ArrowDown'});
-        return true;
-      }
-      f.selectionStart = f.selectionEnd = p;
-      return true;
-    } catch (e) { return false; }
-  }
-
-  function deleteBackward() {
-    var f = field();
-    if (f) {
-      try {
-        var s = f.selectionStart, e2 = f.selectionEnd;
-        if (s === null || s === undefined) { s = (f.value || '').length; e2 = s; }
-        if (s === e2) { if (s === 0) return true; s = s - 1; }
-        if (f.setRangeText) f.setRangeText('', s, e2, 'end');
-        else { f.value = (f.value || '').slice(0, s) + (f.value || '').slice(e2); try { f.selectionStart = f.selectionEnd = s; } catch (e) {} }
-        fire(f, 'input');
-        fire(f, 'change');
-        return true;
-      } catch (e) {}
-    }
-    try {
-      if (document.queryCommandSupported && document.queryCommandSupported('delete')) {
-        return document.execCommand('delete', false, null);
-      }
-    } catch (e) {}
-    return false;
+      if (dir === 'right') p = Math.min(len, e2 + 1);
+      el.selectionStart = el.selectionEnd = p;
+      return 'курсор ' + p + '/' + len;
+    } catch (e) { return 'err:' + e; }
   }
 
   window.__omniInsert = function(txt) {
-    var f = field();
-    var ok = putText(f, txt);
-    if (f) {
-      fire(f, 'keydown', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
-      fire(f, 'keypress', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
-      fire(f, 'keyup', {key: txt, code: '', keyCode: txt.charCodeAt(0)});
+    var el = target();
+    var res = putText(el, txt);
+    if (el) {
+      fire(el, 'keydown', {key: txt, keyCode: txt.charCodeAt(0)});
+      fire(el, 'keypress', {key: txt, keyCode: txt.charCodeAt(0)});
+      fire(el, 'keyup', {key: txt, keyCode: txt.charCodeAt(0)});
     }
-    return ok;
+    return res;
   };
 
   window.__omniAct = function(name) {
-    var f = field();
     switch (name) {
       case 'space': return window.__omniInsert(' ');
       case 'del': return deleteBackward();
       case 'clear':
-        if (f) {
-          try {
-            f.value = '';
-            fire(f, 'input');
-            fire(f, 'change');
-            return true;
-          } catch (e) {}
-        }
+        var el = target();
+        if (!el) return 'no-field';
         try {
-          document.execCommand('selectAll', false, null);
-          document.execCommand('delete', false, null);
-        } catch (e) {}
-        return false;
+          if (el.isContentEditable) {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+          } else {
+            setNativeValue(el, '');
+            try { el.selectionStart = el.selectionEnd = 0; } catch (e) {}
+          }
+          fire(el, 'input');
+          fire(el, 'change');
+          return 'ok';
+        } catch (e) { return 'err:' + e; }
       case 'enter':
-        if (f) { fire(f, 'keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13}); }
-        if (submitForm()) return true;
-        return clickNear(true);
-      case 'submit': return clickNear(true);
+        if (submitForm()) return 'форма отправлена';
+        return clickNear();
+      case 'submit': return clickNear();
       case 'tab': return nextFocusable(false);
       case 'esc':
-        if (f) { fire(f, 'keydown', {key: 'Escape', code: 'Escape', keyCode: 27}); fire(f, 'keyup', {key: 'Escape', code: 'Escape', keyCode: 27}); }
-        try { document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true})); } catch (e) {}
-        return true;
-      case 'left': case 'right': case 'up': case 'down': return moveCaret(name);
-      default: return false;
+        var f = document.activeElement || document.body;
+        fire(f, 'keydown', {key: 'Escape', code: 'Escape', keyCode: 27});
+        fire(f, 'keyup', {key: 'Escape', code: 'Escape', keyCode: 27});
+        return 'событие отправлено';
+      case 'left': return moveCaret('left');
+      case 'right': return moveCaret('right');
+      case 'up': case 'down': return 'событие через WebView';
+      default: return 'неизвестное действие';
     }
   };
 })();
