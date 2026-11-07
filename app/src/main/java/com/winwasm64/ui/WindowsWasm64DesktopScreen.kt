@@ -324,6 +324,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var longPressedUrl by remember { mutableStateOf<String?>(null) }
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+    // v4.19.0: своя панель ввода для полноэкранных игр (клавиатура сайта не всегда доносит нажатия)
+    var showKeyPanel by remember { mutableStateOf(false) }
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -1210,6 +1212,10 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (newProgress >= 15 && view != null) {
                         injectActiveExtensions(view)
                     }
+                    if (newProgress >= 100 && view != null) {
+                        // v4.19.0: приёмник клавиш для своей панели ввода
+                        try { view.evaluateJavascript(com.winwasm64.ui.browser.OMNI_KEY_JS, null) } catch (_: Throwable) {}
+                    }
                 }
 
                 override fun onReceivedTitle(view: WebView?, title: String?) {
@@ -1843,6 +1849,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             try { win.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {} // v4.10.0: экран не гаснет в полноэкранной игре/видео
         }
         onDispose {
+            // v4.19.0: вышли из полного экрана — панель ввода больше не нужна
+            showKeyPanel = false
             if (act != null && win != null && act.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
                 WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
                 act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -2967,27 +2975,40 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             // ===================== PERSISTENT WEBVIEW CONTAINER =====================
             if (fullscreenCustomView != null) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
-                    AndroidView(
-                        factory = { ctx ->
-                            FrameLayout(ctx).apply {
-                                val v = fullscreenCustomView
-                                if (v != null) {
-                                    (v.parent as? ViewGroup)?.removeView(v)
-                                    addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-                                }
+                    // v4.19.0: постоянный контейнер + явная перепривязка и фокус.
+                    // Раньше вид создавался внутри factory и после пересборки оставался без фокуса —
+                    // из-за этого тапы и клавиатура «оживали» только после выхода и повторного входа
+                    // в полноэкранный режим.
+                    val fsHost = remember { FrameLayout(context) }
+                    LaunchedEffect(fullscreenCustomView) {
+                        val v = fullscreenCustomView
+                        try {
+                            fsHost.removeAllViews()
+                            if (v != null) {
+                                (v.parent as? ViewGroup)?.removeView(v)
+                                fsHost.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                                v.isFocusable = true
+                                v.isFocusableInTouchMode = true
+                                v.requestFocus()
+                                v.requestLayout()
+                                com.winwasm64.vpn.VpnLog.i("Браузер", "полный экран: вид игры подключён заново и получил фокус — тапы и клавиатура должны работать сразу")
                             }
-                        },
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    AndroidView(
+                        factory = { fsHost },
                         modifier = Modifier.fillMaxSize()
                     )
                     if (!inPip) Row(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) {
                         // v4.16.0: в полноэкранной игре (GeForce NOW и подобные) клавиатура, которую просит
                         // страница, могла не открыться — даём кнопку, которая показывает её принудительно.
                         Button(
-                            onClick = { forceShowKeyboard(context, activeTab.webView) },
+                            onClick = { showKeyPanel = !showKeyPanel },
                             colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
                             modifier = Modifier.padding(end = 8.dp)
                         ) {
-                            Text("⌨ Клавиатура", fontSize = 11.sp, color = Color.White)
+                            Text(if (showKeyPanel) "⌨ Скрыть ввод" else "⌨ Клавиатура", fontSize = 11.sp, color = Color.White)
                         }
                         Button(
                             onClick = {
@@ -2998,6 +3019,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f))
                         ) {
                             Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
+                        }
+                    }
+                    if (showKeyPanel && !inPip) {
+                        // v4.19.0: своя панель ввода — символы уходят прямо в страницу
+                        Box(modifier = Modifier.align(Alignment.BottomCenter)) {
+                            com.winwasm64.ui.browser.OmniKeyPanel(
+                                webView = activeTab.webView,
+                                onClose = { showKeyPanel = false },
+                                onShowSystemKeyboard = { forceShowKeyboard(context, activeTab.webView) }
+                            )
                         }
                     }
                 }
@@ -5027,7 +5058,10 @@ private fun omniAudioBoostJs(gain: Double): String = """
 private fun forceShowKeyboard(ctx: android.content.Context, wv: android.webkit.WebView?) {
     try {
         if (wv == null) return
-        wv.requestFocus()
+        // v4.19.0: requestFocus() у WebView сбрасывал DOM-фокус на document.body — именно из-за этого
+        // клавиатура открывалась, а нажатия до игры не доходили. Теперь фокус забираем только если
+        // WebView его вообще не имеет.
+        if (!wv.hasFocus()) wv.requestFocus()
         val imm = ctx.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
             as? android.view.inputmethod.InputMethodManager ?: return
         imm.showSoftInput(wv, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
