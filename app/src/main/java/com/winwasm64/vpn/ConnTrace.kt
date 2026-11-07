@@ -28,6 +28,7 @@ object ConnTrace {
     const val CAT_UDP = "UDP"
     const val CAT_BYPASS = "Обход DPI"
     const val CAT_DNS = "DNS"
+    const val CAT_TORRENT = "Торренты"
 
     private const val MAX = 3000
     private const val DEDUP_MS = 2_000L
@@ -48,6 +49,10 @@ object ConnTrace {
         val repeats: Int
     )
 
+    /** Запрос страницы, который ещё не превратился в соединение (ждёт своей строки маршрута). */
+    private class Pending(val initiator: String, val purpose: String, val at: Long)
+
+    private val pending = ConcurrentHashMap<String, Pending>()
     private val entries = ArrayDeque<Entry>()
     private val dedup = ConcurrentHashMap<String, Long>()
 
@@ -62,8 +67,82 @@ object ConnTrace {
 
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
+    /**
+     * v4.18.0: запрос страницы/подресурса из WebView.
+     *
+     * Раньше он сразу писал отдельную строку, и в журнале каждый адрес появлялся ДВАЖДЫ:
+     * «маршрут браузера» из WebView и «Browsec lv210» из прокси. Теперь запрос запоминается
+     * и «прилипает» к ближайшему реальному соединению с тем же адресом — в одной строке сразу
+     * видно и кто вызвал, и зачем, и через что пошло, и сколько заняло.
+     * Если соединения так и не было (кэш, отсечено, service worker) — строка появится сама
+     * через 2,5 с, чтобы запрос не пропал из журнала.
+     */
+    fun pendingRequest(initiator: String, host: String, port: Int, purpose: String) {
+        if (host.isBlank()) return
+        flushStale()
+        pending["$host:$port"] = Pending(initiator, purpose, System.currentTimeMillis())
+    }
+
+    private fun takePending(host: String, port: Int): Pending? {
+        pending.remove("$host:$port")?.let { return it }
+        // порт мог отличаться (443 против 80) — ищем по имени
+        val it = pending.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (e.key.startsWith("$host:")) {
+                it.remove()
+                return e.value
+            }
+        }
+        return null
+    }
+
+    private fun flushStale() {
+        val now = System.currentTimeMillis()
+        if (pending.isEmpty()) return
+        val it = pending.entries.iterator()
+        var released = 0
+        while (it.hasNext() && released < 20) {
+            val e = it.next()
+            if (now - e.value.at > 2_500L) {
+                it.remove()
+                released++
+                val parts = e.key.split(":")
+                val host = parts.getOrNull(0).orEmpty()
+                val port = parts.getOrNull(1)?.toIntOrNull() ?: 443
+                if (host.isNotBlank() && !isNoise(host)) {
+                    push(
+                        Entry(
+                            at = e.value.at,
+                            cat = CAT_BROWSER,
+                            who = if (e.value.initiator.isBlank()) "Браузер" else "Браузер (${e.value.initiator})",
+                            target = "$host:$port",
+                            proto = "TCP",
+                            route = "из кэша / соединение не открывалось",
+                            purpose = e.value.purpose,
+                            ok = true,
+                            ms = -1L,
+                            downBytes = -1L,
+                            err = null,
+                            repeats = 0
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /** Служебный мусор, который не должен засорять журнал (PAC-заглушка расширения и т.п.). */
+    fun isNoise(host: String): Boolean =
+        host.endsWith(".invalid", true) || host.contains("omni-ext", true) || host == "localhost"
+
     /** Запрос страницы/подресурса из WebView: кто вызвал, для кого и зачем. */
     fun request(initiator: String, host: String, port: Int, purpose: String, blocked: Boolean) {
+        if (isNoise(host)) return
+        if (!blocked) {
+            pendingRequest(initiator, host, port, purpose)
+            return
+        }
         val who = if (initiator.isBlank()) "Браузер" else "Браузер ($initiator)"
         push(
             Entry(
@@ -96,6 +175,10 @@ object ConnTrace {
         proto: String = "TCP",
         purpose: String = ""
     ) {
+        if (isNoise(host)) return
+        val pend = takePending(host, port)
+        val whoFull = if (who.startsWith("Браузер") && pend != null && pend.initiator.isNotBlank()) "Браузер (${pend.initiator})" else who
+        val purposeFull = if (purpose.isNotBlank()) purpose else (pend?.purpose ?: "")
         val isBypass = route.contains("обход", ignoreCase = true)
         val cat = when {
             who.startsWith("Браузер") -> CAT_BROWSER
@@ -108,11 +191,11 @@ object ConnTrace {
             Entry(
                 at = System.currentTimeMillis(),
                 cat = if (isBypass && cat == CAT_BROWSER) CAT_BYPASS else cat,
-                who = who,
+                who = whoFull,
                 target = "$host:$port",
                 proto = proto,
                 route = route,
-                purpose = purpose,
+                purpose = purposeFull,
                 ok = ok,
                 ms = ms,
                 downBytes = downBytes,
@@ -139,6 +222,32 @@ object ConnTrace {
                 ms = -1L,
                 downBytes = -1L,
                 err = null,
+                repeats = 0
+            )
+        )
+    }
+
+    /**
+     * v4.18.0: события торрент-движка — трекер, пир, webseed.
+     * Без этого нельзя ответить на вопрос «почему 0% и 0 пиров»: видно, что именно не ответило.
+     */
+    fun torrent(target: String, what: String, ok: Boolean, note: String = "") {
+        if (!ok) failedConnections.incrementAndGet()
+        totalConnections.incrementAndGet()
+        byRoute.computeIfAbsent("Торренты") { AtomicLong(0L) }.incrementAndGet()
+        push(
+            Entry(
+                at = System.currentTimeMillis(),
+                cat = CAT_TORRENT,
+                who = "Торрент",
+                target = target,
+                proto = if (what.contains("webseed", true)) "HTTP" else if (what.contains("udp", true)) "UDP" else "TCP",
+                route = "BitTorrent P2P",
+                purpose = what,
+                ok = ok,
+                ms = -1L,
+                downBytes = -1L,
+                err = note.takeIf { it.isNotBlank() },
                 repeats = 0
             )
         )
@@ -191,6 +300,7 @@ object ConnTrace {
     }
 
     fun snapshot(filter: String?): List<String> {
+        flushStale()
         val list = synchronized(entries) { entries.toList() }
         val filtered = when (filter) {
             null -> list
@@ -200,6 +310,7 @@ object ConnTrace {
             "udp" -> list.filter { it.cat == CAT_UDP }
             "bypass" -> list.filter { it.cat == CAT_BYPASS || it.route.contains("обход", true) }
             "dns" -> list.filter { it.cat == CAT_DNS }
+            "torrent" -> list.filter { it.cat == CAT_TORRENT }
             else -> list.filter { it.cat == filter }
         }
         return filtered.map { render(it) }
@@ -222,6 +333,7 @@ object ConnTrace {
             !e.ok -> "❌"
             e.cat == CAT_UDP -> "🎮"
             e.cat == CAT_DNS -> "🔎"
+            e.cat == CAT_TORRENT -> "🧲"
             e.cat == CAT_BYPASS -> "🔀"
             e.cat == CAT_BROWSER -> "🌐"
             else -> "📱"

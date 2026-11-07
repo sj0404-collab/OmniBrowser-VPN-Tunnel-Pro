@@ -141,6 +141,7 @@ class VpnLogActivity : Activity() {
             "Приложения" to "apps",
             "UDP/игры" to "udp",
             "Обход DPI" to "bypass",
+            "Торренты" to "torrent",
             "DNS" to "dns"
         ) else listOf<Pair<String, String?>>(
             "Все" to null,

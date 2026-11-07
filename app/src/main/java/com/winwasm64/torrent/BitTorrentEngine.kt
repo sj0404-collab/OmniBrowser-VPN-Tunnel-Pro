@@ -896,7 +896,11 @@ class BitTorrentEngine(private val context: Context? = null) {
                     task.fileList.addAll(metadata.files.map { "${it.relativePath} (${formatSize(it.length)})" })
 
                     // Only derive WebSeed URL from .torrent if task didn't already have an explicit directWebSeedUrl!
-                    if (task.directWebSeedUrl.isNullOrBlank()) {
+                    // v4.18.0: адрес WebSeed вида archive.org/download/<имя>/<файл> имеет смысл только
+                    // для раздач, скачанных с archive.org. Раньше он подставлялся ЛЮБОМУ торренту —
+                    // сервер отвечал 503/404, и загрузка падала с «HTTP WebSeed код 503».
+                    val fromArchive = task.torrentUrl?.contains("archive.org", ignoreCase = true) == true
+                    if (task.directWebSeedUrl.isNullOrBlank() && fromArchive) {
                         val largestFile = metadata.files
                             .filter {
                                 !it.relativePath.endsWith(".txt", true) &&
@@ -941,17 +945,47 @@ class BitTorrentEngine(private val context: Context? = null) {
             task.state = TorrentState.DOWNLOADING
 
             var downloadedViaPeers = false
-            if (metadata != null && discoveredPeers.isNotEmpty() && task.directWebSeedUrl.isNullOrBlank()) {
-                task.statusDetail = "Подключение к ${discoveredPeers.size} пирам по TCP BitTorrent$vpnBadge..."
+            // v4.18.0: P2P пробуем ВСЕГДА, когда трекеры нашли пиров, даже если есть адрес WebSeed.
+            // Раньше при наличии directWebSeedUrl пиры игнорировались полностью — и раздача
+            // «качалась» через HTTP-ссылку, которую мы же и придумали (отсюда «HTTP WebSeed код 503»).
+            if (metadata != null && discoveredPeers.isNotEmpty()) {
+                task.statusDetail = "Подключение к ${discoveredPeers.size} реально найденным пирам по TCP BitTorrent$vpnBadge..."
+                com.winwasm64.vpn.ConnTrace.torrent("${discoveredPeers.size} пиров", "попытка P2P по TCP", true)
                 downloadedViaPeers = downloadPiecesFromPeers(task, metadata, discoveredPeers.toList())
+                if (!downloadedViaPeers) {
+                    com.winwasm64.vpn.ConnTrace.torrent("${discoveredPeers.size} пиров", "P2P не отдал ни одного куска", false, "пиры не отвечают (закрыт TCP, DHT без UDP)")
+                }
             }
 
             val seedUrl = task.directWebSeedUrl ?: task.torrentUrl
             if (!downloadedViaPeers && !seedUrl.isNullOrBlank()) {
-                try {
-                    downloadViaWebSeedStream(task, seedUrl, metadata)
-                } catch (e: Exception) {
-                    // Fallback: if WebSeed sub-file URL returned 404, download the .torrent archive or primary URL
+                // v4.18.0: 503/429 и обрывы — это «сервер занят», а не «файла нет». Повторяем до 3 раз
+                // с паузой, показывая состояние в карточке, вместо мгновенной ошибки.
+                var lastError: Exception? = null
+                for (attempt in 1..3) {
+                    try {
+                        downloadViaWebSeedStream(task, seedUrl, metadata)
+                        lastError = null
+                        break
+                    } catch (e: Exception) {
+                        lastError = e
+                        val msg = e.message ?: ""
+                        val retryable = msg.contains("503") || msg.contains("429") || msg.contains("timed out") ||
+                            msg.contains("timeout") || msg.contains("Unable to resolve host") || msg.contains("Connection reset")
+                        com.winwasm64.vpn.ConnTrace.torrent(
+                            seedUrl.take(120),
+                            if (attempt < 3 && retryable) "WebSeed: повтор $attempt из 3" else "WebSeed не отдал файл",
+                            ok = false,
+                            note = msg.take(120)
+                        )
+                        if (!retryable || attempt == 3 || task.cancelled.get() || task.paused.get()) break
+                        task.statusDetail = "Сервер отдал «$msg» — повтор $attempt из 3 через ${attempt * 2} с…"
+                        try { Thread.sleep(1_000L * attempt * 2) } catch (_: InterruptedException) { break }
+                    }
+                }
+                if (lastError != null) {
+                    val e = lastError!!
+                    // Fallback: если ссылка на файл не сработала — пробуем исходный .torrent/URL
                     if (!task.torrentUrl.isNullOrBlank() && task.torrentUrl != seedUrl) {
                         task.outputFile = File(getDownloadDirectory(), sanitizeFileName(task.initialName + ".torrent"))
                         downloadViaWebSeedStream(task, task.torrentUrl, metadata)
@@ -984,9 +1018,10 @@ class BitTorrentEngine(private val context: Context? = null) {
         metadata: TorrentMetadata?
     ) {
         val vpnBadge = if (useBrowsecVpn) " • Browsec $browsecCountryCode" else ""
-        task.statusDetail = "Канал BitTorrent P2P + WebSeed активен$vpnBadge..."
-        task.connectedPeers = (task.knownPeers.coerceAtLeast(5)).coerceAtMost(28)
-        task.knownPeers = task.knownPeers.coerceAtLeast(19)
+        task.statusDetail = "Канал WebSeed (HTTP) активен$vpnBadge..."
+        // v4.18.0: убраны «нарисованные» пиры. Раньше здесь присваивалось
+        // connectedPeers = max(5) и knownPeers = max(19) — числа брались из воздуха, и по ним
+        // нельзя было понять, работает P2P или нет. Показываем только то, что реально известно.
 
         val conn = (URL(seedUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 12000
@@ -1000,8 +1035,10 @@ class BitTorrentEngine(private val context: Context? = null) {
 
         val code = conn.responseCode
         if (code !in 200..299) {
+            com.winwasm64.vpn.ConnTrace.torrent(seedUrl.take(120), "WebSeed ответил HTTP $code", false, if (code == 503 || code == 429) "сервер занят/лимит — повторяем" else "недоступно")
             throw IllegalStateException("HTTP WebSeed код $code")
         }
+        com.winwasm64.vpn.ConnTrace.torrent(seedUrl.take(120), "WebSeed отвечает, качаем по HTTP", true)
 
         val contentLength = conn.contentLengthLong
         val resumeOffset = if (code == 206) task.downloadedBytes.get() else 0L
@@ -1179,8 +1216,13 @@ class BitTorrentEngine(private val context: Context? = null) {
     }
 
     fun announceTracker(trackerUrl: String, infoHash: ByteArray, leftBytes: Long): List<PeerEndpoint> {
+        // v4.18.0: каждый трекер виден в журнале соединений — сколько пиров он реально дал.
+        // Именно этого не хватало, чтобы понять «0 пиров»: трекер молчит, отвечает отказом
+        // или пиры есть, но не подключаются.
+        val proto = if (trackerUrl.startsWith("udp://", ignoreCase = true)) "UDP" else "HTTP"
+        val short = trackerUrl.removePrefix("http://").removePrefix("https://").removePrefix("udp://").take(80)
         return try {
-            when {
+            val result = when {
                 trackerUrl.startsWith("http://", ignoreCase = true) ||
                     trackerUrl.startsWith("https://", ignoreCase = true) ->
                     announceHttpTracker(trackerUrl, infoHash, leftBytes)
@@ -1188,7 +1230,15 @@ class BitTorrentEngine(private val context: Context? = null) {
                     announceUdpTracker(trackerUrl, infoHash, leftBytes)
                 else -> emptyList()
             }
-        } catch (_: Exception) {
+            com.winwasm64.vpn.ConnTrace.torrent(
+                target = short,
+                what = "трекер ($proto) → ${result.size} пиров",
+                ok = result.isNotEmpty(),
+                note = if (result.isEmpty()) "трекер не дал пиров (отказ, таймаут или раздача без сидов)" else ""
+            )
+            result
+        } catch (e: Throwable) {
+            com.winwasm64.vpn.ConnTrace.torrent(short, "трекер ($proto) не ответил", false, e.message ?: e.javaClass.simpleName)
             emptyList()
         }
     }

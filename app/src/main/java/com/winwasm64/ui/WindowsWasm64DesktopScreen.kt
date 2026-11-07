@@ -1306,16 +1306,28 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     }
                     if (adBlockEnabled) {
                         val host = request.url.host?.lowercase() ?: ""
-                        val blocked = AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
-                            com.winwasm64.ui.browser.AdBlockList.isBlocked(host) ||
-                            customBlockedDomains.any { it.isNotBlank() && host.contains(it.lowercase()) } ||
-                            reqUrl.contains("/pagead/") || reqUrl.contains("doubleclick.net") ||
-                            reqUrl.contains("googleads.")
+                        val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
+                        // v4.18.0: журнал 4.17.0 показал, что AdBlock резал СВОЙ ЖЕ API сервисов —
+                        // gx-target-experiments-frontend-api.gx.nvidia.com (из-за него GeForce NOW
+                        // не мог получить настройки сессии). Теперь: запросы того же сайта и адреса,
+                        // похожие на API сервиса, не блокируются никогда.
+                        val sameSite = isSameSite(pageHost, host)
+                        val serviceApi = isServiceApiHost(host)
+                        val blocked = !sameSite && !serviceApi && (
+                            AD_DOMAINS.any { host == it || host.endsWith(".$it") } ||
+                                com.winwasm64.ui.browser.AdBlockList.isBlocked(host) ||
+                                customBlockedDomains.any { it.isNotBlank() && host.contains(it.lowercase()) } ||
+                                reqUrl.contains("/pagead/") || reqUrl.contains("doubleclick.net") ||
+                                reqUrl.contains("googleads.")
+                            )
                         if (blocked) {
                             adBlockedCount++
                             try {
-                                val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
-                                com.winwasm64.vpn.ConnTrace.request(pageHost, host, if ((request.url.port) > 0) request.url.port else 443, "реклама/трекер — отсечено", true)
+                                com.winwasm64.vpn.ConnTrace.request(
+                                    pageHost, host,
+                                    if ((request.url.port) > 0) request.url.port else 443,
+                                    adBlockReason(host), true
+                                )
                             } catch (_: Throwable) {
                             }
                             return WebResourceResponse(
@@ -5048,4 +5060,37 @@ private fun requestPurpose(request: android.webkit.WebResourceRequest?, reqUrl: 
             reqUrl.contains("i/v1/") || reqUrl.contains("/ajax") -> "API/данные"
         else -> "подресурс"
     }
+}
+
+/**
+ * v4.18.0: «тот же сайт» — грубо, но безопасно: сравниваем два последних сегмента домена
+ * (play.geforcenow.com → geforcenow.com). Запросы своего же сайта не блокируем никогда:
+ * именно так AdBlock ломал API GeForce NOW.
+ */
+private fun isSameSite(pageHost: String?, reqHost: String): Boolean {
+    if (pageHost.isNullOrBlank() || reqHost.isBlank()) return false
+    fun tail(h: String): String = h.split('.').takeLast(2).joinToString(".")
+    return tail(pageHost) == tail(reqHost)
+}
+
+/**
+ * v4.18.0: адрес похож на API сервиса, а не на рекламу — такие не блокируем.
+ * В журнале 4.17.0 под «реклама/трекер» попали gx-target-…-frontend-api.gx.nvidia.com и
+ * gx-target-survey-frontend-api.gx.nvidia.com — это рабочие API GeForce NOW, а не трекеры.
+ */
+private fun isServiceApiHost(host: String): Boolean {
+    if (host.isBlank()) return false
+    val h = host.lowercase()
+    if (h.contains("telemetry") || h.contains("analytics") || h.contains("otel") || h.contains("metrics")) return false
+    return h.contains("-api.") || h.startsWith("api.") || h.contains("cloudmatch") ||
+        h.contains("gx-target-") || h.endsWith("nvidia.com") || h.endsWith("geforcenow.com") ||
+        h.endsWith("nvidiagrid.net")
+}
+
+/** v4.18.0: честная подпись в журнале — телеметрия это или реклама. */
+private fun adBlockReason(host: String): String {
+    val h = host.lowercase()
+    return if (h.contains("telemetry") || h.contains("analytics") || h.contains("otel") ||
+        h.contains("metrics") || h.contains("kaizen") || h.contains("tracker") || h.contains("stats")
+    ) "телеметрия — отсечено (на работу сайта не влияет)" else "реклама/трекер — отсечено"
 }

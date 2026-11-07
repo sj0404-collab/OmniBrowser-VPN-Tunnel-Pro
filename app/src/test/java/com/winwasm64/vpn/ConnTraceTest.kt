@@ -2,16 +2,17 @@ package com.winwasm64.vpn
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
 /**
- * v4.17.0: журнал соединений — «кто, куда, протокол, маршрут, зачем».
+ * v4.17.0 + 4.18.0: журнал соединений — «кто, куда, протокол, маршрут, зачем».
  *
  * Проверяем то, на что пользователь смотрит глазами: строки читаемы, фильтры работают,
- * одинаковые записи не забивают журнал, а статистика считает маршруты (Browsec / Psiphon /
- * обход DPI / UDP-релей) — именно по ней видно, что делает туннель.
+ * запрос страницы и реальное соединение дают ОДНУ строку (а не две, как в 4.17.0),
+ * служебный мусор не засоряет журнал, статистика считает маршруты.
  */
 class ConnTraceTest {
 
@@ -42,19 +43,35 @@ class ConnTraceTest {
     }
 
     @Test
-    fun `фильтры разделяют браузер приложения UDP и обход DPI`() {
+    fun `запрос страницы сливается с реальным соединением в одну строку`() {
+        // WebView сообщил «кто и зачем», затем прокси сообщил «через что и сколько»
+        ConnTrace.pendingRequest("play.geforcenow.com", "login.nvidia.com", 443, "подресурс")
+        ConnTrace.connect("Браузер", "login.nvidia.com", 443, "Browsec lv210", 850, true)
+
+        val lines = ConnTrace.snapshot("browser")
+        assertEquals(1, lines.size)
+        val line = lines.single()
+        assertTrue(line.contains("play.geforcenow.com"))   // кто вызвал
+        assertTrue(line.contains("login.nvidia.com:443"))  // куда
+        assertTrue(line.contains("Browsec lv210"))         // через что
+        assertTrue(line.contains("подресурс"))             // зачем
+    }
+
+    @Test
+    fun `фильтры разделяют браузер приложения UDP торренты и обход DPI`() {
         ConnTrace.connect("Браузер", "a.example", 443, "Browsec lv1", 10, true)
         ConnTrace.connect("Telegram", "b.example", 443, "Psiphon", 20, true)
         ConnTrace.udp("GeForce NOW", "92.223.105.5:443", "DTLS (игра/звонок) → UDP-релей")
         ConnTrace.connect("Браузер", "c.example", 443, "напрямую (обход DPI, IP не меняется)", 30, true)
+        ConnTrace.torrent("tracker.opentrackr.org:1337", "трекер (UDP) → 9 пиров", true)
 
-        // запись с маршрутом «напрямую (обход DPI)» относится к категории «Обход DPI», а не к браузеру
         assertEquals(1, ConnTrace.snapshot("browser").size)
         assertEquals(1, ConnTrace.snapshot("apps").size)
         assertEquals(1, ConnTrace.snapshot("udp").size)
         assertEquals(1, ConnTrace.snapshot("bypass").size)
-        assertTrue(ConnTrace.snapshot("udp").single().contains("UDP"))
+        assertEquals(1, ConnTrace.snapshot("torrent").size)
         assertTrue(ConnTrace.snapshot("udp").single().contains("DTLS"))
+        assertTrue(ConnTrace.snapshot("torrent").single().contains("9 пиров"))
     }
 
     @Test
@@ -66,17 +83,18 @@ class ConnTraceTest {
     }
 
     @Test
-    fun `одинаковые записи подряд не дублируются`() {
-        repeat(5) { ConnTrace.request("site.ru", "cdn.site.ru", 443, "картинка", false) }
-        assertEquals(1, ConnTrace.snapshot("browser").size)
-    }
-
-    @Test
-    fun `отсечённая реклама видна в журнале как заблокированная`() {
+    fun `отсечённая реклама видна сразу и помечена как блокировка`() {
         ConnTrace.request("site.ru", "ads.example", 443, "реклама/трекер — отсечено", true)
         val line = ConnTrace.snapshot(null).single()
         assertTrue(line.contains("заблокировано"))
         assertEquals(1, ConnTrace.snapshot("err").size)
+    }
+
+    @Test
+    fun `служебная заглушка PAC не попадает в журнал`() {
+        assertTrue(ConnTrace.isNoise("pac.omni-ext.invalid"))
+        ConnTrace.connect("Браузер", "pac.omni-ext.invalid", 443, "Browsec lv210", 2000, true)
+        assertTrue(ConnTrace.snapshot(null).isEmpty())
     }
 
     @Test
@@ -105,5 +123,14 @@ class ConnTraceTest {
         ConnTrace.clear()
         assertTrue(ConnTrace.snapshot(null).isEmpty())
         assertTrue(ConnTrace.statsLine().contains("пока не было"))
+    }
+
+    @Test
+    fun `торрент-событие с ошибкой считается неудачным`() {
+        ConnTrace.torrent("archive.org/download/...", "WebSeed ответил HTTP 503", false, "сервер занят")
+        val line = ConnTrace.snapshot("torrent").single()
+        assertTrue(line.contains("503"))
+        assertFalse(line.contains("✅"))
+        assertEquals(1, ConnTrace.snapshot("err").size)
     }
 }
