@@ -990,6 +990,16 @@ function alert(){}
     // стартует первым с форой 1,2 с; остальные подключаются к гонке, только если он не ответил.
     @Volatile private var stickyUp: Upstream? = null
     @Volatile private var stickyAt: Long = 0L
+    /**
+     * v4.12.0: «держать один сервер» — по умолчанию ВКЛ.
+     * Раньше сервер сессии получал фору 1,2 с, а потом начиналась обычная гонка: если он отвечал медленнее,
+     * побеждал другой сервер и внешний IP менялся посреди сессии (отсюда «имя сервера одно, IP другой»).
+     * Теперь, пока сервер сессии жив, все соединения идут только через него; смена — только если он не ответил
+     * за [PIN_WAIT_MS], и всегда с записью в журнал.
+     */
+    @Volatile var pinSessionServer: Boolean = true
+    private const val PIN_WAIT_MS = 4_000L
+
     private fun setSticky(up: Upstream) {
         // v4.10.4: только серверы общего списка (tunnelServers). Прокси, который PAC даёт отдельному сайту (browsec.com → gr21,
         // требует логин/пароль), «сервером сессии» становиться не должен — иначе все остальные сайты получают 407.
@@ -1056,7 +1066,11 @@ function alert(){}
         val live = proxies.filter { !isDown(it) && it.key != sticky?.key }.take(2)
         var liveStarted = sticky == null
         if (liveStarted) for (p in live) launch(0, p) { if (p.type == "SOCKS5") viaSocks5(p, host, port) else viaHttpProxy(p, host, port, url) }
-        val shift = if (sticky != null) 1_200L else 0L
+        val pinned = pinSessionServer && sticky != null
+        val shift = if (pinned) PIN_WAIT_MS else if (sticky != null) 1_200L else 0L
+        if (pinned && shift > 0) {
+            com.winwasm64.vpn.VpnLog.i("Браузер", "сервер сессии ${sticky?.key}: все соединения держим через него (IP не меняется)")
+        }
         val liveAt = t0 + shift
         val stage1At = if (live.isEmpty() && sticky == null) t0 else t0 + 1_500L + shift
         var stage2At = if (live.isEmpty() && sticky == null) t0 + 3_000L else t0 + 5_000L + shift
@@ -1167,6 +1181,7 @@ function alert(){}
             if (rp > 0) return viaHttpProxy(Upstream("HTTP", "127.0.0.1", rp), host, port, url, direct = true)
         }
         val s = Socket()
+        com.winwasm64.vpn.NetworkBypass.bind(s) // v4.12.0: напрямую — мимо чужого VPN
         s.connect(InetSocketAddress(host, port), 15_000)
         s.tcpNoDelay = true
         return s to s.getInputStream()
@@ -1174,6 +1189,8 @@ function alert(){}
 
     private fun openToProxy(up: Upstream, readTimeoutMs: Int = 5_000): Socket {
         val raw = Socket()
+        // v4.12.0: «в обход чужого VPN» — привязываем к физической сети до connect(), как это делает VpnService.protect()
+        if (up.host != "127.0.0.1") com.winwasm64.vpn.NetworkBypass.bind(raw)
         raw.connect(InetSocketAddress(up.host, up.port), 4_000)
         // v4.1.1: WebView ждёт ответ на CONNECT ~10 с — зависший сервер должен отвалиться раньше; локальному репитеру даём больше
         raw.soTimeout = if (up.host == "127.0.0.1") 15_000 else readTimeoutMs

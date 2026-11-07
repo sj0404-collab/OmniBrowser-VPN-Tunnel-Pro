@@ -27,10 +27,14 @@ object EgressCheck {
     private const val PRIMARY = "https://ipinfo.io/json"
     private const val FALLBACK = "https://api.ipify.org?format=text"
 
-    /** IP без прокси — «домашний». */
+    /**
+     * IP без прокси — «домашний». v4.12.0: сначала пробуем в ОБХОД чужого VPN
+     * (сокет/соединение привязано к физической сети), иначе показывался бы выход чужого VPN.
+     */
     fun direct(): Info {
-        val info = fetch(useProxy = false)
-        VpnLog.i("IP", "напрямую: " + info.label())
+        val bypassed = fetch(useProxy = false, bypassVpn = true)
+        val info = if (bypassed.ok) bypassed else fetch(useProxy = false)
+        VpnLog.i("IP", "без прокси: " + info.label() + (if (bypassed.ok) " (в обход чужого VPN)" else ""))
         return info
     }
 
@@ -41,12 +45,12 @@ object EgressCheck {
         return info
     }
 
-    private fun fetch(useProxy: Boolean): Info {
+    private fun fetch(useProxy: Boolean, bypassVpn: Boolean = false): Info {
         try {
             val text = if (useProxy) {
                 MediaGrabber.getText(PRIMARY, emptyMap(), 8192)
             } else {
-                readText(PRIMARY)
+                readText(PRIMARY, bypassVpn)
             }
             parse(text)?.let { return it }
         } catch (e: Exception) {
@@ -61,8 +65,9 @@ object EgressCheck {
         }
     }
 
-    private fun readText(url: String): String {
-        val c = URL(url).openConnection(Proxy.NO_PROXY) as HttpURLConnection
+    private fun readText(url: String, bypassVpn: Boolean = false): String {
+        val c = (if (bypassVpn) com.winwasm64.vpn.NetworkBypass.openConnection(url) else null)
+            ?: (URL(url).openConnection(Proxy.NO_PROXY) as HttpURLConnection)
         return try {
             c.connectTimeout = 12_000
             c.readTimeout = 15_000

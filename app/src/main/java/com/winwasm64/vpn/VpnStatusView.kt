@@ -83,6 +83,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             setStroke(dp(1), 0x335B8DEF)
         }
         VpnLog.init(context)
+        com.winwasm64.vpn.NetworkBypass.init(context)
         val title = TextView(context)
         styleText(title, 16f, 0xFFECECEC.toInt(), true)
         title.text = "Что сейчас включено"
@@ -215,7 +216,8 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         tvDns.visibility = VISIBLE
         tvDns.text = "🔎 DNS: браузер — имя сайта разрешает сам сервер Browsec (ваш DNS не участвует); " +
             "приложения — DoH 1.1.1.1/8.8.8.8 внутри туннеля, только пока включён «VPN приложений»" +
-            (if (BrowsecVpnService.isRunning && BrowsecVpnService.routedPackages.isNotEmpty()) " (сейчас включён)." else " (сейчас ВЫКЛЮЧЕН — приложения резолвят вашим обычным DNS).")
+            (if (BrowsecVpnService.isRunning && BrowsecVpnService.routedPackages.isNotEmpty()) " (сейчас включён)." else " (сейчас ВЫКЛЮЧЕН — приложения резолвят вашим обычным DNS).") +
+            "\n🔀 " + com.winwasm64.vpn.NetworkBypass.statusLine()
         tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Настоящую смену IP дают серверы Browsec: для браузера — через расширение, для приложений — кнопкой ниже. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
         val missing = missingPopular()
         btnAdd.visibility = if (missing.isEmpty()) GONE else VISIBLE

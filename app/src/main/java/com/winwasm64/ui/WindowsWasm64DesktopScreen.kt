@@ -309,6 +309,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var blockThirdPartyCookies by remember { mutableStateOf(prefs.getBoolean("block_3p_cookies", false)) }
     // v4.10.9: плавающая кнопка «Скачать видео» перекрывала поле ввода на сайтах без видео — её можно выключить
     var hideMediaButton by remember { mutableStateOf(prefs.getBoolean("hide_media_button", false)) }
+    // v4.12.0: держать один сервер Browsec (IP не меняется) и обходить чужой VPN на телефоне
+    var pinSessionServer by remember { mutableStateOf(prefs.getBoolean("pin_session_server", true)) }
+    var bypassForeignVpn by remember { mutableStateOf(prefs.getBoolean("bypass_foreign_vpn", true)) }
     var webrtcTcpAll by remember { mutableStateOf(prefs.getBoolean("webrtc_tcp_all", false)) }
     var autoNextVideo by remember { mutableStateOf(prefs.getBoolean("auto_next_video", true)) }
     var doNotTrackEnabled by remember { mutableStateOf(prefs.getBoolean("dnt_enabled", true)) }
@@ -1615,6 +1618,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     LaunchedEffect(Unit) {
         // v4.5.0: незавершённые загрузки продолжаются после перезапуска приложения
         try { com.winwasm64.ui.browser.MediaDownloadService.resumePending(context) } catch (_: Exception) {}
+        com.winwasm64.vpn.NetworkBypass.init(context)
+        com.winwasm64.vpn.NetworkBypass.enabled = bypassForeignVpn
+        com.winwasm64.extensions.ExtensionProxy.pinSessionServer = pinSessionServer
         com.winwasm64.ui.browser.UpdateChecker.autoCheck(context)
         com.winwasm64.ui.browser.AdBlockList.init(context, adBlockEnabled)
     }
@@ -2657,6 +2663,25 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     ) { v ->
                                         hideMediaButton = v
                                         prefs.edit().putBoolean("hide_media_button", v).apply()
+                                    }
+                                    // v4.12.0: один сервер на сессию и обход чужого VPN
+                                    SettingSwitchRow(
+                                        "Держать один сервер Browsec (IP не меняется)",
+                                        "Все соединения браузера идут через один сервер сессии; смена — только если он не ответил за 4 с (в журнале)",
+                                        pinSessionServer
+                                    ) { v ->
+                                        pinSessionServer = v
+                                        com.winwasm64.extensions.ExtensionProxy.pinSessionServer = v
+                                        prefs.edit().putBoolean("pin_session_server", v).apply()
+                                    }
+                                    SettingSwitchRow(
+                                        "Обходить чужой VPN на телефоне",
+                                        "Наши сокеты привязываются к Wi-Fi/мобильной сети и идут мимо другого VPN — тогда выход только через Browsec, а «домашний IP» настоящий",
+                                        bypassForeignVpn
+                                    ) { v ->
+                                        bypassForeignVpn = v
+                                        com.winwasm64.vpn.NetworkBypass.enabled = v
+                                        prefs.edit().putBoolean("bypass_foreign_vpn", v).apply()
                                     }
                                     // v4.4.0: экспорт / импорт настроек
                                     var backupStatus by remember { mutableStateOf("") }
@@ -4056,6 +4081,10 @@ private fun NativeAppsWithBrowsecSection(
                                     }
                                 }
                             }
+                            Text(
+                                "🔀 " + com.winwasm64.vpn.NetworkBypass.statusLine(),
+                                color = Omni.Accent, fontSize = 10.sp
+                            )
                             Text(
                                 "Профили обхода ниже (${BrowsecLocalProxyServer.SERVER_NODES.size}) IP НЕ меняют: помогают открыть заблокированный сайт, но внешний IP остаётся вашим.",
                                 color = Omni.Warning, fontSize = 10.sp
