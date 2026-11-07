@@ -2,23 +2,29 @@ package com.winwasm64.ui.browser
 
 import android.content.res.Configuration
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.webkit.WebView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -27,7 +33,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -35,23 +44,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * v4.21.0: ввод в страницу — теперь настоящими (доверенными) событиями клавиш.
+ * v4.22.0: полупрозрачная строка ввода + отдельная сенсорная клавиатура + виртуальная мышь.
  *
- * Что показало устройство:
- *  • 4.19.0 — печать символов работает, кнопки нет;
- *  • 4.20.0 — «Пробел» работает (это вставка текста в поле), а Enter, ⌫, Tab и «Далее» — нет.
+ * По просьбе с устройства: сама панель не нужна — нужна строка, в которую можно печатать,
+ * чтобы символы доходили до игры, и чтобы работало удаление. Кнопки-клавиши при этом должны
+ * быть отдельной сенсорной клавиатурой (своей, не системной), а не висеть в строке.
  *
- * Вывод: страница принимает только то, что пришло от системы. Подделанные нами события браузер
- * помечает `isTrusted = false`, и игра их выбрасывает — вставку текста она видит (значение поля
- * изменилось), а «нажатие клавиши» нет. Родная сенсорная клавиатура GeForce NOW по той же причине
- * не работает: она тоже шлёт синтетику.
+ * Что было выяснено на устройстве:
+ *  • печать символов и пробел работают всегда — это вставка текста в поле страницы;
+ *  • «нажатия» клавиш, созданные в JS, страница выбрасывает (`isTrusted = false`), поэтому Enter,
+ *    Tab, ⌫ и стрелки ничего не делали. Теперь они идут настоящими `KeyEvent` через
+ *    `WebView.dispatchKeyEvent` — такие события Chromium считает системными.
  *
- * Настоящий путь — отдать клавишу через сам WebView: `WebView.dispatchKeyEvent(KeyEvent(...))`.
- * Он идёт внутрь Chromium как системная, с `isTrusted = true`, и страница обязана её увидеть.
- * Поэтому Enter, Tab, ⌫, Esc и стрелки теперь отправляются так, а хитрости из 4.20.0 (правка
- * значения поля, отправка формы, click() ближайшей кнопки) остаются запасным путём.
- *
- * Ещё: в альбомном режиме панель сжимается в одну строку, чтобы не закрывать игру.
+ * Устройство интерфейса:
+ *  • по умолчанию видна только полупрозрачная строка ввода (системная клавиатура не всплывает сама);
+ *  • «⌨» — своя сенсорная клавиатура (рус/eng, цифры, ⇧, ⌫, Пробел, Enter, Tab, Esc, стрелки);
+ *  • «🖱» — виртуальная мышь-тачпад: точка на площадке = точка на экране игры, тап = клик левой,
+ *    кнопка «ПКМ» — правой, «↑/↓» — прокрутка. Сворачивается кнопкой «—»;
+ *  • «✕» — закрыть всё.
  */
 @Composable
 fun OmniKeyPanel(
@@ -61,14 +71,17 @@ fun OmniKeyPanel(
 ) {
     var proxy by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
+    var keysOpen by remember { mutableStateOf(false) }
+    var mouseOpen by remember { mutableStateOf(false) }
+    var ru by remember { mutableStateOf(true) }
+    var shift by remember { mutableStateOf(false) }
+    var digits by remember { mutableStateOf(false) }
     val focus = remember { FocusRequester() }
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val root = LocalView.current.rootView
 
-    LaunchedEffect(Unit) {
-        try { focus.requestFocus() } catch (_: Throwable) {}
-        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта (4.21.0): Enter/Tab/⌫/стрелки идут доверенными событиями WebView")
-    }
+    // v4.22.0: НЕ просим фокус при открытии — из-за этого вылезала системная клавиатура
+    // и закрывала игру. Печатать можно своей сенсорной клавиатурой.
 
     /** Настоящее нажатие клавиши внутрь WebView: страница видит его как системное. */
     fun nativeKey(keyCode: Int, tag: String) {
@@ -79,8 +92,8 @@ fun OmniKeyPanel(
             if (!wv.hasFocus()) wv.requestFocus()
             wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
             wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
-            status = "$tag: системная клавиша отправлена"
-            com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода: $tag → KeyEvent($keyCode)")
+            status = "$tag → KeyEvent $keyCode"
+            com.winwasm64.vpn.VpnLog.i("Браузер", "ввод: $tag → KeyEvent($keyCode)")
         } catch (e: Throwable) {
             status = "$tag: сбой — ${e.message}"
         } finally {
@@ -88,7 +101,7 @@ fun OmniKeyPanel(
         }
     }
 
-    /** Свой JS — запасной путь и вставка текста. */
+    /** Свой JS — вставка текста и запасной путь. */
     fun js(code: String, tag: String, delay: Long = 0) {
         val wv = webView ?: return
         val run = Runnable {
@@ -103,7 +116,7 @@ fun OmniKeyPanel(
         if (delay > 0) wv.postDelayed(run, delay) else run.run()
     }
 
-    fun insertChar(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка")
+    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка")
     fun del() {
         nativeKey(KeyEvent.KEYCODE_DEL, "⌫")
         js("window.__omniAct&&window.__omniAct('del')", "⌫ (запасной путь)", 160)
@@ -113,103 +126,329 @@ fun OmniKeyPanel(
         js("window.__omniAct&&window.__omniAct('enter')", "Enter (запасной путь)", 200)
     }
 
-    @Composable
-    fun chip(title: String, onClick: () -> Unit) {
-        Box(
-            modifier = Modifier
-                .background(Color(0x40FFFFFF))
-                .clickable {
-                    onClick()
-                    try { focus.requestFocus() } catch (_: Throwable) {}
-                }
-                .padding(horizontal = 10.dp, vertical = if (landscape) 4.dp else 8.dp)
-        ) { Text(title, fontSize = if (landscape) 11.sp else 12.sp, color = Color.White) }
-    }
-
-    @Composable
-    fun fieldInput(mod: Modifier) {
-        BasicTextField(
-            value = proxy,
-            onValueChange = { next ->
-                if (next.length > proxy.length) {
-                    next.substring(proxy.length).forEach { ch -> insertChar(ch.toString()) }
-                } else if (next.length < proxy.length) {
-                    repeat(proxy.length - next.length) { js("window.__omniAct&&window.__omniAct('del')", "⌫") }
-                }
-                proxy = if (next.length > 400) next.takeLast(400) else next
-            },
-            singleLine = true,
-            textStyle = TextStyle(color = Color.White, fontSize = if (landscape) 13.sp else 15.sp),
-            modifier = mod
-                .background(Color(0xFF26282F))
-                .padding(horizontal = 8.dp, vertical = if (landscape) 6.dp else 10.dp)
-                .focusRequester(focus)
-        ) { inner ->
-            if (proxy.isEmpty()) {
-                Text("Печатайте здесь", fontSize = 12.sp, color = Color(0xFF8A8F99))
-            }
-            inner()
-        }
-    }
-
-    @Composable
-    fun keyRow() {
-        Row(
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(if (landscape) 4.dp else 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            chip("Пробел") { js("window.__omniInsert&&window.__omniInsert(' ')", "Пробел") }
-            chip("Enter") { enter() }
-            chip("Далее") { js("window.__omniAct&&window.__omniAct('submit')", "Далее") }
-            chip("⌫") { del() }
-            chip("Tab") { nativeKey(KeyEvent.KEYCODE_TAB, "Tab") }
-            chip("Esc") { nativeKey(KeyEvent.KEYCODE_ESCAPE, "Esc") }
-            chip("←") { nativeKey(KeyEvent.KEYCODE_DPAD_LEFT, "←") }
-            chip("↑") { nativeKey(KeyEvent.KEYCODE_DPAD_UP, "↑") }
-            chip("↓") { nativeKey(KeyEvent.KEYCODE_DPAD_DOWN, "↓") }
-            chip("→") { nativeKey(KeyEvent.KEYCODE_DPAD_RIGHT, "→") }
-            chip("Стереть всё") {
-                js("window.__omniAct&&window.__omniAct('clear')", "очистка")
-                proxy = ""
-            }
+    fun key(code: Int, tag: String) {
+        when (code) {
+            KeyEvent.KEYCODE_DEL -> del()
+            KeyEvent.KEYCODE_ENTER -> enter()
+            else -> nativeKey(code, tag)
         }
     }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xE6141519))
-            .padding(if (landscape) 4.dp else 8.dp)
+            .background(Color(0x66101216))
+            .padding(if (landscape) 3.dp else 6.dp)
     ) {
-        if (landscape) {
-            // Альбомный режим: всё в одну строку, максимум места игре
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                fieldInput(Modifier.weight(1f))
-                keyRow()
-                chip("⌨") { onShowSystemKeyboard() }
-                chip("✕") { onClose() }
+        if (mouseOpen) {
+            OmniTouchPad(
+                webView = webView,
+                compact = landscape,
+                onStatus = { status = it },
+                onCollapse = { mouseOpen = false }
+            )
+        }
+        if (keysOpen) {
+            OmniSoftKeyboard(
+                ru = ru,
+                shift = shift,
+                digits = digits,
+                compact = landscape,
+                onInsert = { ch -> insert(ch) },
+                onKey = { code, tag -> key(code, tag) },
+                onToggleLang = { ru = !ru },
+                onToggleShift = { shift = !shift },
+                onToggleDigits = { digits = !digits }
+            )
+        }
+        OmniInputLine(
+            value = proxy,
+            onValueChange = { next ->
+                if (next.length > proxy.length) {
+                    next.substring(proxy.length).forEach { ch -> insert(ch.toString()) }
+                } else if (next.length < proxy.length) {
+                    repeat(proxy.length - next.length) { del() }
+                }
+                proxy = if (next.length > 400) next.takeLast(400) else next
+            },
+            focus = focus,
+            compact = landscape,
+            keysOpen = keysOpen,
+            onToggleKeys = {
+                keysOpen = !keysOpen
+                if (keysOpen) {
+                    // закрываем системную клавиатуру, чтобы не занимала пол-экрана
+                    try { root.findFocus()?.clearFocus() } catch (_: Throwable) {}
+                }
+            },
+            mouseOpen = mouseOpen,
+            onToggleMouse = { mouseOpen = !mouseOpen },
+            onShowSystemKeyboard = onShowSystemKeyboard,
+            onClose = onClose
+        )
+        if (status.isNotEmpty()) {
+            Text(
+                status,
+                fontSize = 9.sp,
+                color = Color(0xFF9AA0AA),
+                modifier = Modifier.padding(top = 2.dp, start = 4.dp)
+            )
+        }
+    }
+}
+
+/* ================= полупрозрачная строка ввода ================= */
+
+@Composable
+private fun OmniInputLine(
+    value: String,
+    onValueChange: (String) -> Unit,
+    focus: FocusRequester,
+    compact: Boolean,
+    keysOpen: Boolean,
+    onToggleKeys: () -> Unit,
+    mouseOpen: Boolean,
+    onToggleMouse: () -> Unit,
+    onShowSystemKeyboard: () -> Unit,
+    onClose: () -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 5.dp)
+    ) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            textStyle = TextStyle(color = Color.White, fontSize = if (compact) 13.sp else 15.sp),
+            modifier = Modifier
+                .weight(1f)
+                .background(Color(0x4D26282F))
+                .padding(horizontal = 8.dp, vertical = if (compact) 5.dp else 8.dp)
+                .focusRequester(focus)
+        ) { inner ->
+            if (value.isEmpty()) {
+                Text("печать сюда →", fontSize = 12.sp, color = Color(0x99AAB0BC))
             }
-            if (status.isNotEmpty()) {
-                Text(status, fontSize = 9.sp, color = Color(0xFF9AA0AA), modifier = Modifier.padding(top = 2.dp))
+            inner()
+        }
+        SmallChip(if (keysOpen) "⌨▾" else "⌨", onToggleKeys, active = keysOpen)
+        SmallChip(if (mouseOpen) "🖱▾" else "🖱", onToggleMouse, active = mouseOpen)
+        SmallChip("сист", onShowSystemKeyboard)
+        SmallChip("✕", onClose)
+    }
+}
+
+@Composable
+private fun SmallChip(
+    title: String,
+    onClick: () -> Unit,
+    active: Boolean = false
+) {
+    Box(
+        modifier = Modifier
+            .background(if (active) Color(0x66FFC857) else Color(0x40FFFFFF))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 7.dp)
+    ) { Text(title, fontSize = 12.sp, color = Color.White) }
+}
+
+/* ================= своя сенсорная клавиатура ================= */
+
+private val RU_LOWER = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
+private val EN_LOWER = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
+private const val SYMBOL_ROW = "1234567890"
+private const val PUNCT_ROW = "-=.,!?()/@#"
+
+@Composable
+private fun OmniSoftKeyboard(
+    ru: Boolean,
+    shift: Boolean,
+    digits: Boolean,
+    compact: Boolean,
+    onInsert: (String) -> Unit,
+    onKey: (Int, String) -> Unit,
+    onToggleLang: () -> Unit,
+    onToggleShift: () -> Unit,
+    onToggleDigits: () -> Unit
+) {
+    val rows = if (ru) RU_LOWER else EN_LOWER
+    val pad = if (compact) 2.dp else 3.dp
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = pad)
+            .background(Color(0x59000000))
+            .padding(pad),
+        verticalArrangement = Arrangement.spacedBy(pad)
+    ) {
+        rows.forEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(pad)
+            ) {
+                row.forEach { c ->
+                    val t = if (shift) c.toString().uppercase() else c.toString()
+                    SmallKey(t) { onInsert(t) }
+                }
             }
-        } else {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "⌨ Ввод в страницу",
-                    fontSize = 11.sp,
-                    color = Color(0xFFECECEC),
-                    modifier = Modifier.weight(1f)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(pad)
+        ) {
+            (SYMBOL_ROW + PUNCT_ROW).forEach { c ->
+                val t = c.toString()
+                SmallKey(t) { onInsert(t) }
+            }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(pad),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SmallChip(if (ru) "Рус" else "Eng", onToggleLang, active = true)
+            SmallChip(if (shift) "⇧▴" else "⇧", onToggleShift, active = shift)
+            SmallChip("123", onToggleDigits, active = digits)
+            SmallKey("Пробел") { onInsert(" ") }
+            SmallKey("⌫") { onKey(KeyEvent.KEYCODE_DEL, "⌫") }
+            SmallKey("Enter") { onKey(KeyEvent.KEYCODE_ENTER, "Enter") }
+            SmallKey("Tab") { onKey(KeyEvent.KEYCODE_TAB, "Tab") }
+            SmallKey("Esc") { onKey(KeyEvent.KEYCODE_ESCAPE, "Esc") }
+            SmallKey("←") { onKey(KeyEvent.KEYCODE_DPAD_LEFT, "←") }
+            SmallKey("↑") { onKey(KeyEvent.KEYCODE_DPAD_UP, "↑") }
+            SmallKey("↓") { onKey(KeyEvent.KEYCODE_DPAD_DOWN, "↓") }
+            SmallKey("→") { onKey(KeyEvent.KEYCODE_DPAD_RIGHT, "→") }
+        }
+    }
+}
+
+@Composable
+private fun SmallKey(title: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .background(Color(0x4DFFFFFF))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 9.dp)
+    ) { Text(title, fontSize = 13.sp, color = Color.White) }
+}
+
+/* ================= виртуальная мышь (тачпад) ================= */
+
+@Composable
+private fun OmniTouchPad(
+    webView: WebView?,
+    compact: Boolean,
+    onStatus: (String) -> Unit,
+    onCollapse: () -> Unit
+) {
+    // положение «курсора» в долях площадки: 0..1
+    var fx by remember { mutableStateOf(0.5f) }
+    var fy by remember { mutableStateOf(0.5f) }
+    var padW by remember { mutableStateOf(1f) }
+    var padH by remember { mutableStateOf(1f) }
+
+    fun point(): Offset {
+        val wv = webView ?: return Offset.Zero
+        return Offset(fx * wv.width.toFloat(), fy * wv.height.toFloat())
+    }
+
+    fun hover(x: Float, y: Float) {
+        val wv = webView ?: return
+        try {
+            val t = SystemClock.uptimeMillis()
+            val ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_HOVER_MOVE, x, y, 0)
+            ev.source = InputDevice.SOURCE_MOUSE
+            wv.dispatchGenericMotionEvent(ev)
+            ev.recycle()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun click(secondary: Boolean) {
+        val wv = webView ?: return
+        val p = point()
+        try {
+            val t = SystemClock.uptimeMillis()
+            val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, p.x, p.y, 0)
+            down.source = InputDevice.SOURCE_MOUSE
+            down.buttonState = if (secondary) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_PRIMARY
+            wv.dispatchTouchEvent(down)
+            down.recycle()
+            val up = MotionEvent.obtain(t, t + 40, MotionEvent.ACTION_UP, p.x, p.y, 0)
+            up.source = InputDevice.SOURCE_MOUSE
+            up.buttonState = 0
+            wv.dispatchTouchEvent(up)
+            up.recycle()
+            onStatus(if (secondary) "мышь: правая кнопка ${p.x.toInt()},${p.y.toInt()}" else "мышь: клик ${p.x.toInt()},${p.y.toInt()}")
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun scroll(dy: Float) {
+        val wv = webView ?: return
+        val p = point()
+        try {
+            val t = SystemClock.uptimeMillis()
+            val ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, p.x, p.y, 0)
+            ev.source = InputDevice.SOURCE_MOUSE
+            ev.setAxisValue(MotionEvent.AXIS_VSCROLL, dy)
+            wv.dispatchGenericMotionEvent(ev)
+            ev.recycle()
+            onStatus(if (dy > 0) "мышь: колесо вверх" else "мышь: колесо вниз")
+        } catch (_: Throwable) {
+        }
+    }
+
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("мышь (тап по площадке = клик)", fontSize = 9.sp, color = Color(0xFFB9BFC9))
+            SmallChip("ЛКМ") { click(false) }
+            SmallChip("ПКМ") { click(true) }
+            SmallChip("↑") { scroll(1f) }
+            SmallChip("↓") { scroll(-1f) }
+            SmallChip("—") { onCollapse() }
+        }
+        Box(
+            modifier = Modifier
+                .padding(top = 3.dp)
+                .size(if (compact) 200.dp else 240.dp, if (compact) 110.dp else 140.dp)
+                .background(Color(0x4A1E2A38))
+                .onSizeChanged { padW = it.width.toFloat().coerceAtLeast(1f); padH = it.height.toFloat().coerceAtLeast(1f) }
+                .pointerInput(webView) {
+                    detectTapGestures(
+                        onTap = { off ->
+                            fx = (off.x / padW).coerceIn(0f, 1f)
+                            fy = (off.y / padH).coerceIn(0f, 1f)
+                            hover(fx * padW, fy * padH)
+                            click(false)
+                        },
+                        onLongPress = { off ->
+                            fx = (off.x / padW).coerceIn(0f, 1f)
+                            fy = (off.y / padH).coerceIn(0f, 1f)
+                            click(true)
+                        }
+                    )
+                }
+                .pointerInput(webView) {
+                    detectDragGestures { change, drag ->
+                        change.consume()
+                        fx = (change.position.x / padW).coerceIn(0f, 1f)
+                        fy = (change.position.y / padH).coerceIn(0f, 1f)
+                        val p = point()
+                        hover(p.x, p.y)
+                    }
+                }
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawCircle(
+                    color = Color(0xFFFFC857),
+                    radius = 7f,
+                    center = Offset(fx * size.width, fy * size.height)
                 )
-                chip("системная") { onShowSystemKeyboard() }
-                Box(Modifier.padding(start = 6.dp)) { chip("✕") { onClose() } }
-            }
-            Box(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                Row(Modifier.fillMaxWidth()) { fieldInput(Modifier.weight(1f)) }
-            }
-            Box(Modifier.fillMaxWidth().padding(top = 6.dp)) { keyRow() }
-            if (status.isNotEmpty()) {
-                Text(status, fontSize = 10.sp, color = Color(0xFF9AA0AA), modifier = Modifier.padding(top = 4.dp))
             }
         }
     }
@@ -223,19 +462,8 @@ private fun esc(s: String): String = s
     .replace("\r", "\\r")
     .replace("\t", "\\t")
 
-/**
- * Приёмник ввода в странице. Ставится один раз (idempotent), вызывается из Kotlin:
- *   __omniInsert('символ')  — вставить символ (это работает всегда: это правка значения поля)
- *   __omniAct('space'|'del'|'clear'|'enter'|'submit'|'tab'|'esc'|'left'|'right'|'up'|'down')
- *
- * Кнопки-клавиши в основном идут доверенными событиями через WebView.dispatchKeyEvent;
- * здесь — запасной путь: если страница всё равно ничего не сделала, мы правим DOM напрямую:
- * отправляем форму, нажимаем ближайшую кнопку «Далее», двигаем фокус, чистим поле.
- *
- * Важная деталь: значение поля меняем через родной сеттер (`HTMLInputElement.prototype.value`),
- * иначе React-подобные страницы не замечают изменения — они сравнивают значение со своим
- * «следящим» и молча игнорируют прямую запись.
- */
+/** Приёмник ввода в странице: вставка текста, удаление, отправка формы, нажатие «Далее», фокус. */
+
 const val OMNI_KEY_JS = """
 (function(){
   if (window.__omniAct) return;
