@@ -1540,7 +1540,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         if (!host.isNullOrBlank()) {
                             val localProxy = when {
                                 ExtensionProxy.isActive -> ExtensionProxy.webViewPort()
-                                browserVpnEnabled -> BrowserDirectRepeater.localProxyPort
+                                browserVpnEnabled -> BrowserDirectRepeater.ensureServerRunning()
                                 else -> -1
                             }
                             Thread {
