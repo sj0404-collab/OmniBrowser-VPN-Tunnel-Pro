@@ -21,7 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
@@ -148,20 +148,18 @@ fun OmniKeyPanel(
                 val v = json.optString("v")
                 val tag = json.optString("tag")
                 proxy = v.takeLast(400)
+                val cands = json.optString("cands")
                 status = if (json.optBoolean("ok")) {
-                    "в поле «$tag»: ${json.optInt("n")} симв. — $v".take(90)
+                    val blind = if (json.optBoolean("blind")) " [вне доступа] " else ""
+                    "$blind«$tag»: ${json.optInt("n")} симв. — $v   | поля: $cands".take(120)
                 } else {
-                    "поле страницы не найдено"
+                    "поле не найдено | поля: $cands"
                 }
             } catch (_: Throwable) {
                 // ответ не JSON — ничего не делаем
             }
         }
     }
-
-    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { refreshValue() }
-    fun back() = js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { refreshValue() }
-    fun enter() = js("window.__omniAct?window.__omniAct('enter'):'нет функций'", "Enter") { refreshValue() }
 
     /** Клавиша внутрь WebView: доходит только при фокусе у WebView, поэтому фокус даём, а IME гасим. */
     fun nativeKey(keyCode: Int, tag: String) {
@@ -182,6 +180,21 @@ fun OmniKeyPanel(
             wv.postDelayed({ hideIme() }, 60)
         }
     }
+
+    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { refreshValue() }
+    fun back() {
+        js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { text ->
+            refreshValue()
+            // Поле в недоступном документе (iframe) или не читается — тогда остаётся
+            // единственный честный путь: настоящая клавиша Backspace внутрь WebView.
+            if (text.contains("не читается") || text.contains("вне доступа") || text.contains("не удалось")) {
+                nativeKey(KeyEvent.KEYCODE_DEL, "⌫ (системная)")
+            }
+        }
+    }
+
+    fun pickAtCursor() = js("window.__omniPickAtCursor?window.__omniPickAtCursor():'нет функций'", "поле") { refreshValue() }
+    fun enter() = js("window.__omniAct?window.__omniAct('enter'):'нет функций'", "Enter") { refreshValue() }
 
     fun handleKey(code: Int, tag: String) {
         when (code) {
@@ -312,6 +325,7 @@ fun OmniKeyPanel(
                 }
             },
             onRefresh = { refreshValue() },
+            onPickField = { pickAtCursor() },
             onShowSystemKeyboard = { showSystemKeyboard() },
             onClose = onClose
         )
@@ -339,6 +353,7 @@ private fun InputLine(
     mouseOpen: Boolean,
     onToggleMouse: () -> Unit,
     onRefresh: () -> Unit,
+    onPickField: () -> Unit,
     onShowSystemKeyboard: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -364,6 +379,7 @@ private fun InputLine(
             inner()
         }
         SmallChip("⟳") { onRefresh() }
+        SmallChip("◎") { onPickField() }
         SmallChip(if (keysOpen) "⌨▾" else "⌨", active = keysOpen) { onToggleKeys() }
         SmallChip(if (mouseOpen) "🖱▾" else "🖱", active = mouseOpen) { onToggleMouse() }
         SmallChip("сист") { onShowSystemKeyboard() }
@@ -410,7 +426,8 @@ private fun MousePad(
         Box(
             modifier = Modifier
                 .padding(top = 3.dp)
-                .size(if (compact) 230.dp else 260.dp, if (compact) 120.dp else 150.dp)
+                .fillMaxWidth(if (compact) 0.42f else 0.5f)
+                .aspectRatio(2.0f)
                 .background(Color(0xC4141B24))
                 .border(1.dp, Color(0x77FFC857))
                 .pointerInput(Unit) {
@@ -527,7 +544,20 @@ const val OMNI_KEY_JS = """
   if (window.__omniAct) return;
 
   window.__omniBound = null;
+  window.__omniBlind = false;   // true, если поле живёт в недоступном документе (iframe)
   window.__omniCursorPos = {x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2)};
+
+  // Документы, до которых можем дотянуться: свой и вложенные того же происхождения.
+  function docs() {
+    var out = [document];
+    try {
+      var fr = document.querySelectorAll('iframe, frame');
+      for (var i = 0; i < fr.length; i++) {
+        try { var d = fr[i].contentDocument; if (d) out.push(d); } catch (e) {}
+      }
+    } catch (e) {}
+    return out;
+  }
 
   function textish(el) {
     if (!el) return false;
@@ -547,32 +577,74 @@ const val OMNI_KEY_JS = """
     return !!r && r.width > 1 && r.height > 1;
   }
 
-  function pick() {
-    var b = window.__omniBound;
-    if (b && b.isConnected && visible(b)) return b;
-    window.__omniBound = null;
-    var all = document.querySelectorAll('input, textarea, [contenteditable="true"]');
-    var best = null, bestArea = 0;
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      if (!textish(el) || el.disabled || el.readOnly) continue;
+  function readOf(el) {
+    if (!el) return null;
+    try {
+      if (el.isContentEditable) return (el.innerText || '');
+      return el.value == null ? '' : String(el.value);
+    } catch (e) { return null; }
+  }
+
+  function allCandidates() {
+    var out = [];
+    var ds = docs();
+    for (var k = 0; k < ds.length; k++) {
+      var list;
+      try { list = ds[k].querySelectorAll('input, textarea, [contenteditable="true"]'); } catch (e) { continue; }
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i];
+        if (!textish(el) || el.disabled || el.readOnly) continue;
+        out.push(el);
+      }
+    }
+    return out;
+  }
+
+  function diag() {
+    var cs = allCandidates();
+    var parts = [];
+    for (var i = 0; i < cs.length && i < 4; i++) {
+      parts.push((cs[i].tagName || '?') + '(' + ((readOf(cs[i]) || '').length) + ')');
+    }
+    return parts.length ? parts.join(' ') : 'полей нет';
+  }
+
+  /** Кандидат, который реально принимает фокус и самый заметный. */
+  function focusTarget() {
+    var ae = document.activeElement;
+    if (textish(ae)) return ae;
+    var cs = allCandidates();
+    var best = null, bestScore = -1;
+    for (var i = 0; i < cs.length; i++) {
+      var el = cs[i];
       if (!visible(el)) continue;
       var r = box(el);
-      var a = r.width * r.height;
-      if (a > bestArea) { bestArea = a; best = el; }
+      var v = readOf(el) || '';
+      var score = (v.length > 0 ? 100000000 : 0) + r.width * r.height;
+      if (score > bestScore) { bestScore = score; best = el; }
     }
-    if (!best) {
-      var ae = document.activeElement;
-      if (textish(ae)) best = ae;
-    }
-    if (best) window.__omniBound = best;
     return best;
   }
 
-  function readOf(el) {
-    if (!el) return null;
-    if (el.isContentEditable) return (el.innerText || '');
-    return el.value == null ? '' : String(el.value);
+  function snapshot() {
+    var cs = allCandidates();
+    var snap = [];
+    for (var i = 0; i < cs.length; i++) snap.push({el: cs[i], v: readOf(cs[i])});
+    return snap;
+  }
+
+  function changed(snap) {
+    var best = null, bestLen = -1;
+    for (var i = 0; i < snap.length; i++) {
+      var el = snap[i].el;
+      if (!el || !el.isConnected) continue;
+      var v = readOf(el);
+      if (v !== snap[i].v) {
+        var len = (v || '').length;
+        if (len > bestLen) { bestLen = len; best = el; }
+      }
+    }
+    return best;
   }
 
   function setNativeValue(el, v) {
@@ -596,78 +668,127 @@ const val OMNI_KEY_JS = """
     } catch (e) {}
   }
 
-  // ── Вставка «как человек»: фокус, курсор в конец, родная команда браузера ──────────────
-  // Так страница на React получает честное событие ввода и не откатывает значение.
-  function nativeInsert(el, txt) {
-    try {
-      el.focus();
-      var len = readOf(el).length;
-      if (el.setSelectionRange) { el.setSelectionRange(len, len); }
-      var ok = document.execCommand('insertText', false, txt);
-      return ok && readOf(el).length === len + txt.length;
-    } catch (e) { return false; }
-  }
+  function bindTo(el) { if (el) window.__omniBound = el; return el; }
 
-  function nativeDeleteLast(el) {
-    try {
-      el.focus();
-      var v = readOf(el);
-      if (!v.length) return false;
-      if (el.setSelectionRange) { el.setSelectionRange(v.length - 1, v.length); }
-      var ok = document.execCommand('delete', false, null);
-      return ok && readOf(el).length === v.length - 1;
-    } catch (e) { return false; }
-  }
-
+  // ── Чтение того поля, которое реально на экране ───────────────────────────────────────
   window.__omniRead = function() {
-    var el = pick();
-    if (!el) return JSON.stringify({ok: false, v: '', n: 0, tag: '—'});
-    var v = readOf(el) || '';
-    return JSON.stringify({ok: true, v: v.slice(-200), n: v.length, tag: el.tagName || '?'});
+    var b = window.__omniBound;
+    if (!b || !b.isConnected || !visible(b)) {
+      b = focusTarget();
+      bindTo(b);
+    }
+    if (!b) return JSON.stringify({ok: false, v: '', n: 0, tag: '—', cands: diag(), blind: window.__omniBlind});
+    var v = readOf(b) || '';
+    return JSON.stringify({ok: true, v: v.slice(-200), n: v.length, tag: b.tagName || '?', cands: diag(), blind: window.__omniBlind});
   };
 
-  window.__omniInsert = function(txt) {
-    var el = pick();
-    if (!el) return 'поле не найдено';
-    var before = readOf(el);
-    if (nativeInsert(el, txt)) {
-      try { el.blur(); } catch (e) {}
-      return 'ок, в поле ' + (before.length + txt.length) + ' символов';
+  /** Привязаться к полю, над которым сейчас курсор (ручной выбор). */
+  window.__omniPickAtCursor = function() {
+    var p = window.__omniCursorPos;
+    var el = document.elementFromPoint(p.x, p.y);
+    if (!el) return 'под курсором пусто';
+    var target = el;
+    while (target && !textish(target)) target = target.parentElement;
+    if (!target) {
+      if (el.tagName === 'IFRAME') {
+        try {
+          var d = el.contentDocument;
+          if (d) {
+            var inner = d.querySelector('input, textarea, [contenteditable="true"]');
+            if (inner) { bindTo(inner); return 'поле в iframe (доступно), ' + (readOf(inner) || '').length + ' симв.'; }
+          } else {
+            window.__omniBlind = true;
+            return 'поле в iframe, документ недоступен — только ввод и Backspace';
+          }
+        } catch (e) {}
+      }
+      return 'под курсором не поле: ' + (el.tagName || '?');
     }
-    // запасной путь: прямая запись значения
-    var v = before + txt;
-    setNativeValue(el, v);
-    fire(el, 'input');
-    fire(el, 'change');
-    try { el.blur(); } catch (e) {}
-    return readOf(el) === v ? ('ок (запись), ' + v.length + ' символов') : 'не удалось записать в поле';
+    bindTo(target);
+    return 'выбрано поле «' + (target.tagName || '?') + '», ' + (readOf(target) || '').length + ' симв.';
+  };
+
+  // ── Вставка: находим поле ПО ФАКТУ ИЗМЕНЕНИЯ ─────────────────────────────────────────
+  window.__omniInsert = function(txt) {
+    var snap = snapshot();
+    var el = focusTarget();
+    var okCmd = false;
+    if (el) {
+      try {
+        el.focus();
+        var len = (readOf(el) || '').length;
+        if (el.setSelectionRange) el.setSelectionRange(len, len);
+        okCmd = document.execCommand('insertText', false, txt);
+      } catch (e) { okCmd = false; }
+    } else {
+      try { okCmd = document.execCommand('insertText', false, txt); } catch (e) {}
+    }
+    var ch = changed(snap);
+    if (ch) {
+      bindTo(ch);
+      window.__omniBlind = false;
+      try { ch.blur(); } catch (e) {}
+      return 'ок → «' + ch.tagName + '» ' + ((readOf(ch) || '').length) + ' симв.';
+    }
+    // прямая запись в найденное поле
+    if (el) {
+      var v = (readOf(el) || '') + txt;
+      setNativeValue(el, v);
+      fire(el, 'input');
+      fire(el, 'change');
+      var ch2 = changed(snap);
+      if (ch2 || readOf(el) === v) {
+        bindTo(ch2 || el);
+        window.__omniBlind = false;
+        try { el.blur(); } catch (e) {}
+        return 'ок (запись) ' + ((readOf(el) || '').length) + ' симв.';
+      }
+    }
+    if (okCmd) {
+      // команда сработала, но ни одно доступное поле не изменилось — поле в чужом документе
+      window.__omniBlind = true;
+      return 'текст ушёл, но поле вне доступа (' + diag() + ')';
+    }
+    return 'поле не изменилось (' + diag() + ')';
   };
 
   window.__omniBack = function() {
-    var el = pick();
-    if (!el) return 'поле не найдено';
-    var v = readOf(el) || '';
-    if (!v.length) return 'поле пустое (' + (el.tagName || '?') + ')';
-    if (nativeDeleteLast(el)) {
-      try { el.blur(); } catch (e) {}
-      return 'было ' + v.length + ' → стало ' + readOf(el).length;
+    var b = window.__omniBound;
+    var el = (b && b.isConnected && visible(b)) ? b : focusTarget();
+    if (!el) {
+      window.__omniBlind = true;
+      return 'поле не читается (' + diag() + ')';
     }
+    var v = readOf(el) || '';
+    if (!v.length) {
+      if (window.__omniBlind) return 'поле вне доступа — нужна клавиша Backspace';
+      return 'поле пустое («' + el.tagName + '»)';
+    }
+    try {
+      el.focus();
+      if (el.setSelectionRange) el.setSelectionRange(v.length - 1, v.length);
+      if (document.execCommand('delete', false, null) && (readOf(el) || '').length === v.length - 1) {
+        try { el.blur(); } catch (e) {}
+        return 'было ' + v.length + ' → стало ' + (v.length - 1);
+      }
+    } catch (e) {}
     var nv = v.slice(0, v.length - 1);
     setNativeValue(el, nv);
     fire(el, 'input');
     fire(el, 'change');
     try { el.blur(); } catch (e) {}
-    return readOf(el) === nv ? ('было ' + v.length + ' → стало ' + nv.length + ' (запись)') : 'не удалось удалить';
+    return (readOf(el) === nv) ? ('было ' + v.length + ' → стало ' + nv.length + ' (запись)') : 'не удалось удалить';
   };
 
   window.__omniClear = function() {
-    var el = pick();
-    if (!el) return 'поле не найдено';
+    var el = window.__omniBound;
+    if (!el || !el.isConnected) el = focusTarget();
+    if (!el) return 'поле не читается (' + diag() + ')';
     var v = readOf(el) || '';
     try {
       el.focus();
       if (el.setSelectionRange) el.setSelectionRange(0, v.length);
-      if (document.execCommand('delete', false, null) && readOf(el).length === 0) {
+      if (document.execCommand('delete', false, null) && (readOf(el) || '').length === 0) {
         try { el.blur(); } catch (e) {}
         return 'очищено (было ' + v.length + ')';
       }
@@ -676,7 +797,7 @@ const val OMNI_KEY_JS = """
     fire(el, 'input');
     fire(el, 'change');
     try { el.blur(); } catch (e) {}
-    return readOf(el).length === 0 ? ('очищено (было ' + v.length + ')') : 'не удалось очистить';
+    return (readOf(el) || '').length === 0 ? ('очищено (было ' + v.length + ')') : 'не удалось очистить';
   };
 
   window.__omniBlur = function() {
@@ -687,7 +808,7 @@ const val OMNI_KEY_JS = """
     return 'blur';
   };
 
-  // ── Поиск и нажатие кнопки по всей странице ───────────────────────────────────────────
+  // ── Кнопка «Далее» и подобные ────────────────────────────────────────────────────────
   var WORDS = ['далее', 'дальше', 'продолжить', 'отправить', 'войти', 'вход', 'подтвердить',
                'ok', 'okay', 'next', 'continue', 'submit', 'send', 'sign in', 'login'];
 
@@ -700,37 +821,32 @@ const val OMNI_KEY_JS = """
   }
 
   window.__omniClickButton = function() {
-    var all = document.querySelectorAll('*');
-    var best = null, bestDepth = -1, bestText = '';
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      var t = textOf(el);
-      if (!t || t.length > 40) continue;
-      var rank = 0;
-      for (var w = 0; w < WORDS.length; w++) {
-        if (t.indexOf(WORDS[w]) >= 0) { rank = WORDS.length - w; break; }
+    var best = null, bestDepth = -1, bestText = '', ds = docs();
+    for (var k = 0; k < ds.length; k++) {
+      var all;
+      try { all = ds[k].querySelectorAll('*'); } catch (e) { continue; }
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var t = textOf(el);
+        if (!t || t.length > 40) continue;
+        var rank = 0;
+        for (var w = 0; w < WORDS.length; w++) {
+          if (t.indexOf(WORDS[w]) >= 0) { rank = WORDS.length - w; break; }
+        }
+        if (!rank) continue;
+        if (!visible(el)) continue;
+        var depth = 0, n = el;
+        while (n) { depth++; n = n.parentElement; }
+        if (depth > bestDepth) { bestDepth = depth; best = el; bestText = t; }
       }
-      if (!rank) continue;
-      if (!visible(el)) continue;
-      var depth = 0, n = el;
-      while (n) { depth++; n = n.parentElement; }
-      if (depth > bestDepth) { bestDepth = depth; best = el; bestText = t; }
     }
     if (!best) return 'кнопка не найдена';
-    try { best.scrollIntoView({block: 'center'}); } catch (e) {}
     try { best.click(); return 'нажато: ' + bestText.slice(0, 24); } catch (e) {}
-    try {
-      var r = best.getBoundingClientRect();
-      var o = {bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, view: window};
-      best.dispatchEvent(new MouseEvent('mousedown', o));
-      best.dispatchEvent(new MouseEvent('mouseup', o));
-      best.dispatchEvent(new MouseEvent('click', o));
-      return 'нажато событием: ' + bestText.slice(0, 24);
-    } catch (e) { return 'err:' + e; }
+    return 'err:' + e;
   };
 
   window.__omniSubmitForm = function() {
-    var f = pick();
+    var f = focusTarget();
     if (!f) return 'поле не найдено';
     var form = f.form || (f.closest ? f.closest('form') : null);
     if (!form) return 'формы нет';
@@ -743,7 +859,7 @@ const val OMNI_KEY_JS = """
     } catch (e) { return 'err:' + e; }
   };
 
-  // ── Курсор (в оверлее приложения) и мышь ──────────────────────────────────────────────
+  // ── Мышь ────────────────────────────────────────────────────────────────────────────
   window.__omniMouseShow = function(show) { return 'ок'; };
 
   window.__omniMouseMove = function(dx, dy) {
@@ -793,6 +909,7 @@ const val OMNI_KEY_JS = """
         if (r === 'поле не найдено' || r === 'формы нет') return window.__omniClickButton();
         return r;
       case 'submit': return window.__omniClickButton();
+      case 'pick': return window.__omniPickAtCursor();
       default: return 'неизвестное действие';
     }
   };
