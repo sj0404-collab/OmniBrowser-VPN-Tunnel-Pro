@@ -232,18 +232,18 @@ private fun OmniInputLine(
             }
             inner()
         }
-        SmallChip(if (keysOpen) "⌨▾" else "⌨", onToggleKeys, active = keysOpen)
-        SmallChip(if (mouseOpen) "🖱▾" else "🖱", onToggleMouse, active = mouseOpen)
-        SmallChip("сист", onShowSystemKeyboard)
-        SmallChip("✕", onClose)
+        SmallChip(if (keysOpen) "⌨▾" else "⌨", active = keysOpen) { onToggleKeys() }
+        SmallChip(if (mouseOpen) "🖱▾" else "🖱", active = mouseOpen) { onToggleMouse() }
+        SmallChip("сист") { onShowSystemKeyboard() }
+        SmallChip("✕") { onClose() }
     }
 }
 
 @Composable
 private fun SmallChip(
     title: String,
-    onClick: () -> Unit,
-    active: Boolean = false
+    active: Boolean = false,
+    onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
@@ -310,9 +310,9 @@ private fun OmniSoftKeyboard(
             horizontalArrangement = Arrangement.spacedBy(pad),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            SmallChip(if (ru) "Рус" else "Eng", onToggleLang, active = true)
-            SmallChip(if (shift) "⇧▴" else "⇧", onToggleShift, active = shift)
-            SmallChip("123", onToggleDigits, active = digits)
+            SmallChip(if (ru) "Рус" else "Eng", active = true) { onToggleLang() }
+            SmallChip(if (shift) "⇧▴" else "⇧", active = shift) { onToggleShift() }
+            SmallChip("123", active = digits) { onToggleDigits() }
             SmallKey("Пробел") { onInsert(" ") }
             SmallKey("⌫") { onKey(KeyEvent.KEYCODE_DEL, "⌫") }
             SmallKey("Enter") { onKey(KeyEvent.KEYCODE_ENTER, "Enter") }
@@ -371,16 +371,27 @@ private fun OmniTouchPad(
     fun click(secondary: Boolean) {
         val wv = webView ?: return
         val p = point()
+        if (secondary) {
+            // v4.22.0: buttonState у MotionEvent — скрытый API, поэтому правую кнопку
+            // отправляем в страницу как DOM-событие по точке курсора.
+            try {
+                wv.evaluateJavascript(
+                    "try{window.__omniMouse&&window.__omniMouse('right',${p.x.toInt()},${p.y.toInt()})}catch(e){}",
+                    null
+                )
+            } catch (_: Throwable) {
+            }
+            onStatus("мышь: правая кнопка (DOM) ${p.x.toInt()},${p.y.toInt()}")
+            return
+        }
         try {
             val t = SystemClock.uptimeMillis()
             val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, p.x, p.y, 0)
             down.source = InputDevice.SOURCE_MOUSE
-            down.buttonState = if (secondary) MotionEvent.BUTTON_SECONDARY else MotionEvent.BUTTON_PRIMARY
             wv.dispatchTouchEvent(down)
             down.recycle()
             val up = MotionEvent.obtain(t, t + 40, MotionEvent.ACTION_UP, p.x, p.y, 0)
             up.source = InputDevice.SOURCE_MOUSE
-            up.buttonState = 0
             wv.dispatchTouchEvent(up)
             up.recycle()
             onStatus(if (secondary) "мышь: правая кнопка ${p.x.toInt()},${p.y.toInt()}" else "мышь: клик ${p.x.toInt()},${p.y.toInt()}")
@@ -390,17 +401,12 @@ private fun OmniTouchPad(
 
     fun scroll(dy: Float) {
         val wv = webView ?: return
-        val p = point()
+        val delta = (dy * 320f).toInt()
         try {
-            val t = SystemClock.uptimeMillis()
-            val ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, p.x, p.y, 0)
-            ev.source = InputDevice.SOURCE_MOUSE
-            ev.setAxisValue(MotionEvent.AXIS_VSCROLL, dy)
-            wv.dispatchGenericMotionEvent(ev)
-            ev.recycle()
-            onStatus(if (dy > 0) "мышь: колесо вверх" else "мышь: колесо вниз")
+            wv.evaluateJavascript("try{window.scrollBy(0,$delta)}catch(e){}", null)
         } catch (_: Throwable) {
         }
+        onStatus(if (dy > 0) "мышь: прокрутка вверх" else "мышь: прокрутка вниз")
     }
 
     Column {
@@ -672,6 +678,25 @@ const val OMNI_KEY_JS = """
       fire(el, 'keyup', {key: txt, keyCode: txt.charCodeAt(0)});
     }
     return res;
+  };
+
+  window.__omniMouse = function(kind, x, y) {
+    try {
+      var el = document.elementFromPoint(x, y) || document.body;
+      var base = {bubbles: true, cancelable: true, clientX: x, clientY: y,
+                  screenX: x, screenY: y, button: kind === 'right' ? 2 : 0,
+                  buttons: kind === 'right' ? 2 : 1};
+      if (kind === 'right') {
+        try { el.dispatchEvent(new MouseEvent('mousedown', base)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', base)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('contextmenu', base)); } catch (e) {}
+      } else {
+        try { el.dispatchEvent(new MouseEvent('mousedown', base)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', base)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('click', base)); } catch (e) {}
+      }
+      return 'ok';
+    } catch (e) { return 'err:' + e; }
   };
 
   window.__omniAct = function(name) {
