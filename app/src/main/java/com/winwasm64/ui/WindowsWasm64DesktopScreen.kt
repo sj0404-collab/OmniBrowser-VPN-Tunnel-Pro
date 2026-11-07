@@ -612,6 +612,131 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     val webViewContainer = remember { FrameLayout(context) }
 
+    fun startWebDownload(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        when {
+            url.startsWith("blob:", ignoreCase = true) -> {
+                tab.webView?.evaluateJavascript(blobBridge.scriptFor(url, fileName), null)
+                Toast.makeText(context, "Сохраняю $fileName…", Toast.LENGTH_SHORT).show()
+            }
+            url.startsWith("data:", ignoreCase = true) -> {
+                try {
+                    val decoded = DownloadSaver.decodeDataUrl(url) ?: throw IllegalArgumentException("неверная data:-ссылка")
+                    val where = DownloadSaver.saveBytes(context, fileName, mimeType?.ifBlank { null } ?: decoded.first, decoded.second)
+                    Toast.makeText(context, "Сохранено: $where", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Не удалось сохранить: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            else -> {
+                try {
+                    val req = DownloadManager.Request(Uri.parse(url)).apply {
+                        if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                        if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+                        if (!tab.isIncognito) {
+                            CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                        }
+                        val ref = tab.webView?.url
+                        if (ref != null && ref.startsWith("http")) addRequestHeader("Referer", ref)
+                        setTitle(fileName)
+                        setDescription("OmniBrowser")
+                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    }
+                    (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+                    Toast.makeText(context, "Загрузка началась: $fileName", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Не удалось начать загрузку: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * v4.10.9: «скачивался сам .torrent-файл вместо содержимого» — сайты отдают торрент ссылкой
+     * `download.php?id=...`, с `Content-Disposition: attachment; filename="x.torrent"` или типом
+     * `application/octet-stream`. Проверяем не только конец URL, но и имя файла из заголовка.
+     */
+    fun isTorrentLink(url: String, mimeType: String?, contentDisposition: String?): Boolean {
+        val u = url.trim()
+        if (u.startsWith("magnet:", ignoreCase = true)) return true
+        val mime = (mimeType ?: "").lowercase()
+        if (mime.contains("bittorrent")) return true
+        val cd = (contentDisposition ?: "").lowercase()
+        if (cd.contains(".torrent")) return true
+        val path = u.substringBefore('#').substringBefore('?').lowercase()
+        return path.endsWith(".torrent") || path.contains(".torrent/")
+    }
+
+    /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
+    fun looksLikeTorrentBytes(b: ByteArray): Boolean {
+        if (b.size < 32) return false
+        val head = String(b, 0, minOf(b.size, 4096), Charsets.ISO_8859_1)
+        return head.startsWith("d") && (head.contains("8:announce") || head.contains("4:info"))
+    }
+
+    /** Тело ответа через локальный прокси браузера (внутри VPN). */
+    fun fetchTorrentBytesViaProxy(url: String, headers: Map<String, String>): ByteArray {
+        val c = com.winwasm64.ui.browser.MediaGrabber.open(url, headers)
+        return try {
+            if (c.responseCode !in 200..299) throw java.io.IOException("HTTP ${c.responseCode}")
+            com.winwasm64.ui.browser.MediaGrabber.readAll(c.inputStream, 16 * 1024 * 1024)
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /** Тело ответа напрямую, без прокси (если VPN/прокси сейчас не поднят). */
+    fun fetchTorrentBytesDirect(url: String, headers: Map<String, String>): ByteArray {
+        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        return try {
+            c.connectTimeout = 15_000
+            c.readTimeout = 25_000
+            c.instanceFollowRedirects = true
+            for ((k, v) in headers) if (v.isNotBlank()) c.setRequestProperty(k, v)
+            if (c.responseCode !in 200..299) throw java.io.IOException("HTTP ${c.responseCode}")
+            com.winwasm64.ui.browser.MediaGrabber.readAll(c.inputStream, 16 * 1024 * 1024)
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    /**
+     * Скачивает .torrent по ссылке и отдаёт его торрент-движку (а не в «Загрузки»).
+     * Если по ссылке пришёл не торрент — откатываемся на обычную загрузку файла.
+     */
+    fun startTorrentFromUrl(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        Toast.makeText(context, "🧲 Читаю .torrent и запускаю загрузку…", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val headers = LinkedHashMap<String, String>()
+                headers["Referer"] = tab.webView?.url ?: url
+                if (!userAgent.isNullOrBlank()) headers["User-Agent"] = userAgent
+                if (!tab.isIncognito) CookieManager.getInstance().getCookie(url)?.let { headers["Cookie"] = it }
+                val bytes = try {
+                    fetchTorrentBytesViaProxy(url, headers)
+                } catch (e: Exception) {
+                    com.winwasm64.vpn.VpnLog.w("Торрент", "через прокси не вышло (${e.message}) — читаю напрямую")
+                    fetchTorrentBytesDirect(url, headers)
+                }
+                if (!looksLikeTorrentBytes(bytes)) throw java.io.IOException("по ссылке не .torrent (${bytes.size} Б)")
+                val fallbackName = URLUtil.guessFileName(url, contentDisposition, mimeType).ifBlank { "link.torrent" }
+                val id = torrentEngine.startFromTorrentBytes(bytes, fallbackName)
+                val hostLabel = try { java.net.URI(url).host ?: "сайт" } catch (_: Exception) { "сайт" }
+                com.winwasm64.vpn.VpnLog.i("Торрент", "по ссылке $hostLabel: разобран .torrent (${bytes.size} Б), задача $id")
+                Handler(Looper.getMainLooper()).post {
+                    currentSection = 1
+                    Toast.makeText(context, "🧲 Торрент запущен: ${id.take(8)}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось прочитать .torrent по ссылке: ${e.message} — сохраняю как файл")
+                Handler(Looper.getMainLooper()).post {
+                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
+                }
+            }
+        }.start()
+    }
+
     fun normalizeInputToUrl(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return homePageUrl
@@ -958,108 +1083,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             context.startActivity(Intent.createChooser(send, "Поделиться").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } catch (e: Exception) {
             Toast.makeText(context, "Не удалось поделиться: ${e.message}", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    /**
-     * v4.10.9: «скачивался сам .torrent-файл вместо содержимого» — сайты отдают торрент ссылкой
-     * `download.php?id=...`, с `Content-Disposition: attachment; filename="x.torrent"` или типом
-     * `application/octet-stream`. Проверяем не только конец URL, но и имя файла из заголовка.
-     */
-    fun isTorrentLink(url: String, mimeType: String?, contentDisposition: String?): Boolean {
-        val u = url.trim()
-        if (u.startsWith("magnet:", ignoreCase = true)) return true
-        val mime = (mimeType ?: "").lowercase()
-        if (mime.contains("bittorrent")) return true
-        val cd = (contentDisposition ?: "").lowercase()
-        if (cd.contains(".torrent")) return true
-        val path = u.substringBefore('#').substringBefore('?').lowercase()
-        return path.endsWith(".torrent") || path.contains(".torrent/")
-    }
-
-    /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
-    fun looksLikeTorrentBytes(b: ByteArray): Boolean {
-        if (b.size < 32) return false
-        val head = String(b, 0, minOf(b.size, 4096), Charsets.ISO_8859_1)
-        return head.startsWith("d") && (head.contains("8:announce") || head.contains("4:info"))
-    }
-
-    /**
-     * Скачивает .torrent по ссылке и отдаёт его торрент-движку (а не в «Загрузки»).
-     * Если по ссылке пришёл не торрент — откатываемся на обычную загрузку файла.
-     */
-    fun startTorrentFromUrl(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
-        Toast.makeText(context, "🧲 Читаю .torrent и запускаю загрузку…", Toast.LENGTH_SHORT).show()
-        Thread {
-            try {
-                val headers = LinkedHashMap<String, String>()
-                headers["Referer"] = tab.webView?.url ?: url
-                if (!userAgent.isNullOrBlank()) headers["User-Agent"] = userAgent
-                if (!tab.isIncognito) CookieManager.getInstance().getCookie(url)?.let { headers["Cookie"] = it }
-                val bytes = try {
-                    val c = com.winwasm64.ui.browser.MediaGrabber.open(url, headers)
-                    try {
-                        if (c.responseCode !in 200..299) throw java.io.IOException("HTTP ${c.responseCode}")
-                        com.winwasm64.ui.browser.MediaGrabber.readAll(c.inputStream, 16 * 1024 * 1024)
-                    } finally {
-                        c.disconnect()
-                    }
-                }
-                if (!looksLikeTorrentBytes(bytes)) throw java.io.IOException("по ссылке не .torrent (${bytes.size} Б)")
-                val fallbackName = URLUtil.guessFileName(url, contentDisposition, mimeType).ifBlank { "link.torrent" }
-                val id = torrentEngine.startFromTorrentBytes(bytes, fallbackName)
-                val hostLabel = try { java.net.URI(url).host ?: "сайт" } catch (_: Exception) { "сайт" }
-                com.winwasm64.vpn.VpnLog.i("Торрент", "по ссылке $hostLabel: разобран .torrent (${bytes.size} Б), задача $id")
-                Handler(Looper.getMainLooper()).post {
-                    currentSection = 1
-                    Toast.makeText(context, "🧲 Торрент запущен: ${id.take(8)}", Toast.LENGTH_LONG).show()
-                }
-            } catch (e: Exception) {
-                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось прочитать .torrent по ссылке: ${e.message} — сохраняю как файл")
-                Handler(Looper.getMainLooper()).post {
-                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
-                }
-            }
-        }.start()
-    }
-
-    fun startWebDownload(tab: BrowserTabModel, url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
-        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-        when {
-            url.startsWith("blob:", ignoreCase = true) -> {
-                tab.webView?.evaluateJavascript(blobBridge.scriptFor(url, fileName), null)
-                Toast.makeText(context, "Сохраняю $fileName…", Toast.LENGTH_SHORT).show()
-            }
-            url.startsWith("data:", ignoreCase = true) -> {
-                try {
-                    val decoded = DownloadSaver.decodeDataUrl(url) ?: throw IllegalArgumentException("неверная data:-ссылка")
-                    val where = DownloadSaver.saveBytes(context, fileName, mimeType?.ifBlank { null } ?: decoded.first, decoded.second)
-                    Toast.makeText(context, "Сохранено: $where", Toast.LENGTH_LONG).show()
-                } catch (e: Exception) {
-                    Toast.makeText(context, "Не удалось сохранить: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-            else -> {
-                try {
-                    val req = DownloadManager.Request(Uri.parse(url)).apply {
-                        if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
-                        if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
-                        if (!tab.isIncognito) {
-                            CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
-                        }
-                        val ref = tab.webView?.url
-                        if (ref != null && ref.startsWith("http")) addRequestHeader("Referer", ref)
-                        setTitle(fileName)
-                        setDescription("OmniBrowser")
-                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                    }
-                    (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
-                    Toast.makeText(context, "Загрузка началась: $fileName", Toast.LENGTH_LONG).show()
-                } catch (e: Exception) {
-                    Toast.makeText(context, "Не удалось начать загрузку: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
         }
     }
 
