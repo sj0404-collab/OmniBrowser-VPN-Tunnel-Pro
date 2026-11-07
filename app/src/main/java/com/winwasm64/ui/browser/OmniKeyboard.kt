@@ -52,6 +52,23 @@ fun OmniKeyPanel(
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         try { focus.requestFocus() } catch (_: Throwable) {}
+        com.winwasm64.vpn.VpnLog.i("Браузер", "панель ввода открыта: символы и удаление уходят в страницу напрямую (родная клавиатура сайта не нужна)")
+    }
+
+    fun deleteBackward() {
+        val wv = webView ?: return
+        try {
+            wv.evaluateJavascript("try{window.__omniKeyDel&&window.__omniKeyDel()}catch(e){}", null)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun clearField() {
+        val wv = webView ?: return
+        try {
+            wv.evaluateJavascript("try{window.__omniKeyClear&&window.__omniKeyClear()}catch(e){}", null)
+        } catch (_: Throwable) {
+        }
     }
 
     fun send(key: String, code: String, ch: String) {
@@ -89,7 +106,9 @@ fun OmniKeyPanel(
                     // добавленные символы — по одному
                     next.substring(proxy.length).forEach { ch -> send(ch.toString(), codeFor(ch), ch.toString()) }
                 } else if (next.length < proxy.length) {
-                    repeat(proxy.length - next.length) { send("Backspace", "Backspace", "") }
+                    // v4.20.0: удаление нельзя делать событием Backspace — браузер на синтетическое
+                    // событие поле не чистит. Правим значение активного элемента напрямую.
+                    repeat(proxy.length - next.length) { deleteBackward() }
                 }
                 proxy = if (next.length > 400) next.takeLast(400) else next
             },
@@ -115,21 +134,31 @@ fun OmniKeyPanel(
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             @Composable
-            fun keyButton(title: String, key: String, code: String, ch: String = "") {
+            fun actionButton(title: String, action: () -> Unit) {
                 Button(
-                    onClick = { send(key, code, ch) },
+                    onClick = action,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF))
                 ) { Text(title, fontSize = 11.sp, color = Color.White) }
             }
+
+            @Composable
+            fun keyButton(title: String, key: String, code: String, ch: String = "") {
+                actionButton(title) { send(key, code, ch) }
+            }
+
             keyButton("Пробел", " ", "Space", " ")
             keyButton("Enter", "Enter", "Enter", "\n")
-            keyButton("⌫", "Backspace", "Backspace")
+            actionButton("⌫") { deleteBackward() }
             keyButton("Tab", "Tab", "Tab", "\t")
             keyButton("Esc", "Escape", "Escape")
             keyButton("←", "ArrowLeft", "ArrowLeft")
             keyButton("↑", "ArrowUp", "ArrowUp")
             keyButton("↓", "ArrowDown", "ArrowDown")
             keyButton("→", "ArrowRight", "ArrowRight")
+            actionButton("Стереть всё") {
+                clearField()
+                proxy = ""
+            }
         }
     }
 }
@@ -158,6 +187,50 @@ private fun esc(s: String): String = s
  * так его видят и обычные поля, и игры, которые слушают клавиатуру на уровне страницы.
  */
 const val OMNI_KEY_JS = """
+(function(){
+  if (!window.__omniKeyDel) {
+    window.__omniKeyDel = function() {
+      try {
+        var el = document.activeElement;
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+          var s = el.selectionStart == null ? el.value.length : el.selectionStart;
+          var e2 = el.selectionEnd == null ? s : el.selectionEnd;
+          if (s === e2 && s > 0) s = s - 1;
+          if (el.setRangeText) { el.setRangeText('', s, e2, 'end'); }
+          else { el.value = (el.value || '').slice(0, s) + (el.value || '').slice(e2); }
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          return true;
+        }
+        if (document.queryCommandSupported && document.queryCommandSupported('delete')) {
+          return document.execCommand('delete', false, null);
+        }
+      } catch (e) {}
+      try {
+        (document.activeElement || document.body).dispatchEvent(
+          new KeyboardEvent('keydown', {key: 'Backspace', code: 'Backspace', bubbles: true, cancelable: true}));
+      } catch (e) {}
+      return false;
+    };
+    window.__omniKeyClear = function() {
+      try {
+        var el = document.activeElement;
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+          el.value = '';
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          return true;
+        }
+        if (document.queryCommandSupported && document.queryCommandSupported('selectAll')) {
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+        }
+      } catch (e) {}
+      return false;
+    };
+  }
+})();
+(function(){
 (function(){
   if (window.__omniKeyFn) return;
   window.__omniKeyFn = function(key, code, ch) {
