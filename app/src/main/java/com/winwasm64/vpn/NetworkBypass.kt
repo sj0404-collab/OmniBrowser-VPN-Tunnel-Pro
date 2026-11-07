@@ -70,10 +70,13 @@ object NetworkBypass {
         return best
     }
 
-    private fun cm(): ConnectivityManager? = try {
-        (ctx ?: return null).getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-    } catch (_: Exception) {
-        null
+    private fun cm(): ConnectivityManager? {
+        val app = ctx ?: return null
+        return try {
+            app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Привязать сокет к физической сети ДО connect(). true — привязка удалась. */
