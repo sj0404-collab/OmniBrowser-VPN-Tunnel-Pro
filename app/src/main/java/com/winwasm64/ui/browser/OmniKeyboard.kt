@@ -114,6 +114,7 @@ fun OmniKeyPanel(
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            @Composable
             fun keyButton(title: String, key: String, code: String, ch: String = "") {
                 Button(
                     onClick = { send(key, code, ch) },
