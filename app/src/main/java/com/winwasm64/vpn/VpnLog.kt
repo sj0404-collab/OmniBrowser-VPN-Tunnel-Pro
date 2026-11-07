@@ -131,9 +131,12 @@ object VpnLog {
     fun text(filter: String?): String = snapshot(filter).joinToString("\n")
 
     /** Сохраняет журнал в «Загрузки/OmniBrowser-logs». Возвращает путь для показа или null. */
-    fun saveToDownloads(ctx: Context): String? {
+    fun saveToDownloads(ctx: Context, extra: String = ""): String? {
         val name = "omnibrowser_vpn_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".txt"
-        val data = ("OmniBrowser VPN — журнал\n" + text(null) + "\n").toByteArray(Charsets.UTF_8)
+        // v4.17.0: в файл попадают оба журнала — события VPN и соединения (кто, куда, протокол, маршрут, зачем)
+        val body = "OmniBrowser VPN — журнал\n" + text(null) + "\n" +
+            (if (extra.isBlank()) "" else "\n===== Соединения =====\n" + extra + "\n")
+        val data = body.toByteArray(Charsets.UTF_8)
         return try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val values = ContentValues().apply {

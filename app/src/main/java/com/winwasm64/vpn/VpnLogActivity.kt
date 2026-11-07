@@ -21,14 +21,17 @@ import android.widget.Toast
 /** Экран «Журнал VPN»: фильтры, копировать / поделиться / сохранить / очистить. */
 class VpnLogActivity : Activity() {
     private lateinit var tvLog: TextView
+    private lateinit var filtersRow: LinearLayout
     private lateinit var scroll: ScrollView
     private val chips = ArrayList<Pair<TextView, String?>>()
     private var filter: String? = null
     private var shownVersion = -1
+    /** v4.17.0: true — «Соединения» (кто, куда, протокол, маршрут, зачем), false — события VPN. */
+    private var showConnections = true
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
-            if (VpnLog.version != shownVersion) render()
+            if (VpnLog.version + ConnTrace.version != shownVersion) render()
             handler.postDelayed(this, 1000L)
         }
     }
@@ -70,38 +73,43 @@ class VpnLogActivity : Activity() {
         header.addView(pill("✕") { finish() })
         root.addView(header)
 
-        val filters = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((label, f) in listOf<Pair<String, String?>>("Все" to null, "Ошибки" to "err", "Приложения" to "Прил", "Браузер" to "Браузер", "Туннель" to "Туннель", "Сервис" to "Сервис")) {
+        // v4.17.0: два режима — «Соединения» (что и куда шло: TCP/UDP, маршрут, зачем) и «События»
+        val modes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((label, conn) in listOf("🔗 Соединения" to true, "⚙ События" to false)) {
             val chip = pill(label) {
-                filter = f
+                showConnections = conn
+                filter = null
+                buildFilters()
                 shownVersion = -1
                 render()
             }
-            chips.add(chip to f)
-            filters.addView(chip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
+            modes.addView(chip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
         }
+        root.addView(modes, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        filtersRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         root.addView(HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            addView(filters)
+            addView(filtersRow)
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        buildFilters()
 
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         actions.addView(pill("Копировать") {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("OmniBrowser VPN", VpnLog.text(filter)))
+            cm.setPrimaryClip(ClipData.newPlainText("OmniBrowser VPN", if (showConnections) ConnTrace.text(filter) else VpnLog.text(filter)))
             Toast.makeText(this, "Журнал скопирован", Toast.LENGTH_SHORT).show()
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
         actions.addView(pill("Поделиться") {
-            val t = VpnLog.text(filter)
+            val t = if (showConnections) ConnTrace.text(filter) else VpnLog.text(filter)
             val body = if (t.length > 90_000) t.substring(t.length - 90_000) else t
             startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, body), "Журнал VPN"))
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
         actions.addView(pill("Сохранить") {
-            val path = VpnLog.saveToDownloads(this)
+            val path = VpnLog.saveToDownloads(this, com.winwasm64.vpn.ConnTrace.text(null))
             Toast.makeText(this, if (path != null) "Сохранено: $path" else "Не удалось сохранить", Toast.LENGTH_LONG).show()
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
         actions.addView(pill("Очистить") {
-            VpnLog.clear()
+            if (showConnections) ConnTrace.clear() else VpnLog.clear()
             render()
         })
         root.addView(HorizontalScrollView(this).apply {
@@ -122,10 +130,47 @@ class VpnLogActivity : Activity() {
         render()
     }
 
+    /** v4.17.0: набор фильтров зависит от режима — у соединений свои категории. */
+    private fun buildFilters() {
+        filtersRow.removeAllViews()
+        chips.clear()
+        val list = if (showConnections) listOf<Pair<String, String?>>(
+            "Все" to null,
+            "Ошибки" to "err",
+            "Браузер" to "browser",
+            "Приложения" to "apps",
+            "UDP/игры" to "udp",
+            "Обход DPI" to "bypass",
+            "DNS" to "dns"
+        ) else listOf<Pair<String, String?>>(
+            "Все" to null,
+            "Ошибки" to "err",
+            "Приложения" to "Прил",
+            "Браузер" to "Браузер",
+            "Туннель" to "Туннель",
+            "Сервис" to "Сервис"
+        )
+        for ((label, f) in list) {
+            val chip = pill(label) {
+                filter = f
+                shownVersion = -1
+                render()
+            }
+            chip.text = label
+            chips.add(chip to f)
+            filtersRow.addView(chip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
+        }
+    }
+
     private fun render() {
-        shownVersion = VpnLog.version
-        val list = VpnLog.snapshot(filter)
-        tvLog.text = if (list.isEmpty()) "Пока пусто. Включите VPN и откройте сайт или приложение — сюда попадёт каждое подключение и каждая ошибка." else list.joinToString("\n")
+        shownVersion = VpnLog.version + ConnTrace.version
+        val list = if (showConnections) ConnTrace.snapshot(filter) else VpnLog.snapshot(filter)
+        tvLog.text = if (list.isEmpty()) {
+            if (showConnections)
+                "Пока пусто. Откройте сайт или приложение — здесь будет каждое соединение: кто вызвал, куда, TCP это или UDP, через что (Browsec/Psiphon/обход DPI) и зачем."
+            else
+                "Пока пусто. Включите VPN и откройте сайт или приложение — сюда попадёт каждое событие и каждая ошибка."
+        } else list.joinToString("\n")
         for ((chip, f) in chips) {
             (chip.background as? GradientDrawable)?.setColor(if (f == filter) 0x665B8DEF else 0x1FFFFFFF)
         }

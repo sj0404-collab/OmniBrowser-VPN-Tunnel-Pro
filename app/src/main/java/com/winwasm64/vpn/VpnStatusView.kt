@@ -232,7 +232,9 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
         tvDns.text = "🔎 DNS: браузер — имя сайта разрешает сам сервер Browsec (ваш DNS не участвует); " +
             "приложения — DoH 1.1.1.1/8.8.8.8 внутри туннеля, только пока включён «VPN приложений»" +
             (if (BrowsecVpnService.isRunning && BrowsecVpnService.routedPackages.isNotEmpty()) " (сейчас включён)." else " (сейчас ВЫКЛЮЧЕН — приложения резолвят вашим обычным DNS).") +
-            "\n🔀 " + com.winwasm64.vpn.NetworkBypass.statusLine()
+            "\n🔀 " + com.winwasm64.vpn.NetworkBypass.statusLine() +
+            "\n" + com.winwasm64.vpn.ConnTrace.statsLine() +
+            " — подробно: «Журнал VPN» → «Соединения»"
         tvHint.text = "«Страны» в списках — это профили обхода DPI: IP не меняется. Настоящую смену IP дают серверы Browsec: для браузера — через расширение, для приложений — кнопкой ниже. Не открывается сайт или приложение — откройте «Журнал VPN», там видно, куда и с какой ошибкой оно подключалось."
         val missing = missingPopular()
         btnAdd.visibility = if (missing.isEmpty()) GONE else VISIBLE

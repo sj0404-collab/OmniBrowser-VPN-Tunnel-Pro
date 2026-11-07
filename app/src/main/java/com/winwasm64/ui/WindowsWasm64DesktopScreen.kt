@@ -1284,6 +1284,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 ): WebResourceResponse? {
                     val reqUrl = request?.url?.toString()?.lowercase() ?: return null
                     BrowserDirectRepeater.recordWebViewActivity(txEstimate = 420L, rxEstimate = 3200L)
+                    // v4.17.0: журнал соединений — кто вызвал (страница), куда, по какому протоколу и зачем
+                    try {
+                        val rh = request?.url?.host.orEmpty()
+                        if (rh.isNotEmpty()) {
+                            val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
+                            val rport = if ((request?.url?.port ?: -1) > 0) request!!.url.port
+                            else if (reqUrl.startsWith("http://")) 80 else 443
+                            com.winwasm64.vpn.ConnTrace.request(
+                                initiator = pageHost,
+                                host = rh,
+                                port = rport,
+                                purpose = requestPurpose(request, reqUrl),
+                                blocked = false
+                            )
+                        }
+                    } catch (_: Throwable) {
+                    }
                     if (!tab.isIncognito) {
                         ExtensionRuntime.interceptTabRequest(tab.numericId, request)?.let { return it }
                     }
@@ -1296,6 +1313,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             reqUrl.contains("googleads.")
                         if (blocked) {
                             adBlockedCount++
+                            try {
+                                val pageHost = try { android.net.Uri.parse(tab.url).host.orEmpty() } catch (_: Throwable) { "" }
+                                com.winwasm64.vpn.ConnTrace.request(pageHost, host, if ((request.url.port) > 0) request.url.port else 443, "реклама/трекер — отсечено", true)
+                            } catch (_: Throwable) {
+                            }
                             return WebResourceResponse(
                                 "text/plain",
                                 "UTF-8",
@@ -5000,5 +5022,30 @@ private fun forceShowKeyboard(ctx: android.content.Context, wv: android.webkit.W
         com.winwasm64.vpn.VpnLog.i("Браузер", "полный экран: клавиатура запрошена вручную (кнопка ⌨)")
     } catch (e: Throwable) {
         com.winwasm64.vpn.VpnLog.w("Браузер", "клавиатуру показать не удалось: ${e.message ?: e.javaClass.simpleName}")
+    }
+}
+
+/**
+ * v4.17.0: «зачем» для журнала соединений — по адресу запроса и его типу.
+ * Нужен, чтобы в журнале было не просто «куда», но и что это за запрос:
+ * страница, скрипт, картинка, медиа, API или реклама.
+ */
+private fun requestPurpose(request: android.webkit.WebResourceRequest?, reqUrl: String): String {
+    try {
+        if (request?.isForMainFrame == true) return "страница (переход)"
+    } catch (_: Throwable) {
+    }
+    val path = reqUrl.substringBefore('?')
+    return when {
+        reqUrl.contains("googlevideo.com") || path.endsWith(".m3u8") || path.endsWith(".mpd") ||
+            path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".ts") -> "медиа (видео/аудио)"
+        path.endsWith(".js") || path.endsWith(".mjs") -> "скрипт"
+        path.endsWith(".css") -> "стиль"
+        path.endsWith(".png") || path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+            path.endsWith(".webp") || path.endsWith(".svg") || path.endsWith(".gif") || path.endsWith(".ico") -> "картинка"
+        path.endsWith(".woff2") || path.endsWith(".woff") || path.endsWith(".ttf") -> "шрифт"
+        reqUrl.contains("/api") || reqUrl.contains("/graphql") || path.endsWith(".json") ||
+            reqUrl.contains("i/v1/") || reqUrl.contains("/ajax") -> "API/данные"
+        else -> "подресурс"
     }
 }

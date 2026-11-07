@@ -246,6 +246,15 @@ class TransparentTunEngine(
                     } catch (_: Throwable) {
                     }
                 }
+                try {
+                    // v4.17.0: UDP-поток в журнале соединений — кто, куда, что за пакеты
+                    ConnTrace.udp(
+                        who = VpnLog.label(udpOwner(sport, dst, dport)),
+                        target = TunPackets.ipToInet(dst).hostAddress + ":" + dport,
+                        kind = UdpClassifier.title(UdpClassifier.kind(buf, payloadOff, payloadLen))
+                    )
+                } catch (_: Throwable) {
+                }
                 startUdpReceiver(k, created)
             }
         }
