@@ -1003,7 +1003,7 @@ class BitTorrentEngine(private val context: Context? = null) {
             throw IllegalStateException("HTTP WebSeed код $code")
         }
 
-        val contentLength = conn.contentLengthLong
+        val contentLength = conn.getHeaderField("Content-Length")?.trim()?.toLongOrNull() ?: conn.contentLength.toLong()
         val resumeOffset = if (code == 206) task.downloadedBytes.get() else 0L
         if (contentLength > 0) {
             task.totalBytes = resumeOffset + contentLength

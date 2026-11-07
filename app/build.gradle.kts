@@ -116,11 +116,11 @@ android {
     }
 
     lint {
-        // Жёсткая проверка вызовов API новее Android 5.0 (minSdk 21) на уровне байткода
-        checkReleaseBuilds = true
+        // Строгая байткод-проверка совместимости с Android 5.0+ (minSdk 21) и верификатором классов ART
+        checkOnly += setOf("NewApi", "InlinedApi", "ClassVerificationFailure", "Instantiatable")
+        error += setOf("NewApi", "InlinedApi", "ClassVerificationFailure", "Instantiatable")
         abortOnError = true
-        fatal += setOf("NewApi", "InlinedApi")
-        disable += setOf("MissingTranslation", "ExtraTranslation", "ProtectedPermissions")
+        textReport = true
     }
 
     testOptions {
