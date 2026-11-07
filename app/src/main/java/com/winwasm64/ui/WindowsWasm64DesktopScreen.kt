@@ -104,7 +104,9 @@ import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.math.sin
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 private fun playNativeAudioChime(freqHz: Double = 523.25, durationMs: Int = 110) {
     thread(isDaemon = true) {
@@ -519,7 +521,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         val savedSet = prefs.getStringSet("vpn_routed_apps", emptySet()).orEmpty()
         mutableStateListOf<String>().apply {
             addAll(savedSet)
-            BrowsecVpnService.routedPackages.addAll(savedSet)
+            // v4.11.0: маршрут сервиса ровно такой же, как список в настройках (без «тихо добавленных»)
+            BrowsecVpnService.syncRoutedFromPrefs(context)
         }
     }
 
@@ -3904,6 +3907,23 @@ private fun NativeAppsWithBrowsecSection(
 
     var liveTraffic by remember { mutableStateOf(BrowsecLocalProxyServer.sampleTraffic()) }
     var refreshTick by remember { mutableIntStateOf(0) }
+    // v4.11.0: «значок VPN ≠ VPN для всех приложений» — область действия видна и переключается явно
+    var perAppOnly by remember { mutableStateOf(BrowsecVpnService.perAppMode) }
+    var ipCheckLine by remember { mutableStateOf("") }
+    var ipChecking by remember { mutableStateOf(false) }
+    var realServers by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    LaunchedEffect(refreshTick / 4) {
+        if (realServers.isEmpty()) {
+            withContext(Dispatchers.IO) {
+                val keys = try { com.winwasm64.extensions.ExtensionProxy.tunnelServerKeysRanked() } catch (_: Exception) { emptyList() }
+                val rows = keys.take(10).map { k ->
+                    val ip = try { MediaGrabber.egressIp(k) } catch (_: Exception) { null }
+                    k to (ip ?: "IP не проверить")
+                }
+                withContext(Dispatchers.Main) { realServers = rows }
+            }
+        }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             liveTraffic = BrowsecLocalProxyServer.sampleTraffic()
@@ -3966,6 +3986,119 @@ private fun NativeAppsWithBrowsecSection(
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
+                            // ===== v4.11.0: честная область действия VPN =====
+                            Text(
+                                text = com.winwasm64.vpn.VpnScope.scopeLine(perAppOnly, vpnRoutedApps.size),
+                                color = if (perAppOnly) Omni.Warning else Omni.Accent,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    color = if (perAppOnly) Omni.AccentContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Accent),
+                                    modifier = Modifier.clickable {
+                                        perAppOnly = true
+                                        BrowsecVpnService.setPerAppMode(context, true)
+                                        if (browsecEnabled) BrowsecVpnService.startForApp(context, BrowsecVpnService.activeCountry, null)
+                                    }
+                                ) {
+                                    Text(
+                                        "VPN только для выбранных (${vpnRoutedApps.size})",
+                                        color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                    )
+                                }
+                                Surface(
+                                    color = if (!perAppOnly) Omni.DangerContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Warning),
+                                    modifier = Modifier.clickable {
+                                        perAppOnly = false
+                                        BrowsecVpnService.setPerAppMode(context, false)
+                                        if (browsecEnabled) BrowsecVpnService.startForApp(context, BrowsecVpnService.activeCountry, null)
+                                    }
+                                ) {
+                                    Text(
+                                        "VPN для ВСЕХ приложений (кроме браузера)",
+                                        color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                    )
+                                }
+                            }
+
+                            // ===== v4.11.0: реальные серверы (меняют IP) против профилей обхода (не меняют) =====
+                            Text(
+                                "Серверы Browsec — меняют ваш IP (${realServers.size} из пула расширения)",
+                                color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold
+                            )
+                            if (realServers.isEmpty()) {
+                                Text(
+                                    "пул ещё не получен — нужен поднятый Browsec в браузере (вкладка «Расширения»)",
+                                    color = Omni.TextDim, fontSize = 10.sp
+                                )
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    realServers.forEach { (key, ip) ->
+                                        Text(
+                                            "• $key → $ip",
+                                            color = Omni.TextDim, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                "Профили обхода ниже (${BrowsecLocalProxyServer.SERVER_NODES.size}) IP НЕ меняют: помогают открыть заблокированный сайт, но внешний IP остаётся вашим.",
+                                color = Omni.Warning, fontSize = 10.sp
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Button(
+                                    onClick = {
+                                        if (!ipChecking) {
+                                            ipChecking = true
+                                            ipCheckLine = "Проверяю IP напрямую и через VPN…"
+                                            Thread {
+                                                val d = EgressCheck.direct()
+                                                val v = EgressCheck.viaBrowserProxy()
+                                                val line = com.winwasm64.vpn.VpnScope.ipCompare(d.ip, v.ip) +
+                                                    " · напрямую: ${d.label()} · через VPN: ${v.label()}"
+                                                com.winwasm64.vpn.VpnLog.i("IP", line)
+                                                Handler(Looper.getMainLooper()).post {
+                                                    ipCheckLine = line
+                                                    ipChecking = false
+                                                }
+                                            }.start()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(34.dp)
+                                ) {
+                                    Text(
+                                        if (ipChecking) "Проверяю…" else "Проверить мой IP",
+                                        fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White
+                                    )
+                                }
+                                Text(
+                                    "показывает домашний IP и IP через VPN",
+                                    color = Omni.TextDim, fontSize = 10.sp
+                                )
+                            }
+                            if (ipCheckLine.isNotBlank()) {
+                                Text(
+                                    ipCheckLine,
+                                    color = Omni.Accent, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                                )
+                            }
                             if (showVpnDetails) {
                             Text(
                                 text = "⬇ ${BitTorrentEngine.formatSpeed(liveTraffic.rxSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.rxBytesTotal)})   ⬆ ${BitTorrentEngine.formatSpeed(liveTraffic.txSpeedBytesPerSec)} (${BitTorrentEngine.formatSize(liveTraffic.txBytesTotal)})   соединений: ${TransparentTunEngine.activeSessionCount()}",
@@ -4089,7 +4222,7 @@ private fun NativeAppsWithBrowsecSection(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Общий сервер:", color = Omni.TextDim, fontSize = 11.sp)
+                        Text("Профиль обхода:", color = Omni.TextDim, fontSize = 11.sp)
                         BrowsecLocalProxyServer.SERVER_NODES.forEach { node ->
                             val isSel = browsecCountry == node.code
                             val st = BrowsecLocalProxyServer.getServerState(node.code)
@@ -4194,7 +4327,7 @@ private fun NativeAppsWithBrowsecSection(
                                     )
                                     if (!itemExpanded) {
                                         Text(
-                                            text = if (isInVpn) "🟢 через VPN · ${appNode.code}" else "⚪ напрямую",
+                                            text = if (isInVpn) "🟢 в VPN · ${appNode.code}" else "⚪ вне VPN · напрямую",
                                             color = if (isInVpn) Omni.Success else Omni.TextDim,
                                             fontSize = 11.sp
                                         )
@@ -4204,7 +4337,8 @@ private fun NativeAppsWithBrowsecSection(
                                         text = if (isInVpn) {
                                             "🟢 В СПИСКЕ VPN • Свой сервер: ${appNode.flag} ${appNode.countryRu} (${appNode.remoteIp}:${appNode.remotePort}) • ⚡ Пинг: ${appServerState.pingMs} мс • Порт: 127.0.0.1:${appProfile.localPort}"
                                         } else {
-                                            "⚪ НЕ В СПИСКЕ VPN: Идёт напрямую через обычную сеть БЕЗ туннеля и БЕЗ обхода блокировок"
+                                            "⚪ ВНЕ VPN: идёт напрямую, VPN к этому приложению не применяется. " +
+                                                "Если открывается — значит не заблокировано, VPN тут ни при чём."
                                         },
                                         color = if (isInVpn) Omni.Success else Omni.Warning,
                                         fontSize = 11.sp,

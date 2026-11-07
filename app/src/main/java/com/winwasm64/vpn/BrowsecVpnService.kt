@@ -3413,10 +3413,49 @@ class BrowsecVpnService : VpnService() {
             VpnLog.i("Сервис", if (on) "приложения из списка идут через серверы Browsec (если расширение включено)" else "приложения из списка идут напрямую с обходом DPI")
         }
 
-        val routedPackages = CopyOnWriteArraySet<String>().apply {
-            add("com.google.android.youtube")
-            add("com.android.vending")
+        /**
+         * v4.11.0: раньше здесь ЖЁСТКО лежали `com.google.android.youtube` и `com.android.vending`.
+         * Из-за этого YouTube ходил через туннель даже когда его снимали галочкой в списке — интерфейс
+         * показывал «вне VPN», а трафик шёл через VPN («значок VPN ≠ VPN для всех приложений»).
+         * Теперь единственный источник правды — список из настроек ([syncRoutedFromPrefs]).
+         */
+        val routedPackages = CopyOnWriteArraySet<String>()
+
+        const val PREF_ROUTED_APPS = "vpn_routed_apps"
+        const val PREF_PER_APP_MODE = "per_app_mode"
+
+        /** Приводит маршрут сервиса к списку из настроек — без «лишних» приложений. */
+        fun syncRoutedFromPrefs(context: Context) {
+            val saved = context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE)
+                .getStringSet(PREF_ROUTED_APPS, emptySet()).orEmpty()
+            val extra = routedPackages.filter { it !in saved }
+            if (extra.isNotEmpty()) {
+                routedPackages.removeAll(extra.toSet())
+                VpnLog.i("Туннель", "список VPN приведён к настройкам: убраны «лишние» приложения " + VpnLog.appList(extra.toSet()))
+            }
+            routedPackages.addAll(saved)
+            perAppMode = context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE)
+                .getBoolean(PREF_PER_APP_MODE, true)
         }
+
+        fun setRoutedPackage(context: Context, pkg: String, inVpn: Boolean) {
+            if (inVpn) routedPackages.add(pkg) else routedPackages.remove(pkg)
+            context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).edit()
+                .putStringSet(PREF_ROUTED_APPS, routedPackages.toSet()).apply()
+        }
+
+        fun setPerAppMode(context: Context, onlySelectedApps: Boolean) {
+            perAppMode = onlySelectedApps
+            context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).edit()
+                .putBoolean(PREF_PER_APP_MODE, onlySelectedApps).apply()
+            VpnLog.i(
+                "Туннель",
+                if (onlySelectedApps) "область действия VPN: ТОЛЬКО выбранные приложения (${routedPackages.size}) — остальные идут напрямую"
+                else "область действия VPN: ВСЕ приложения, кроме OmniBrowser"
+            )
+        }
+
+        fun routedSnapshot(): Set<String> = routedPackages.toSet()
 
         fun protectSocket(socket: Socket) {
             try {
@@ -3499,6 +3538,8 @@ class BrowsecVpnService : VpnService() {
         fun startForApp(context: Context, country: String = activeCountry, packageName: String? = null) {
             if (!packageName.isNullOrBlank()) {
                 routedPackages.add(packageName)
+                context.getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).edit()
+                    .putStringSet(PREF_ROUTED_APPS, routedPackages.toSet()).apply()
                 BrowsecLocalProxyServer.getOrCreateAppProfile(packageName, country.uppercase())
             }
             startOrUpdate(context, country)
@@ -3556,6 +3597,7 @@ class BrowsecVpnService : VpnService() {
         appContext = applicationContext
         VpnLog.init(this)
         appsViaBrowsecTunnel = getSharedPreferences("omni_browser_v21_prefs", Context.MODE_PRIVATE).getBoolean(PREF_APPS_VIA_BROWSEC, true)
+        syncRoutedFromPrefs(this)
         createNotificationChannel()
         BrowsecLocalProxyServer.initAssetBundleIfNeeded(this)
         BrowsecLocalProxyServer.ensureRunning()
@@ -3931,15 +3973,19 @@ class BrowsecVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // v4.11.0: в заголовке сразу видно, кого VPN касается — значок сам по себе больше ничего не обещает
+        val scopeTag = "VPN: " + VpnScope.titleShort(perAppMode, routedPackages.size)
         val title = if (isPaused) {
-            "⏸ VPN Приложений: ПАУЗА | Браузер: ${bNode.flag} ${bNode.code} (${bSnap.pingMs} мс)"
+            "⏸ $scopeTag · ПАУЗА | Браузер: ${bNode.flag} ${bNode.code} (${bSnap.pingMs} мс)"
         } else {
-            "🌐 ${bNode.flag}${bNode.code} ⚡${bSnap.pingMs}мс ⬇${formatSpeedRu(bSnap.rxSpeedBytesPerSec)} ⬆${formatSpeedRu(bSnap.txSpeedBytesPerSec)} | 📱 ${aNode.flag}${aNode.code} ⚡${aSnap.pingMs}мс ⬇${formatSpeedRu(aSnap.rxSpeedBytesPerSec)} ⬆${formatSpeedRu(aSnap.txSpeedBytesPerSec)}"
+            "🌐 $scopeTag · ${bNode.flag}${bNode.code} ⚡${bSnap.pingMs}мс | 📱 ${aNode.flag}${aNode.code} ⚡${aSnap.pingMs}мс ⬇${formatSpeedRu(aSnap.rxSpeedBytesPerSec)} ⬆${formatSpeedRu(aSnap.txSpeedBytesPerSec)}"
         }
 
         val shortLine = "Браузер(${bNode.code} • ${bSnap.pingMs}мс): ⬇${formatBytesRu(bSnap.rxBytesTotal)} ⬆${formatBytesRu(bSnap.txBytesTotal)} • Прил.(${aNode.code} • ${aSnap.pingMs}мс): ⬇${formatBytesRu(aSnap.rxBytesTotal)} ⬆${formatBytesRu(aSnap.txBytesTotal)}"
 
         val perAppSummary = buildString {
+            appendLine("🎯 " + VpnScope.scopeLine(perAppMode, routedPackages.size))
+            if (perAppMode && routedPackages.isNotEmpty()) appendLine("   список: " + VpnLog.appList(routedPackages))
             appendLine("1️⃣ БРАУЗЕР VPN (${bNode.flag} ${bNode.countryRu} • 127.0.0.1:${bSnap.proxyPort} • Пинг: ${bSnap.pingMs} мс • ${bSnap.currentStrategyLabel}):")
             appendLine("   Скорость сейчас: ⬇ ${formatSpeedRu(bSnap.rxSpeedBytesPerSec)} | ⬆ ${formatSpeedRu(bSnap.txSpeedBytesPerSec)}")
             appendLine("   Трафик сервера ${bNode.code}: ⬇ ${formatBytesRu(bSnap.rxBytesTotal)} | ⬆ ${formatBytesRu(bSnap.txBytesTotal)}")
