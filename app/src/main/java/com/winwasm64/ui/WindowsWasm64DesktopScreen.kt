@@ -347,6 +347,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         BrowserDirectRepeater.countryCode = browserVpnCountry
         BrowserDirectRepeater.syncWithAppsVpn = syncBothVpnsAuto
         BrowserDirectRepeater.autoFailoverEnabled = autoHealEnabled
+        // v4.30.0: резервные каналы — поднимаем то, что уже скачано, и восстанавливаем переключатель
+        com.winwasm64.vpn.ReserveChain.autoEnabled = prefs.getBoolean("reserve_auto_enabled", true)
+        com.winwasm64.vpn.ReserveChain.applyPool(com.winwasm64.vpn.ReservePool.load(context))
         BrowserDirectRepeater.ensureDirectBrowserMode()
 
         // 2. Инициализируем Репитер №2 (Локальный сервер 127.0.0.1:8899 для раздела Приложений)
@@ -2759,6 +2762,88 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         }) { Text("Импорт", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
                                     }
                                     if (backupStatus.isNotBlank()) Text(backupStatus, color = Omni.TextDim, fontSize = 11.sp)
+                                    // v4.30.0: резервные VPN — на случай, когда у основного канала и у Psiphon лимит
+                                    var reserveStatus by remember { mutableStateOf(com.winwasm64.vpn.ReserveChain.statusLine()) }
+                                    var reserveBusy by remember { mutableStateOf(false) }
+                                    Surface(color = Omni.Surface, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Text("Резервные VPN", color = Color.White, fontSize = 12.sp)
+                                            Text(
+                                                "Когда основной канал или Psiphon упёрлись в лимит, браузер уходит на следующий живой резерв: локальный прокси Psiphon, затем публичные HTTP/SOCKS5 из пула. Прокси проверяются настоящим рукопожатием (CONNECT/SOCKS5), а не «по списку».",
+                                                color = Omni.TextDim,
+                                                fontSize = 10.sp
+                                            )
+                                            Text(
+                                                if (reserveBusy) "проверяю…" else reserveStatus,
+                                                color = if (reserveBusy) Omni.Accent else Omni.TextDim,
+                                                fontSize = 11.sp
+                                            )
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                Surface(
+                                                    color = Omni.Surface,
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    modifier = Modifier.clickable(enabled = !reserveBusy) {
+                                                        reserveBusy = true
+                                                        reserveStatus = "скачиваю списки прокси…"
+                                                        Thread {
+                                                            val n = com.winwasm64.vpn.ReservePool.refresh(context)
+                                                            reserveStatus = "скачано $n, проверяю живые…"
+                                                            val cached = com.winwasm64.vpn.ReservePool.load(context)
+                                                            val alive = com.winwasm64.vpn.ReserveDialer.validateAll(
+                                                                cached,
+                                                                limit = 24,
+                                                                protect = { s -> runCatching { BrowsecVpnService.protectSocket(s) } }
+                                                            )
+                                                            val ranked = com.winwasm64.vpn.ReservePool.sanitize(alive.map { it.first }, 20)
+                                                            com.winwasm64.vpn.ReserveChain.applyPool(ranked)
+                                                            reserveStatus = if (alive.isEmpty()) {
+                                                                "живых прокси не нашлось (списки отдали $n) — резервом остаётся Psiphon"
+                                                            } else {
+                                                                "живых ${alive.size} из ${cached.size} · лучший ${alive.first().first.label} · ${alive.first().second} мс"
+                                                            }
+                                                            reserveBusy = false
+                                                        }.start()
+                                                    }
+                                                ) { Text("Обновить пул прокси", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                                Surface(
+                                                    color = Omni.Surface,
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    modifier = Modifier.clickable(enabled = !reserveBusy) {
+                                                        reserveBusy = true
+                                                        reserveStatus = "проверяю резервы…"
+                                                        Thread {
+                                                            val cached = com.winwasm64.vpn.ReservePool.load(context)
+                                                            val alive = com.winwasm64.vpn.ReserveDialer.validateAll(
+                                                                cached,
+                                                                limit = 24,
+                                                                protect = { s -> runCatching { BrowsecVpnService.protectSocket(s) } }
+                                                            )
+                                                            com.winwasm64.vpn.ReserveChain.applyPool(com.winwasm64.vpn.ReservePool.sanitize(alive.map { it.first }, 20))
+                                                            reserveStatus = if (alive.isEmpty()) "живых резервов нет · " + com.winwasm64.vpn.ReserveChain.statusLine() else "живых ${alive.size} · " + com.winwasm64.vpn.ReserveChain.statusLine()
+                                                            reserveBusy = false
+                                                        }.start()
+                                                    }
+                                                ) { Text("Проверить резервы", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                                Surface(
+                                                    color = Omni.Surface,
+                                                    shape = RoundedCornerShape(6.dp),
+                                                    modifier = Modifier.clickable {
+                                                        com.winwasm64.vpn.ReserveChain.reset()
+                                                        reserveStatus = com.winwasm64.vpn.ReserveChain.statusLine()
+                                                    }
+                                                ) { Text("Сброс", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                            }
+                                            SettingSwitchRow(
+                                                "Автоперебор резерва",
+                                                "При отказе или лимите у текущего канала браузер сам переключается на следующий живой резерв",
+                                                com.winwasm64.vpn.ReserveChain.autoEnabled
+                                            ) { v ->
+                                                com.winwasm64.vpn.ReserveChain.autoEnabled = v
+                                                prefs.edit().putBoolean("reserve_auto_enabled", v).apply()
+                                                reserveStatus = com.winwasm64.vpn.ReserveChain.statusLine()
+                                            }
+                                        }
+                                    }
                                     SettingSwitchRow("Не отслеживать (DNT и GPC)", "Отправлять сайтам запрет на отслеживание", doNotTrackEnabled) { v ->
                                         doNotTrackEnabled = v
                                         persistBrowserSettings()

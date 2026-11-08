@@ -1287,6 +1287,18 @@ object BrowserDirectRepeater {
      * как в v3.6.0, чтобы ни один запрос к m.youtube.com / googlevideo.com / gofile.io не зависал!
      */
     private fun openBrowserOutboundSocket(host: String, port: Int, st: ServerNodeRuntimeState): Socket {
+        // v4.30.0: если включён перебор резервов и текущий резерв жив — идём через него.
+        // Это и есть «запасной выход», когда основной канал упёрся в лимит или лёг.
+        val reserve = ReserveChain.active()
+        if (reserve != null) {
+            val tunnel = ReserveDialer.connect(reserve, host, port) { BrowsecVpnService.protectSocket(it) }
+            if (tunnel != null) {
+                ReserveChain.reportSuccess(reserve)
+                if (enabled) st.recordTx(128L)
+                return tunnel
+            }
+            ReserveChain.reportFailure(reserve, "HTTP-туннель не открылся")
+        }
         val candidates = FastMultiDnsResolver.buildCandidateIps(
             host = host,
             ecsSubnet = st.node.ecsSubnet,
@@ -1345,6 +1357,36 @@ object BrowserDirectRepeater {
             }
         )
         if (candidates.isEmpty()) return
+
+        // v4.30.0: сначала резервный канал (Psiphon / публичный прокси), если он включён и жив.
+        // Туннель через резерв открываем ДО ответа 200 — если не вышло, спокойно идём обычным путём.
+        run {
+            val reserve = ReserveChain.active() ?: return@run
+            val tunnel = ReserveDialer.connect(reserve, host, port) { BrowsecVpnService.protectSocket(it) }
+            if (tunnel == null) {
+                ReserveChain.reportFailure(reserve, "CONNECT через резерв не открылся")
+                return@run
+            }
+            try {
+                val establishedR = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
+                clientOut.write(establishedR)
+                clientOut.flush()
+                if (enabled) st.recordRx(establishedR.size.toLong())
+                val t1 = Thread {
+                    pipeSubsequentClientToServer(clientIn, tunnel.getOutputStream(), st, countTraffic = enabled)
+                }
+                val t2 = Thread {
+                    pipeServerToClient(tunnel.getInputStream(), clientOut, st, countTraffic = enabled)
+                }
+                t1.start(); t2.start(); t1.join(); t2.join()
+                ReserveChain.reportSuccess(reserve)
+            } catch (_: Exception) {
+                ReserveChain.reportFailure(reserve, "обрыв в резервном туннеле")
+            } finally {
+                try { tunnel.close() } catch (_: Exception) {}
+            }
+            return
+        }
 
         // Отправляем подтверждение 200 Connection Established в WebView, чтобы он сразу прислал TLS ClientHello
         val established = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)

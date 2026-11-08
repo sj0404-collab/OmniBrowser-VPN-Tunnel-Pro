@@ -319,7 +319,12 @@ object PsiphonBackup {
         private val failCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
         @Volatile private var summaryAt = 0L
         private val diagLoggedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-        override fun onListeningHttpProxyPort(port: Int) { httpPort = port; VpnLog.i(TAG, "локальный HTTP-прокси 127.0.0.1:$port") }
+        override fun onListeningHttpProxyPort(port: Int) {
+            httpPort = port
+            // v4.30.0: сообщаем цепочке резервов, что Psiphon готов принимать соединения
+            ReserveChain.setPsiphonPort(port)
+            VpnLog.i(TAG, "локальный HTTP-прокси 127.0.0.1:$port")
+        }
         override fun onListeningSocksProxyPort(port: Int) { socksPort = port }
         override fun onHttpProxyPortInUse(port: Int) { VpnLog.w(TAG, "порт $port занят — Psiphon не сможет принять соединения") }
         override fun onConnecting() {
