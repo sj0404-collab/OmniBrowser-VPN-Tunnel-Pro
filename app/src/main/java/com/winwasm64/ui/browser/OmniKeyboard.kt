@@ -89,6 +89,9 @@ fun OmniKeyPanel(
     onShowSystemKeyboard: () -> Unit
 ) {
     var proxy by remember { mutableStateOf("") }
+    // v4.28.0: если поле диалога закрыто от чтения, строка показывает свой буфер —
+    // иначе она всегда была бы пустой, хотя текст вводится.
+    var localBuf by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
     var keysOpen by remember { mutableStateOf(false) }
     var mouseOpen by remember { mutableStateOf(false) }
@@ -149,6 +152,10 @@ fun OmniKeyPanel(
                 val tag = json.optString("tag")
                 proxy = v.takeLast(400)
                 val cands = json.optString("cands")
+                if (json.optBoolean("blind")) {
+                    status = "поле компонента: чтение закрыто, ввод и ⌫ идут командами браузера (поля: $cands)"
+                    return@js
+                }
                 status = if (json.optBoolean("ok")) {
                     val blind = if (json.optBoolean("blind")) " [вне доступа] " else ""
                     "$blind«$tag»: ${json.optInt("n")} симв. — $v   | поля: $cands".take(120)
@@ -181,14 +188,47 @@ fun OmniKeyPanel(
         }
     }
 
-    fun insert(ch: String) = js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { refreshValue() }
+    /**
+     * Клавиша без снятия фокуса с поля страницы: нужна для Backspace, когда поле закрыто
+     * от чтения — стирать приходится самой системной клавишей.
+     */
+    fun nativeKeyKeepFocus(keyCode: Int, tag: String) {
+        val wv = webView ?: return
+        val prev: View? = try { view.rootView.findFocus() } catch (_: Throwable) { null }
+        try {
+            if (!wv.hasFocus()) wv.requestFocus()
+            val t = SystemClock.uptimeMillis()
+            wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
+            wv.dispatchKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
+            status = "$tag → Backspace внутрь WebView"
+        } catch (_: Throwable) {
+        } finally {
+            try { if (prev != null && prev !== wv) prev.requestFocus() } catch (_: Throwable) {}
+            wv.postDelayed({ hideIme() }, 60)
+        }
+    }
+
+    fun insert(ch: String) {
+        js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { text ->
+            if (text.contains("компонента")) {
+                localBuf = (localBuf + ch).takeLast(200)
+                proxy = localBuf
+            } else {
+                refreshValue()
+            }
+        }
+    }
     fun back() {
         js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { text ->
-            refreshValue()
-            // Поле в недоступном документе (iframe) или не читается — тогда остаётся
-            // единственный честный путь: настоящая клавиша Backspace внутрь WebView.
-            if (text.contains("не читается") || text.contains("вне доступа") || text.contains("не удалось")) {
-                nativeKey(KeyEvent.KEYCODE_DEL, "⌫ (системная)")
+            if (text.contains("компонента")) {
+                localBuf = if (localBuf.isEmpty()) "" else localBuf.dropLast(1)
+                proxy = localBuf
+            } else {
+                refreshValue()
+            }
+            // Поле закрыто/не читается — последний честный путь: настоящий Backspace внутрь WebView
+            if (text.contains("нужна клавиша") || text.contains("не читается") || text.contains("вне доступа")) {
+                nativeKeyKeepFocus(KeyEvent.KEYCODE_DEL, "⌫")
             }
         }
     }
@@ -697,6 +737,26 @@ const val OMNI_KEY_JS = """
 
   function bindTo(el) { if (el) window.__omniBound = el; return el; }
 
+  /**
+   * v4.28.0: поле диалога GeForce NOW лежит в ЗАКРЫТОМ shadow root — прочитать его нельзя,
+   * но браузер умеет в него печатать и стирать по сфокусированному полю. Поэтому ввод, удаление
+   * и очистка идут командами браузера (insertText / delete / selectAll+delete), а чтение —
+   * по возможности, если поле всё-таки доступно.
+   */
+  function activeEditable() {
+    var el = deepActive();
+    if (textish(el)) return el;
+    if (el && el.isContentEditable) return el;
+    return null;
+  }
+
+  function cmdInsert(txt) {
+    try { return document.execCommand('insertText', false, txt) === true; } catch (e) { return false; }
+  }
+  function cmdDelete() {
+    try { return document.execCommand('delete', false, null) === true; } catch (e) { return false; }
+  }
+
   // ── Чтение того поля, которое реально на экране ───────────────────────────────────────
   window.__omniRead = function() {
     var b = window.__omniBound;
@@ -755,7 +815,7 @@ const val OMNI_KEY_JS = """
   // ── Вставка: находим поле ПО ФАКТУ ИЗМЕНЕНИЯ ─────────────────────────────────────────
   window.__omniInsert = function(txt) {
     var snap = snapshot();
-    var el = focusTarget();
+    var el = activeEditable() || focusTarget();
     var okCmd = false;
     if (el) {
       try {
@@ -788,24 +848,31 @@ const val OMNI_KEY_JS = """
         return 'ок (запись) ' + ((readOf(el) || '').length) + ' симв.';
       }
     }
-    if (okCmd) {
-      // команда сработала, но ни одно доступное поле не изменилось — поле в чужом документе
+    // Последняя попытка — команда по сфокусированному полю (работает и в закрытом shadow root)
+    if (cmdInsert(txt)) {
       window.__omniBlind = true;
-      return 'текст ушёл, но поле вне доступа (' + diag() + ')';
+      return 'введено (поле компонента, чтение закрыто)';
+    }
+    if (okCmd) {
+      window.__omniBlind = true;
+      return 'введено (поле компонента)';
     }
     return 'поле не изменилось (' + diag() + ')';
   };
 
   window.__omniBack = function() {
     var b = window.__omniBound;
-    var el = (b && b.isConnected && visible(b)) ? b : focusTarget();
-    if (!el) {
-      window.__omniBlind = true;
-      return 'поле не читается (' + diag() + ')';
-    }
-    var v = readOf(el) || '';
-    if (!v.length) {
+    var el = activeEditable() || ((b && b.isConnected && visible(b)) ? b : focusTarget());
+    var v = el ? (readOf(el) || '') : '';
+    if (!el || !v.length) {
+      // Поле либо закрыто от чтения, либо пустое. Стираем командой браузера по фокусу —
+      // это единственный путь для закрытого shadow root.
+      if (cmdDelete()) {
+        window.__omniBlind = true;
+        return 'удалено (поле компонента)';
+      }
       if (window.__omniBlind) return 'поле вне доступа — нужна клавиша Backspace';
+      if (!el) return 'поле не читается (' + diag() + ')';
       return 'поле пустое («' + el.tagName + '»)';
     }
     try {
@@ -825,9 +892,16 @@ const val OMNI_KEY_JS = """
   };
 
   window.__omniClear = function() {
-    var el = window.__omniBound;
+    var el = activeEditable() || window.__omniBound;
     if (!el || !el.isConnected) el = focusTarget();
-    if (!el) return 'поле не читается (' + diag() + ')';
+    if (!el) {
+      // очистка по фокусу: выделить всё в поле и удалить
+      try {
+        document.execCommand('selectAll', false, null);
+        if (cmdDelete()) return 'очищено (поле компонента)';
+      } catch (e) {}
+      return 'поле не читается (' + diag() + ')';
+    }
     var v = readOf(el) || '';
     try {
       el.focus();
