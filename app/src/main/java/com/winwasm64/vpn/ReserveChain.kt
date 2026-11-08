@@ -108,6 +108,14 @@ object ReserveChain {
     @Volatile
     var autoEnabled: Boolean = true
 
+    /**
+     * v4.30.1: ручной режим «сначала резерв».
+     * По умолчанию false — резерв обязан оставаться запасным путём. Включать, только когда
+     * основной канал заведомо упёрся в лимит и надо срочно выйти другим путём.
+     */
+    @Volatile
+    var preferReserve: Boolean = false
+
     /** Последний известный порт локального HTTP-прокси Psiphon (0 — не поднят). */
     @Volatile
     var psiphonHttpPort: Int = 0
@@ -147,7 +155,8 @@ object ReserveChain {
         if (pool.isNotEmpty() || port > 0) applyPool(pool)
     }
 
-    fun active(): ReserveUpstream? = if (!autoEnabled) null else synchronized(lock) { state.active(now()) }
+    fun active(): ReserveUpstream? =
+        if (!autoEnabled && !preferReserve) null else synchronized(lock) { state.active(now()) }
 
     fun reportSuccess(u: ReserveUpstream) {
         synchronized(lock) { state.reportSuccess(u, now()) }

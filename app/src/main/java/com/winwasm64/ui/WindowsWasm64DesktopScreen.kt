@@ -349,6 +349,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         BrowserDirectRepeater.autoFailoverEnabled = autoHealEnabled
         // v4.30.0: резервные каналы — поднимаем то, что уже скачано, и восстанавливаем переключатель
         com.winwasm64.vpn.ReserveChain.autoEnabled = prefs.getBoolean("reserve_auto_enabled", true)
+        com.winwasm64.vpn.ReserveChain.preferReserve = prefs.getBoolean("reserve_prefer", false)
         com.winwasm64.vpn.ReserveChain.applyPool(com.winwasm64.vpn.ReservePool.load(context))
         BrowserDirectRepeater.ensureDirectBrowserMode()
 
@@ -2832,6 +2833,15 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                                         reserveStatus = com.winwasm64.vpn.ReserveChain.statusLine()
                                                     }
                                                 ) { Text("Сброс", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) }
+                                            }
+                                            SettingSwitchRow(
+                                                "Сначала резерв (вручную)",
+                                                "Основной канал не трогаем: весь трафик сразу идёт через резервный. Нужно, когда свой канал упёрся в лимит или отдаёт ошибки. Выключите, когда отпустит",
+                                                com.winwasm64.vpn.ReserveChain.preferReserve
+                                            ) { v ->
+                                                com.winwasm64.vpn.ReserveChain.preferReserve = v
+                                                prefs.edit().putBoolean("reserve_prefer", v).apply()
+                                                reserveStatus = com.winwasm64.vpn.ReserveChain.statusLine()
                                             }
                                             SettingSwitchRow(
                                                 "Автоперебор резерва",

@@ -1287,17 +1287,21 @@ object BrowserDirectRepeater {
      * как в v3.6.0, чтобы ни один запрос к m.youtube.com / googlevideo.com / gofile.io не зависал!
      */
     private fun openBrowserOutboundSocket(host: String, port: Int, st: ServerNodeRuntimeState): Socket {
-        // v4.30.0: если включён перебор резервов и текущий резерв жив — идём через него.
-        // Это и есть «запасной выход», когда основной канал упёрся в лимит или лёг.
-        val reserve = ReserveChain.active()
-        if (reserve != null) {
-            val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
-            if (tunnel != null) {
-                ReserveChain.reportSuccess(reserve)
-                if (enabled) st.recordTx(128L)
-                return tunnel
+        // v4.30.1: резерв — ЗАПАСНОЙ путь, а не основной.
+        // (В 4.30.0 резерв пробовался первым: при загруженном пуле браузер уходил на чужой прокси,
+        //  хотя свой канал был жив. Это была ошибка — исправлено.)
+        // Резерв идёт первым только если пользователь сам включил «Сначала резерв».
+        if (ReserveChain.preferReserve) {
+            val forced = ReserveChain.active()
+            if (forced != null) {
+                val tunnel = ReserveDialer.connect(forced, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
+                if (tunnel != null) {
+                    ReserveChain.reportSuccess(forced)
+                    if (enabled) st.recordTx(128L)
+                    return tunnel
+                }
+                ReserveChain.reportFailure(forced, "HTTP-туннель не открылся")
             }
-            ReserveChain.reportFailure(reserve, "HTTP-туннель не открылся")
         }
         val candidates = FastMultiDnsResolver.buildCandidateIps(
             host = host,
@@ -1329,6 +1333,19 @@ object BrowserDirectRepeater {
                 lastErr = e
             }
         }
+        // Основной канал не смог ни по одному адресу — вот теперь запасной выход.
+        if (!ReserveChain.preferReserve) {
+            val reserve = ReserveChain.active()
+            if (reserve != null) {
+                val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
+                if (tunnel != null) {
+                    ReserveChain.reportSuccess(reserve)
+                    if (enabled) st.recordTx(128L)
+                    return tunnel
+                }
+                ReserveChain.reportFailure(reserve, "HTTP-туннель не открылся")
+            }
+        }
         st.consecutiveFailures.incrementAndGet()
         throw (lastErr ?: java.io.IOException("Failed to connect to $host:$port"))
     }
@@ -1358,33 +1375,21 @@ object BrowserDirectRepeater {
         )
         if (candidates.isEmpty()) return
 
-        // v4.30.0: сначала резервный канал (Psiphon / публичный прокси), если он включён и жив.
-        // Туннель через резерв открываем ДО ответа 200 — если не вышло, спокойно идём обычным путём.
+        // v4.30.1: если пользователь включил «Сначала резерв» — идём в обход основного канала.
+        // Туннель открываем ДО ответа 200; не вышло — спокойно продолжаем обычным путём.
         run {
+            if (!ReserveChain.preferReserve) return@run
             val reserve = ReserveChain.active() ?: return@run
             val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
             if (tunnel == null) {
                 ReserveChain.reportFailure(reserve, "CONNECT через резерв не открылся")
                 return@run
             }
-            try {
-                val establishedR = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
-                clientOut.write(establishedR)
-                clientOut.flush()
-                if (enabled) st.recordRx(establishedR.size.toLong())
-                val t1 = Thread {
-                    pipeSubsequentClientToServer(clientIn, tunnel.getOutputStream(), st, countTraffic = enabled)
-                }
-                val t2 = Thread {
-                    pipeServerToClient(tunnel.getInputStream(), clientOut, st, countTraffic = enabled)
-                }
-                t1.start(); t2.start(); t1.join(); t2.join()
-                ReserveChain.reportSuccess(reserve)
-            } catch (_: Exception) {
-                ReserveChain.reportFailure(reserve, "обрыв в резервном туннеле")
-            } finally {
-                try { tunnel.close() } catch (_: Exception) {}
-            }
+            val establishedR = "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            clientOut.write(establishedR)
+            clientOut.flush()
+            if (enabled) st.recordRx(establishedR.size.toLong())
+            pipeReserveTunnel(clientIn, clientOut, tunnel, st, helloBuf = null, helloLen = 0, reserve = reserve)
             return
         }
 
@@ -1472,6 +1477,51 @@ object BrowserDirectRepeater {
             } catch (_: Exception) {
                 try { upstream?.close() } catch (_: Exception) {}
             }
+        }
+
+        // v4.30.1: ни один адрес основного канала не ответил — и только теперь резерв.
+        // ClientHello уже прочитан из браузера, поэтому отправляем его в туннель первым.
+        val reserve = ReserveChain.active()
+        if (reserve != null) {
+            val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
+            if (tunnel != null) {
+                pipeReserveTunnel(clientIn, clientOut, tunnel, st, helloBuf = helloBuf, helloLen = helloLen, reserve = reserve)
+                return
+            }
+            ReserveChain.reportFailure(reserve, "CONNECT через резерв не открылся")
+        }
+    }
+
+    /**
+     * v4.30.1: прокачка уже установленного резервного туннеля.
+     * [helloBuf] — ClientHello, который браузер успел прислать в основной канал; его надо отправить первым.
+     */
+    private fun pipeReserveTunnel(
+        clientIn: InputStream,
+        clientOut: OutputStream,
+        tunnel: Socket,
+        st: ServerNodeRuntimeState,
+        helloBuf: ByteArray?,
+        helloLen: Int,
+        reserve: ReserveUpstream
+    ) {
+        try {
+            val upOut = tunnel.getOutputStream()
+            val upIn = tunnel.getInputStream()
+            if (helloBuf != null && helloLen > 0) {
+                upOut.write(helloBuf, 0, helloLen)
+                upOut.flush()
+                if (enabled) st.recordTx(helloLen.toLong())
+            }
+            tunnel.soTimeout = 25_000
+            val t1 = Thread { pipeSubsequentClientToServer(clientIn, upOut, st, countTraffic = enabled) }
+            val t2 = Thread { pipeServerToClient(upIn, clientOut, st, countTraffic = enabled) }
+            t1.start(); t2.start(); t1.join(); t2.join()
+            ReserveChain.reportSuccess(reserve)
+        } catch (_: Exception) {
+            ReserveChain.reportFailure(reserve, "обрыв в резервном туннеле")
+        } finally {
+            try { tunnel.close() } catch (_: Exception) {}
         }
     }
 
