@@ -1291,7 +1291,7 @@ object BrowserDirectRepeater {
         // Это и есть «запасной выход», когда основной канал упёрся в лимит или лёг.
         val reserve = ReserveChain.active()
         if (reserve != null) {
-            val tunnel = ReserveDialer.connect(reserve, host, port) { BrowsecVpnService.protectSocket(it) }
+            val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
             if (tunnel != null) {
                 ReserveChain.reportSuccess(reserve)
                 if (enabled) st.recordTx(128L)
@@ -1362,7 +1362,7 @@ object BrowserDirectRepeater {
         // Туннель через резерв открываем ДО ответа 200 — если не вышло, спокойно идём обычным путём.
         run {
             val reserve = ReserveChain.active() ?: return@run
-            val tunnel = ReserveDialer.connect(reserve, host, port) { BrowsecVpnService.protectSocket(it) }
+            val tunnel = ReserveDialer.connect(reserve, host, port, protect = { sock -> BrowsecVpnService.protectSocket(sock) })
             if (tunnel == null) {
                 ReserveChain.reportFailure(reserve, "CONNECT через резерв не открылся")
                 return@run
