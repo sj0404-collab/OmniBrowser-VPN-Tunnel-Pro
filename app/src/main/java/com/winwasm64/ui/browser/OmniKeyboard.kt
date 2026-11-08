@@ -143,27 +143,56 @@ fun OmniKeyPanel(
         }
     }
 
-    /** Перечитать значение из поля страницы в нашу строку — чтобы строка не была «пустышкой». */
-    fun refreshValue() {
+    /** Показать в строке наш буфер (единственный надёжный источник, когда поле закрыто). */
+    fun syncLine() {
+        proxy = if (localBuf.length > 400) localBuf.takeLast(400) else localBuf
+    }
+
+    /** Только статус: что сейчас в поле страницы. Строку НЕ трогаем. */
+    fun pageStatus() {
         js("window.__omniRead?window.__omniRead():''", "поле") { text ->
             try {
                 val json = JSONObject(text)
-                val v = json.optString("v")
-                val tag = json.optString("tag")
-                proxy = v.takeLast(400)
                 val cands = json.optString("cands")
-                if (json.optBoolean("blind")) {
-                    status = "поле компонента: чтение закрыто, ввод и ⌫ идут командами браузера (поля: $cands)"
-                    return@js
-                }
-                status = if (json.optBoolean("ok")) {
-                    val blind = if (json.optBoolean("blind")) " [вне доступа] " else ""
-                    "$blind«$tag»: ${json.optInt("n")} симв. — $v   | поля: $cands".take(120)
+                status = if (json.optBoolean("blind")) {
+                    "поле компонента: чтение закрыто (наш ввод: ${localBuf.length} симв.) | поля: $cands"
+                } else if (json.optBoolean("ok")) {
+                    "«${json.optString("tag")}»: ${json.optInt("n")} симв. — ${json.optString("v")}".take(90)
                 } else {
                     "поле не найдено | поля: $cands"
                 }
             } catch (_: Throwable) {
-                // ответ не JSON — ничего не делаем
+            }
+        }
+    }
+
+    /**
+     * Явное перечитывание (кнопка «⟳»): тянем значение из страницы и, если доступно, обновляем буфер.
+     *
+     * v4.29.0: обычный ввод строку больше не перезаписывает. Раньше после каждого нажатия мы
+     * перечитывали поле и подставляли ответ в строку — а закрытое поле всегда отдаёт «0»,
+     * поэтому строка «исчезала» прямо во время набора, хотя текст в игре оставался.
+     */
+    fun refreshValue() {
+        js("window.__omniRead?window.__omniRead():''", "поле") { text ->
+            try {
+                val json = JSONObject(text)
+                val cands = json.optString("cands")
+                if (json.optBoolean("blind")) {
+                    status = "поле компонента: чтение закрыто (наш ввод: ${localBuf.length} симв.) | поля: $cands"
+                    syncLine()
+                    return@js
+                }
+                if (json.optBoolean("ok")) {
+                    localBuf = json.optString("v").takeLast(200)
+                    syncLine()
+                    status = "перечитано из «${json.optString("tag")}»: ${json.optInt("n")} симв."
+                } else {
+                    status = "поле не найдено | поля: $cands"
+                    syncLine()
+                }
+            } catch (_: Throwable) {
+                syncLine()
             }
         }
     }
@@ -209,23 +238,18 @@ fun OmniKeyPanel(
     }
 
     fun insert(ch: String) {
+        // Строка обновляется сразу и не зависит от того, что ответит страница.
+        localBuf = (localBuf + ch).takeLast(200)
+        syncLine()
         js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { text ->
-            if (text.contains("компонента")) {
-                localBuf = (localBuf + ch).takeLast(200)
-                proxy = localBuf
-            } else {
-                refreshValue()
-            }
+            status = "вставка: $text"
         }
     }
     fun back() {
+        localBuf = if (localBuf.isEmpty()) "" else localBuf.dropLast(1)
+        syncLine()
         js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { text ->
-            if (text.contains("компонента")) {
-                localBuf = if (localBuf.isEmpty()) "" else localBuf.dropLast(1)
-                proxy = localBuf
-            } else {
-                refreshValue()
-            }
+            status = "⌫: $text"
             // Поле закрыто/не читается — последний честный путь: настоящий Backspace внутрь WebView
             if (text.contains("нужна клавиша") || text.contains("не читается") || text.contains("вне доступа")) {
                 nativeKeyKeepFocus(KeyEvent.KEYCODE_DEL, "⌫")
@@ -351,7 +375,8 @@ fun OmniKeyPanel(
             onToggleKeys = {
                 keysOpen = !keysOpen
                 if (keysOpen) hideIme()
-                refreshValue()
+                syncLine()
+                pageStatus()
             },
             mouseOpen = mouseOpen,
             onToggleMouse = {
