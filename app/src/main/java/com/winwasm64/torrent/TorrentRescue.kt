@@ -84,7 +84,14 @@ object TorrentRescue {
         return words.joinToString(" ").take(80)
     }
 
-    /** Похожесть названий по общим словам: 0 — ничего общего, 1 — те же слова. */
+    /**
+     * Похожесть названий по общим словам: 0 — ничего общего, 1 — те же слова.
+     *
+     * v4.40.0: делим на МЕНЬШИЙ набор слов, а не на больший. Иначе запрос «stalker» против
+     * «STALKER Тень Чернобыля (PC) Repack» давал 0.33 и годная раздача отбрасывалась как «не похожая».
+     * Для нас важно, покрыты ли слова запроса, а не сколько лишнего в названии раздачи.
+     * Одиночное совпадение всё же считается слабым доказательством и слегка занижается.
+     */
     fun similarity(a: String, b: String): Double {
         val wa = cleanQuery(a).split(' ').filter { it.length >= 2 }.toSet()
         val wb = cleanQuery(b).split(' ').filter { it.length >= 2 }.toSet()
@@ -93,7 +100,10 @@ object TorrentRescue {
         for (w in wa) {
             if (wb.any { it == w || (w.length >= 4 && (it.startsWith(w) || w.startsWith(it))) }) hits++
         }
-        return hits.toDouble() / maxOf(wa.size, wb.size).toDouble()
+        if (hits == 0) return 0.0
+        val denom = minOf(wa.size, wb.size).toDouble()
+        val raw = hits / denom
+        return if (hits == 1 && minOf(wa.size, wb.size) == 1) raw * 0.8 else raw
     }
 
     /**
