@@ -40,6 +40,7 @@ object TorrentSearchAgent {
         val seeders: Int = 0,
         val source: String = "",
         val platform: String = "",
+        val poster: String = "",
         var score: Double = 0.0,
         var reason: String = ""
     ) {
@@ -226,6 +227,7 @@ object TorrentSearchAgent {
                 .find(page)?.groupValues?.get(1) ?: ""
             val platform = Regex("Платформа[^>]*>(?:\\s*<[^>]+>)*\\s*([A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9 \\-]{2,24})")
                 .find(page)?.groupValues?.get(1)?.trim() ?: ""
+            val poster = extractPoster(page, pageUrl)
             val host = pageUrl.substringAfter("://").substringBefore('/')
             out.add(
                 Found(
@@ -235,7 +237,8 @@ object TorrentSearchAgent {
                     sizeBytes = TorrentRescue.parseSizeLabel(sizeText),
                     seeders = 0, // эти сайты не публикуют число сидов — не выдумываем
                     source = site.name,
-                    platform = platform
+                    platform = platform,
+                    poster = poster
                 )
             )
         }
@@ -254,10 +257,12 @@ object TorrentSearchAgent {
             val sizeText = Regex("Размер[:\\s][^0-9]{0,20}([0-9]+[.,]?[0-9]*\\s*[KMGT]?[Bb])")
                 .find(page)?.groupValues?.get(1) ?: ""
             val seeders = Regex("Раздают</td>\\s*<td>\\s*(\\d+)").find(page)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val poster = extractPoster(page, pageUrl)
             out.add(
                 Found(
                     name = title,
                     magnet = magnet,
+                    poster = poster,
                     sizeBytes = TorrentRescue.parseSizeLabel(sizeText.replace('\u00A0', ' ')),
                     seeders = seeders,
                     source = site.name
@@ -265,6 +270,30 @@ object TorrentSearchAgent {
             )
         }
         return out
+    }
+
+    /**
+     * v4.41.0: обложка со страницы раздачи — og:image, постер DLE или первая крупная картинка.
+     * Отдаём абсолютный URL; пустая строка, если картинки нет (тогда рисуется заглушка по букве).
+     */
+    fun extractPoster(html: String, pageUrl: String): String {
+        val candidates = listOf(
+            Regex("<meta[^>]+property=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE),
+            Regex("<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:image[\"']", RegexOption.IGNORE_CASE),
+            Regex("<img[^>]+class=[\"'][^\"']*(?:poster|xfieldimage|poster_new)[^\"']*[\"'][^>]+src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE),
+            Regex("<img[^>]+src=[\"']([^\"']+)[\"'][^>]+class=[\"'][^\"']*poster[^\"']*[\"']", RegexOption.IGNORE_CASE)
+        )
+        for (re in candidates) {
+            val raw = re.find(html)?.groupValues?.get(1)?.trim() ?: continue
+            if (raw.isBlank() || raw.startsWith("data:")) continue
+            return when {
+                raw.startsWith("http://") || raw.startsWith("https://") -> raw
+                raw.startsWith("//") -> "https:" + raw
+                raw.startsWith("/") -> "https://" + pageUrl.substringAfter("://").substringBefore('/') + raw
+                else -> pageUrl.substringBeforeLast('/') + "/" + raw
+            }
+        }
+        return ""
     }
 
     /** Собрать ссылки на страницы раздач: (url, заголовок), только те, что вообще похожи на запрос. */

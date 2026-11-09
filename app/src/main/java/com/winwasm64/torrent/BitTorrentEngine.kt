@@ -227,7 +227,9 @@ data class CatalogTorrentItem(
     val seeders: Int = 0,
     val reason: String = "",
     /** Some сайты (catorrent) отдают .torrent только с Referer страницы. */
-    val referer: String = ""
+    val referer: String = "",
+    /** v4.41.0: обложка (og:image со страницы) — превью вместо голого текста. */
+    val poster: String = ""
 )
 
 object BitTorrentParser {
@@ -501,6 +503,13 @@ class BitTorrentEngine(private val context: Context? = null) {
     @Volatile var browsecEdgeIp: String = "185.220.101.42"
 
     /**
+     * v4.41.0: результаты поиска живут в движке, а не в Composable.
+     * Раньше они были `remember` в разделе торрентов и стирались при переходе на другую вкладку.
+     */
+    @Volatile var cachedSearchQuery: String = ""
+    @Volatile var cachedSearchResults: List<CatalogTorrentItem> = emptyList()
+
+    /**
      * Working directory for active RandomAccessFile downloads (always writable on Android 7-15),
      * and upon completion we also export/sync directly to public /storage/emulated/0/Download/OmniTorrents
      * via MediaStore.Downloads so it is 100% visible in Android's Files / Downloads app!
@@ -654,7 +663,8 @@ class BitTorrentEngine(private val context: Context? = null) {
                             estimatedSizeBytes = f.sizeBytes,
                             seeders = f.seeders,
                             reason = f.reason,
-                            referer = f.referer
+                            referer = f.referer,
+                            poster = f.poster
                         )
                     )
                 }
@@ -706,6 +716,8 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
             } catch (_: Exception) {
             }
+            cachedSearchQuery = cleanQuery
+            cachedSearchResults = results.toList()
             val matchingBuiltIn = getBuiltInVerifiedTorrents().filter {
                 it.title.contains(cleanQuery, ignoreCase = true) ||
                     it.category.contains(cleanQuery, ignoreCase = true) ||
@@ -820,6 +832,78 @@ class BitTorrentEngine(private val context: Context? = null) {
             }
         }
         return BitTorrentParser.toHex(BitTorrentParser.sha1(found.name.toByteArray())).take(16)
+    }
+
+    /** Источник для потокового просмотра/прослушивания: метаданные + живые пиры. */
+    data class StreamSource(
+        val name: String,
+        val metadata: TorrentMetadata,
+        val peers: List<PeerEndpoint>,
+        val infoHashHex: String
+    )
+
+    /**
+     * v4.41.0: подготовить поток. Метаданные берём из .torrent (или кеша по infoHash), пиров —
+     * у трекеров, включая дополнительные. Дальше [TorrentStreamer] тянет куски по порядку,
+     * локальный сервер отдаёт их плееру — смотреть можно, не скачивая всю раздачу.
+     */
+    fun prepareStream(
+        magnetUri: String? = null,
+        torrentUrl: String? = null,
+        referer: String? = null
+    ): StreamSource? {
+        var bytes: ByteArray? = null
+        if (!torrentUrl.isNullOrBlank()) bytes = fetchUrlBytes(torrentUrl, referer)
+        val metadata: TorrentMetadata
+        if (bytes != null && bytes.isNotEmpty() && bytes[0] == 'd'.code.toByte()) {
+            metadata = BitTorrentParser.parseTorrentBytes(bytes)
+        } else if (!magnetUri.isNullOrBlank()) {
+            val mag = BitTorrentParser.parseMagnetUri(magnetUri)
+            val cacheUrls = listOf(
+                "https://itorrents.org/torrent/${mag.infoHashHex.uppercase()}.torrent",
+                "https://watercache.libertycorp.org/get/${mag.infoHashHex.lowercase()}"
+            )
+            var got: ByteArray? = null
+            for (u in cacheUrls) {
+                val f = fetchUrlBytes(u)
+                if (f != null && f.isNotEmpty() && f[0] == 'd'.code.toByte()) {
+                    got = f
+                    break
+                }
+            }
+            metadata = if (got != null) BitTorrentParser.parseTorrentBytes(got) else return null
+        } else {
+            return null
+        }
+
+        val peers = LinkedHashSet<PeerEndpoint>()
+        val trackers = (metadata.trackers + TorrentRescue.EXTRA_TRACKERS).distinct()
+        for (tr in trackers.take(8)) {
+            if (peers.size >= 40) break
+            peers.addAll(announceTracker(tr, metadata.infoHash, metadata.totalSize))
+        }
+        com.winwasm64.vpn.ConnTrace.torrent(
+            "поток: ${metadata.name.take(40)}",
+            "пиров: ${peers.size} · ${formatSize(metadata.totalSize)}",
+            peers.isNotEmpty()
+        )
+        return StreamSource(metadata.name, metadata, peers.toList(), metadata.infoHashHex)
+    }
+
+    /** Скачать байты по ссылке, при необходимости с Referer (catorrent и подобные). */
+    private fun fetchUrlBytes(url: String, referer: String?): ByteArray? {
+        return try {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8000
+                readTimeout = 8000
+                instanceFollowRedirects = true
+                applyBrowsecHeaders(this)
+                if (!referer.isNullOrBlank()) setRequestProperty("Referer", referer)
+            }
+            if (conn.responseCode in 200..299) conn.inputStream.use { it.readBytes() } else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun startFromTorrentBytes(bytes: ByteArray, fallbackName: String = "custom.torrent"): String {
