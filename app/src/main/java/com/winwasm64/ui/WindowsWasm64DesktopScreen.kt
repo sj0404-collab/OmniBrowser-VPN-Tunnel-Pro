@@ -3650,9 +3650,27 @@ private fun TorrentClientSection(
 ) {
     val context = LocalContext.current
     var magnetOrUrlInput by remember { mutableStateOf("") }
-    var searchQuery by remember { mutableStateOf("") }
-    var catalogItems by remember { mutableStateOf(torrentEngine.getBuiltInVerifiedTorrents()) }
+    // v4.41.0: запрос и результаты берём из движка — они переживают переход на другую вкладку.
+    // Раньше это был remember, и при возврате в «Торренты» список был пуст.
+    var searchQuery by remember { mutableStateOf(torrentEngine.cachedSearchQuery) }
+    var catalogItems by remember {
+        mutableStateOf(
+            torrentEngine.cachedSearchResults.ifEmpty { torrentEngine.getBuiltInVerifiedTorrents() }
+        )
+    }
     var isSearching by remember { mutableStateOf(false) }
+    // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
+    val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
+    fun runSearch(query: String) {
+        isSearching = true
+        catalogItems = emptyList()
+        torrentEngine.searchPublicTorrents(query) { res ->
+            mainHandler.post {
+                catalogItems = res
+                isSearching = false
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -3825,22 +3843,10 @@ private fun TorrentClientSection(
                         onValueChange = { searchQuery = it },
                         placeholder = "Что найти? Например: elliot quest switch, apk, flac, фильм 2024...",
                         modifier = Modifier.weight(1f),
-                        onGo = {
-                            isSearching = true
-                            torrentEngine.searchPublicTorrents(searchQuery) { res ->
-                                catalogItems = res
-                                isSearching = false
-                            }
-                        }
+                        onGo = { runSearch(searchQuery) }
                     )
                     Button(
-                        onClick = {
-                            isSearching = true
-                            torrentEngine.searchPublicTorrents(searchQuery) { res ->
-                                catalogItems = res
-                                isSearching = false
-                            }
-                        },
+                        onClick = { runSearch(searchQuery) },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
@@ -4036,7 +4042,9 @@ private fun TorrentClientSection(
             } else {
                 item {
                     Text(
-                        text = "Найдено раздач: ${catalogItems.size}",
+                        text = "Найдено раздач: ${catalogItems.size}" +
+                            (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
+                            (if (isSearching) " · ищу…" else ""),
                         color = Omni.Warning,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
@@ -4044,7 +4052,7 @@ private fun TorrentClientSection(
                 }
             }
 
-            items(catalogItems) { item ->
+            items(catalogItems, key = { it.torrentUrl + "|" + it.title }) { item ->
                 Surface(
                     color = Omni.Surface,
                     shape = RoundedCornerShape(10.dp),
@@ -4057,7 +4065,10 @@ private fun TorrentClientSection(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        // v4.41.0: превью-обложка (og:image со страницы раздачи) вместо голого текста
+                        resultCover(item.poster)
+
+                        Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
                             Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             Text(
                                 "${item.category} • Размер: ${item.sizeLabel}" +
@@ -4065,16 +4076,37 @@ private fun TorrentClientSection(
                                 color = Omni.Accent, fontSize = 11.sp
                             )
                             Text(item.description, color = Omni.TextDim, fontSize = 11.sp, maxLines = 2)
-                        }
-                        Button(
-                            onClick = {
-                                torrentEngine.startFromCatalogItem(item)
-                                Toast.makeText(context, "🧲 Скачивание начато: ${item.title}", Toast.LENGTH_SHORT).show()
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                        ) {
-                            Text("Торрент", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Button(
+                                    onClick = {
+                                        torrentEngine.startFromCatalogItem(item)
+                                        Toast.makeText(context, "🧲 Скачивание начато: ${item.title}", Toast.LENGTH_SHORT).show()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                ) {
+                                    Text("⬇ Скачать", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                }
+                                // смотреть/слушать без полной загрузки — куски идут по порядку
+                                Button(
+                                    onClick = {
+                                        context.startActivity(
+                                            android.content.Intent(context, com.winwasm64.torrent.TorrentPlayerActivity::class.java)
+                                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                .putExtra("name", item.title)
+                                                .putExtra("magnet", item.magnetUri)
+                                                .putExtra("torrentUrl", item.torrentUrl)
+                                                .putExtra("referer", item.referer)
+                                        )
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                                ) {
+                                    Text("▶ Смотреть", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                }
+                            }
                         }
                     }
                 }
@@ -5285,6 +5317,50 @@ private fun VpnChannelsSection(
             "Маршрутизация по отдельным приложениям, серверы для каждой программы и запуск приложений " +
                 "через туннель — во вкладке «Приложения».",
             fontSize = 11.sp, color = Omni.TextDim
+        )
+    }
+}
+
+/**
+ * v4.41.0: превью раздачи в списке результатов — обложка со страницы (og:image) или заглушка.
+ * Картинки кешируются в памяти ([com.winwasm64.ui.browser.CoverCache]), повторно не качаются.
+ */
+@Composable
+private fun resultCover(posterUrl: String) {
+    val placeholder: @Composable () -> Unit = {
+        Box(
+            modifier = Modifier
+                .size(56.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Omni.SurfaceHighest),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("🎬", fontSize = 20.sp)
+        }
+    }
+    if (posterUrl.isBlank()) {
+        placeholder()
+        return
+    }
+    var bitmap by remember(posterUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(posterUrl) {
+        if (bitmap == null) {
+            bitmap = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.winwasm64.ui.browser.CoverCache.load(posterUrl)
+            }
+        }
+    }
+    val bmp = bitmap
+    if (bmp == null) {
+        placeholder()
+    } else {
+        Image(
+            bitmap = androidx.compose.ui.graphics.asImageBitmap(bmp),
+            contentDescription = null,
+            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+            modifier = Modifier
+                .size(56.dp)
+                .clip(RoundedCornerShape(8.dp))
         )
     }
 }

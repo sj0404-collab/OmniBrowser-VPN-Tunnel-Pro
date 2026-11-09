@@ -646,9 +646,22 @@ class BitTorrentEngine(private val context: Context? = null) {
             // v4.39.0: сначала агент — catorrent (тот же сайт, откуда берутся .torrent) плюс открытые
             // индексы, с сидами и объяснением выбора. Если он ничего не нашёл, работает старый путь.
             try {
-                val intent = TorrentSearchAgent.parseIntent(cleanQuery)
+                // v4.41.0: намерение — из СЫРОГО запроса. Раньше cleanQuery выбрасывал «pc»/«switch»,
+                // и «scarlet» с «scarlet pc» давали один и тот же список: уточнение просто терялось.
+                val intent = TorrentSearchAgent.parseIntent(query)
                 val found = TorrentSearchAgent.searchAll(cleanQuery)
-                val ranked = TorrentSearchAgent.rank(found, intent)
+                val rankedAll = TorrentSearchAgent.rank(found, intent)
+                // если человек уточнил платформу/формат — подходящее поднимаем наверх, но не выбрасываем
+                // остальное: иногда в названии платформы нет, а внутри она та самая
+                val strict = if (intent.platform.isNotBlank() || intent.format.isNotBlank()) {
+                    rankedAll.filter { f ->
+                        f.platform.contains(intent.platform, true) ||
+                            f.name.contains(intent.platform, true) ||
+                            (intent.format.isNotBlank() && f.name.contains(intent.format, true)) ||
+                            f.platform.isBlank()
+                    }
+                } else rankedAll
+                val ranked = strict.ifEmpty { rankedAll }
                 for (f in ranked.take(12)) {
                     results.add(
                         CatalogTorrentItem(
