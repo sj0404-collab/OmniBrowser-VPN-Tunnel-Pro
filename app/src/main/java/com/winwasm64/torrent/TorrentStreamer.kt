@@ -31,10 +31,18 @@ object TorrentStreamer {
         private set
     @Volatile var fileName: String = ""
         private set
+    /** Список файлов раздачи — чтобы человек выбрал, что смотреть (как в любом торрент-клиенте). */
+    @Volatile var files: List<TorrentFileEntry> = emptyList()
+        private set
+    @Volatile var selectedFile: TorrentFileEntry? = null
+        private set
     @Volatile var playing: Boolean = false
         private set
 
     private var file: File? = null
+    /** Границы выбранного файла внутри раздачи (для многофайловых раздач). */
+    @Volatile private var rangeStart: Long = 0L
+    @Volatile private var rangeEnd: Long = 0L
     private val stopFlag = AtomicBoolean(false)
     private var worker: Thread? = null
 
@@ -51,7 +59,8 @@ object TorrentStreamer {
         magnetUri: String?,
         torrentUrl: String?,
         referer: String?,
-        dir: File
+        dir: File,
+        preferredFile: String? = null
     ): Boolean {
         stop()
         stopFlag.set(false)
@@ -64,10 +73,19 @@ object TorrentStreamer {
             return false
         }
         val meta = source.metadata
-        // для потока берём самый крупный файл: для фильма и для песни это одно и то же
-        val biggest = meta.files.maxByOrNull { it.length }
+        files = meta.files
+        // v4.42.0: если файлов несколько — берём выбранный, иначе самый крупный.
+        // Так раздачи с папками (сезон сериала, дискография) не превращаются в «первый попавшийся» файл.
+        val biggest = when {
+            preferredFile != null -> meta.files.firstOrNull { it.relativePath == preferredFile }
+                ?: meta.files.maxByOrNull { it.length }
+            else -> meta.files.maxByOrNull { it.length }
+        }
+        selectedFile = biggest
         fileName = biggest?.relativePath?.substringAfterLast('/') ?: meta.name
         totalBytes = biggest?.length ?: meta.totalSize
+        rangeStart = biggest?.offsetInTorrent ?: 0L
+        rangeEnd = rangeStart + totalBytes
         val target = File(dir, fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_"))
         file = target
         if (!target.exists()) target.createNewFile()
@@ -100,6 +118,9 @@ object TorrentStreamer {
 
         for (piece in 0 until pieceCount) {
             if (stopFlag.get()) break
+            val pieceStart = piece.toLong() * pieceLen
+            // куски вне выбранного файла пропускаем: не тратим трафик на сезон целиком
+            if (pieceStart + pieceLen <= rangeStart || pieceStart >= rangeEnd) continue
             var ok = false
             var attempts = 0
             while (!ok && attempts < 3 && !stopFlag.get()) {
@@ -186,9 +207,14 @@ object TorrentStreamer {
             if (received < len) return false
             val digest = BitTorrentParser.sha1(data)
             if (piece < meta.pieceHashes.size && !digest.contentEquals(meta.pieceHashes[piece])) return false
-            RandomAccessFile(target, "rw").use { raf ->
-                raf.seek(offset)
-                raf.write(data)
+            // пишем только ту часть куска, которая попадает в выбранный файл
+            val fileStart = maxOf(offset, rangeStart)
+            val fileEnd = minOf(offset + data.size, rangeEnd)
+            if (fileEnd > fileStart) {
+                RandomAccessFile(target, "rw").use { raf ->
+                    raf.seek(fileStart - rangeStart)
+                    raf.write(data, (fileStart - offset).toInt(), (fileEnd - fileStart).toInt())
+                }
             }
             return true
         }

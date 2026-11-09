@@ -1,7 +1,6 @@
 package com.winwasm64.torrent
 
 import android.app.Activity
-import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
@@ -12,25 +11,31 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.MediaController
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.VideoView
+import java.io.File
 
 /**
- * v4.41.0: встроенный плеер «смотреть/слушать из раздачи».
+ * v4.42.0: встроенный плеер «смотреть/слушать из раздачи».
  *
- * Открывается кнопкой «▶ Смотреть» в результатах поиска. Куски качаются по порядку, локальный сервер
- * отдаёт их по HTTP, VideoView играет — без ожидания полной загрузки. Аудио играет так же (VideoView
- * справляется с mp3/flac/m4a через системный декодер).
+ * Куски качаются по порядку, локальный сервер отдаёт их по HTTP (с Range), VideoView играет.
+ * Если в раздаче несколько файлов — сначала показывается список: как в торрент-клиенте, выбираешь
+ * один файл и качается только он, а не весь сезон.
  *
- * Если пиров нет — экран говорит это прямо, а не крутит «загрузка…» вечно.
+ * В статусе видно, каким КАНАЛОМ идёт трафик (Browsec / резерв / напрямую) — чтобы не гадать.
  */
 class TorrentPlayerActivity : Activity() {
 
     private lateinit var video: VideoView
     private lateinit var status: TextView
     private val handler = Handler(Looper.getMainLooper())
-    private var engine: BitTorrentEngine? = null
     private var prepared = false
+
+    private var magnetArg: String? = null
+    private var torrentUrlArg: String? = null
+    private var refererArg: String? = null
+    private var preferredFile: String? = null
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -41,25 +46,33 @@ class TorrentPlayerActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val name = intent.getStringExtra("name").orEmpty()
-        val magnet = intent.getStringExtra("magnet").orEmpty().ifBlank { null }
-        val torrentUrl = intent.getStringExtra("torrentUrl").orEmpty().ifBlank { null }
-        val referer = intent.getStringExtra("referer").orEmpty().ifBlank { null }
+        magnetArg = intent.getStringExtra("magnet").orEmpty().ifBlank { null }
+        torrentUrlArg = intent.getStringExtra("torrentUrl").orEmpty().ifBlank { null }
+        refererArg = intent.getStringExtra("referer").orEmpty().ifBlank { null }
+        preferredFile = savedInstanceState?.getString("preferredFile")
+        buildView(intent.getStringExtra("name").orEmpty())
+        startStream()
+        handler.post(ticker)
+    }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        preferredFile?.let { outState.putString("preferredFile", it) }
+    }
+
+    private fun buildView(titleText: String) {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0E0F12"))
             setPadding(24, 32, 24, 24)
         }
-        val title = TextView(this).apply {
-            text = name.ifBlank { "Воспроизведение из раздачи" }
+        root.addView(TextView(this).apply {
+            text = titleText.ifBlank { "Воспроизведение из раздачи" }
             setTextColor(Color.WHITE)
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             maxLines = 2
-        }
-        root.addView(title)
-
+        })
         status = TextView(this).apply {
             text = "Готовлю поток…"
             setTextColor(Color.parseColor("#9AA0A6"))
@@ -67,13 +80,11 @@ class TorrentPlayerActivity : Activity() {
             setPadding(0, 12, 0, 12)
         }
         root.addView(status)
-
         video = VideoView(this).apply {
             setBackgroundColor(Color.BLACK)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         root.addView(video)
-
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -89,20 +100,33 @@ class TorrentPlayerActivity : Activity() {
         })
         controls.addView(Button(this).apply {
             text = "⏯ Пауза"
+            setOnClickListener { if (video.isPlaying) video.pause() else video.start() }
+        })
+        controls.addView(Button(this).apply {
+            text = "📂 Файлы"
             setOnClickListener {
-                if (video.isPlaying) video.pause() else video.start()
+                val all = TorrentStreamer.files
+                if (all.size > 1) showFilePicker(all) else status.text = "В этой раздаче один файл"
             }
         })
         root.addView(controls)
         setContentView(root)
+    }
 
+    /** Запуск подготовки потока в фоне (метаданные, пиры, сервер). */
+    private fun startStream() {
+        prepared = false
         Thread({
             val engine = BitTorrentEngine(applicationContext)
-            this.engine = engine
-            val dir = java.io.File(cacheDir, "stream").apply { mkdirs() }
-            val ok = TorrentStreamer.start(engine, magnet, torrentUrl, referer, dir)
+            val dir = File(cacheDir, "stream").apply { mkdirs() }
+            val ok = TorrentStreamer.start(engine, magnetArg, torrentUrlArg, refererArg, dir, preferredFile)
             if (!ok) {
                 handler.post { status.text = TorrentStreamer.statusText }
+                return@Thread
+            }
+            val all = TorrentStreamer.files
+            if (preferredFile == null && all.size > 1) {
+                handler.post { showFilePicker(all) }
                 return@Thread
             }
             val url = TorrentStreamServer.start()
@@ -110,7 +134,6 @@ class TorrentPlayerActivity : Activity() {
                 handler.post { status.text = "Не удалось поднять локальный сервер потока" }
                 return@Thread
             }
-            // ждём, пока появится первый мегабайт — иначе плеер сразу покажет ошибку
             val deadline = System.currentTimeMillis() + 40_000L
             while (System.currentTimeMillis() < deadline &&
                 TorrentStreamer.availableBytes < 1_000_000L &&
@@ -137,8 +160,40 @@ class TorrentPlayerActivity : Activity() {
                 }
             }
         }, "StreamPrepare").also { it.isDaemon = true; it.start() }
+    }
 
-        handler.post(ticker)
+    /** Список файлов раздачи: выбрать один — остальное даже не будет качаться. */
+    private fun showFilePicker(files: List<TorrentFileEntry>) {
+        TorrentStreamer.stop()
+        TorrentStreamServer.stop()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 24, 24, 24)
+            setBackgroundColor(Color.parseColor("#0E0F12"))
+        }
+        box.addView(TextView(this).apply {
+            text = "В раздаче ${files.size} файлов — что открыть?"
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, 12)
+        })
+        val scroll = ScrollView(this)
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        files.sortedByDescending { it.length }.take(80).forEach { f ->
+            list.addView(Button(this).apply {
+                text = "${f.relativePath.substringAfterLast('/')}  ·  ${BitTorrentEngine.formatSize(f.length)}"
+                textSize = 12f
+                setOnClickListener {
+                    preferredFile = f.relativePath
+                    buildView(intent.getStringExtra("name").orEmpty())
+                    startStream()
+                }
+            })
+        }
+        scroll.addView(list)
+        box.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(box)
     }
 
     private fun updateStatus() {
@@ -146,10 +201,11 @@ class TorrentPlayerActivity : Activity() {
             status.text = TorrentStreamer.statusText
             return
         }
-        val have = BitTorrentStreamerFormatting.format(BitTorrentStreamerHolder.available())
-        val total = BitTorrentStreamerFormatting.format(TorrentStreamer.totalBytes)
-        val speed = BitTorrentStreamerFormatting.formatSpeed(TorrentStreamer.speedBytesPerSec)
-        status.text = "${TorrentStreamer.statusText}\n$have из $total · ↓ $speed"
+        val have = BitTorrentEngine.formatSize(TorrentStreamer.availableBytes)
+        val total = BitTorrentEngine.formatSize(TorrentStreamer.totalBytes)
+        val speed = BitTorrentEngine.formatSpeed(TorrentStreamer.speedBytesPerSec)
+        val channel = com.winwasm64.vpn.TorrentTunnel.lastChannel
+        status.text = "${TorrentStreamer.statusText}\n$have из $total · ↓ $speed · канал: $channel"
     }
 
     override fun onDestroy() {
@@ -158,14 +214,4 @@ class TorrentPlayerActivity : Activity() {
         TorrentStreamServer.stop()
         super.onDestroy()
     }
-}
-
-/** Мелочи форматирования, чтобы не тянуть их из Compose. */
-internal object BitTorrentStreamerFormatting {
-    fun format(bytes: Long): String = BitTorrentEngine.formatSize(bytes)
-    fun formatSpeed(bytesPerSec: Long): String = BitTorrentEngine.formatSpeed(bytesPerSec)
-}
-
-internal object BitTorrentStreamerHolder {
-    fun available(): Long = TorrentStreamer.availableBytes
 }

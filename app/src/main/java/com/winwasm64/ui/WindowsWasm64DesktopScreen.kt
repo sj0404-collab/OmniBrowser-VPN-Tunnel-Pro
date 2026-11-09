@@ -3660,6 +3660,14 @@ private fun TorrentClientSection(
         )
     }
     var isSearching by remember { mutableStateOf(false) }
+    // v4.42.0: фильтр по категориям — игры/видео/музыка/книги/софт
+    var categoryFilter by remember { mutableStateOf("Все") }
+    val visibleItems = remember(catalogItems, categoryFilter) {
+        if (categoryFilter == "Все") catalogItems
+        else catalogItems.filter {
+            com.winwasm64.torrent.TorrentSearchAgent.categoryMatches(categoryFilter, it.category)
+        }
+    }
     // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     fun runSearch(query: String) {
@@ -4042,10 +4050,32 @@ private fun TorrentClientSection(
                 }
             } else {
                 item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        com.winwasm64.torrent.TorrentSearchAgent.CATEGORIES.forEach { cat ->
+                            val sel = cat == categoryFilter
+                            Surface(
+                                color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable { categoryFilter = cat }
+                            ) {
+                                Text(
+                                    cat, color = Color.White, fontSize = 11.sp,
+                                    fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+                item {
                     Text(
                         text = "Найдено раздач: ${catalogItems.size}" +
                             (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
-                            (if (isSearching) " · ищу…" else ""),
+                            (if (isSearching) " · ищу…" else "") +
+                            (if (categoryFilter != "Все") " · фильтр: $categoryFilter" else ""),
                         color = Omni.Warning,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
@@ -4053,7 +4083,7 @@ private fun TorrentClientSection(
                 }
             }
 
-            items(catalogItems, key = { it.torrentUrl + "|" + it.title }) { item ->
+            items(visibleItems, key = { it.torrentUrl + "|" + it.title }) { item ->
                 Surface(
                     color = Omni.Surface,
                     shape = RoundedCornerShape(10.dp),
