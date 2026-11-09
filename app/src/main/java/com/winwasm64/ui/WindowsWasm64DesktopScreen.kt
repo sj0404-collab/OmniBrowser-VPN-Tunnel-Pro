@@ -3685,6 +3685,26 @@ private fun TorrentClientSection(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        // v4.38.0: автопоиск живой копии вместо пустышки — видно и отключаемо
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            var autoRescue by remember { mutableStateOf(torrentEngine.autoRescue) }
+                            Surface(
+                                color = if (autoRescue) Omni.AccentContainer else Omni.SurfaceHighest,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable {
+                                    autoRescue = !autoRescue
+                                    torrentEngine.setAutoRescue(autoRescue)
+                                }
+                            ) {
+                                Text(
+                                    text = if (autoRescue) "🔁 Автозамена мёртвых раздач: ВКЛ" else "🔁 Автозамена мёртвых раздач: ВЫКЛ",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
                         // v4.33.0: трафик и скорость — по всем задачам сразу, обновляется каждые 0,5 с
                         val totalsDown = statuses.sumOf { it.downloadedBytes }
                         val totalsSize = statuses.sumOf { it.totalBytes }

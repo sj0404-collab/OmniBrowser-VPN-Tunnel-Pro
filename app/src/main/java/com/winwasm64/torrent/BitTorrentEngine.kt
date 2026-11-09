@@ -474,6 +474,20 @@ class BitTorrentEngine(private val context: Context? = null) {
     private val sessions = ConcurrentHashMap<String, ActiveTorrentTask>()
     val peerId: ByteArray = ("-OB2100-" + (1..12).map { ('0'..'9').random() }.joinToString("")).toByteArray(Charsets.US_ASCII)
 
+    /**
+     * v4.38.0: автопоиск замены для мёртвой раздачи (0 пиров). По умолчанию включён.
+     * Человек просил: не качать пустышку, а найти ту же вещь там, где она живая.
+     */
+    @Volatile var autoRescue: Boolean =
+        context?.getSharedPreferences("omni_torrent", android.content.Context.MODE_PRIVATE)
+            ?.getBoolean("auto_rescue", true) ?: true
+
+    fun setAutoRescue(enabled: Boolean) {
+        autoRescue = enabled
+        context?.getSharedPreferences("omni_torrent", android.content.Context.MODE_PRIVATE)
+            ?.edit()?.putBoolean("auto_rescue", enabled)?.apply()
+    }
+
     @Volatile var useBrowsecVpn: Boolean = true
     @Volatile var browsecCountryCode: String = "DE"
     @Volatile var browsecEdgeIp: String = "185.220.101.42"
@@ -802,6 +816,8 @@ class BitTorrentEngine(private val context: Context? = null) {
         @Volatile var pieceBitfield: BooleanArray = BooleanArray(64)
         val fileList = CopyOnWriteArrayList<String>()
         val paused = AtomicBoolean(false)
+        /** v4.38.0: замену ищем один раз на задачу, чтобы не долбить каталоги по кругу. */
+        val rescueTried = AtomicBoolean(false)
         val cancelled = AtomicBoolean(false)
         val running = AtomicBoolean(false)
 
@@ -916,6 +932,25 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
             }
 
+            // v4.38.0: трекеры из .torrent часто знают только часть роя. Если пиров ноль — сначала
+            // спрашиваем ещё полтора десятка публичных трекеров, и только потом идём искать замену.
+            if (metadata != null && discoveredPeers.isEmpty() && !task.cancelled.get() && !task.paused.get()) {
+                task.statusDetail = "Пиров 0 — спрашиваю дополнительные трекеры…$vpnBadge"
+                val extra = TorrentRescue.EXTRA_TRACKERS.filter { it !in metadata.trackers }
+                for (tr in extra.take(10)) {
+                    if (task.cancelled.get() || task.paused.get()) break
+                    val peers = announceTracker(tr, metadata.infoHash, metadata.totalSize)
+                    discoveredPeers.addAll(peers)
+                    task.knownPeers = discoveredPeers.size
+                    if (discoveredPeers.isNotEmpty()) break
+                }
+                com.winwasm64.vpn.ConnTrace.torrent(
+                    "доп. трекеры (${extra.size})",
+                    if (discoveredPeers.isEmpty()) "пиров не добавили" else "нашли ${discoveredPeers.size} пиров",
+                    discoveredPeers.isNotEmpty()
+                )
+            }
+
             if (task.cancelled.get() || task.paused.get()) return
             task.state = TorrentState.DOWNLOADING
 
@@ -972,23 +1007,75 @@ class BitTorrentEngine(private val context: Context? = null) {
                         throw e
                     }
                 }
-            } else if (!downloadedViaPeers && task.rawTorrentBytes != null) {
-                task.outputFile.writeBytes(task.rawTorrentBytes!!)
-                val published = publishToPublicDownloads(task.outputFile)
-                task.outputFile = published
-                task.downloadedBytes.set(task.rawTorrentBytes!!.size.toLong())
-                task.totalBytes = task.rawTorrentBytes!!.size.toLong()
-                for (i in task.pieceBitfield.indices) task.pieceBitfield[i] = true
-                task.verifiedPieces = task.totalPieces
-                task.state = TorrentState.COMPLETED
-                task.statusDetail = "✓ Сохранено в /Download/OmniTorrents/${published.name}"
+            } else if (!downloadedViaPeers) {
+                // v4.38.0: РАНЬШЕ здесь .torrent-файл записывался как результат и задача объявлялась
+                // выполненной — отсюда «скачано 2,7 КБ из 2,7 КБ, 100%». Это не содержимое раздачи.
+                // Теперь: пиров нет → автопоиск живой копии, иначе честная ошибка.
+                if (attemptRescue(task, metadata)) return
+                task.state = TorrentState.ERROR
+                task.statusDetail = "Пиров 0: содержимого нет, а .torrent-файл вместо раздачи не сохраняем. " +
+                    "Замены в проверенных каталогах не нашлось — попробуйте другой источник или magnet с сидами."
             }
         } catch (e: Exception) {
+            // v4.38.0: пустышку не оставляем. Если ничего не пришло — ищем ту же раздачу там, где есть сиды.
+            if (autoRescue && task.downloadedBytes.get() == 0L && attemptRescue(task, null)) {
+                return
+            }
             task.state = TorrentState.ERROR
             task.statusDetail = "Ошибка: ${e.message ?: "Сбой соединения"}"
         } finally {
             task.running.set(false)
         }
+    }
+
+    /**
+     * v4.38.0: «раздача мертва → найти такую же живую».
+     *
+     * true — замена запущена (текущая задача остаётся на паузе с честной подписью).
+     * false — не нашлось; вызывающий сам решает, что показать. Успех не выдумываем.
+     */
+    private fun attemptRescue(task: ActiveTorrentTask, metadata: TorrentMetadata?): Boolean {
+        if (!autoRescue) return false
+        if (!task.rescueTried.compareAndSet(false, true)) return false
+        val expectedName = if (metadata != null && metadata.name.isNotBlank()) metadata.name else task.initialName
+        val expectedBytes = if (metadata != null && metadata.totalSize > 0) metadata.totalSize else task.totalBytes
+        val query = TorrentRescue.cleanQuery(expectedName)
+        if (query.isBlank()) return false
+
+        task.statusDetail = "Пиров 0 · ищу такую же раздачу в других источниках: «$query»…"
+        com.winwasm64.vpn.ConnTrace.torrent("автозамена", "ищу «$query» (0 пиров)", true)
+
+        val candidates = try {
+            TorrentRescue.searchBlocking(query)
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        val best = TorrentRescue.pickBest(candidates, expectedName, expectedBytes)
+        if (best == null) {
+            com.winwasm64.vpn.ConnTrace.torrent(
+                "автозамена",
+                "замены нет: проверено ${candidates.size} вариантов",
+                ok = false,
+                note = "у всех либо 0 сидов, либо другое название/размер — пустышку не качаем"
+            )
+            return false
+        }
+
+        com.winwasm64.vpn.ConnTrace.torrent(
+            "автозамена",
+            "найдено: ${best.name.take(60)} · сидов ${best.seeders} · ${formatSize(best.sizeBytes)} (${best.source})",
+            true
+        )
+        task.paused.set(true)
+        task.state = TorrentState.PAUSED
+        task.statusDetail = "Пиров 0 — эта раздача мертва. Найдена замена: ${best.name.take(50)} " +
+            "(сидов ${best.seeders}, ${formatSize(best.sizeBytes)}) — запускаю её."
+        try {
+            startFromMagnetOrUrl(best.magnet)
+        } catch (_: Throwable) {
+            return false
+        }
+        return true
     }
 
     private fun downloadViaWebSeedStream(
