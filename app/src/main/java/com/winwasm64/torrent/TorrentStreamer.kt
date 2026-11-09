@@ -91,12 +91,14 @@ object TorrentStreamer {
         val target = File(dir, fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_"))
         file = target
         if (!target.exists()) target.createNewFile()
-        if (source.peers.isEmpty()) {
-            statusText = "В раздаче 0 пиров — смотреть нечего (нужен сид)"
+        // v4.45.0: бывает и 0 живых пиров, но файл лежит на сервере (веб-сид) — тогда поток возможен
+        if (source.peers.isEmpty() && meta.webSeeds.isEmpty()) {
+            statusText = "В раздаче 0 пиров и нет веб-сида — смотреть нечего (нужен сид)"
             return false
         }
         playing = true
-        statusText = "Подключение к пирам…"
+        statusText = if (meta.webSeeds.isNotEmpty()) "Качаю напрямую с сервера (веб-сид)…"
+            else "Подключение к пирам…"
         worker = Thread({ pump(source, target, biggest) }, "TorrentStreamer").also { it.isDaemon = true; it.start() }
         return true
     }
@@ -117,15 +119,31 @@ object TorrentStreamer {
         val pieceCount = meta.pieceCount
         var downloaded = 0L
         val startedAt = System.currentTimeMillis()
+        var piece = 0
 
-        for (piece in 0 until pieceCount) {
-            if (stopFlag.get()) break
+        while (piece < pieceCount && !stopFlag.get()) {
             val pieceStart = piece.toLong() * pieceLen
             // куски вне выбранного файла пропускаем: не тратим трафик на сезон целиком
-            if (pieceStart + pieceLen <= rangeStart || pieceStart >= rangeEnd) continue
+            if (pieceStart + pieceLen <= rangeStart || pieceStart >= rangeEnd) { piece++; continue }
+
+            // v4.45.0: сначала пробуем веб-сид. У раздач Archive.org в .torrent прописан url-list:
+            // файл доступен по обычному HTTPS, и это работает там, где пиры ничего не отдают.
+            if (meta.webSeeds.isNotEmpty()) {
+                statusText = "Загрузка по HTTP с сервера: кусок ${piece + 1} из $pieceCount"
+                val got = webSeedPieces(meta.webSeeds, meta, piece, 4, target)
+                if (got > 0) {
+                    piece += got
+                    downloaded += got.toLong() * pieceLen
+                    availableBytes = minOf(downloaded, totalBytes)
+                    val elapsed = (System.currentTimeMillis() - startedAt).coerceAtLeast(1)
+                    speedBytesPerSec = downloaded * 1000 / elapsed
+                    continue
+                }
+            }
+
             var ok = false
             var attempts = 0
-            while (!ok && attempts < 3 && !stopFlag.get()) {
+            while (!ok && attempts < 3 && peers.isNotEmpty() && !stopFlag.get()) {
                 val peer = peers[(peerIndex++) % peers.size]
                 attempts++
                 statusText = "Загрузка по порядку: кусок ${piece + 1} из $pieceCount"
@@ -136,15 +154,148 @@ object TorrentStreamer {
                 }
             }
             if (!ok) {
-                statusText = "Пиры не отдали кусок ${piece + 1} — поток остановлен"
+                statusText = when {
+                    peers.isEmpty() -> "Пиров нет, веб-сид не отдал кусок ${piece + 1} — поток остановлен"
+                    else -> "Пиры не отдали кусок ${piece + 1} — поток остановлен"
+                }
                 break
             }
+            piece++
             downloaded += pieceLen.toLong()
             availableBytes = minOf(downloaded, totalBytes)
             val elapsed = (System.currentTimeMillis() - startedAt).coerceAtLeast(1)
             speedBytesPerSec = downloaded * 1000 / elapsed
         }
         statusText = if (availableBytes >= totalBytes && totalBytes > 0) "Загружено полностью" else "Поток: ${statusText}"
+    }
+
+    /**
+     * v4.45.0: взять до [maxPieces] кусков по HTTP из веб-сида (BEP 19 / url-list в .torrent).
+     * Каждый кусок сверяется с SHA-1 из .torrent — в файл не попадёт ничего непроверенного.
+     * Возвращает число записанных подряд кусков (0 — веб-сид не помог).
+     */
+    private fun webSeedPieces(
+        seeds: List<String>,
+        meta: TorrentMetadata,
+        firstPiece: Int,
+        maxPieces: Int,
+        target: File
+    ): Int {
+        val pieceLen = meta.pieceLength
+        val winStart = firstPiece.toLong() * pieceLen
+        val winEnd = minOf(meta.totalSize, winStart + maxPieces.toLong() * pieceLen)
+        if (winEnd <= winStart) return 0
+        val buf = ByteArray((winEnd - winStart).toInt())
+
+        // окно режем по файлам раздачи: у каждого файла свой адрес на сервере
+        for (f in meta.files) {
+            val from = maxOf(winStart, f.offsetInTorrent)
+            val to = minOf(winEnd, f.offsetInTorrent + f.length)
+            if (to <= from) continue
+            val offInFile = from - f.offsetInTorrent
+            val len = (to - from).toInt()
+            var got: ByteArray? = null
+            outer@ for (seed in seeds) {
+                for (url in webSeedUrls(seed, meta, f)) {
+                    val b = httpRange(url, offInFile, len)
+                    if (b != null && b.size == len) {
+                        got = b
+                        break@outer
+                    }
+                }
+            }
+            if (got == null) return 0
+            System.arraycopy(got, 0, buf, (from - winStart).toInt(), got.size)
+        }
+
+        var done = 0
+        var written = 0L
+        for (i in 0 until maxPieces) {
+            val p = firstPiece + i
+            if (p >= meta.pieceCount) break
+            val off = p.toLong() * pieceLen
+            if (off >= winEnd) break
+            val len = minOf(pieceLen.toLong(), meta.totalSize - off).toInt()
+            val from = (off - winStart).toInt()
+            if (from + len > buf.size) break
+            val data = buf.copyOfRange(from, from + len)
+            if (p < meta.pieceHashes.size && !BitTorrentParser.sha1(data).contentEquals(meta.pieceHashes[p])) break
+            // пишем только ту часть куска, что попадает в выбранный файл
+            val fileStart = maxOf(off, rangeStart)
+            val fileEnd = minOf(off + len, rangeEnd)
+            if (fileEnd > fileStart) {
+                RandomAccessFile(target, "rw").use { raf ->
+                    raf.seek(fileStart - rangeStart)
+                    raf.write(data, (fileStart - off).toInt(), (fileEnd - fileStart).toInt())
+                }
+                written += fileEnd - fileStart
+            }
+            done++
+        }
+        if (done > 0) availableBytes = minOf(availableBytes + written, totalBytes)
+        return done
+    }
+
+    /** Адреса файла на веб-сиде: <seed>/<путь> и <seed>/<имя раздачи>/<путь>. */
+    private fun webSeedUrls(seed: String, meta: TorrentMetadata, f: TorrentFileEntry): List<String> {
+        val base = seed.trimEnd('/')
+        val rel = f.relativePath.trimStart('/')
+        val urls = linkedSetOf<String>()
+        if (base.startsWith("http")) urls.add("$base/${encodePath(rel)}")
+        if (base.startsWith("http") && !rel.startsWith(meta.name + "/")) {
+            urls.add("$base/${encodePath(meta.name)}/${encodePath(rel)}")
+        }
+        return urls.toList()
+    }
+
+    private fun encodePath(path: String): String =
+        path.split('/').joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
+
+    /** HTTP Range-запрос: ровно [len] байт с [offset]. Редиректы проходим сами. */
+    private fun httpRange(url: String, offset: Long, len: Int, hops: Int = 0): ByteArray? {
+        if (hops > 5 || len <= 0) return null
+        return try {
+            val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 8000
+            c.readTimeout = 15000
+            c.instanceFollowRedirects = false
+            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) OmniBrowser/4.45")
+            c.setRequestProperty("Accept", "*/*")
+            c.setRequestProperty("Range", "bytes=$offset-${offset + len - 1}")
+            val code = c.responseCode
+            if (code in 300..399) {
+                val loc = c.getHeaderField("Location")
+                c.disconnect()
+                if (loc.isNullOrBlank()) return null
+                val next = if (loc.startsWith("http")) loc else java.net.URL(java.net.URL(url), loc).toString()
+                return httpRange(next, offset, len, hops + 1)
+            }
+            if (code != 206 && code != 200) {
+                c.disconnect()
+                return null
+            }
+            val inp = c.inputStream
+            if (code == 200) {
+                var skip = offset
+                while (skip > 0) {
+                    val s = inp.skip(skip)
+                    if (s <= 0) break
+                    skip -= s
+                }
+            }
+            val out = ByteArray(len)
+            var read = 0
+            while (read < len) {
+                val r = inp.read(out, read, len - read)
+                if (r <= 0) break
+                read += r
+            }
+            inp.close()
+            c.disconnect()
+            if (read == len) out else null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     /** Скачать один кусок целиком, запросив все его блоки (16 КБ) конвейером. */

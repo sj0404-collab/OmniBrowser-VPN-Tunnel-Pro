@@ -75,3 +75,35 @@ class CategoryAndQueryTest {
         assertEquals("pink floyd", TorrentSearchAgent.stripQueryNoise("pink floyd flac"))
     }
 }
+
+/** v4.45.0: ссылки поисковиков разворачиваются в настоящие адреса трекеров. */
+class SearchRedirectTest {
+
+    @Test
+    fun `ссылка DuckDuckGo разворачивается`() {
+        assertEquals(
+            "https://rutor.info/torrent/12345/sherlock",
+            TorrentSearchAgent.resolveSearchRedirect(
+                "https://duckduckgo.com/l/?uddg=https%3A%2F%2Frutor.info%2Ftorrent%2F12345%2Fsherlock&rut=abc"
+            )
+        )
+    }
+
+    @Test
+    fun `ссылка Google urlq разворачивается`() {
+        assertEquals(
+            "https://nnmclub.to/forum/viewtopic.php?t=999",
+            TorrentSearchAgent.resolveSearchRedirect(
+                "https://www.google.com/url?q=https%3A%2F%2Fnnmclub.to%2Fforum%2Fviewtopic.php%3Ft%3D999&sa=U"
+            )
+        )
+    }
+
+    @Test
+    fun `обычная ссылка не меняется`() {
+        assertEquals(
+            "https://byxatab.com/igry/12345-sherlock.html",
+            TorrentSearchAgent.resolveSearchRedirect("https://byxatab.com/igry/12345-sherlock.html")
+        )
+    }
+}

@@ -674,40 +674,108 @@ object TorrentSearchAgent {
     /* ===================== страница раздачи → magnet/.torrent ===================== */
 
     /**
-     * v4.44.0: универсальный разбор ЛЮБОЙ страницы раздачи, найденной где угодно (в том числе
-     * через поисковик): берём magnet, а если его нет — ссылку `do=download&id=` (DLE-сайты).
-     * Так поисковик может привести на незнакомый трекер, а приложение всё равно получит файл.
+     * v4.45.0: универсальный разбор ЛЮБОЙ страницы раздачи, найденной где угодно (в том числе
+     * через поисковик). Понимает:
+     *   • magnet: прямо в странице раздачи;
+     *   • .torrent по ссылке (в том числе протокол-относительной //host/file.torrent);
+     *   • DLE-сайты: index.php?do=download&id=N (byxatab, torrent-igruha, tapochek…);
+     *   • download.php / dl.php / d.rutor.info/download/N / gettorrent (rutor, kinozal, nnmclub, rutracker).
+     * Ссылки-редиректы поисковиков (google /url?q=, DDG uddg=, Bing a1…base64) разворачиваются.
      */
     fun fromPageUrl(pageUrl: String, title: String = "", timeoutMs: Int = 8000): Found? {
-        val page = httpGet(pageUrl, timeoutMs) ?: return null
+        val url = resolveSearchRedirect(pageUrl)
+        if (!url.startsWith("http")) return null
+        val page = httpGet(url, timeoutMs) ?: return null
+        val host = url.substringAfter("://").substringBefore('/')
+
         val magnet = Regex("magnet:\\?xt=urn:btih:[A-Fa-f0-9]{20,}[^\"'<\\s]*").find(page)?.value
-        val dlId = Regex("do=download&(?:amp;)?id=(\\d+)").find(page)?.groupValues?.get(1)
-        val directTorrent = Regex("href=\"([^\"]+\\.torrent)\"", RegexOption.IGNORE_CASE).find(page)?.groupValues?.get(1)
-        val sizeText = Regex("Размер[:\\s][^0-9]{0,20}([0-9]+[.,]?[0-9]*\\s*[KMGТ]?[Bb])")
-            .find(page)?.groupValues?.get(1) ?: ""
-        val host = pageUrl.substringAfter("://").substringBefore('/')
         val torrentUrl = when {
-            dlId != null -> "https://$host/index.php?do=download&id=$dlId"
-            directTorrent != null -> if (directTorrent.startsWith("http")) directTorrent
-                else "https://$host/" + directTorrent.trimStart('/')
-            else -> ""
+            magnet != null -> ""
+            else -> findTorrentLink(page, url) ?: ""
         }
         if (magnet.isNullOrBlank() && torrentUrl.isBlank()) return null
+
+        // v4.45.0: «11 КБ» — это размер страницы, а не раздачи. Меньше 1 МБ считаем «размер неизвестен».
+        val sizeText = Regex("(?:Размер|размер|Раздают|Size)[^0-9]{0,30}([0-9]+[.,]?[0-9]*\\s*(?:[KMGТ]?[Bb]|Гб|Мб|Кб))")
+            .find(page)?.groupValues?.get(1) ?: ""
+        val sizeBytes = TorrentRescue.parseSizeLabel(sizeText).takeIf { it >= 1_000_000L } ?: 0L
+
         val realTitle = title.ifBlank {
             Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).find(page)
                 ?.groupValues?.get(1)?.trim().orEmpty()
         }
         return Found(
-            name = realTitle.ifBlank { pageUrl.substringAfterLast('/') },
+            name = cleanPageTitle(realTitle).ifBlank { url.substringAfterLast('/') },
             magnet = magnet.orEmpty(),
             torrentUrl = torrentUrl,
-            referer = pageUrl,
-            sizeBytes = TorrentRescue.parseSizeLabel(sizeText),
+            referer = url,
+            sizeBytes = sizeBytes,
             seeders = 0,
             source = host,
             platform = Regex("Платформа[^>]*>(?:\\s*<[^>]+>)*\\s*([A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9 \\-]{2,24})")
                 .find(page)?.groupValues?.get(1)?.trim() ?: "",
-            poster = extractPoster(page, pageUrl)
+            poster = extractPoster(page, url)
         )
     }
+
+    /** Найти на странице ссылку на сам .torrent (все известные варианты оформления). */
+    private fun findTorrentLink(page: String, pageUrl: String): String? {
+        val host = pageUrl.substringAfter("://").substringBefore('/')
+        val hrefs = Regex("(?:href|data-href|data-url)\\s*=\\s*[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
+            .findAll(page).map { it.groupValues[1].replace("&amp;", "&") }.toList()
+        val patterns = listOf(
+            Regex("\\.torrent(?:[?#]|$)", RegexOption.IGNORE_CASE),
+            Regex("do=download", RegexOption.IGNORE_CASE),
+            Regex("download\\.php", RegexOption.IGNORE_CASE),
+            Regex("dl\\.php", RegexOption.IGNORE_CASE),
+            Regex("gettorrent", RegexOption.IGNORE_CASE),
+            Regex("/download/\\d+", RegexOption.IGNORE_CASE),
+            Regex("attach\\(", RegexOption.IGNORE_CASE)
+        )
+        for (h in hrefs) {
+            if (h.startsWith("javascript") || h.startsWith("#")) continue
+            if (patterns.none { it.containsMatchIn(h) }) continue
+            val abs = when {
+                h.startsWith("http") -> h
+                h.startsWith("//") -> "https:$h"
+                h.startsWith("/") -> "https://$host$h"
+                else -> "https://$host/$h"
+            }
+            return abs
+        }
+        return null
+    }
+
+    /** Развернуть ссылку-редирект поисковика в настоящий адрес. */
+    fun resolveSearchRedirect(link: String): String {
+        try {
+            if (link.contains("duckduckgo.com/l/")) {
+                val target = Regex("[?&]uddg=([^&]+)").find(link)?.groupValues?.get(1)
+                return target?.let { java.net.URLDecoder.decode(it, "UTF-8") } ?: link
+            }
+            if (link.contains("/url?")) {
+                for (key in listOf("q", "url")) {
+                    val target = Regex("[?&]$key=([^&]+)").find(link)?.groupValues?.get(1) ?: continue
+                    val dec = java.net.URLDecoder.decode(target, "UTF-8")
+                    if (dec.startsWith("http")) return dec
+                }
+            }
+            if (link.contains("bing.com/ck/a") && link.contains("u=a1")) {
+                val b64 = Regex("[?&]u=a1([^&]+)").find(link)?.groupValues?.get(1)
+                if (b64 != null) {
+                    val padded = b64 + "=".repeat((4 - b64.length % 4) % 4)
+                    val dec = String(android.util.Base64.decode(padded, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING))
+                    if (dec.startsWith("http")) return dec
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return link
+    }
+
+    private fun cleanPageTitle(raw: String): String =
+        raw.replace(Regex("\\s+"), " ")
+            .replace(Regex("(?i)\\s*[|—–-]\\s*(скачать|торрент|torrent|бесплатно).*$"), "")
+            .trim()
+            .take(110)
 }

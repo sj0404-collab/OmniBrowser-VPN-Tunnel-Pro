@@ -32,6 +32,18 @@ class TorrentWebSearchActivity : Activity() {
     private lateinit var status: TextView
     private var query = ""
 
+    /** v4.45.0: движки по порядку. Если один отдал пустую выдачу (Google в WebView часто рисует
+     * только «скелетоны») — автоматически пробуем следующий, а не оставляем человека с пустым экраном. */
+    private val engines = listOf(
+        "Google" to "https://www.google.com/search?q=",
+        "Яндекс" to "https://yandex.ru/search/?text=",
+        "DuckDuckGo" to "https://html.duckduckgo.com/html/?q=",
+        "Bing" to "https://www.bing.com/search?q="
+    )
+    private var engineIndex = 0
+    private var triedFallback = false
+    private val seen = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         query = intent.getStringExtra("query").orEmpty()
@@ -52,14 +64,19 @@ class TorrentWebSearchActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
-        listOf("Google" to "https://www.google.com/search?q=", "Яндекс" to "https://yandex.ru/search/?text=", "DDG" to "https://duckduckgo.com/?q=")
-            .forEach { (name, base) ->
-                top.addView(Button(this).apply {
-                    text = name
-                    textSize = 11f
-                    setOnClickListener { load(base + android.net.Uri.encode("$query torrent")) }
-                })
-            }
+        engines.forEachIndexed { idx, (name, base) ->
+            top.addView(Button(this).apply {
+                text = if (name == "DuckDuckGo") "DDG" else name
+                textSize = 11f
+                setOnClickListener {
+                    engineIndex = idx
+                    triedFallback = false
+                    seen.clear()
+                    resultsBox.removeAllViews()
+                    load(base + android.net.Uri.encode("$query torrent"))
+                }
+            })
+        }
         root.addView(top)
 
         status = TextView(this).apply {
@@ -94,7 +111,7 @@ class TorrentWebSearchActivity : Activity() {
         root.addView(scroll)
 
         setContentView(root)
-        load("https://www.google.com/search?q=" + android.net.Uri.encode("$query torrent"))
+        load(engines[0].second + android.net.Uri.encode("$query torrent"))
     }
 
     private fun load(url: String) {
@@ -102,7 +119,7 @@ class TorrentWebSearchActivity : Activity() {
         web.loadUrl(url)
     }
 
-    /** Собрать ссылки со страницы выдачи и оставить только трекеры/magnet. */
+    /** Собрать ссылки со страницы выдачи; редиректы поисковиков разворачиваются в Kotlin. */
     private fun collectLinks() {
         val js = """
             (function() {
@@ -111,49 +128,103 @@ class TorrentWebSearchActivity : Activity() {
               for (var i = 0; i < as.length; i++) {
                 var h = as[i].href || '';
                 var t = (as[i].innerText || '').replace(/\s+/g, ' ').trim();
-                if (!h) continue;
+                if (!h || h.indexOf('javascript:') === 0) continue;
                 if (h.indexOf('magnet:') === 0) { out.push('MAGNET|' + h + '|' + t); continue; }
-                if (/(rutor|nnmclub|rutracker|kinozal|torrent-igruha|byxatab|brotorrent|catorrent|1337x|kickass|torrentdownloads|limetorrents|yts|torrentgalaxy|tapochek|bitru|nnm-club|piratebay|magnetdl)/i.test(h)) {
-                  out.push('PAGE|' + h + '|' + t);
-                }
+                out.push('PAGE|' + h + '|' + t);
               }
-              return out.slice(0, 40).join('\n');
+              return out.slice(0, 150).join('\n');
             })();
         """.trimIndent()
         web.evaluateJavascript(js) { raw ->
-            val decoded = raw?.replace("\\n", "\n")?.trim('"')?.replace("\\\"", "\"")?.replace("\\\\", "\\")
+            val decoded = raw?.replace("\\n", "\n")?.trim('"')
+                ?.replace("\\\"", "\"")?.replace("\\\\", "\\")
             val lines = decoded?.split('\n')?.filter { it.contains('|') } ?: emptyList()
-            if (lines.isEmpty()) {
-                status.text = "Ссылок на трекеры на этой странице нет. Попробуйте другой поисковик или прокрутите выдачу."
+
+            // magnet-ссылки берём как есть; страницы — только похожие на трекеры
+            val magnets = mutableListOf<Triple<String, String, String>>()
+            val pages = linkedMapOf<String, String>()
+            for (line in lines) {
+                val parts = line.split('|')
+                val kind = parts.getOrNull(0) ?: continue
+                val url = parts.getOrNull(1) ?: continue
+                val title = parts.getOrNull(2) ?: ""
+                if (kind == "MAGNET") {
+                    magnets.add(Triple(kind, url, title))
+                    continue
+                }
+                val real = TorrentSearchAgent.resolveSearchRedirect(url)
+                if (!real.startsWith("http")) continue
+                if (!looksLikeTracker(real)) continue
+                val key = real.substringBefore('#')
+                if (!pages.containsKey(key)) pages[key] = title
+                if (pages.size >= 16) break
+            }
+
+            if (magnets.isEmpty() && pages.isEmpty()) {
+                // пустая выдача: пробуем следующий поисковик сами
+                if (!triedFallback && engines.size > 1) {
+                    triedFallback = true
+                    val next = (engineIndex + 1) % engines.size
+                    engineIndex = next
+                    status.text = "«${engines[engineIndex].first}» ничего не отдал — пробую «${engines[next].first}»…"
+                    load(engines[next].second + android.net.Uri.encode("$query torrent"))
+                } else {
+                    status.text = "Ни один поисковик не отдал ссылок. Проверьте запрос или откройте поиск сами."
+                }
                 return@evaluateJavascript
             }
+
             resultsBox.removeAllViews()
-            status.text = "Найдено ссылок: ${lines.size} — проверяю…"
+            seen.clear()
+            status.text = "Проверяю ${magnets.size + pages.size} ссылок из «${engines[engineIndex].first}»…"
             Thread({
                 var added = 0
-                for (line in lines) {
-                    if (added >= 8) break
-                    val parts = line.split('|')
-                    val kind = parts.getOrNull(0) ?: continue
-                    val url = parts.getOrNull(1) ?: continue
-                    val title = parts.getOrNull(2) ?: ""
-                    val found = when (kind) {
-                        "MAGNET" -> TorrentSearchAgent.Found(
-                            name = title.ifBlank { "magnet" },
-                            magnet = url,
-                            source = "поисковик"
-                        )
-                        else -> TorrentSearchAgent.fromPageUrl(url, title)
-                    } ?: continue
+                for ((_, url, title) in magnets) {
+                    if (added >= 12) break
+                    val found = TorrentSearchAgent.Found(
+                        name = title.ifBlank { "magnet" },
+                        magnet = url,
+                        source = "magnet со страницы"
+                    )
                     added++
                     runOnUiThread { addResultRow(found) }
                 }
+                // страницы разбираем параллельно: так 16 ссылок не ждут друг друга по 8 секунд
+                val queue = java.util.concurrent.LinkedBlockingQueue<Pair<String, String>>(pages.map { it.key to it.value })
+                val workers = (1..3).map {
+                    Thread({
+                        while (true) {
+                            val next = queue.poll() ?: break
+                            if (added >= 12) break
+                            val found = try {
+                                TorrentSearchAgent.fromPageUrl(next.first, next.second)
+                            } catch (_: Throwable) {
+                                null
+                            } ?: continue
+                            synchronized(seen) {
+                                val key = found.magnet.ifBlank { found.torrentUrl }
+                                if (key.isNotBlank() && !seen.add(key)) continue
+                                added++
+                            }
+                            runOnUiThread { addResultRow(found) }
+                        }
+                    }, "WebSearchParse$it").also { it.isDaemon = true; it.start() }
+                }
+                workers.forEach { it.join(25_000) }
                 runOnUiThread {
-                    status.text = if (added == 0) "По ссылкам не удалось вытащить ни magnet, ни .torrent"
-                    else "Готово: $added вариантов ниже"
+                    status.text = when {
+                        added == 0 -> "По ссылкам не удалось вытащить ни magnet, ни .torrent. Откройте страницу раздачи в браузере — ссылка на .torrent часто появляется после клика."
+                        else -> "Готово: $added вариантов ниже"
+                    }
                 }
             }, "WebSearchParse").also { it.isDaemon = true; it.start() }
         }
+    }
+
+    private fun looksLikeTracker(url: String): Boolean {
+        val host = url.substringAfter("://").substringBefore('/').lowercase()
+        return Regex("(torrent|torr|tracker|rutor|nnm|rutracker|kinozal|pirat|byxatab|catorrent|tapochek|bitru|igruha|zooqle|yts|1337x|kickass|limetorrent|magnet|btdig|galaxy|rustorrent|bt\.|bt-|тorrent)", RegexOption.IGNORE_CASE)
+            .containsMatchIn(host)
     }
 
     private fun addResultRow(found: TorrentSearchAgent.Found) {
