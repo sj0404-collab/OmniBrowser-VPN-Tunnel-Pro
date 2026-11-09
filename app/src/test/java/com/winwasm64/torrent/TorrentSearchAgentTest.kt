@@ -84,4 +84,21 @@ class TorrentSearchAgentTest {
         assertTrue(analogs.isNotEmpty())
         assertTrue(analogs.none { it.name == "Совсем другое" })
     }
+
+    @Test
+    fun `ПК-каталоги без счётчика сидов всё равно считаются годными`() {
+        val intent = TorrentSearchAgent.parseIntent("stalker pc repack")
+        val found = listOf(
+            f("STALKER Тень Чернобыля (PC) Repack", seeders = 0, size = 2_400_000_000L,
+                source = "igruha", magnet = "", torrentUrl = "https://torrent-igruha.org/index.php?do=download&id=12359")
+        )
+        val ranked = TorrentSearchAgent.rank(found, intent, "STALKER Тень Чернобыля", 2_400_000_000L)
+        assertTrue(TorrentSearchAgent.bestForAutoStart(ranked, intent, "STALKER Тень Чернобыля", 2_400_000_000L) != null)
+    }
+
+    @Test
+    fun `чужие результаты отсекаются по словам запроса`() {
+        assertTrue(TorrentSearchAgent.sharesWord("STALKER Тень Чернобыля (PC)", "stalker"))
+        assertTrue(!TorrentSearchAgent.sharesWord("Cyberpunk 2077", "stalker"))
+    }
 }
