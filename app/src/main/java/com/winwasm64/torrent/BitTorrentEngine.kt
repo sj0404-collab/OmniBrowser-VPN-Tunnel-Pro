@@ -229,7 +229,9 @@ data class CatalogTorrentItem(
     /** Some сайты (catorrent) отдают .torrent только с Referer страницы. */
     val referer: String = "",
     /** v4.41.0: обложка (og:image со страницы) — превью вместо голого текста. */
-    val poster: String = ""
+    val poster: String = "",
+    /** v4.42.0: категория для фильтра — game/video/music/book/soft/other. */
+    val category: String = "other"
 )
 
 object BitTorrentParser {
@@ -677,7 +679,8 @@ class BitTorrentEngine(private val context: Context? = null) {
                             seeders = f.seeders,
                             reason = f.reason,
                             referer = f.referer,
-                            poster = f.poster
+                            poster = f.poster,
+                            category = f.category
                         )
                     )
                 }
@@ -884,7 +887,20 @@ class BitTorrentEngine(private val context: Context? = null) {
                     break
                 }
             }
-            metadata = if (got != null) BitTorrentParser.parseTorrentBytes(got) else return null
+            if (got != null) {
+                metadata = BitTorrentParser.parseTorrentBytes(got)
+            } else {
+                // v4.42.0: кэши не отдали .torrent — берём метаданные прямо у пиров (ut_metadata).
+                // Без этого magnet-раздачи из открытых каталогов вообще не открывались в плеере.
+                val magTrackers = (mag.trackers + TorrentRescue.EXTRA_TRACKERS).distinct()
+                val magPeers = LinkedHashSet<PeerEndpoint>()
+                for (tr in magTrackers.take(8)) {
+                    if (magPeers.size >= 40) break
+                    magPeers.addAll(announceTracker(tr, mag.infoHash, mag.exactLength.coerceAtLeast(10_485_760L)))
+                }
+                val fetched = MagnetMetadata.fetch(mag.infoHash, mag.infoHashHex, magPeers.toList())
+                metadata = fetched ?: return null
+            }
         } else {
             return null
         }

@@ -41,6 +41,7 @@ object TorrentSearchAgent {
         val source: String = "",
         val platform: String = "",
         val poster: String = "",
+        var category: String = "other",
         var score: Double = 0.0,
         var reason: String = ""
     ) {
@@ -387,6 +388,7 @@ object TorrentSearchAgent {
     ): List<Found> {
         val needle = intent.title.ifBlank { expectedName }
         for (f in found) {
+            f.category = classify(f.name, f.platform, f.source)
             val sim = TorrentRescue.similarity(needle, f.name)
             val seedScore = when {
                 f.seeders <= 0 -> 0.0
@@ -456,4 +458,46 @@ object TorrentSearchAgent {
             .filter { it.seeders >= 1 || it.source in CATALOG_SOURCES }
             .filter { it.magnet.startsWith("magnet:", true) || it.torrentUrl.isNotBlank() }
             .take(limit)
+
+    /* ===================== категории ===================== */
+
+    /** Категории для фильтра в списке результатов. */
+    val CATEGORIES = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "💾 Софт")
+
+    private val VIDEO_EXT = listOf("mkv", "mp4", "avi", "bdrip", "webrip", "web-dl", "dvdrip", "hdtv", "x264", "x265", "hevc", "1080p", "720p", "2160p", "camrip", "bdremux")
+    private val MUSIC_EXT = listOf("flac", "mp3", "lossless", "aac", "wav", "album", "discography", "ost", "soundtrack", "m4a", "opus")
+    private val BOOK_EXT = listOf("epub", "fb2", "pdf", "mobi", "djvu", "cbz", "cbr", "manga", "манга", "книга", "novel", "роман", "аудиокнига", "lib")
+    private val SOFT_EXT = listOf("exe", "msi", "apk", "iso", "dmg", "portable", "лицензия", "office", "windows", "photoshop", "kms")
+    private val GAME_EXT = listOf("repack", "репак", "nsz", "nsp", "xci", "game", "игра", "switch", "ps4", "ps5", "xbox", " steam", "gog")
+
+    /**
+     * v4.42.0: к какой категории отнести раздачу.
+     * Решаем по расширениям/словам в названии и по платформе. Это эвристика — но она объяснима,
+     * и её всегда можно переопределить фильтром «Все».
+     */
+    fun classify(name: String, platform: String = "", source: String = ""): String {
+        val n = name.lowercase()
+        fun has(list: List<String>) = list.any { n.contains(it) }
+        return when {
+            has(GAME_EXT) || platform.isNotBlank() -> "game"
+            has(VIDEO_EXT) -> "video"
+            has(MUSIC_EXT) -> "music"
+            has(BOOK_EXT) -> "book"
+            has(SOFT_EXT) -> "soft"
+            // источники-игровые каталоги
+            source in CATALOG_SOURCES -> "game"
+            else -> "other"
+        }
+    }
+
+    /** Категория → подпись чипа. */
+    fun categoryMatches(chip: String, category: String): Boolean = when (chip) {
+        "Все" -> true
+        "🎮 Игры" -> category == "game"
+        "🎬 Видео" -> category == "video"
+        "🎵 Музыка" -> category == "music"
+        "📚 Книги" -> category == "book"
+        "💾 Софт" -> category == "soft"
+        else -> true
+    }
 }

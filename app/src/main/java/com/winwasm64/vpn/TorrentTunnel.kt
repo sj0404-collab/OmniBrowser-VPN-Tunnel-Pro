@@ -39,6 +39,10 @@ object TorrentTunnel {
      * TCP-соединение до пира через канал браузера.
      * null — канал недоступен или не пустил; вызывающий идёт напрямую.
      */
+    /** v4.42.0: чем реально открылось последнее соединение — это и показываем человеку. */
+    @Volatile var lastChannel: String = "не было соединений"
+        private set
+
     fun connect(host: String, port: Int, timeoutMs: Int = 6000): Socket? {
         // 1) канал браузера (Browsec)
         proxyOrNull()?.let { proxy ->
@@ -47,6 +51,7 @@ object TorrentTunnel {
                 s.tcpNoDelay = true
                 s.connect(InetSocketAddress(host, port), timeoutMs)
                 s.soTimeout = 8000
+                lastChannel = "Browsec (канал браузера)"
                 return s
             } catch (_: Throwable) {
             }
@@ -57,11 +62,13 @@ object TorrentTunnel {
             val s = ReserveDialer.connect(up, host, port, timeoutMs = timeoutMs)
             if (s != null) {
                 ReserveChain.reportSuccess(up)
+                lastChannel = "резерв: " + up.label
                 return s
             }
             ReserveChain.reportFailure(up, "пир $host:$port через резерв не открылся")
         }
         // 3) напрямую — как было, чтобы торрент не зависел от VPN
+        lastChannel = "напрямую (без прокси)"
         return null
     }
 }
