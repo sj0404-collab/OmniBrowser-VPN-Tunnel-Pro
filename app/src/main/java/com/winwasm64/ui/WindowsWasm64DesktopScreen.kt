@@ -3662,11 +3662,20 @@ private fun TorrentClientSection(
     var isSearching by remember { mutableStateOf(false) }
     // v4.42.0: фильтр по категориям — игры/видео/музыка/книги/софт
     var categoryFilter by remember { mutableStateOf("Все") }
-    val visibleItems = remember(catalogItems, categoryFilter) {
+    // v4.43.0: фильтр по качеству/формату — «хочу 360p» или «только FLAC»
+    var qualityFilter by remember { mutableStateOf("") }
+    val byCategory = remember(catalogItems, categoryFilter) {
         if (categoryFilter == "Все") catalogItems
         else catalogItems.filter {
             com.winwasm64.torrent.TorrentSearchAgent.categoryMatches(categoryFilter, it.kind)
         }
+    }
+    // какие качества реально есть в выдаче — показываем только их, чтобы не врать
+    val qualityOptions = remember(byCategory) {
+        byCategory.map { it.quality }.filter { it.isNotBlank() }.distinct()
+    }
+    val visibleItems = remember(byCategory, qualityFilter) {
+        if (qualityFilter.isBlank()) byCategory else byCategory.filter { it.quality == qualityFilter }
     }
     // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
@@ -4070,12 +4079,38 @@ private fun TorrentClientSection(
                         }
                     }
                 }
+                if (qualityOptions.size > 1) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // «Любое» + только те разрешения, что есть у найденных раздач
+                            listOf("").plus(qualityOptions).forEach { q ->
+                                val sel = q == qualityFilter
+                                Surface(
+                                    color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.clickable { qualityFilter = q }
+                                ) {
+                                    Text(
+                                        if (q.isBlank()) "Любое качество" else q,
+                                        color = Color.White, fontSize = 10.sp,
+                                        fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 item {
                     Text(
                         text = "Найдено раздач: ${catalogItems.size}" +
                             (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
                             (if (isSearching) " · ищу…" else "") +
-                            (if (categoryFilter != "Все") " · фильтр: $categoryFilter" else ""),
+                            (if (categoryFilter != "Все") " · фильтр: $categoryFilter" else "") +
+                            (if (qualityFilter.isNotBlank()) " · качество: $qualityFilter" else ""),
                         color = Omni.Warning,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
@@ -4103,7 +4138,9 @@ private fun TorrentClientSection(
                             Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             Text(
                                 "${item.category} • Размер: ${item.sizeLabel}" +
-                                    (if (item.seeders > 0) " • Сидов: ${item.seeders}" else ""),
+                                    (if (item.seeders > 0) " • Сидов: ${item.seeders}" else "") +
+                                    (if (item.quality.isNotBlank()) " • ${item.quality}" else "") +
+                                    (if (item.codec.isNotBlank()) " • ${item.codec}" else ""),
                                 color = Omni.Accent, fontSize = 11.sp
                             )
                             Text(item.description, color = Omni.TextDim, fontSize = 11.sp, maxLines = 2)

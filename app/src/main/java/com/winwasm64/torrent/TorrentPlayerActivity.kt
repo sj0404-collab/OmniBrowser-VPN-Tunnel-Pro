@@ -205,7 +205,17 @@ class TorrentPlayerActivity : Activity() {
         val total = BitTorrentEngine.formatSize(TorrentStreamer.totalBytes)
         val speed = BitTorrentEngine.formatSpeed(TorrentStreamer.speedBytesPerSec)
         val channel = com.winwasm64.vpn.TorrentTunnel.lastChannel
-        status.text = "${TorrentStreamer.statusText}\n$have из $total · ↓ $speed · канал: $channel"
+        val format = com.winwasm64.torrent.TorrentSearchAgent.formatLabel(
+            com.winwasm64.torrent.TorrentSearchAgent.Found(name = TorrentStreamer.fileName)
+                .let { f ->
+                    f.quality = com.winwasm64.torrent.TorrentSearchAgent.qualityOf(TorrentStreamer.fileName)
+                    f.codec = com.winwasm64.torrent.TorrentSearchAgent.codecOf(TorrentStreamer.fileName)
+                    f.audio = com.winwasm64.torrent.TorrentSearchAgent.audioOf(TorrentStreamer.fileName)
+                    f
+                }
+        )
+        status.text = "${TorrentStreamer.statusText}\n$have из $total · ↓ $speed · канал: $channel" +
+            (if (format.isNotBlank()) "\nформат: $format" else "")
     }
 
     override fun onDestroy() {
