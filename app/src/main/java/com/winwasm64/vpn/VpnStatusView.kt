@@ -41,6 +41,10 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     private val btnAdd = TextView(context)
     private val btnTunnel = TextView(context)
     private val btnPsiphon = TextView(context)
+    /** v4.36.0: панель диагностики каналов. */
+    private val btnDiag = TextView(context)
+    private val tvDiag = TextView(context)
+    @Volatile private var diagRunning = false
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -108,6 +112,38 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             refresh()
         })
         addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+
+        // v4.36.0: «Диагностика каналов» — одна кнопка, честная таблица: DNS, Browsec, Psiphon,
+        // резервные прокси, выход в интернет. Нужна ровно в тот момент, когда «нет сети» и непонятно почему.
+        val diagRow = LinearLayout(context).apply { orientation = HORIZONTAL }
+        diagRow.addView(pill(btnDiag, "🩺 Диагностика каналов") {
+            if (diagRunning) {
+                Toast.makeText(context, "Проверка уже идёт…", Toast.LENGTH_SHORT).show()
+                return@pill
+            }
+            diagRunning = true
+            btnDiag.text = "Проверяю…"
+            tvDiag.text = "Проверяю сеть, DNS, Browsec, Psiphon и резервы…"
+            Thread({
+                val rows = try {
+                    ChannelCheck.runAll()
+                } catch (e: Exception) {
+                    emptyList<ChannelCheck.Row>()
+                }
+                val text = if (rows.isEmpty()) "Проверка не удалась: все шаги упали" else ChannelCheck.summary(rows)
+                handler.post {
+                    tvDiag.text = text
+                    btnDiag.text = "🩺 Диагностика каналов"
+                    diagRunning = false
+                }
+            }, "ChannelCheck").start()
+        }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        addView(diagRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+
+        styleText(tvDiag, 11f, 0xFFCFD3D8.toInt())
+        tvDiag.typeface = Typeface.MONOSPACE
+        tvDiag.text = "Нажмите «Диагностика каналов», когда что-то не открывается: будет видно, какой именно канал отказал и почему."
+        addView(tvDiag)
         // v4.1.0: приложения через серверы Browsec (настоящая смена IP) или напрямую с обходом DPI
         pill(btnTunnel, "") {
             val on = !BrowsecVpnService.appsViaBrowsecTunnel

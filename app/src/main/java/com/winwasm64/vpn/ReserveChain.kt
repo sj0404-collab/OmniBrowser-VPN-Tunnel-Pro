@@ -156,6 +156,9 @@ object ReserveChain {
 
     fun poolSize(): Int = pool.size
 
+    /** v4.36.0: текущий пул — нужен диагностике, чтобы проверить несколько прокси вживую. */
+    fun poolList(): List<ReservePool.Proxy> = pool
+
     /** Вызывается, когда Psiphon поднял локальный прокси (HTTP или SOCKS5). */
     fun setPsiphonPort(port: Int, socks: Boolean = false) {
         if (socks) psiphonSocksPort = port else psiphonHttpPort = port
