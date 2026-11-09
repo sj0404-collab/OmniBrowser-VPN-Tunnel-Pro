@@ -19,7 +19,8 @@ class TorrentRescueTest {
     fun `имя раздачи чистится до поискового запроса`() {
         assertEquals("elliot quest", TorrentRescue.cleanQuery("[catorrent.net]-elliot-quest-nsz.torrent"))
         assertEquals("crafty survivors", TorrentRescue.cleanQuery("Crafty Survivors [NSZ].torrent"))
-        assertEquals("zelda tears kingdom", TorrentRescue.cleanQuery("The Legend of Zelda - Tears (RU).nsp"))
+        // служебные слова выкидываются: «The … of» в каталогах только мешают
+        assertEquals("legend zelda tears", TorrentRescue.cleanQuery("The Legend of Zelda - Tears (RU).nsp"))
     }
 
     @Test

@@ -59,7 +59,9 @@ object TorrentRescue {
     private val NOISE = setOf(
         "torrent", "torrents", "nsp", "nsz", "xci", "cia", "3ds", "switch", "pc", "ps4", "ps5",
         "repack", "rip", "webrip", "web", "dl", "rus", "eng", "multi", "iso", "exe", "apk",
-        "каторрент", "catorrent", "nnm", "club", "net", "com", "org", "www"
+        "каторрент", "catorrent", "nnm", "club", "net", "com", "org", "www",
+        // служебные слова — в поиске по каталогам только мешают
+        "the", "of", "and", "for", "with", "und", "der", "die", "das"
     )
 
     /**
@@ -67,8 +69,12 @@ object TorrentRescue {
      * `[catorrent.net]-elliot-quest-nsz.torrent` → `elliot quest`
      */
     fun cleanQuery(raw: String): String {
-        var s = raw
-        s = s.substringBeforeLast(".torrent", s).substringBeforeLast(".nsp", s).substringBeforeLast(".nsz", s)
+        var s = raw.trim()
+        // расширения отрезаем по одному: substringBeforeLast с общим missingDelimiterValue
+        // сбрасывал строку к исходной, если расширения не было
+        for (ext in listOf(".torrent", ".nsp", ".nsz", ".xci", ".zip", ".rar")) {
+            if (s.endsWith(ext, ignoreCase = true)) s = s.dropLast(ext.length)
+        }
         s = s.replace(Regex("\\[[^\\]]*\\]"), " ")          // [NSZ], [catorrent.net]
         s = s.replace(Regex("\\([^)]*\\)"), " ")           // (2023), (RU)
         s = s.replace('_', ' ').replace('.', ' ').replace('-', ' ').replace('+', ' ')
