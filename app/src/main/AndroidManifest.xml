@@ -169,6 +169,11 @@
             </intent-filter>
         </activity>
         <activity
+            android:name="com.winwasm64.torrent.TorrentWebSearchActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+        <activity
             android:name="com.winwasm64.torrent.TorrentPlayerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"

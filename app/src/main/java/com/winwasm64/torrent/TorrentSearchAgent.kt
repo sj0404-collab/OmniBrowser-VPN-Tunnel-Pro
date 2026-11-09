@@ -148,6 +148,18 @@ object TorrentSearchAgent {
             "https://rutor.info"
         ),
         MagnetSite(
+            "kickass",
+            { q -> "https://kickasstorrents.to/usearch/$q/" },
+            Regex("href=\"(/[a-z0-9\\-]+-t\\d+\\.html)\"[^>]*>(.*?)</a>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)),
+            "https://kickasstorrents.to"
+        ),
+        MagnetSite(
+            "torrentdownloads",
+            { q -> "https://www.torrentdownloads.pro/search/?search=$q" },
+            Regex("href=\"(/torrent/\\d+/[^\"#]+)\"[^>]*>(.*?)</a>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)),
+            "https://www.torrentdownloads.pro"
+        ),
+        MagnetSite(
             "nnmclub",
             { q -> "https://nnmclub.to/forum/tracker.php?nm=$q" },
             Regex(
@@ -192,7 +204,9 @@ object TorrentSearchAgent {
     /** Ищем везде сразу, параллельно. Блокирующий вызов — из фонового потока. */
     fun searchAll(query: String, timeoutMs: Int = 7000): List<Found> {
         val intent = parseIntent(query)
-        val q = intent.title.ifBlank { query.trim() }
+        // v4.44.0: сайтам отдаём название БЕЗ качества/формата («шерлок», а не «шерлок 360p»),
+        // иначе поиск по трекерам возвращает пустоту, а фильтр по качеству убивает всё остальное
+        val q = stripQueryNoise(intent.title.ifBlank { query.trim() })
         if (q.isBlank()) return emptyList()
         val encoded = URLEncoder.encode(q, "UTF-8")
         val out = java.util.Collections.synchronizedList(ArrayList<Found>())
@@ -500,7 +514,8 @@ object TorrentSearchAgent {
     private val MUSIC_EXT = listOf("flac", "mp3", "lossless", "aac", "wav", "album", "discography", "ost", "soundtrack", "m4a", "opus")
     private val BOOK_EXT = listOf("epub", "fb2", "pdf", "mobi", "djvu", "cbz", "cbr", "manga", "манга", "книга", "novel", "роман", "аудиокнига", "lib")
     private val SOFT_EXT = listOf("exe", "msi", "apk", "iso", "dmg", "portable", "лицензия", "office", "windows", "photoshop", "kms")
-    private val GAME_EXT = listOf("repack", "репак", "nsz", "nsp", "xci", "game", "игра", "switch", "ps4", "ps5", "xbox", " steam", "gog")
+    // «game»/«игра» из признаков убраны: в названиях фильмов они встречаются чаще, чем в играх
+    private val GAME_EXT = listOf("repack", "репак", "nsz", "nsp", "xci", "switch", "ps4", "ps5", "xbox", "steam", "gog", "лицензия")
 
     /**
      * v4.42.0: к какой категории отнести раздачу.
@@ -510,14 +525,14 @@ object TorrentSearchAgent {
     fun classify(name: String, platform: String = "", source: String = ""): String {
         val n = name.lowercase()
         fun has(list: List<String>) = list.any { n.contains(it) }
+        // v4.44.0: сначала признаки ФИЛЬМА/МУЗЫКИ/КНИГИ. Раньше слово «Game» в названии фильма
+        // («Шерлок Холмс: Игра теней») отправляло видео в «Игры». Признак формата важнее слов.
         return when {
-            has(GAME_EXT) || platform.isNotBlank() -> "game"
             has(VIDEO_EXT) -> "video"
             has(MUSIC_EXT) -> "music"
             has(BOOK_EXT) -> "book"
+            has(GAME_EXT) || platform.isNotBlank() || source in CATALOG_SOURCES -> "game"
             has(SOFT_EXT) -> "soft"
-            // источники-игровые каталоги
-            source in CATALOG_SOURCES -> "game"
             else -> "other"
         }
     }
@@ -643,4 +658,56 @@ object TorrentSearchAgent {
     /** Подпись формата для карточки: «720p · x264 · FLAC». */
     fun formatLabel(f: Found): String = listOf(f.quality, f.codec, f.audio)
         .filter { it.isNotBlank() }.joinToString(" · ")
+
+    /** Убрать из запроса к сайтам разрешение и формат: сайты ищут по названию. */
+    fun stripQueryNoise(query: String): String {
+        val words = query.split(' ').filter { w ->
+            val clean = w.removeSuffix("p").removeSuffix("р")
+            val num = clean.toIntOrNull()
+            num == null || num !in 200..4320
+        }.filter { w ->
+            w.lowercase() !in setOf("4k", "uhd", "fhd", "fullhd", "hd", "flac", "mp3", "lossless", "x264", "x265", "hevc", "av1", "ac3", "dts", "aac")
+        }
+        return words.joinToString(" ").trim().ifBlank { query }
+    }
+
+    /* ===================== страница раздачи → magnet/.torrent ===================== */
+
+    /**
+     * v4.44.0: универсальный разбор ЛЮБОЙ страницы раздачи, найденной где угодно (в том числе
+     * через поисковик): берём magnet, а если его нет — ссылку `do=download&id=` (DLE-сайты).
+     * Так поисковик может привести на незнакомый трекер, а приложение всё равно получит файл.
+     */
+    fun fromPageUrl(pageUrl: String, title: String = "", timeoutMs: Int = 8000): Found? {
+        val page = httpGet(pageUrl, timeoutMs) ?: return null
+        val magnet = Regex("magnet:\\?xt=urn:btih:[A-Fa-f0-9]{20,}[^\"'<\\s]*").find(page)?.value
+        val dlId = Regex("do=download&(?:amp;)?id=(\\d+)").find(page)?.groupValues?.get(1)
+        val directTorrent = Regex("href=\"([^\"]+\\.torrent)\"", RegexOption.IGNORE_CASE).find(page)?.groupValues?.get(1)
+        val sizeText = Regex("Размер[:\\s][^0-9]{0,20}([0-9]+[.,]?[0-9]*\\s*[KMGТ]?[Bb])")
+            .find(page)?.groupValues?.get(1) ?: ""
+        val host = pageUrl.substringAfter("://").substringBefore('/')
+        val torrentUrl = when {
+            dlId != null -> "https://$host/index.php?do=download&id=$dlId"
+            directTorrent != null -> if (directTorrent.startsWith("http")) directTorrent
+                else "https://$host/" + directTorrent.trimStart('/')
+            else -> ""
+        }
+        if (magnet.isNullOrBlank() && torrentUrl.isBlank()) return null
+        val realTitle = title.ifBlank {
+            Regex("<title>(.*?)</title>", RegexOption.DOT_MATCHES_ALL).find(page)
+                ?.groupValues?.get(1)?.trim().orEmpty()
+        }
+        return Found(
+            name = realTitle.ifBlank { pageUrl.substringAfterLast('/') },
+            magnet = magnet.orEmpty(),
+            torrentUrl = torrentUrl,
+            referer = pageUrl,
+            sizeBytes = TorrentRescue.parseSizeLabel(sizeText),
+            seeders = 0,
+            source = host,
+            platform = Regex("Платформа[^>]*>(?:\\s*<[^>]+>)*\\s*([A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9 \\-]{2,24})")
+                .find(page)?.groupValues?.get(1)?.trim() ?: "",
+            poster = extractPoster(page, pageUrl)
+        )
+    }
 }
