@@ -106,6 +106,33 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="magnet" />
             </intent-filter>
+            <!-- v4.33.0: .torrent открывается в нашем же клиенте, а не «чем-нибудь извне» -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/x-bittorrent" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\.torrent" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\.torrent" />
+            </intent-filter>
             <!-- локальные html / mhtml (сохранённые страницы) из файловых менеджеров -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />

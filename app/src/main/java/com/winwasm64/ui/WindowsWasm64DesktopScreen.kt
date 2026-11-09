@@ -680,6 +680,56 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         return path.endsWith(".torrent") || path.contains(".torrent/")
     }
 
+    /** v4.33.0: локальный файл — это .torrent? (по имени или по типу из ContentResolver). */
+    fun isLocalTorrentUri(uriStr: String): Boolean {
+        val lower = uriStr.lowercase()
+        if (lower.contains(".torrent")) return true
+        return try {
+            val type = context.contentResolver.getType(Uri.parse(uriStr))?.lowercase().orEmpty()
+            type.contains("bittorrent")
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** v4.33.0: схемы, которые относятся к обмену файлами, но не magnet и не http. */
+    fun isTorrentishScheme(url: String): Boolean {
+        val u = url.trim().lowercase()
+        return u.startsWith("magnet:") || u.startsWith("thunder:") || u.startsWith("td:") ||
+            u.startsWith("ed2k:") || u.startsWith("dchttp:") || u.startsWith("dchub:")
+    }
+
+    /**
+     * v4.33.0: открыть .torrent, пришедший файлом (content:// или file://) — например,
+     * когда пользователь нажал на скачанный .torrent и выбрал OmniBrowser.
+     */
+    fun openTorrentFromUri(uriStr: String) {
+        Toast.makeText(context, "🧲 Читаю файл .torrent…", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val uri = Uri.parse(uriStr)
+                val bytes = if (uriStr.startsWith("content:", ignoreCase = true)) {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw java.io.IOException("пустой файл")
+                } else {
+                    java.io.File(uri.path ?: throw java.io.IOException("нет пути")).readBytes()
+                }
+                if (!looksLikeTorrentBytes(bytes)) throw java.io.IOException("это не .torrent (${bytes.size} Б)")
+                val name = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "file.torrent"
+                val id = torrentEngine.startFromTorrentBytes(bytes, name)
+                Handler(Looper.getMainLooper()).post {
+                    currentSection = 1
+                    Toast.makeText(context, "🧲 Торрент запущен: ${id.take(8)}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось открыть .torrent файлом: ${e.message}")
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(context, "Не удалось открыть .torrent: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
     /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
     fun looksLikeTorrentBytes(b: ByteArray): Boolean {
         if (b.size < 32) return false
@@ -741,9 +791,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     Toast.makeText(context, "🧲 Торрент запущен: ${id.take(8)}", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
-                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось прочитать .torrent по ссылке: ${e.message} — сохраняю как файл")
+                // v4.33.0: раньше здесь был откат в обычную загрузку — .torrent падал в «Загрузки»,
+                // а при нажатии на него Android предлагал сторонние торрент-клиенты.
+                // Теперь никаких внешних приложений: либо свой клиент, либо понятная ошибка.
+                com.winwasm64.vpn.VpnLog.w("Торрент", "не удалось прочитать .torrent по ссылке: ${e.message}")
                 Handler(Looper.getMainLooper()).post {
-                    startWebDownload(tab, url, userAgent, contentDisposition, mimeType)
+                    Toast.makeText(
+                        context,
+                        "Не удалось прочитать .torrent по ссылке: ${e.message}. Скачайте файл и откройте его через «Файл .torrent».",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }.start()
@@ -1175,6 +1232,14 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
                 when {
+                    // v4.33.0: торрент-подобные схемы — только внутрь, наружу не отдаём
+                    isTorrentishScheme(url) && !url.startsWith("magnet:", ignoreCase = true) -> {
+                        Toast.makeText(
+                            context,
+                            "Формат «${url.substringBefore(':')}» не поддерживается. Нужна magnet-ссылка или файл .torrent.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                     url.startsWith("magnet:", ignoreCase = true) -> {
                         torrentEngine.startFromMagnetOrUrl(url)
                         currentSection = 1
@@ -1371,6 +1436,24 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         val fallback = Regex("S\\.browser_fallback_url=([^;]+)").find(nextUrl)?.groupValues?.getOrNull(1)
                         if (!fallback.isNullOrBlank()) {
                             view?.loadUrl(Uri.decode(fallback))
+                        }
+                        return true
+                    }
+                    // v4.33.0: торрент-подобные схемы никогда не отдаём наружу — раньше Android
+                    // показывал список сторонних торрент-клиентов вместо нашей загрузки
+                    if (isTorrentishScheme(nextUrl)) {
+                        if (nextUrl.startsWith("magnet:", ignoreCase = true)) {
+                            torrentEngine.startFromMagnetOrUrl(nextUrl)
+                            currentSection = 1
+                            Toast.makeText(context, "🧲 Magnet перехвачен и запущен!", Toast.LENGTH_LONG).show()
+                        } else {
+                            val kind = nextUrl.substringBefore(':').lowercase()
+                            Toast.makeText(
+                                context,
+                                "Формат «$kind» не поддерживается этим клиентом. Нужна magnet-ссылка или файл .torrent.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            com.winwasm64.vpn.VpnLog.w("Торрент", "ссылка вида $kind не поддерживается — внешние приложения не предлагаем")
                         }
                         return true
                     }
@@ -1652,6 +1735,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         if (u == initialIntentUri) return@LaunchedEffect
         if (u.startsWith("magnet:", ignoreCase = true) || isTorrentLink(u, null, null)) {
             torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
+        } else if ((u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(u)) {
+            openTorrentFromUri(u); currentSection = 1
         } else if (u.startsWith("http", ignoreCase = true) || u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) {
             openNewTab(u); currentSection = 0
         } else {
@@ -1677,6 +1762,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 isTorrentLink(initialIntentUri, null, null)
             ) {
                 torrentEngine.startFromMagnetOrUrl(initialIntentUri)
+                currentSection = 1
+            } else if ((initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(initialIntentUri)) {
+                openTorrentFromUri(initialIntentUri)
                 currentSection = 1
             } else if (initialIntentUri.startsWith("http", ignoreCase = true) || initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) {
                 navigateTab(activeTab, initialIntentUri)
@@ -3498,6 +3586,21 @@ private fun TorrentClientSection(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        // v4.33.0: трафик и скорость — по всем задачам сразу, обновляется каждые 0,5 с
+                        val totalsDown = statuses.sumOf { it.downloadedBytes }
+                        val totalsSize = statuses.sumOf { it.totalBytes }
+                        val totalsSpeed = statuses.sumOf { it.downloadSpeedBytesPerSec }
+                        val totalsPeers = statuses.sumOf { it.connectedPeers }
+                        Text(
+                            text = "📥 Скачано ${BitTorrentEngine.formatSize(totalsDown)}" +
+                                (if (totalsSize > 0) " из ${BitTorrentEngine.formatSize(totalsSize)}" else "") +
+                                " · скорость ↓ ${BitTorrentEngine.formatSpeed(totalsSpeed)}" +
+                                " · пиры $totalsPeers · задач ${statuses.size}",
+                            color = if (totalsSpeed > 0) Omni.Success else Omni.TextDim,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                     Button(
                         onClick = onPickTorrentFile,
@@ -3753,13 +3856,33 @@ private fun TorrentClientSection(
                 }
             }
 
-            item {
-                Text(
-                    text = "Проверенные торренты (Игры .EXE, Программы 32/64-bit, Видео MP4, APK):",
-                    color = Omni.Warning,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp
-                )
+            if (catalogItems.isEmpty()) {
+                // v4.33.0: список по умолчанию пустой — никаких «демо-раздач»
+                item {
+                    Surface(
+                        color = Omni.Surface,
+                        shape = RoundedCornerShape(10.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Список раздач пуст", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text(
+                                "Откройте .torrent по ссылке на сайте или файлом — он запустится в этом клиенте. Или вставьте magnet-ссылку выше. Встроенных демонстрационных раздач больше нет.",
+                                color = Omni.TextDim,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
+            } else {
+                item {
+                    Text(
+                        text = "Найдено раздач: ${catalogItems.size}",
+                        color = Omni.Warning,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
             }
 
             items(catalogItems) { item ->

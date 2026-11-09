@@ -459,6 +459,15 @@ object BitTorrentParser {
     )
 }
 
+/** v4.33.0: суммарный трафик по всем задачам — для панели «Трафик и скорость». */
+data class TorrentTotals(
+    val tasks: Int,
+    val downloaded: Long,
+    val total: Long,
+    val speedBytesPerSec: Long,
+    val peers: Int
+)
+
 class BitTorrentEngine(private val context: Context? = null) {
 
     private val executor = Executors.newCachedThreadPool()
@@ -565,127 +574,29 @@ class BitTorrentEngine(private val context: Context? = null) {
         }
     }
 
-    fun getBuiltInVerifiedTorrents(): List<CatalogTorrentItem> = listOf(
-        CatalogTorrentItem(
-            title = "DOOM Shareware v1.9 (Original PC x86 .EXE Game)",
-            category = "Игры .EXE (PC / DOS / Win32)",
-            sizeLabel = "2.39 МБ",
-            description = "Официальный архив игры DOOM (DOOM.EXE + DOOM1.WAD) через BitTorrent + WebSeed Archive.org",
-            torrentUrl = "https://archive.org/download/DoomsharewareEpisode/DoomsharewareEpisode_archive.torrent",
-            magnetUri = "",
-            directWebSeedUrl = "https://archive.org/download/DoomsharewareEpisode/Doom19s.zip",
-            fileName = "DOOM_Shareware_v1.9_x86.zip",
-            estimatedSizeBytes = 2_410_233L
-        ),
-        CatalogTorrentItem(
-            title = "7-Zip 24.08 (x64/x86 Official Windows .EXE Installer)",
-            category = "Прямая загрузка (HTTP) • Windows .EXE",
-            sizeLabel = "1.58 МБ",
-            description = "Настоящий Windows .exe инсталлятор архиватора 7-Zip",
-            torrentUrl = "",
-            magnetUri = "",
-            directWebSeedUrl = "https://www.7-zip.org/a/7z2408-x64.exe",
-            fileName = "7z2408-x64.exe",
-            estimatedSizeBytes = 1_656_000L
-        ),
-        CatalogTorrentItem(
-            title = "PuTTY 0.81 (32-bit x86 Official Windows SSH/Telnet .EXE)",
-            category = "Прямая загрузка (HTTP) • Windows 32-bit .EXE",
-            sizeLabel = "1.28 МБ",
-            description = "Чистый 32-битный x86 Windows .EXE файл (putty.exe) без инсталлятора",
-            torrentUrl = "",
-            magnetUri = "",
-            directWebSeedUrl = "https://the.earth.li/~sgtatham/putty/latest/w32/putty.exe",
-            fileName = "putty_w32_x86.exe",
-            estimatedSizeBytes = 1_340_000L
-        ),
-        CatalogTorrentItem(
-            title = "Big Buck Bunny 720p HD (MP4 Video + Stereo Audio)",
-            category = "Видео и Фильмы (MP4)",
-            sizeLabel = "64.8 МБ",
-            description = "Открытый HD-фильм 720p со звуком для проверки торрента и нативных видеоплееров",
-            torrentUrl = "https://archive.org/download/BigBuckBunny_124/BigBuckBunny_124_archive.torrent",
-            magnetUri = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=BigBuckBunny_512kb.mp4&ws=https%3A%2F%2Farchive.org%2Fdownload%2FBigBuckBunny_124%2FContent%2Fbig_buck_bunny_720p_surround.mp4",
-            directWebSeedUrl = "https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4",
-            fileName = "Big_Buck_Bunny_720p.mp4",
-            estimatedSizeBytes = 67_960_000L
-        ),
-        CatalogTorrentItem(
-            title = "F-Droid Official Android Client (.APK)",
-            category = "Прямая загрузка (HTTP) • Android .APK",
-            sizeLabel = "11.4 МБ",
-            description = "Официальный APK пакет F-Droid для проверки нативной установки .apk",
-            torrentUrl = "",
-            magnetUri = "",
-            directWebSeedUrl = "https://f-droid.org/F-Droid.apk",
-            fileName = "F-Droid.apk",
-            estimatedSizeBytes = 11_950_000L
-        )
-    )
+    /**
+     * v4.33.0: встроенный список раздач убран — по умолчанию список пустой.
+     * Раньше здесь лежали демонстрационные записи (DOOM, 7-Zip, PuTTY), и человек видел «чьи-то»
+     * торренты вместо своего пустого списка. Функция оставлена, чтобы не ломать вызовы:
+     * теперь она отдаёт пусто, а наполняется список только тем, что вы открыли или нашли.
+     */
+    fun getBuiltInVerifiedTorrents(): List<CatalogTorrentItem> = emptyList()
 
-    private fun applyBrowsecHeaders(conn: HttpURLConnection) {
-        // Подставные заголовки X-Forwarded-For / CF-IPCountry удалены: они не меняют IP и только вводили в заблуждение
-        conn.setRequestProperty("User-Agent", "OmniBrowser/4.0 (BitTorrent; Android)")
-        conn.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
+    /** v4.33.0: суммарный трафик и скорость по всем задачам. */
+    fun totals(): TorrentTotals {
+        var downloaded = 0L
+        var total = 0L
+        var speed = 0L
+        var peers = 0
+        for (st in getAllStatuses()) {
+            downloaded += st.downloadedBytes
+            total += st.totalBytes
+            speed += st.downloadSpeedBytesPerSec
+            peers += st.connectedPeers
+        }
+        return TorrentTotals(sessions.size, downloaded, total, speed, peers)
     }
 
-    fun searchPublicTorrents(query: String, onResults: (List<CatalogTorrentItem>) -> Unit) {
-        val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) {
-            onResults(getBuiltInVerifiedTorrents())
-            return
-        }
-        executor.submit {
-            val results = mutableListOf<CatalogTorrentItem>()
-            try {
-                val encoded = java.net.URLEncoder.encode(cleanQuery, "UTF-8")
-                val apiUrl = "https://archive.org/advancedsearch.php?q=($encoded)+AND+mediatype:(movies+OR+software+OR+audio)&fl[]=identifier,title,mediatype,item_size,description&rows=12&page=1&output=json"
-                val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 8000
-                    readTimeout = 8000
-                    applyBrowsecHeaders(this)
-                }
-                if (conn.responseCode in 200..299) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = JSONObject(body)
-                    val docs = json.optJSONObject("response")?.optJSONArray("docs")
-                    if (docs != null) {
-                        for (i in 0 until docs.length()) {
-                            val d = docs.getJSONObject(i)
-                            val id = d.optString("identifier")
-                            if (id.isBlank()) continue
-                            val title = d.optString("title", id)
-                            val mediaType = d.optString("mediatype", "archive")
-                            val sizeBytes = d.optLong("item_size", 0L).coerceAtLeast(0L)
-                            val sizeMb = if (sizeBytes > 0L) String.format("%.1f МБ", sizeBytes / (1024.0 * 1024.0)) else "размер неизвестен"
-                            val torrentUrl = "https://archive.org/download/$id/${id}_archive.torrent"
-                            results.add(
-                                CatalogTorrentItem(
-                                    title = title,
-                                    category = "Archive.org BitTorrent ($mediaType)",
-                                    sizeLabel = sizeMb,
-                                    description = "Archive.org: $id (настоящий .torrent файл)",
-                                    torrentUrl = torrentUrl,
-                                    magnetUri = "",
-                                    directWebSeedUrl = "",
-                                    fileName = "$id.torrent",
-                                    estimatedSizeBytes = sizeBytes
-                                )
-                            )
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            val matchingBuiltIn = getBuiltInVerifiedTorrents().filter {
-                it.title.contains(cleanQuery, ignoreCase = true) ||
-                    it.category.contains(cleanQuery, ignoreCase = true) ||
-                    it.description.contains(cleanQuery, ignoreCase = true)
-            }
-            val combined = (matchingBuiltIn + results).distinctBy { it.title }
-            onResults(combined.ifEmpty { getBuiltInVerifiedTorrents() })
-        }
-    }
 
     fun startFromCatalogItem(item: CatalogTorrentItem): String {
         val id = BitTorrentParser.toHex(BitTorrentParser.sha1(item.title.toByteArray(Charsets.UTF_8))).take(16)
