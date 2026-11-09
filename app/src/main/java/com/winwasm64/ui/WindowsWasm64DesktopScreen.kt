@@ -76,6 +76,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
@@ -5355,7 +5356,7 @@ private fun resultCover(posterUrl: String) {
         placeholder()
     } else {
         Image(
-            bitmap = androidx.compose.ui.graphics.asImageBitmap(bmp),
+            bitmap = bmp.asImageBitmap(),
             contentDescription = null,
             contentScale = androidx.compose.ui.layout.ContentScale.Crop,
             modifier = Modifier
