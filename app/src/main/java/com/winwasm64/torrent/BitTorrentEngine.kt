@@ -232,7 +232,10 @@ data class CatalogTorrentItem(
     val poster: String = "",
     /** v4.42.0: тип содержимого для фильтра — game/video/music/book/soft/other.
      *  (поле `category` уже занято источником/подписью, поэтому здесь `kind`) */
-    val kind: String = "other"
+    val kind: String = "other",
+    /** v4.43.0: разрешение и кодек из названия — «720p · x264». */
+    val quality: String = "",
+    val codec: String = ""
 )
 
 object BitTorrentParser {
@@ -664,7 +667,11 @@ class BitTorrentEngine(private val context: Context? = null) {
                             f.platform.isBlank()
                     }
                 } else rankedAll
-                val ranked = strict.ifEmpty { rankedAll }
+                var ranked = strict.ifEmpty { rankedAll }
+                // v4.43.0: «шерлок 360p» — сначала точное качество, иначе ближайшие (что реально есть)
+                if (intent.quality.isNotBlank() || intent.audio.isNotBlank()) {
+                    ranked = TorrentSearchAgent.filterByQuality(ranked, intent.quality)
+                }
                 for (f in ranked.take(12)) {
                     results.add(
                         CatalogTorrentItem(
@@ -681,7 +688,9 @@ class BitTorrentEngine(private val context: Context? = null) {
                             reason = f.reason,
                             referer = f.referer,
                             poster = f.poster,
-                            kind = f.category
+                            kind = f.category,
+                            quality = f.quality,
+                            codec = f.codec
                         )
                     )
                 }

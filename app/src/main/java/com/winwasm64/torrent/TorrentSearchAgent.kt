@@ -42,6 +42,12 @@ object TorrentSearchAgent {
         val platform: String = "",
         val poster: String = "",
         var category: String = "other",
+        /** v4.43.0: 2160p/1080p/720p/480p/360p (если в названии указано). */
+        var quality: String = "",
+        /** v4.43.0: кодек — x264/x265(hevc)/av1; влияет на воспроизведение. */
+        var codec: String = "",
+        /** v4.43.0: звук — flac/mp3/ac3/dts/aac. */
+        var audio: String = "",
         var score: Double = 0.0,
         var reason: String = ""
     ) {
@@ -55,7 +61,15 @@ object TorrentSearchAgent {
     }
 
     /** Что человек хочет: название, формат, платформа. */
-    data class Intent(val title: String, val format: String, val platform: String)
+    data class Intent(
+        val title: String,
+        val format: String,
+        val platform: String,
+        /** Запрошенное качество («360p», «1080p», «4K»); пусто — любое. */
+        val quality: String = "",
+        /** Запрошенный звук для музыки («flac», «mp3»). */
+        val audio: String = ""
+    )
 
     private val FORMAT_WORDS = mapOf(
         "apk" to "apk", "android" to "apk",
@@ -162,8 +176,15 @@ object TorrentSearchAgent {
                 break
             }
         }
+        val words = lower.replace(Regex("[^\\p{L}\\p{N} .]+"), " ").split(Regex("\\s+"))
+        val quality = qualityFromQuery(words)
+        val audio = when {
+            lower.contains("flac") || lower.contains("lossless") -> "flac"
+            lower.contains("mp3") -> "mp3"
+            else -> ""
+        }
         val title = TorrentRescue.cleanQuery(lower.replace(Regex("[^\\p{L}\\p{N} .]+"), " "))
-        return Intent(title, format, platform)
+        return Intent(title, format, platform, quality, audio)
     }
 
     /* ===================== поиск ===================== */
@@ -389,6 +410,9 @@ object TorrentSearchAgent {
         val needle = intent.title.ifBlank { expectedName }
         for (f in found) {
             f.category = classify(f.name, f.platform, f.source)
+            if (f.quality.isBlank()) f.quality = qualityOf(f.name)
+            if (f.codec.isBlank()) f.codec = codecOf(f.name)
+            if (f.audio.isBlank()) f.audio = audioOf(f.name)
             val sim = TorrentRescue.similarity(needle, f.name)
             val seedScore = when {
                 f.seeders <= 0 -> 0.0
@@ -407,7 +431,15 @@ object TorrentSearchAgent {
                 intent.format.isNotBlank() && f.name.contains(intent.format, true) -> 1.0
                 else -> 0.3
             }
-            f.score = 0.5 * sim + 0.25 * seedScore + 0.15 * sizeScore + 0.10 * fmtScore
+            // v4.43.0: качество учитывается отдельно — «хочу 360p» больше не значит «любое»
+            val qualityScore = when {
+                intent.quality.isBlank() && intent.audio.isBlank() -> 0.5
+                intent.quality.isNotBlank() && f.quality == intent.quality -> 1.0
+                intent.audio.isNotBlank() && f.audio.equals(intent.audio, true) -> 1.0
+                f.quality.isBlank() && f.audio.isBlank() -> 0.4
+                else -> 0.2
+            }
+            f.score = 0.45 * sim + 0.20 * seedScore + 0.15 * sizeScore + 0.10 * fmtScore + 0.10 * qualityScore
             f.reason = buildReason(f, sim, sizeScore, wantSized)
         }
         return found.sortedByDescending { it.score }
@@ -500,4 +532,115 @@ object TorrentSearchAgent {
         "💾 Софт" -> category == "soft"
         else -> true
     }
+
+    /* ===================== качество и форматы ===================== */
+
+    /** Разрешения, которые реально встречаются в названиях раздач. */
+    val QUALITY_ORDER = listOf("2160p", "1080p", "720p", "480p", "360p", "240p")
+
+    private fun qualityRank(q: String): Int = when (q) {
+        "2160p" -> 2160
+        "1080p" -> 1080
+        "720p" -> 720
+        "480p" -> 480
+        "360p" -> 360
+        "240p" -> 240
+        else -> 0
+    }
+
+    /** Качество из названия раздачи: «…WEB-DL 720p…» → 720p. Пусто — если не указано. */
+    fun qualityOf(name: String): String {
+        val n = name.lowercase()
+        val m = Regex("(\\d{3,4})\\s*p\\b").find(n)
+        if (m != null) {
+            val v = m.groupValues[1].toIntOrNull() ?: 0
+            return when {
+                v >= 2000 -> "2160p"
+                v >= 1000 -> "1080p"
+                v >= 700 -> "720p"
+                v >= 460 -> "480p"
+                v >= 340 -> "360p"
+                v >= 200 -> "240p"
+                else -> ""
+            }
+        }
+        return when {
+            Regex("\\b(4k|uhd)\\b").containsMatchIn(n) -> "2160p"
+            Regex("\\bfull\\s?hd\\b").containsMatchIn(n) -> "1080p"
+            Regex("\\bhd\\b").containsMatchIn(n) -> "720p"
+            else -> ""
+        }
+    }
+
+    /** Кодек из названия. Важно для воспроизведения: x265/HEVC декодируется не на всех телефонах. */
+    fun codecOf(name: String): String {
+        val n = name.lowercase()
+        return when {
+            n.contains("x265") || n.contains("h265") || n.contains("hevc") -> "x265 (HEVC)"
+            n.contains("x264") || n.contains("h264") || n.contains("avc") -> "x264"
+            n.contains("av1") -> "AV1"
+            else -> ""
+        }
+    }
+
+    /** Звук из названия: для музыки это важнее разрешения. */
+    fun audioOf(name: String): String {
+        val n = name.lowercase()
+        return when {
+            n.contains("flac") || n.contains("lossless") || n.contains("без потерь") -> "FLAC"
+            n.contains("mp3") -> "MP3"
+            n.contains("ac3") || n.contains("dolby digital") -> "AC3"
+            n.contains("dts") -> "DTS"
+            n.contains("aac") -> "AAC"
+            else -> ""
+        }
+    }
+
+    /** Запрос «360», «360p», «720p 60fps» → «360p». */
+    private fun qualityFromQuery(words: List<String>): String {
+        for (w in words) {
+            val clean = w.removeSuffix("p").removeSuffix("р")
+            val v = clean.toIntOrNull() ?: continue
+            if (v !in 200..4320) continue
+            return when {
+                v >= 2000 -> "2160p"
+                v >= 1000 -> "1080p"
+                v >= 700 -> "720p"
+                v >= 460 -> "480p"
+                v >= 340 -> "360p"
+                else -> "240p"
+            }
+        }
+        for (w in words) {
+            if (w == "4k" || w == "uhd") return "2160p"
+            if (w == "hd" || w == "720") return "720p"
+            if (w == "fullhd" || w == "fhd") return "1080p"
+        }
+        return ""
+    }
+
+    /**
+     * Подобрать раздачи под запрошенное качество.
+     * Сначала точное совпадение; если такого нет — ближайшие по разрешению (вверх и вниз),
+     * чтобы человек видел, что реально есть в раздачах, а не пустой экран.
+     */
+    fun filterByQuality(items: List<Found>, wanted: String): List<Found> {
+        if (wanted.isBlank()) return items
+        val exact = items.filter { it.quality == wanted }
+        if (exact.isNotEmpty()) return exact
+        val target = qualityRank(wanted)
+        return items
+            .filter { it.quality.isNotBlank() }
+            .sortedBy { kotlin.math.abs(qualityRank(it.quality) - target) }
+            .ifEmpty { items }
+    }
+
+    /** Какие качества вообще есть в текущем списке — для подсказки «в наличии: …». */
+    fun availableQualities(items: List<Found>): List<String> =
+        items.map { it.quality }.filter { it.isNotBlank() }.distinct()
+            .sortedByDescending { qualityRank(it) }
+
+    /** Подпись формата для карточки: «720p · x264 · FLAC». */
+    fun formatLabel(f: Found): String = listOf(f.quality, f.codec, f.audio)
+        .filter { it.isNotBlank() }.joinToString(" · ")
 }
