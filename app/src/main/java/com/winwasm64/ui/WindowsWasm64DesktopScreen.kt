@@ -3693,7 +3693,7 @@ private fun TorrentClientSection(
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.clickable {
                                     autoRescue = !autoRescue
-                                    torrentEngine.setAutoRescue(autoRescue)
+                                    torrentEngine.updateAutoRescue(autoRescue)
                                 }
                             ) {
                                 Text(

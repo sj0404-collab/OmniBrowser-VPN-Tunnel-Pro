@@ -482,7 +482,8 @@ class BitTorrentEngine(private val context: Context? = null) {
         context?.getSharedPreferences("omni_torrent", android.content.Context.MODE_PRIVATE)
             ?.getBoolean("auto_rescue", true) ?: true
 
-    fun setAutoRescue(enabled: Boolean) {
+    /** Явное сохранение настройки (имя не setAutoRescue — иначе конфликт со сеттером свойства). */
+    fun updateAutoRescue(enabled: Boolean) {
         autoRescue = enabled
         context?.getSharedPreferences("omni_torrent", android.content.Context.MODE_PRIVATE)
             ?.edit()?.putBoolean("auto_rescue", enabled)?.apply()
