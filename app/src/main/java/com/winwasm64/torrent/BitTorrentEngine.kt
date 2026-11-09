@@ -203,6 +203,8 @@ data class TorrentSessionStatus(
     val outputFilePath: String,
     val files: List<String>,
     val statusDetail: String,
+    /** v4.39.0: аналоги с пирами, когда точной замены нет — показываются в карточке. */
+    val suggestions: List<TorrentSearchAgent.Found> = emptyList(),
     val pieceBitfield: BooleanArray
 ) {
     val progressFraction: Float
@@ -220,7 +222,12 @@ data class CatalogTorrentItem(
     val magnetUri: String,
     val directWebSeedUrl: String,
     val fileName: String,
-    val estimatedSizeBytes: Long
+    val estimatedSizeBytes: Long,
+    /** v4.39.0: сколько сидов нашёл агент и почему он это предложил. */
+    val seeders: Int = 0,
+    val reason: String = "",
+    /** Some сайты (catorrent) отдают .torrent только с Referer страницы. */
+    val referer: String = ""
 )
 
 object BitTorrentParser {
@@ -626,6 +633,39 @@ class BitTorrentEngine(private val context: Context? = null) {
         }
         executor.submit {
             val results = mutableListOf<CatalogTorrentItem>()
+
+            // v4.39.0: сначала агент — catorrent (тот же сайт, откуда берутся .torrent) плюс открытые
+            // индексы, с сидами и объяснением выбора. Если он ничего не нашёл, работает старый путь.
+            try {
+                val intent = TorrentSearchAgent.parseIntent(cleanQuery)
+                val found = TorrentSearchAgent.searchAll(cleanQuery)
+                val ranked = TorrentSearchAgent.rank(found, intent)
+                for (f in ranked.take(12)) {
+                    results.add(
+                        CatalogTorrentItem(
+                            title = f.name,
+                            category = "Найдено агентом · ${f.source}" + (if (f.platform.isNotBlank()) " · ${f.platform}" else ""),
+                            sizeLabel = f.sizeLabel,
+                            description = f.reason.ifBlank { "найдено по запросу «$cleanQuery»" },
+                            torrentUrl = f.torrentUrl,
+                            magnetUri = f.magnet,
+                            directWebSeedUrl = "",
+                            fileName = f.name.take(60) + ".torrent",
+                            estimatedSizeBytes = f.sizeBytes,
+                            seeders = f.seeders,
+                            reason = f.reason,
+                            referer = f.referer
+                        )
+                    )
+                }
+                com.winwasm64.vpn.ConnTrace.torrent(
+                    "агент: «$cleanQuery»",
+                    "найдено ${found.size}, показано ${results.size}",
+                    results.isNotEmpty()
+                )
+            } catch (_: Throwable) {
+            }
+
             try {
                 val encoded = java.net.URLEncoder.encode(cleanQuery, "UTF-8")
                 val apiUrl = "https://archive.org/advancedsearch.php?q=($encoded)+AND+mediatype:(movies+OR+software+OR+audio)&fl[]=identifier,title,mediatype,item_size,description&rows=12&page=1&output=json"
@@ -678,6 +718,20 @@ class BitTorrentEngine(private val context: Context? = null) {
 
 
     fun startFromCatalogItem(item: CatalogTorrentItem): String {
+        // v4.39.0: результат агента — запускаем через агента (magnet или .torrent с Referer)
+        if (item.magnetUri.isNotBlank() || item.referer.isNotBlank()) {
+            return startFromFound(
+                TorrentSearchAgent.Found(
+                    name = item.title,
+                    magnet = item.magnetUri,
+                    torrentUrl = item.torrentUrl,
+                    referer = item.referer,
+                    sizeBytes = item.estimatedSizeBytes,
+                    seeders = item.seeders,
+                    source = item.category
+                )
+            )
+        }
         val id = BitTorrentParser.toHex(BitTorrentParser.sha1(item.title.toByteArray(Charsets.UTF_8))).take(16)
         val existing = sessions[id]
         if (existing != null && existing.state != TorrentState.ERROR) {
@@ -745,6 +799,27 @@ class BitTorrentEngine(private val context: Context? = null) {
             executor.submit { runTorrentTask(task) }
             id
         }
+    }
+
+    /**
+     * v4.39.0: запуск того, что нашёл агент — либо magnet, либо .torrent по ссылке (с Referer).
+     */
+    fun startFromFound(found: TorrentSearchAgent.Found): String {
+        if (found.magnet.isNotBlank()) return startFromMagnetOrUrl(found.magnet)
+        executor.submit {
+            val bytes = TorrentSearchAgent.downloadTorrent(found)
+            if (bytes != null) {
+                startFromTorrentBytes(bytes, found.name + ".torrent")
+            } else {
+                com.winwasm64.vpn.ConnTrace.torrent(
+                    "агент",
+                    ".torrent не скачался: ${found.name.take(50)}",
+                    ok = false,
+                    note = found.torrentUrl.take(80)
+                )
+            }
+        }
+        return BitTorrentParser.toHex(BitTorrentParser.sha1(found.name.toByteArray())).take(16)
     }
 
     fun startFromTorrentBytes(bytes: ByteArray, fallbackName: String = "custom.torrent"): String {
@@ -819,6 +894,8 @@ class BitTorrentEngine(private val context: Context? = null) {
         val paused = AtomicBoolean(false)
         /** v4.38.0: замену ищем один раз на задачу, чтобы не долбить каталоги по кругу. */
         val rescueTried = AtomicBoolean(false)
+        /** v4.39.0: аналоги, найденные агентом (показываются кнопками в карточке). */
+        @Volatile var suggestions: List<TorrentSearchAgent.Found> = emptyList()
         val cancelled = AtomicBoolean(false)
         val running = AtomicBoolean(false)
 
@@ -837,6 +914,7 @@ class BitTorrentEngine(private val context: Context? = null) {
             outputFilePath = outputFile.absolutePath,
             files = fileList.toList(),
             statusDetail = statusDetail,
+            suggestions = suggestions,
             pieceBitfield = pieceBitfield.copyOf()
         )
     }
@@ -1014,8 +1092,12 @@ class BitTorrentEngine(private val context: Context? = null) {
                 // Теперь: пиров нет → автопоиск живой копии, иначе честная ошибка.
                 if (attemptRescue(task, metadata)) return
                 task.state = TorrentState.ERROR
-                task.statusDetail = "Пиров 0: содержимого нет, а .torrent-файл вместо раздачи не сохраняем. " +
-                    "Замены в проверенных каталогах не нашлось — попробуйте другой источник или magnet с сидами."
+                task.statusDetail = if (task.suggestions.isEmpty()) {
+                    "Пиров 0: содержимого нет, а .torrent-файл вместо раздачи не сохраняем. " +
+                        "Замены в проверенных каталогах не нашлось — попробуйте другой источник или magnet с сидами."
+                } else {
+                    "Пиров 0. Точной замены нет, но есть похожие с пирами — выберите из списка ниже."
+                }
             }
         } catch (e: Exception) {
             // v4.38.0: пустышку не оставляем. Если ничего не пришло — ищем ту же раздачу там, где есть сиды.
@@ -1046,33 +1128,40 @@ class BitTorrentEngine(private val context: Context? = null) {
         task.statusDetail = "Пиров 0 · ищу такую же раздачу в других источниках: «$query»…"
         com.winwasm64.vpn.ConnTrace.torrent("автозамена", "ищу «$query» (0 пиров)", true)
 
-        val candidates = try {
-            TorrentRescue.searchBlocking(query)
+        // v4.39.0: ищем агентом — catorrent (тот сайт, откуда берутся .torrent) плюс открытые индексы,
+        // с ранжированием по имени/сидам/размеру/формату и объяснением выбора.
+        val intent = TorrentSearchAgent.parseIntent(expectedName).copy(title = query)
+        val found = try {
+            TorrentSearchAgent.searchAll(query)
         } catch (_: Throwable) {
             emptyList()
         }
-        val best = TorrentRescue.pickBest(candidates, expectedName, expectedBytes)
+        val ranked = TorrentSearchAgent.rank(found, intent, expectedName, expectedBytes)
+        val best = TorrentSearchAgent.bestForAutoStart(ranked, intent, expectedName, expectedBytes)
         if (best == null) {
+            val analogs = TorrentSearchAgent.analogs(ranked, expectedName)
+            task.suggestions = analogs
             com.winwasm64.vpn.ConnTrace.torrent(
                 "автозамена",
-                "замены нет: проверено ${candidates.size} вариантов",
+                "точного совпадения нет: проверено ${found.size} вариантов" +
+                    (if (analogs.isNotEmpty()) ", предложено аналогов: ${analogs.size}" else ""),
                 ok = false,
-                note = "у всех либо 0 сидов, либо другое название/размер — пустышку не качаем"
+                note = "у остальных либо 0 сидов, либо другое название/размер — пустышку не качаем"
             )
             return false
         }
 
         com.winwasm64.vpn.ConnTrace.torrent(
             "автозамена",
-            "найдено: ${best.name.take(60)} · сидов ${best.seeders} · ${formatSize(best.sizeBytes)} (${best.source})",
+            "выбрано: ${best.name.take(60)} (${best.reason})",
             true
         )
         task.paused.set(true)
         task.state = TorrentState.PAUSED
         task.statusDetail = "Пиров 0 — эта раздача мертва. Найдена замена: ${best.name.take(50)} " +
-            "(сидов ${best.seeders}, ${formatSize(best.sizeBytes)}) — запускаю её."
+            "(${best.sizeLabel}, ${best.reason}) — запускаю её."
         try {
-            startFromMagnetOrUrl(best.magnet)
+            startFromFound(best)
         } catch (_: Throwable) {
             return false
         }

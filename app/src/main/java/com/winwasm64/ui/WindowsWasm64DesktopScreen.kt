@@ -3823,7 +3823,7 @@ private fun TorrentClientSection(
                     CompactDarkTextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        placeholder = "Поиск торрентов (игры .exe, фильмы, музыка, программы)...",
+                        placeholder = "Что найти? Например: elliot quest switch, apk, flac, фильм 2024...",
                         modifier = Modifier.weight(1f),
                         onGo = {
                             isSearching = true
@@ -3935,6 +3935,46 @@ private fun TorrentClientSection(
                                 fontSize = 11.sp
                             )
 
+                            // v4.39.0: аналогов показываем списком, а не запускаем молча —
+                            // человек сам решает, годится ли «другое издание» вместо исходного
+                            if (st.suggestions.isNotEmpty()) {
+                                Text(
+                                    "Похожие с пирами — можно взять вместо этой:",
+                                    color = Omni.Warning, fontSize = 11.sp, fontWeight = FontWeight.Bold
+                                )
+                                st.suggestions.forEach { sug ->
+                                    Surface(
+                                        color = Omni.SurfaceHighest,
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f).padding(end = 6.dp)) {
+                                                Text(sug.name, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+                                                Text(
+                                                    sug.reason.ifBlank { "${sug.sizeLabel} · ${sug.source}" },
+                                                    color = Omni.TextDim, fontSize = 10.sp, maxLines = 2
+                                                )
+                                            }
+                                            Button(
+                                                onClick = {
+                                                    torrentEngine.startFromFound(sug)
+                                                    Toast.makeText(context, "Запущено: ${sug.name.take(40)}", Toast.LENGTH_SHORT).show()
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                                modifier = Modifier.height(30.dp),
+                                                colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                            ) {
+                                                Text("Скачать", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -4019,7 +4059,11 @@ private fun TorrentClientSection(
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                             Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                            Text("${item.category} • Размер: ${item.sizeLabel}", color = Omni.Accent, fontSize = 11.sp)
+                            Text(
+                                "${item.category} • Размер: ${item.sizeLabel}" +
+                                    (if (item.seeders > 0) " • Сидов: ${item.seeders}" else ""),
+                                color = Omni.Accent, fontSize = 11.sp
+                            )
                             Text(item.description, color = Omni.TextDim, fontSize = 11.sp, maxLines = 2)
                         }
                         Button(
