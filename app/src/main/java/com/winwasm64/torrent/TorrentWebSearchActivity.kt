@@ -201,11 +201,10 @@ class TorrentWebSearchActivity : Activity() {
                             } catch (_: Throwable) {
                                 null
                             } ?: continue
-                            synchronized(seen) {
-                                val key = found.magnet.ifBlank { found.torrentUrl }
-                                if (key.isNotBlank() && !seen.add(key)) continue
-                                added++
-                            }
+                            val key = found.magnet.ifBlank { found.torrentUrl }
+                            val fresh = synchronized(seen) { key.isBlank() || seen.add(key) }
+                            if (!fresh) continue
+                            added++
                             runOnUiThread { addResultRow(found) }
                         }
                     }, "WebSearchParse$it").also { it.isDaemon = true; it.start() }
@@ -223,7 +222,11 @@ class TorrentWebSearchActivity : Activity() {
 
     private fun looksLikeTracker(url: String): Boolean {
         val host = url.substringAfter("://").substringBefore('/').lowercase()
-        return Regex("(torrent|torr|tracker|rutor|nnm|rutracker|kinozal|pirat|byxatab|catorrent|tapochek|bitru|igruha|zooqle|yts|1337x|kickass|limetorrent|magnet|btdig|galaxy|rustorrent|bt\.|bt-|тorrent)", RegexOption.IGNORE_CASE)
+        return Regex(
+            "(torrent|torr|tracker|rutor|nnm|rutracker|kinozal|pirat|byxatab|catorrent|tapochek|" +
+                "bitru|igruha|zooqle|yts|1337x|kickass|limetorrent|magnet|btdig|galaxy|rustorrent|bt[.-])",
+            RegexOption.IGNORE_CASE
+        )
             .containsMatchIn(host)
     }
 
