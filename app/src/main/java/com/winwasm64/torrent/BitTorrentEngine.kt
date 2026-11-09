@@ -597,6 +597,70 @@ class BitTorrentEngine(private val context: Context? = null) {
         return TorrentTotals(sessions.size, downloaded, total, speed, peers)
     }
 
+    private fun applyBrowsecHeaders(conn: HttpURLConnection) {
+        // Подставные заголовки X-Forwarded-For / CF-IPCountry удалены: они не меняют IP и только вводили в заблуждение
+        conn.setRequestProperty("User-Agent", "OmniBrowser/4.0 (BitTorrent; Android)")
+        conn.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
+    }
+
+    fun searchPublicTorrents(query: String, onResults: (List<CatalogTorrentItem>) -> Unit) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) {
+            onResults(getBuiltInVerifiedTorrents())
+            return
+        }
+        executor.submit {
+            val results = mutableListOf<CatalogTorrentItem>()
+            try {
+                val encoded = java.net.URLEncoder.encode(cleanQuery, "UTF-8")
+                val apiUrl = "https://archive.org/advancedsearch.php?q=($encoded)+AND+mediatype:(movies+OR+software+OR+audio)&fl[]=identifier,title,mediatype,item_size,description&rows=12&page=1&output=json"
+                val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                    applyBrowsecHeaders(this)
+                }
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val json = JSONObject(body)
+                    val docs = json.optJSONObject("response")?.optJSONArray("docs")
+                    if (docs != null) {
+                        for (i in 0 until docs.length()) {
+                            val d = docs.getJSONObject(i)
+                            val id = d.optString("identifier")
+                            if (id.isBlank()) continue
+                            val title = d.optString("title", id)
+                            val mediaType = d.optString("mediatype", "archive")
+                            val sizeBytes = d.optLong("item_size", 0L).coerceAtLeast(0L)
+                            val sizeMb = if (sizeBytes > 0L) String.format("%.1f МБ", sizeBytes / (1024.0 * 1024.0)) else "размер неизвестен"
+                            val torrentUrl = "https://archive.org/download/$id/${id}_archive.torrent"
+                            results.add(
+                                CatalogTorrentItem(
+                                    title = title,
+                                    category = "Archive.org BitTorrent ($mediaType)",
+                                    sizeLabel = sizeMb,
+                                    description = "Archive.org: $id (настоящий .torrent файл)",
+                                    torrentUrl = torrentUrl,
+                                    magnetUri = "",
+                                    directWebSeedUrl = "",
+                                    fileName = "$id.torrent",
+                                    estimatedSizeBytes = sizeBytes
+                                )
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            val matchingBuiltIn = getBuiltInVerifiedTorrents().filter {
+                it.title.contains(cleanQuery, ignoreCase = true) ||
+                    it.category.contains(cleanQuery, ignoreCase = true) ||
+                    it.description.contains(cleanQuery, ignoreCase = true)
+            }
+            val combined = (matchingBuiltIn + results).distinctBy { it.title }
+            onResults(combined.ifEmpty { getBuiltInVerifiedTorrents() })
+        }
+    }
+
 
     fun startFromCatalogItem(item: CatalogTorrentItem): String {
         val id = BitTorrentParser.toHex(BitTorrentParser.sha1(item.title.toByteArray(Charsets.UTF_8))).take(16)

@@ -699,6 +699,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             u.startsWith("ed2k:") || u.startsWith("dchttp:") || u.startsWith("dchub:")
     }
 
+    /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
+    fun looksLikeTorrentBytes(b: ByteArray): Boolean {
+        if (b.size < 32) return false
+        val head = String(b, 0, minOf(b.size, 4096), Charsets.ISO_8859_1)
+        return head.startsWith("d") && (head.contains("8:announce") || head.contains("4:info"))
+    }
+
     /**
      * v4.33.0: открыть .torrent, пришедший файлом (content:// или file://) — например,
      * когда пользователь нажал на скачанный .torrent и выбрал OmniBrowser.
@@ -728,13 +735,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 }
             }
         }.start()
-    }
-
-    /** Тело настоящего .torrent — bencode-словарь с `announce`/`info`. */
-    fun looksLikeTorrentBytes(b: ByteArray): Boolean {
-        if (b.size < 32) return false
-        val head = String(b, 0, minOf(b.size, 4096), Charsets.ISO_8859_1)
-        return head.startsWith("d") && (head.contains("8:announce") || head.contains("4:info"))
     }
 
     /** Тело ответа через локальный прокси браузера (внутри VPN). */
