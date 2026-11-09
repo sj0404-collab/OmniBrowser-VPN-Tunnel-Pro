@@ -3863,6 +3863,29 @@ private fun TorrentClientSection(
                         modifier = Modifier.weight(1f),
                         onGo = { runSearch(searchQuery) }
                     )
+                    // v4.44.0: то, чего нет в каталогах, ищем настоящими поисковиками
+                    // (Google/Яндекс/DuckDuckGo) во встроенном WebView
+                    Button(
+                        onClick = {
+                            if (searchQuery.isBlank()) {
+                                Toast.makeText(context, "Сначала введите название", Toast.LENGTH_SHORT).show()
+                            } else {
+                                context.startActivity(
+                                    android.content.Intent(
+                                        context,
+                                        com.winwasm64.torrent.TorrentWebSearchActivity::class.java
+                                    )
+                                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        .putExtra("query", searchQuery)
+                                )
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                    ) {
+                        Text("🌐", fontSize = 16.sp)
+                    }
                     Button(
                         onClick = { runSearch(searchQuery) },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
