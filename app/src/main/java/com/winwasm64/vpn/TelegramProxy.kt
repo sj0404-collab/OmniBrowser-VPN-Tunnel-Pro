@@ -30,6 +30,23 @@ object TelegramProxy {
      * Возвращает все шаги (для журнала и экрана) и ключ рабочего сервера (null — ни один не подошёл).
      */
     fun probeAndPin(pkg: String, maxServers: Int = 6): Pair<List<Step>, String?> {
+        // v4.32.0: сначала проверяем УЖЕ закреплённый сервер.
+        // Раньше перебор каждый раз выбирал заново, и рабочий прокси «сам себя менял» даже когда
+        // всё работало: Telegram на каждой смене рвёт сессию и заново показывает «Соединение…».
+        val pinned = try { ExtensionProxy.affinityServer(pkg) } catch (_: Exception) { null }
+        if (pinned != null) {
+            for ((host, port) in DATACENTERS) {
+                val ms = ExtensionProxy.probeServer(pinned, host, port)
+                if (ms != null) {
+                    ExtensionProxy.refreshAffinity(pkg)
+                    ExtensionProxy.resetAffinityMiss(pkg)
+                    VpnLog.ok("Telegram", "сервер $pinned уже открывает Telegram ($host:$port, $ms мс) — оставляем его, перебор не нужен")
+                    return listOf(Step(pinned, true, ms)) to pinned
+                }
+            }
+            VpnLog.w("Telegram", "закреплённый сервер $pinned перестал открывать Telegram — ищем рабочий")
+            ExtensionProxy.clearAffinity(pkg)
+        }
         val keys = try { ExtensionProxy.tunnelServerKeysRanked() } catch (_: Exception) { emptyList() }
         if (keys.isEmpty()) {
             VpnLog.w("Telegram", "серверы Browsec ещё не получены — проверить нечего (включите расширение Browsec в браузере)")

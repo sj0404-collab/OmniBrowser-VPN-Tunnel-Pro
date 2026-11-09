@@ -1925,7 +1925,7 @@ function alert(){}
             // держимся за текущий: медленный, но живой сервер лучше вечного переключения.
             val switchedAgo = now - (affinitySwitchedAt[pkg] ?: 0L)
             val poolDead = tunnelServers.isNotEmpty() && tunnelServers.all { (tunnelDownUntil[it.key] ?: 0L) > now || isPsiphonKey(it.key) }
-            if (poolDead || switchedAgo < 15_000L) return a.first
+            if (poolDead || switchedAgo < 60_000L) return a.first
             return null
         }
         return a.first
@@ -1933,11 +1933,34 @@ function alert(){}
     private val affinitySwitchedAt = ConcurrentHashMap<String, Long>()
     private val affinityHoldLoggedAt = ConcurrentHashMap<String, Long>()
 
+    /** v4.32.0: промахи закреплённого сервера подряд — по ним решаем, менять ли сервер. */
+    private val affinityMisses = ConcurrentHashMap<String, Int>()
+
+    /** Отметить промах закреплённого сервера. Возвращает число промахов подряд. */
+    fun noteAffinityMiss(pkg: String?): Int {
+        if (pkg == null) return 0
+        return affinityMisses.merge(pkg, 1) { a, b -> a + b } ?: 1
+    }
+
+    fun resetAffinityMiss(pkg: String?) {
+        if (pkg != null) affinityMisses.remove(pkg)
+    }
+
+    /** Работающий сервер не «стареет»: продлеваем закрепление, пока он реально отвечает. */
+    fun refreshAffinity(pkg: String?) {
+        if (pkg == null) return
+        val cur = appAffinity[pkg] ?: return
+        appAffinity[pkg] = Pair(cur.first, SystemClock.elapsedRealtime() + AFFINITY_TTL_MS)
+    }
+
     private fun setAffinity(pkg: String?, serverKey: String, reason: String? = null) {
         if (pkg == null) return
         val now = SystemClock.elapsedRealtime()
         val cur = appAffinity[pkg]
-        if (cur != null && cur.first != serverKey && cur.second > now && now - (affinitySwitchedAt[pkg] ?: 0L) < 15_000L) {
+        // v4.32.0: пока закреплённый сервер работает — не меняем его вообще.
+        // Раньше хватало «ответил другой сервер быстрее» или одного промаха, и приложение
+        // прыгало между серверами даже когда всё работало (Telegram рвал сессию на каждом прыжке).
+        if (cur != null && cur.first != serverKey && cur.second > now && now - (affinitySwitchedAt[pkg] ?: 0L) < 60_000L) {
             // v4.4.8: не чаще одной смены сервера за 15 с на приложение — параллельные соединения в час пик
             // приносили разных «победителей» и закрепление прыгало de83 → lv115 → de83 за одну секунду
             if (now - (affinityHoldLoggedAt[pkg] ?: 0L) > 60_000L) {
@@ -2088,6 +2111,11 @@ function alert(){}
             val up = r.up
             lastAutoTunnel = up.key
             lastAutoTunnelAt = SystemClock.elapsedRealtime()
+            if (stickyUpF != null && up.key == stickyUpF.key) {
+                // закреплённый ответил — продлеваем закрепление и забываем промахи
+                resetAffinityMiss(stickyKey)
+                refreshAffinity(stickyKey)
+            }
             if (stickyUpF == null || up.key == stickyUpF.key || switchReason != null) setAffinity(stickyKey, up.key, switchReason)
             val t = lastAutoTunnelAt
             if (t - (appTunnelLoggedAt[up.key] ?: 0L) > 120_000L) {
@@ -2102,7 +2130,12 @@ function alert(){}
             if (now2 >= deadline) break
             if (backup != null && stickyUpF != null && !stickyDone && now2 - t0 >= STICKY_WAIT_MS) {
                 stickyDone = true
-                return accept(backup!!, "закреплённый ${shortName(stickyUpF.key)} не ответил за ${STICKY_WAIT_MS / 1000} с")
+                // v4.32.0: соединение отдаём резервному, но закрепление меняем только со второго
+                // промаха подряд. Иначе один медленный ответ = смена сервера и обрыв сессии Telegram.
+                val misses = noteAffinityMiss(stickyKey)
+                val reason = if (misses >= 2)
+                    "закреплённый ${shortName(stickyUpF.key)} не ответил $misses раза подряд" else null
+                return accept(backup!!, reason)
             }
             val r = results.poll(maxOf(20L, minOf(hedgeAt, deadline) - now2), TimeUnit.MILLISECONDS)
             if (r == null) {

@@ -50,6 +50,16 @@ object PsiphonBackup {
     @Volatile var embeddedCount: Int = 0
     @Volatile var lastDiag: String = ""
     @Volatile var connectAttempts: Int = 0
+    /** v4.32.0: последний протокол/регион, через который реально подключились, — их пробуем первыми. */
+    @Volatile var lastGoodProtocol: String = ""
+    @Volatile var lastGoodRegion: String = ""
+    @Volatile private var lastConnectingProtocol: String = ""
+    /** Пакеты реально шли (а не «канал выбран»): по этому признаку не трогаем рабочую сессию. */
+    @Volatile var lastTrafficAt: Long = 0L
+    /** v4.32.0: сколько попыток за последнюю минуту — понятнее, чем «попыток 100». */
+    @Volatile var attemptsLastMinute: Int = 0
+    @Volatile private var attemptsWindowStart: Long = 0L
+    @Volatile private var attemptsWindowCount: Int = 0
 
     private var tunnel: PsiphonTunnel? = null
     private val lock = Any()
@@ -63,6 +73,8 @@ object PsiphonBackup {
         val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         mode = p.getString("mode", MODE_AUTO) ?: MODE_AUTO
         region = p.getString("region", "") ?: ""
+        lastGoodProtocol = p.getString("good_protocol", "") ?: ""
+        lastGoodRegion = p.getString("good_region", "") ?: ""
     }
 
     fun setMode(ctx: Context, m: String) {
@@ -115,7 +127,7 @@ object PsiphonBackup {
             (if (clientAddress.isNotBlank()) " · IP $clientAddress" else "") +
             " · ↓${MediaFmt.size(rxBytes.get())} ↑${MediaFmt.size(txBytes.get())}" +
             (if (mode == MODE_ALWAYS) " · основной канал" else " · резерв")
-        starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с, попыток $connectAttempts)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "") + (if (lastError.isNotBlank()) " · $lastError" else "")
+        starting -> "Psiphon: подключается… (${(SystemClock.elapsedRealtime() - startedAt) / 1000} с, попыток $connectAttempts · за минуту $attemptsLastMinute)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "") + (if (lastError.isNotBlank()) " · $lastError" else "")
         SystemClock.elapsedRealtime() < pausedUntil -> "Psiphon: пауза ${(pausedUntil - SystemClock.elapsedRealtime()) / 60_000 + 1} мин — не подключился за ${GIVE_UP_MS / 60_000} мин (сеть фильтрует)" + (if (lastDiag.isNotBlank()) " · $lastDiag" else "")
         else -> "Psiphon: не запущен — нажмите, чтобы подключить (${modeTitle()})"
     }
@@ -137,6 +149,9 @@ object PsiphonBackup {
     fun ensureStarted(ctx: Context, why: String) {
         load(ctx)
         if (mode == MODE_OFF) return
+        // v4.32.0: уже подключены и канал живой — не трогаем. Любой перезапуск сбрасывает
+        // и рабочий туннель, и счётчики: со стороны это выглядело как «то работает, то перебирает всё».
+        if (ready()) return
         if (SystemClock.elapsedRealtime() < pausedUntil && mode != MODE_ALWAYS) return
         synchronized(lock) {
             if (tunnel != null) return
@@ -222,17 +237,28 @@ object PsiphonBackup {
         // Реальные порты приходят в onListeningHttpProxyPort / onListeningSocksProxyPort.
         o.put("LocalHttpProxyPort", 0)
         o.put("LocalSocksProxyPort", 0)
-        o.put("EgressRegion", region)
+        // v4.32.0: пользователь регион не выбрал — берём тот, что уже работал на этой сети.
+        // Стабильный выход = стабильный IP, меньше поводов переподключаться.
+        val effectiveRegion = region.ifBlank { lastGoodRegion }
+        o.put("EgressRegion", effectiveRegion)
         // v4.4.6: по журналу 4.4.5 — при активном VPN приложений Android отдаёт библиотеке DNS нашего же TUN (10.215.173.2),
         // недостижимый из процесса браузера: падали meek/tactics/список серверов. Резолвим через публичные DNS.
         o.put("DNSResolverPreferredAlternateServers", org.json.JSONArray(listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1")))
         o.put("DNSResolverAlternateServers", org.json.JSONArray(listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1")))
         o.put("DNSResolverPreferAlternateServerProbability", 1.0)
-        // больше параллельных попыток (на враждебной сети каждая попытка — 10–20 с таймаута)
-        o.put("ConnectionWorkerPoolSize", 20)
-        // сначала протоколы, которые труднее отличить от обычного трафика (TLS/QUIC/meek), потом всё остальное
-        o.put("InitialLimitTunnelProtocols", org.json.JSONArray(listOf("TLS-OSSH", "QUIC-OSSH", "OSSH", "SSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH", "FRONTED-MEEK-QUIC-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "SHADOWSOCKS-OSSH")))
-        o.put("InitialLimitTunnelProtocolsCandidateCount", 60)
+        // v4.32.0: было 20 параллельных воркеров × 60 кандидатов × 10 протоколов — со стороны это
+        // выглядело как «Psiphon каждую секунду перебирает все свои адреса» и «попыток 100».
+        // 6 воркеров и 20 кандидатов подключаются так же быстро на обычной сети, но не устраивают шторм.
+        o.put("ConnectionWorkerPoolSize", 6)
+        // v4.32.0: первым — протокол, который уже подключался на этой сети (запоминаем при успехе).
+        // Это экономит десятки бесполезных попыток при каждом переподключении.
+        val protocolOrder = ArrayList<String>()
+        if (lastGoodProtocol.isNotBlank()) protocolOrder.add(lastGoodProtocol)
+        for (p in listOf("TLS-OSSH", "QUIC-OSSH", "OSSH", "SSH", "FRONTED-MEEK-OSSH", "FRONTED-MEEK-HTTP-OSSH", "FRONTED-MEEK-QUIC-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH", "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "SHADOWSOCKS-OSSH")) {
+            if (p !in protocolOrder) protocolOrder.add(p)
+        }
+        o.put("InitialLimitTunnelProtocols", org.json.JSONArray(protocolOrder))
+        o.put("InitialLimitTunnelProtocolsCandidateCount", 20)
         o.put("TunnelPoolSize", 1)
         o.put("PortForwardFailureThreshold", 10)
         o.put("EmitBytesTransferred", true)
@@ -252,7 +278,16 @@ object PsiphonBackup {
             val important = m.contains("error") || m.contains("fail") || m.contains("alert") || m.contains("timeout") || m.contains("panic")
             if (type == "ConnectingServer") {
                 connectAttempts++
-                lastDiag = "пробуем сервер " + Regex("\"region\":\"([A-Z]+)\"").find(message)?.groupValues?.get(1).orEmpty() + " " + Regex("\"protocol\":\"([A-Z0-9-]+)\"").find(message)?.groupValues?.get(1).orEmpty()
+                // окно в минуту: «попыток 100» за десять минут — это норма, «100 в минуту» — шторм
+                if (now - attemptsWindowStart > 60_000L) {
+                    attemptsWindowStart = now
+                    attemptsWindowCount = 0
+                }
+                attemptsWindowCount++
+                attemptsLastMinute = attemptsWindowCount
+                val protoNow = Regex("\"protocol\":\"([A-Z0-9-]+)\"").find(message)?.groupValues?.get(1).orEmpty()
+                if (protoNow.isNotBlank()) lastConnectingProtocol = protoNow
+                lastDiag = "пробуем сервер " + Regex("\"region\":\"([A-Z]+)\"").find(message)?.groupValues?.get(1).orEmpty() + " " + protoNow
                 val now2 = SystemClock.elapsedRealtime()
                 if (now2 - (diagLoggedAt["cs"] ?: 0L) > 20_000L) { diagLoggedAt["cs"] = now2; VpnLog.i(TAG, "попытка №$connectAttempts: $lastDiag") }
                 return
@@ -333,17 +368,34 @@ object PsiphonBackup {
             starting = true
         }
         override fun onConnected() {
+            // v4.32.0: запоминаем, ЧЕМ подключились, чтобы в следующий раз не перебирать всё подряд
+            if (lastConnectingProtocol.isNotBlank() && lastConnectingProtocol != lastGoodProtocol) {
+                lastGoodProtocol = lastConnectingProtocol
+                appCtx?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("good_protocol", lastGoodProtocol)?.apply()
+            }
             connected = true
             starting = false
             connectedAt = SystemClock.elapsedRealtime()
             VpnLog.ok(TAG, "подключён за ${(connectedAt - startedAt) / 1000} с" + (if (connectedRegion.isNotBlank()) " · регион $connectedRegion" else "") + " · прокси 127.0.0.1:$httpPort")
             try { com.winwasm64.extensions.ExtensionProxy.onPsiphonConnected() } catch (_: Throwable) {}
         }
-        override fun onConnectedServerRegion(region: String) { connectedRegion = region }
+        override fun onConnectedServerRegion(region: String) {
+            connectedRegion = region
+            if (region.isNotBlank() && region != lastGoodRegion) {
+                lastGoodRegion = region
+                appCtx?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("good_region", lastGoodRegion)?.apply()
+            }
+        }
         override fun onClientRegion(region: String) {}
         override fun onClientAddress(address: String) { clientAddress = address }
         override fun onAvailableEgressRegions(regions: MutableList<String>) { availableRegions = regions.toList().sorted() }
-        override fun onBytesTransferred(sent: Long, received: Long) { txBytes.addAndGet(sent); rxBytes.addAndGet(received) }
+        override fun onBytesTransferred(sent: Long, received: Long) {
+            txBytes.addAndGet(sent)
+            rxBytes.addAndGet(received)
+            // v4.32.0: трафик — единственное честное доказательство, что канал живой.
+            // От этого зависит, будут ли сессию трогать вообще (см. конец строчных заметок).
+            if (sent > 0 || received > 0) lastTrafficAt = SystemClock.elapsedRealtime()
+        }
         override fun onStartedWaitingForNetworkConnectivity() {
             val now = SystemClock.elapsedRealtime()
             if (now - waitingNetworkLoggedAt > 60_000L) { waitingNetworkLoggedAt = now; VpnLog.w(TAG, "ждём сеть") }

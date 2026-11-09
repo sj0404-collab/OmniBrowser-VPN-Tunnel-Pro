@@ -2325,8 +2325,21 @@ object BrowsecLocalProxyServer {
             return existing
         }
         val assignedCountry = (preferredCountry ?: BrowsecVpnService.activeCountry).uppercase()
-        var boundPort = nextAppPort.getAndIncrement()
-        if (boundPort > 8980) boundPort = 8901
+        // v4.32.0: порт приложения — устойчивый (из имени пакета), а не «следующий по счётчику».
+        // Раньше после каждого старта процесса Telegram получал новый порт, а в его настройках
+        // оставался старый: прокси «то включался, то сам себя менял».
+        val takenPorts = appProfiles.values.map { it.localPort }.toSet()
+        val boundPort = AppPortAllocator.pick(packageName, takenPorts) { candidate ->
+            try {
+                java.net.ServerSocket().use { probe ->
+                    probe.reuseAddress = true
+                    probe.bind(java.net.InetSocketAddress("127.0.0.1", candidate), 1)
+                }
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
         val profile = AppTunnelProfile(packageName, assignedCountry, boundPort)
         AppTrafficStore.load(profile)
         appProfiles[packageName] = profile
