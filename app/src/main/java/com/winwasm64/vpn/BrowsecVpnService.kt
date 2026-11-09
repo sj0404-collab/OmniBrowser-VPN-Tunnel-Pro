@@ -585,7 +585,10 @@ object FastMultiDnsResolver {
         onTraffic: ((tx: Long, rx: Long) -> Unit)? = null
     ): List<String> {
         val clean = host.trim()
-        if (isIpv4Literal(clean)) return listOf(clean)
+        // v4.31.0: 127.0.0.1 в качестве адресата — это МЫ САМИ либо локальная заглушка DNS
+        // (так отвечает фильтр блокировки). Подключаться к себе бессмысленно: в журнале это
+        // выглядело как `failed to connect to cnlogs.umeng.com/127.0.0.1` и съедало 2.6 с.
+        if (isIpv4Literal(clean)) return if (isLoopbackOrUnspecified(clean)) emptyList() else listOf(clean)
 
         val candidates = LinkedHashSet<String>()
         val primary = resolveFast(clean, ecsSubnet, dohServer, onTraffic)
@@ -617,7 +620,16 @@ object FastMultiDnsResolver {
             } catch (_: Exception) {
             }
         }
-        return candidates.toList()
+        return candidates.filterTo(ArrayList(candidates.size)) { !isLoopbackOrUnspecified(it) }
+    }
+
+    /** v4.31.0: адрес «в себя» — никогда не годный исходящий адресат. */
+    fun isLoopbackOrUnspecified(ip: String): Boolean {
+        val v = ip.trim()
+        if (v.isEmpty()) return true
+        if (v == "::1" || v == "0.0.0.0" || v == "::") return true
+        if (v.startsWith("127.")) return true
+        return false
     }
 
     fun rememberWorkingIp(host: String, ip: String) {
@@ -1345,6 +1357,10 @@ object BrowserDirectRepeater {
                 }
                 ReserveChain.reportFailure(reserve, "HTTP-туннель не открылся")
             }
+        }
+        if (candidates.isEmpty()) {
+            // домен отдаёт только 127.0.0.1/0.0.0.0 — это фильтр блокировки или локальный DNS
+            throw java.io.IOException("$host заблокирован локальным фильтром (DNS отдаёт 127.0.0.1)")
         }
         st.consecutiveFailures.incrementAndGet()
         throw (lastErr ?: java.io.IOException("Failed to connect to $host:$port"))
@@ -2894,6 +2910,9 @@ object BrowsecLocalProxyServer {
                 appProfile?.txBytes?.addAndGet(tx)
             }
         )
+        if (candidates.isEmpty()) {
+            throw java.io.IOException("$host заблокирован локальным фильтром (DNS отдаёт 127.0.0.1)")
+        }
         for (ip in candidates) {
             try {
                 val t0 = System.currentTimeMillis()

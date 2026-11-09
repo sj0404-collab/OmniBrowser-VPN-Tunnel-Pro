@@ -950,7 +950,11 @@ class BitTorrentEngine(private val context: Context? = null) {
             // «качалась» через HTTP-ссылку, которую мы же и придумали (отсюда «HTTP WebSeed код 503»).
             if (metadata != null && discoveredPeers.isNotEmpty()) {
                 task.statusDetail = "Подключение к ${discoveredPeers.size} реально найденным пирам по TCP BitTorrent$vpnBadge..."
-                com.winwasm64.vpn.ConnTrace.torrent("${discoveredPeers.size} пиров", "попытка P2P по TCP", true)
+                com.winwasm64.vpn.ConnTrace.torrent(
+                    "${discoveredPeers.size} пиров",
+                    if (com.winwasm64.vpn.TorrentTunnel.isAvailable()) "попытка P2P по TCP · через канал Browsec" else "попытка P2P по TCP · напрямую (канал не поднят)",
+                    true
+                )
                 downloadedViaPeers = downloadPiecesFromPeers(task, metadata, discoveredPeers.toList())
                 if (!downloadedViaPeers) {
                     com.winwasm64.vpn.ConnTrace.torrent("${discoveredPeers.size} пиров", "P2P не отдал ни одного куска", false, "пиры не отвечают (закрыт TCP, DHT без UDP)")
@@ -1113,9 +1117,14 @@ class BitTorrentEngine(private val context: Context? = null) {
         for (peer in peers.take(8)) {
             if (task.cancelled.get() || task.paused.get()) break
             try {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress(peer.ip, peer.port), 3500)
-                    socket.soTimeout = 5000
+                // v4.31.0: сначала канал браузера (Browsec через локальный прокси), иначе напрямую.
+                // Раньше прямой TCP к пирам в мобильной сети просто не открывался.
+                val tunneled = com.winwasm64.vpn.TorrentTunnel.connect(peer.ip, peer.port)
+                val peerSocket = tunneled ?: Socket().also { s ->
+                    s.connect(InetSocketAddress(peer.ip, peer.port), 3500)
+                    s.soTimeout = 5000
+                }
+                peerSocket.use { socket ->
                     val out = DataOutputStream(socket.getOutputStream())
                     val inp = DataInputStream(socket.getInputStream())
 
@@ -1238,7 +1247,14 @@ class BitTorrentEngine(private val context: Context? = null) {
             )
             result
         } catch (e: Throwable) {
-            com.winwasm64.vpn.ConnTrace.torrent(short, "трекер ($proto) не ответил", false, e.message ?: e.javaClass.simpleName)
+            com.winwasm64.vpn.ConnTrace.torrent(
+                short,
+                "трекер ($proto) не ответил",
+                false,
+                (e.message ?: e.javaClass.simpleName) +
+                    if (proto == "UDP") " · UDP-трекеры в мобильных сетях обычно закрыты, остаются HTTP-трекеры" else
+                        if (!com.winwasm64.vpn.TorrentTunnel.isAvailable()) " · канал браузера не поднят — шли напрямую" else ""
+            )
             emptyList()
         }
     }
@@ -1248,7 +1264,10 @@ class BitTorrentEngine(private val context: Context? = null) {
         val encodedHash = BitTorrentParser.urlEncodeBytes(infoHash)
         val encodedPeerId = BitTorrentParser.urlEncodeBytes(peerId)
         val fullUrl = "${trackerUrl}${sep}info_hash=$encodedHash&peer_id=$encodedPeerId&port=6881&uploaded=0&downloaded=0&left=${leftBytes.coerceAtLeast(0L)}&compact=1&numwant=50"
-        val conn = (URL(fullUrl).openConnection() as HttpURLConnection).apply {
+        // v4.31.0: HTTP-трекер — через тот же канал, что и браузер (если он поднят).
+        // Напрямую такие запросы в мобильной сети не проходят: трекер молча не отвечал.
+        val trackerProxy = com.winwasm64.vpn.TorrentTunnel.proxyOrNull()
+        val conn = (URL(fullUrl).openConnection(trackerProxy ?: java.net.Proxy.NO_PROXY) as HttpURLConnection).apply {
             connectTimeout = 4000
             readTimeout = 4000
             applyBrowsecHeaders(this)

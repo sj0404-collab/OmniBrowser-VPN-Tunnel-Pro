@@ -32,6 +32,8 @@ object ConnTrace {
 
     private const val MAX = 3000
     private const val DEDUP_MS = 2_000L
+    /** v4.31.0: отсечённые запросы пишем в журнал не чаще раза в минуту. */
+    private const val BLOCKED_DEDUP_MS = 60_000L
 
     /** Одна запись журнала. Храним поля, а не готовую строку: нужны фильтры и статистика. */
     data class Entry(
@@ -284,13 +286,19 @@ object ConnTrace {
     private fun push(e: Entry) {
         // Одинаковые записи (страница тянет десятки картинок с одного хоста) — не чаще раза в 2 с,
         // иначе журнал превращается в мусор и его невозможно читать.
+        //
+        // v4.31.0: у ОТСЕЧЁННЫХ записей окно другое. Телеметрия GeForce NOW стучится каждые 2–3 с,
+        // и журнал из журнала с устройства был наполовину из одинаковых строк «заблокировано».
+        // Теперь такая строка возвращается раз в 60 с — факт остаётся виден, шум уходит.
+        val blocked = !e.ok && (e.route.contains("заблокировано", true) || (e.err?.contains("заблокирован", true) == true))
+        val window = if (blocked) BLOCKED_DEDUP_MS else DEDUP_MS
         val key = e.cat + "|" + e.who + "|" + e.target + "|" + e.purpose + "|" + e.ok
         val now = System.currentTimeMillis()
         val prev = dedup[key]
-        if (prev != null && now - prev < DEDUP_MS) return
+        if (prev != null && now - prev < window) return
         dedup[key] = now
         if (dedup.size > 800) {
-            dedup.entries.removeIf { now - it.value > 30_000L }
+            dedup.entries.removeIf { now - it.value > 120_000L }
         }
         synchronized(entries) {
             entries.addLast(e)
