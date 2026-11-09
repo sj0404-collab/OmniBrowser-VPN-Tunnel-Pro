@@ -6,7 +6,6 @@ import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
-import java.util.Random
 
 /**
  * v4.35.0: DNS с несколькими независимыми путями.
@@ -132,7 +131,7 @@ object DohResolver {
     /** DNS-запрос A-записи в бинарном виде. */
     private fun buildQuery(name: String): ByteArray {
         val out = ByteArrayOutputStream(64)
-        val id = Random.nextInt(0, 65535)
+        val id = (0..65535).random()
         out.write((id shr 8) and 0xFF); out.write(id and 0xFF)
         out.write(0x01); out.write(0x00) // рекурсия нужна
         out.write(0x00); out.write(0x01) // вопросов 1
