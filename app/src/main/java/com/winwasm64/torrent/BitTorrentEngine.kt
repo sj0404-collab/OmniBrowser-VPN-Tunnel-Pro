@@ -230,8 +230,9 @@ data class CatalogTorrentItem(
     val referer: String = "",
     /** v4.41.0: обложка (og:image со страницы) — превью вместо голого текста. */
     val poster: String = "",
-    /** v4.42.0: категория для фильтра — game/video/music/book/soft/other. */
-    val category: String = "other"
+    /** v4.42.0: тип содержимого для фильтра — game/video/music/book/soft/other.
+     *  (поле `category` уже занято источником/подписью, поэтому здесь `kind`) */
+    val kind: String = "other"
 )
 
 object BitTorrentParser {
@@ -680,7 +681,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                             reason = f.reason,
                             referer = f.referer,
                             poster = f.poster,
-                            category = f.category
+                            kind = f.category
                         )
                     )
                 }

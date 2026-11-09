@@ -3665,7 +3665,7 @@ private fun TorrentClientSection(
     val visibleItems = remember(catalogItems, categoryFilter) {
         if (categoryFilter == "Все") catalogItems
         else catalogItems.filter {
-            com.winwasm64.torrent.TorrentSearchAgent.categoryMatches(categoryFilter, it.category)
+            com.winwasm64.torrent.TorrentSearchAgent.categoryMatches(categoryFilter, it.kind)
         }
     }
     // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
