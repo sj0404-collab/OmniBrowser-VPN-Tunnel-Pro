@@ -3383,6 +3383,33 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
+            // ===================== SECTION 5: VPN И КАНАЛЫ (отдельная вкладка) =====================
+            if (currentSection == 5 && !inPip) {
+                VpnChannelsSection(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    browsecEnabled = browsecEnabled,
+                    browsecCountry = browsecCountry,
+                    onToggleBrowsec = {
+                        val nextState = !browsecEnabled
+                        browsecEnabled = nextState
+                        browsecPaused = false
+                        if (nextState) {
+                            BrowsecVpnService.startForApp(context, browsecCountry, null)
+                        } else {
+                            BrowsecVpnService.stop(context)
+                        }
+                        persistBrowserSettings()
+                    },
+                    onCycleCountry = {
+                        val nextCode = BrowsecVpnService.cycleCountry(context)
+                        browsecCountry = nextCode
+                        browsecEnabled = true
+                        browsecPaused = false
+                        persistBrowserSettings()
+                    }
+                )
+            }
+
             // ===================== SECTION 3: NATIVE APPS + BROWSEC VPN LAUNCHER =====================
             if (currentSection == 3 && !inPip) {
                 NativeAppsWithBrowsecSection(
@@ -3504,6 +3531,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     onLaunchAppWithBrowsec = { pkg, name ->
                         startBrowsecAndLaunchNativeApp(pkg, name)
                     },
+                    onOpenVpnTab = { currentSection = 5 },
                     onToggleAppInVpn = { pkg ->
                         if (vpnRoutedApps.contains(pkg)) {
                             vpnRoutedApps.remove(pkg)
@@ -3588,12 +3616,17 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 OmniBottomBar(
                     selected = currentSection,
                     items = listOf(
-                        OmniNavItem("Браузер", OmniIcons.Globe),
-                        OmniNavItem("Торренты", OmniIcons.Torrent),
-                        OmniNavItem("История", OmniIcons.History),
-                        // v4.34.0: загрузки — отдельная вкладка, а не подраздел истории
+                        // v4.36.0: у КАЖДОГО пункта теперь указан свой раздел.
+                        // Раньше «Загрузки» вели в раздел 4, а «Приложения» оставались без номера и получали
+                        // номер по позиции — тоже 4. Две вкладки подсвечивались одновременно, и «Приложения»
+                        // не открывались: нажатие выбирало уже выбранный раздел.
+                        OmniNavItem("Браузер", OmniIcons.Globe, section = 0),
+                        OmniNavItem("Торренты", OmniIcons.Torrent, section = 1),
+                        OmniNavItem("История", OmniIcons.History, section = 2),
                         OmniNavItem("Загрузки", OmniIcons.Download, section = 4),
-                        OmniNavItem("Приложения", OmniIcons.Apps)
+                        OmniNavItem("Приложения", OmniIcons.Apps, section = 3),
+                        // v4.36.0: VPN — отдельная вкладка после «Приложений», как и просили
+                        OmniNavItem("VPN", OmniIcons.Shield, section = 5)
                     ),
                     onSelect = { currentSection = it }
                 )
@@ -4288,7 +4321,8 @@ private fun NativeAppsWithBrowsecSection(
     onToggleFloatingVpn: () -> Unit,
     onLaunchAppWithBrowsec: (String, String) -> Unit,
     onToggleAppInVpn: (String) -> Unit,
-    onRefreshApps: () -> Unit
+    onRefreshApps: () -> Unit,
+    onOpenVpnTab: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var selectedCategory by remember { mutableStateOf("Все") }
@@ -4600,12 +4634,26 @@ private fun NativeAppsWithBrowsecSection(
                         }
                     }
 
-                    // v4.0.3: что сейчас включено + журнал VPN
-                    androidx.compose.ui.viewinterop.AndroidView(
-                        factory = { ctx -> com.winwasm64.vpn.VpnStatusView(ctx) { pkgs -> pkgs.forEach { p -> if (!com.winwasm64.vpn.BrowsecVpnService.routedPackages.contains(p)) onToggleAppInVpn(p) } } },
-                        update = { v -> v.compact = !showVpnDetails; v.refresh() },
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    // v4.36.0: панель «что включено» переехала в свою вкладку VPN — здесь только переход,
+                    // иначе один и тот же блок жил в двух местах и расходился в показаниях
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "Состояние VPN, диагностика каналов и журнал — во вкладке «VPN»",
+                            color = Omni.TextDim, fontSize = 10.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedButton(
+                            onClick = onOpenVpnTab,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.height(32.dp)
+                        ) {
+                            Text("VPN →", fontSize = 11.sp, color = Color.White)
+                        }
+                    }
                     if (showVpnDetails) {
                     // Панель выбора сервера, синхронизации обоих VPN и авто-смены настроек с возвратом прошлого в исходное
                     Row(
@@ -5437,4 +5485,85 @@ private fun adBlockReason(host: String): String {
     return if (h.contains("telemetry") || h.contains("analytics") || h.contains("otel") ||
         h.contains("metrics") || h.contains("kaizen") || h.contains("tracker") || h.contains("stats")
     ) "телеметрия — отсечено (на работу сайта не влияет)" else "реклама/трекер — отсечено"
+}
+
+/**
+ * v4.36.0: вкладка «VPN».
+ *
+ * Раньше всё про VPN было разбросано: тумблеры в «Приложениях», журнал отдельным экраном,
+ * а понять, какой канал сейчас работает, было нельзя вообще. Здесь одно место:
+ * состояние → диагностика каналов одной кнопкой → журнал.
+ * Маршрутизация по конкретным приложениям осталась в «Приложениях» — там ей и место.
+ */
+@Composable
+private fun VpnChannelsSection(
+    modifier: Modifier = Modifier,
+    browsecEnabled: Boolean,
+    browsecCountry: String,
+    onToggleBrowsec: () -> Unit,
+    onCycleCountry: () -> Unit
+) {
+    val context = LocalContext.current
+    Column(modifier.verticalScroll(rememberScrollState()).padding(14.dp)) {
+        Text("VPN и каналы", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Когда что-то не открывается — нажмите «Диагностика каналов». Она реальными соединениями " +
+                "проверит сеть, DNS (оба уровня), Browsec, Psiphon, резервные прокси и выход в интернет " +
+                "и покажет, что именно отказало и что делать.",
+            fontSize = 12.sp, color = Omni.TextDim
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Button(
+                onClick = onToggleBrowsec,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (browsecEnabled) Omni.AccentContainer else Color(0xFF2A2B30)
+                ),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Text(
+                    if (browsecEnabled) "Browsec VPN: ВКЛ" else "Browsec VPN: ВЫКЛ",
+                    fontSize = 12.sp, color = Color.White
+                )
+            }
+            OutlinedButton(
+                onClick = onCycleCountry,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                modifier = Modifier.height(36.dp)
+            ) {
+                Text("Сменить страну ($browsecCountry)", fontSize = 12.sp, color = Color.White)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        OutlinedButton(
+            onClick = {
+                context.startActivity(
+                    Intent(context, com.winwasm64.vpn.VpnLogActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            },
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+            modifier = Modifier.height(36.dp)
+        ) {
+            Text("📜 Журнал VPN и браузера", fontSize = 12.sp, color = Color.White)
+        }
+        Spacer(Modifier.height(12.dp))
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                com.winwasm64.vpn.VpnStatusView(ctx) { pkgs ->
+                    pkgs.forEach { pkg -> com.winwasm64.vpn.BrowsecVpnService.setRoutedPackage(ctx, pkg, true) }
+                }.apply { compact = false }
+            },
+            update = { v -> v.compact = false; v.refresh() },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Маршрутизация по отдельным приложениям, серверы для каждой программы и запуск приложений " +
+                "через туннель — во вкладке «Приложения».",
+            fontSize = 11.sp, color = Omni.TextDim
+        )
+    }
 }
