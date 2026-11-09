@@ -40,15 +40,28 @@ object TorrentTunnel {
      * null — канал недоступен или не пустил; вызывающий идёт напрямую.
      */
     fun connect(host: String, port: Int, timeoutMs: Int = 6000): Socket? {
-        val proxy = proxyOrNull() ?: return null
-        return try {
-            val s = Socket(proxy)
-            s.tcpNoDelay = true
-            s.connect(InetSocketAddress(host, port), timeoutMs)
-            s.soTimeout = 8000
-            s
-        } catch (_: Throwable) {
-            null
+        // 1) канал браузера (Browsec)
+        proxyOrNull()?.let { proxy ->
+            try {
+                val s = Socket(proxy)
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(host, port), timeoutMs)
+                s.soTimeout = 8000
+                return s
+            } catch (_: Throwable) {
+            }
         }
+        // 2) v4.35.0: резервный канал (Psiphon / публичный прокси / свой ручной прокси).
+        // Раньше при упавшем Browsec пиры были недоступны вообще, и торрент стоял на 0%.
+        ReserveChain.active()?.let { up ->
+            val s = ReserveDialer.connect(up, host, port, timeoutMs = timeoutMs)
+            if (s != null) {
+                ReserveChain.reportSuccess(up)
+                return s
+            }
+            ReserveChain.reportFailure(up, "пир $host:$port через резерв не открылся")
+        }
+        // 3) напрямую — как было, чтобы торрент не зависел от VPN
+        return null
     }
 }

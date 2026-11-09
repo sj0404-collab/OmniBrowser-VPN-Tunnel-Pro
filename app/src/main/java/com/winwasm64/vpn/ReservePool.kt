@@ -37,7 +37,14 @@ object ReservePool {
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt" to Kind.HTTP,
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt" to Kind.SOCKS5,
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt" to Kind.HTTP,
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt" to Kind.SOCKS5
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt" to Kind.SOCKS5,
+        // v4.35.0: добавлены ещё источники — когда у основных «кончился лимит» и они отдают мусор,
+        // пул не должен становиться пустым
+        "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/protocols/http/data.txt" to Kind.HTTP,
+        "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/protocols/socks5/data.txt" to Kind.SOCKS5,
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt" to Kind.HTTP,
+        "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt" to Kind.SOCKS5,
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt" to Kind.SOCKS5
     )
 
     private val HOST_RE = Regex("^[0-9a-zA-Z.\\-]{4,80}$")

@@ -593,6 +593,11 @@ object FastMultiDnsResolver {
         val candidates = LinkedHashSet<String>()
         val primary = resolveFast(clean, ecsSubnet, dohServer, onTraffic)
         if (primary.isNotBlank()) candidates.add(primary)
+        // v4.35.0: основной путь держался на двух адресах DoH. Если оба молчат — «нет сети» при живом
+        // интернете. Дальше в дело идут восемь независимых DoH-провайдеров и обычный UDP-DNS.
+        if (primary.isBlank() || isLoopbackOrUnspecified(primary)) {
+            DohResolver.resolve(clean, onTraffic = onTraffic)?.let { candidates.add(it) }
+        }
 
         if (isYoutubeWebHost(clean)) {
             candidates.addAll(YOUTUBE_CLEAN_ANYCAST_IPS)

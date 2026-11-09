@@ -360,7 +360,11 @@ object PsiphonBackup {
             ReserveChain.setPsiphonPort(port)
             VpnLog.i(TAG, "локальный HTTP-прокси 127.0.0.1:$port")
         }
-        override fun onListeningSocksProxyPort(port: Int) { socksPort = port }
+        override fun onListeningSocksProxyPort(port: Int) {
+            socksPort = port
+            // v4.35.0: SOCKS-прокси Psiphon тоже становится резервным каналом (HTTP-порт может быть занят)
+            ReserveChain.setPsiphonPort(port, socks = true)
+        }
         override fun onHttpProxyPortInUse(port: Int) { VpnLog.w(TAG, "порт $port занят — Psiphon не сможет принять соединения") }
         override fun onConnecting() {
             if (connected) VpnLog.w(TAG, "соединение потеряно — переподключение")

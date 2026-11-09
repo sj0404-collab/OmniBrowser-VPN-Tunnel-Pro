@@ -120,6 +120,10 @@ object ReserveChain {
     @Volatile
     var psiphonHttpPort: Int = 0
 
+    /** v4.35.0: SOCKS-порт Psiphon — второй путь в тот же туннель, если HTTP-порт не отвечает. */
+    @Volatile
+    var psiphonSocksPort: Int = 0
+
     /** Пул публичных прокси в порядке предпочтения. */
     @Volatile
     private var pool: List<ReservePool.Proxy> = emptyList()
@@ -131,6 +135,9 @@ object ReserveChain {
             val ordered = ArrayList<ReserveUpstream>()
             if (psiphonHttpPort > 0) {
                 ordered.add(ReserveUpstream(Kind.PSIPHON, "127.0.0.1", psiphonHttpPort, "Psiphon (локальный прокси)"))
+            }
+            if (psiphonSocksPort > 0) {
+                ordered.add(ReserveUpstream(Kind.SOCKS5, "127.0.0.1", psiphonSocksPort, "Psiphon (SOCKS5)"))
             }
             for (p in list) {
                 ordered.add(
@@ -149,9 +156,9 @@ object ReserveChain {
 
     fun poolSize(): Int = pool.size
 
-    /** Вызывается, когда Psiphon поднял локальный прокси. */
-    fun setPsiphonPort(port: Int) {
-        psiphonHttpPort = port
+    /** Вызывается, когда Psiphon поднял локальный прокси (HTTP или SOCKS5). */
+    fun setPsiphonPort(port: Int, socks: Boolean = false) {
+        if (socks) psiphonSocksPort = port else psiphonHttpPort = port
         if (pool.isNotEmpty() || port > 0) applyPool(pool)
     }
 

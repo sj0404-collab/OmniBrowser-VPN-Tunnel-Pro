@@ -1002,6 +1002,12 @@ class BitTorrentEngine(private val context: Context? = null) {
         // connectedPeers = max(5) и knownPeers = max(19) — числа брались из воздуха, и по ним
         // нельзя было понять, работает P2P или нет. Показываем только то, что реально известно.
 
+        // v4.35.0: ожидаемый размер знает .torrent (или WebSeed-запись), и его нельзя терять.
+        // Из-за этого потерянного размера раздача «Elliot Quest» весом ~200 МБ «скачалась» за 2,7 КБ
+        // и была помечена 100%: сервер отдал не файл, а служебную страницу.
+        // для многофайловых раздач один WebSeed может отдавать один файл — тогда строгую сверку не делаем
+        val strictSize = metadata == null || metadata.files.size <= 1
+        val expectedBytes = if (!strictSize) 0L else (task.totalBytes.takeIf { it > 0L } ?: metadata?.totalSize ?: 0L)
         val conn = (URL(seedUrl).openConnection() as HttpURLConnection).apply {
             connectTimeout = 12000
             readTimeout = 15000
@@ -1017,9 +1023,31 @@ class BitTorrentEngine(private val context: Context? = null) {
             com.winwasm64.vpn.ConnTrace.torrent(seedUrl.take(120), "WebSeed ответил HTTP $code", false, if (code == 503 || code == 429) "сервер занят/лимит — повторяем" else "недоступно")
             throw IllegalStateException("HTTP WebSeed код $code")
         }
+        val contentType = (conn.contentType ?: "").lowercase()
+        val contentLengthRaw = conn.contentLengthLong
+
+        // v4.35.0: сервер отдал страницу/ошибку вместо файла — это не «скачано», это провал
+        if (contentType.contains("text/html") || contentType.contains("application/json")) {
+            com.winwasm64.vpn.ConnTrace.torrent(
+                seedUrl.take(120),
+                "WebSeed отдал не файл ($contentType)",
+                false,
+                "сервер ответил страницей вместо содержимого раздачи"
+            )
+            throw IllegalStateException("сервер отдал $contentType вместо файла раздачи")
+        }
+        if (expectedBytes > 0L && contentLengthRaw > 0L && contentLengthRaw < expectedBytes) {
+            com.winwasm64.vpn.ConnTrace.torrent(
+                seedUrl.take(120),
+                "WebSeed отдал ${formatSize(contentLengthRaw)} вместо ${formatSize(expectedBytes)}",
+                false,
+                "объём не совпал с .torrent — это не файл раздачи"
+            )
+            throw IllegalStateException("сервер отдал ${formatSize(contentLengthRaw)} вместо ${formatSize(expectedBytes)}")
+        }
         com.winwasm64.vpn.ConnTrace.torrent(seedUrl.take(120), "WebSeed отвечает, качаем по HTTP", true)
 
-        val contentLength = conn.contentLengthLong
+        val contentLength = contentLengthRaw
         val resumeOffset = if (code == 206) task.downloadedBytes.get() else 0L
         if (contentLength > 0) {
             task.totalBytes = resumeOffset + contentLength
@@ -1072,6 +1100,22 @@ class BitTorrentEngine(private val context: Context? = null) {
             val publishedFile = publishToPublicDownloads(task.outputFile)
             task.outputFile = publishedFile
             val finalSize = publishedFile.length()
+            // v4.35.0: главная защита от «100% за 2,7 КБ». Файл меньше ожидаемого — это не успех.
+            if (expectedBytes > 0L && finalSize < expectedBytes) {
+                task.speedBytesPerSec = 0L
+                task.downloadedBytes.set(finalSize)
+                task.state = TorrentState.ERROR
+                task.statusDetail = "Ошибка: получено ${formatSize(finalSize)} из ${formatSize(expectedBytes)} — " +
+                    "сервер отдал не тот файл. Файл удалён, попробуйте другой WebSeed или дождитесь пиров."
+                try { publishedFile.delete() } catch (_: Exception) {}
+                com.winwasm64.vpn.ConnTrace.torrent(
+                    seedUrl.take(120),
+                    "загрузка неполная: ${formatSize(finalSize)} из ${formatSize(expectedBytes)}",
+                    false,
+                    "сервер отдал не файл раздачи"
+                )
+                return
+            }
             task.downloadedBytes.set(finalSize)
             task.totalBytes = finalSize
             task.speedBytesPerSec = 0L
