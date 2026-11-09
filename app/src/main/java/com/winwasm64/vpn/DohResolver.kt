@@ -48,8 +48,12 @@ object DohResolver {
         cache[name]?.let { if (System.currentTimeMillis() - it.second < CACHE_MS) return it.first }
 
         // 1) JSON-API: быстро и без бинарного разбора
-        jsonLookup("https://dns.google/resolve?name=$name&type=A", timeoutMs, onTraffic)?.let { return remember(name, it) }
-        jsonLookup("https://cloudflare-dns.com/dns-query?name=$name&type=A", timeoutMs, onTraffic)?.let { return remember(name, it) }
+        jsonLookup("https://dns.google/resolve?name=$name&type=A", timeoutMs, onTraffic)?.let {
+            lastGood = "Google (JSON)"; return remember(name, it)
+        }
+        jsonLookup("https://cloudflare-dns.com/dns-query?name=$name&type=A", timeoutMs, onTraffic)?.let {
+            lastGood = "Cloudflare (JSON)"; return remember(name, it)
+        }
 
         val query = buildQuery(name)
 

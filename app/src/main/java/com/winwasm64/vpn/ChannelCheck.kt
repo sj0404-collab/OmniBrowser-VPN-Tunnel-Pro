@@ -1,7 +1,6 @@
 package com.winwasm64.vpn
 
 import java.net.InetSocketAddress
-import java.net.Proxy
 import java.net.Socket
 
 /**
@@ -114,11 +113,17 @@ object ChannelCheck {
             return Row("Browsec (браузер)", State.FAIL, "локальный прокси не поднят", "включите расширение Browsec в браузере")
         }
         val t0 = System.currentTimeMillis()
-        return try {
-            val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port))
-            Socket(proxy).use { s ->
-                s.connect(InetSocketAddress(PROBE_HOST, PROBE_PORT), 7000)
-            }
+        // v4.37.0: здесь был java.net.Socket(Proxy) с неразрешённым адресом — он падал с
+        // IllegalArgumentException ещё до соединения, и живой канал выглядел мёртвым.
+        // Проверяем тем же диалером, которым реально ходит торрент: он делает настоящий CONNECT.
+        val localProxy = ReserveUpstream(ReserveChain.Kind.HTTP, "127.0.0.1", port, "Browsec")
+        val probe = try {
+            ReserveDialer.connect(localProxy, PROBE_HOST, PROBE_PORT, timeoutMs = 7000)
+        } catch (_: Throwable) {
+            null
+        }
+        return if (probe != null) {
+            runCatching { probe.close() }
             val ms = System.currentTimeMillis() - t0
             val kept = BrowserDirectRepeater.enabled
             Row(
@@ -126,10 +131,10 @@ object ChannelCheck {
                 "CONNECT до $PROBE_HOST открылся за $ms мс · порт $port" + if (kept) "" else " · расширение выключено",
                 if (kept) "" else "включите Browsec в браузере, иначе трафик идёт обходом DPI", ms
             )
-        } catch (e: Exception) {
+        } else {
             Row(
                 "Browsec (браузер)", State.FAIL,
-                "CONNECT через 127.0.0.1:$port не открылся: ${e.javaClass.simpleName}",
+                "CONNECT через 127.0.0.1:$port не открылся",
                 "смените сервер в браузере или включите Psiphon (режим «всегда»)",
                 System.currentTimeMillis() - t0
             )

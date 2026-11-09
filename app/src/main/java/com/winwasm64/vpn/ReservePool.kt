@@ -158,28 +158,57 @@ object ReservePool {
      * Скачать списки и собрать пул. Возвращает количество записей до проверки.
      * Сеть может быть недоступна — тогда просто пусто, без падений.
      */
-    fun refresh(ctx: Context, perListTimeoutMs: Int = 7000, limit: Int = 80): Int {
+    fun refresh(ctx: Context, perListTimeoutMs: Int = 7000, limit: Int = 80, proxyPort: Int = 0): Int {
         val collected = ArrayList<Proxy>()
         for ((url, kind) in LISTS) {
-            try {
-                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = perListTimeoutMs
-                    readTimeout = perListTimeoutMs
-                    requestMethod = "GET"
-                    setRequestProperty("User-Agent", "OmniBrowser/4.30")
-                }
-                conn.inputStream.use { stream ->
-                    val text = stream.bufferedReader().readText()
-                    collected.addAll(parse(text, kind, url.substringAfterLast('/')))
-                }
-                conn.disconnect()
-            } catch (_: Throwable) {
-                // один список не отдался — не беда, есть другие
-            }
+            fetchList(url, kind, perListTimeoutMs, proxyPort)?.let { collected.addAll(it) }
         }
         val clean = sanitize(collected, limit)
         if (clean.isNotEmpty()) save(ctx, clean)
-        VpnLog.i("Резерв", "пул прокси: собрано ${collected.size}, оставлено ${clean.size}")
+        VpnLog.i(
+            "Резерв",
+            "пул прокси" + (if (proxyPort > 0) " (через прокси 127.0.0.1:$proxyPort)" else " (напрямую)") +
+                ": собрано ${collected.size}, оставлено ${clean.size}"
+        )
         return clean.size
+    }
+
+    private fun fetchList(url: String, kind: Kind, timeoutMs: Int, proxyPort: Int): List<Proxy>? {
+        return try {
+            val conn = (if (proxyPort > 0) {
+                URL(url).openConnection(java.net.Proxy(java.net.Proxy.Type.HTTP, java.net.InetSocketAddress("127.0.0.1", proxyPort)))
+            } else {
+                URL(url).openConnection()
+            } as HttpURLConnection).apply {
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "OmniBrowser/4.30")
+            }
+            val text = conn.inputStream.use { it.bufferedReader().readText() }
+            conn.disconnect()
+            parse(text, kind, url.substringAfterLast('/'))
+        } catch (_: Throwable) {
+            // один список не отдался — не беда, есть другие
+            null
+        }
+    }
+
+    /**
+     * v4.37.0: `raw.githubusercontent.com` в РФ часто недоступен напрямую — пул оставался пустым
+     * («источников 2 · пул пуст» в диагностике). Поэтому: сначала напрямую, а если пришло мало —
+     * повторяем через уже поднятый канал (локальный прокси Browsec, иначе порт Psiphon).
+     */
+    fun refreshSmart(ctx: Context, limit: Int = 80): Int {
+        var got = refresh(ctx, limit = limit)
+        if (got < 10) {
+            val port = runCatching { BrowserDirectRepeater.ensureServerRunning() }.getOrDefault(0)
+                .let { if (it > 0) it else PsiphonBackup.httpPort }
+            if (port > 0) {
+                val viaChannel = refresh(ctx, limit = limit, proxyPort = port)
+                if (viaChannel > got) got = viaChannel
+            }
+        }
+        return got
     }
 }

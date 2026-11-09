@@ -45,6 +45,7 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
     private val btnDiag = TextView(context)
     private val tvDiag = TextView(context)
     @Volatile private var diagRunning = false
+    @Volatile private var poolRunning = false
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -139,6 +140,35 @@ class VpnStatusView(context: Context, private val onQuickAdd: (List<String>) -> 
             }, "ChannelCheck").start()
         }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
         addView(diagRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+
+        // v4.37.0: пул резервных прокси раньше обновлялся только из скрытых настроек, поэтому в
+        // диагностике он всегда был пуст. Теперь кнопка здесь, рядом с проверкой.
+        val poolRow = LinearLayout(context).apply { orientation = HORIZONTAL }
+        poolRow.addView(pill(TextView(context), "🔄 Обновить пул прокси") {
+            if (poolRunning) {
+                Toast.makeText(context, "Пул уже обновляется…", Toast.LENGTH_SHORT).show()
+                return@pill
+            }
+            poolRunning = true
+            Toast.makeText(context, "Скачиваю списки прокси…", Toast.LENGTH_SHORT).show()
+            Thread({
+                val n = try {
+                    ReservePool.refreshSmart(context.applicationContext)
+                } catch (_: Throwable) {
+                    0
+                }
+                handler.post {
+                    poolRunning = false
+                    Toast.makeText(
+                        context,
+                        if (n > 0) "Пул обновлён: $n прокси" else "Не удалось скачать списки — нет канала (включите Browsec или Psiphon)",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    refresh()
+                }
+            }, "ReservePoolRefresh").start()
+        }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT))
+        addView(poolRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
         styleText(tvDiag, 11f, 0xFFCFD3D8.toInt())
         tvDiag.typeface = Typeface.MONOSPACE
