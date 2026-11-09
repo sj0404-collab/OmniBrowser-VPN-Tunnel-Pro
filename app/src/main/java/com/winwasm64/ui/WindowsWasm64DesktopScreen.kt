@@ -4458,8 +4458,6 @@ private fun NativeAppsWithBrowsecSection(
                         }
                     }
                 }
-            }
-                }
                 items(filteredApps, key = { it.packageName }) { app ->
                     var itemExpanded by remember(app.packageName) { mutableStateOf(false) }
                     val isInVpn = vpnRoutedApps.contains(app.packageName)
