@@ -69,7 +69,9 @@ object TorrentStreamer {
         statusText = "Получение метаданных…"
         val source = engine.prepareStream(magnetUri, torrentUrl, referer)
         if (source == null) {
-            statusText = "Не удалось получить метаданные раздачи — поток недоступен"
+            // v4.44.0: говорим, НА КАКОМ шаге всё встало, а не «не удалось» одной фразой
+            statusText = "Метаданные не получены. Этап: " + engine.prepareStage +
+                "\nЕсли пиров 0 — у раздачи нет сидов; если пиров много, но метаданные не идут — пиры не поддерживают обмен метаданными или канал блокирует TCP."
             return false
         }
         val meta = source.metadata

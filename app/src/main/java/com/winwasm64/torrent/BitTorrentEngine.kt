@@ -860,6 +860,9 @@ class BitTorrentEngine(private val context: Context? = null) {
         return BitTorrentParser.toHex(BitTorrentParser.sha1(found.name.toByteArray())).take(16)
     }
 
+    /** v4.44.0: на каком шаге подготовка потока — это показывается в плеере вместо общей фразы. */
+    @Volatile var prepareStage: String = ""
+
     /** Источник для потокового просмотра/прослушивания: метаданные + живые пиры. */
     data class StreamSource(
         val name: String,
@@ -878,6 +881,7 @@ class BitTorrentEngine(private val context: Context? = null) {
         torrentUrl: String? = null,
         referer: String? = null
     ): StreamSource? {
+        prepareStage = "ищу .torrent по ссылке…"
         var bytes: ByteArray? = null
         if (!torrentUrl.isNullOrBlank()) bytes = fetchUrlBytes(torrentUrl, referer)
         val metadata: TorrentMetadata
@@ -885,6 +889,7 @@ class BitTorrentEngine(private val context: Context? = null) {
             metadata = BitTorrentParser.parseTorrentBytes(bytes)
         } else if (!magnetUri.isNullOrBlank()) {
             val mag = BitTorrentParser.parseMagnetUri(magnetUri)
+            prepareStage = "спрашиваю кэши метаданных…"
             val cacheUrls = listOf(
                 "https://itorrents.org/torrent/${mag.infoHashHex.uppercase()}.torrent",
                 "https://watercache.libertycorp.org/get/${mag.infoHashHex.lowercase()}"
@@ -902,12 +907,14 @@ class BitTorrentEngine(private val context: Context? = null) {
             } else {
                 // v4.42.0: кэши не отдали .torrent — берём метаданные прямо у пиров (ut_metadata).
                 // Без этого magnet-раздачи из открытых каталогов вообще не открывались в плеере.
+                prepareStage = "ищу пиров по трекерам…"
                 val magTrackers = (mag.trackers + TorrentRescue.EXTRA_TRACKERS).distinct()
                 val magPeers = LinkedHashSet<PeerEndpoint>()
                 for (tr in magTrackers.take(8)) {
                     if (magPeers.size >= 40) break
                     magPeers.addAll(announceTracker(tr, mag.infoHash, mag.exactLength.coerceAtLeast(10_485_760L)))
                 }
+                prepareStage = "пиров ${magPeers.size} · забираю метаданные у пиров (ut_metadata)…"
                 val fetched = MagnetMetadata.fetch(mag.infoHash, mag.infoHashHex, magPeers.toList())
                 metadata = fetched ?: return null
             }

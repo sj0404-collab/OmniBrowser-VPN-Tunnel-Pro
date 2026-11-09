@@ -55,3 +55,23 @@ class QualityPickerTest {
         assertEquals(listOf("1080p", "720p", "480p"), TorrentSearchAgent.availableQualities(items))
     }
 }
+
+/** v4.44.0: категории и запрос к сайтам. */
+class CategoryAndQueryTest {
+
+    @Test
+    fun `фильм с словом Game в названии остаётся видео`() {
+        assertEquals(
+            "video",
+            TorrentSearchAgent.classify("Шерлок Холмс: Игра теней (2011) AC3 5.1 DVDRiP")
+        )
+        assertEquals("game", TorrentSearchAgent.classify("Cyberpunk 2077 Repack", platform = "PC"))
+    }
+
+    @Test
+    fun `качество не попадает в запрос к трекерам`() {
+        assertEquals("шерлок", TorrentSearchAgent.stripQueryNoise("шерлок 360p"))
+        assertEquals("дюна", TorrentSearchAgent.stripQueryNoise("дюна 1080p x265"))
+        assertEquals("pink floyd", TorrentSearchAgent.stripQueryNoise("pink floyd flac"))
+    }
+}
