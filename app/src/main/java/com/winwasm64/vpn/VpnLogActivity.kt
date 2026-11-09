@@ -134,15 +134,22 @@ class VpnLogActivity : Activity() {
     private fun buildFilters() {
         filtersRow.removeAllViews()
         chips.clear()
+        // v4.34.0: порядок по важности — сначала то, что требует внимания, потом фон.
+        val counts = if (showConnections) ConnTrace.counts() else emptyMap()
+        fun withCount(label: String, key: String): String {
+            val n = counts[key] ?: 0
+            return if (n > 0) "$label $n" else label
+        }
         val list = if (showConnections) listOf<Pair<String, String?>>(
             "Все" to null,
-            "Ошибки" to "err",
-            "Браузер" to "browser",
-            "Приложения" to "apps",
-            "UDP/игры" to "udp",
-            "Обход DPI" to "bypass",
-            "Торренты" to "torrent",
-            "DNS" to "dns"
+            withCount("⚠ Ошибки", "err") to "err",
+            withCount("Обход DPI", ConnTrace.CAT_BYPASS) to "bypass",
+            withCount("Браузер", ConnTrace.CAT_BROWSER) to "browser",
+            withCount("Приложения", ConnTrace.CAT_APPS) to "apps",
+            withCount("UDP/игры", ConnTrace.CAT_UDP) to "udp",
+            withCount("Торренты", ConnTrace.CAT_TORRENT) to "torrent",
+            withCount("DNS", ConnTrace.CAT_DNS) to "dns",
+            withCount("Кэш", ConnTrace.CAT_CACHE) to "cache"
         ) else listOf<Pair<String, String?>>(
             "Все" to null,
             "Ошибки" to "err",

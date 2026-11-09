@@ -29,6 +29,8 @@ object ConnTrace {
     const val CAT_BYPASS = "Обход DPI"
     const val CAT_DNS = "DNS"
     const val CAT_TORRENT = "Торренты"
+    /** v4.34.0: «из кэша / соединение не открывалось» — это не событие, а фон. Отдельная категория. */
+    const val CAT_CACHE = "Кэш"
 
     private const val MAX = 3000
     private const val DEDUP_MS = 2_000L
@@ -116,7 +118,7 @@ object ConnTrace {
                     push(
                         Entry(
                             at = e.value.at,
-                            cat = CAT_BROWSER,
+                            cat = CAT_CACHE,
                             who = if (e.value.initiator.isBlank()) "Браузер" else "Браузер (${e.value.initiator})",
                             target = "$host:$port",
                             proto = "TCP",
@@ -311,8 +313,10 @@ object ConnTrace {
         flushStale()
         val list = synchronized(entries) { entries.toList() }
         val filtered = when (filter) {
-            null -> list
-            "err" -> list.filter { !it.ok }
+            // v4.34.0: в «Все» больше не попадает фон (кэш) — он и так понятен и неизменен
+            null -> list.filter { it.cat != CAT_CACHE }
+            "cache" -> list.filter { it.cat == CAT_CACHE }
+            "err" -> list.filter { !it.ok && it.cat != CAT_CACHE }
             "browser" -> list.filter { it.cat == CAT_BROWSER }
             "apps" -> list.filter { it.cat == CAT_APPS }
             "udp" -> list.filter { it.cat == CAT_UDP }
@@ -322,6 +326,18 @@ object ConnTrace {
             else -> list.filter { it.cat == filter }
         }
         return filtered.map { render(it) }
+    }
+
+    /**
+     * v4.34.0: сколько записей в каждой категории — чтобы на кнопках было видно, где что происходит,
+     * а не листать весь журнал целиком.
+     */
+    fun counts(): Map<String, Int> {
+        val list = synchronized(entries) { entries.toList() }
+        val m = HashMap<String, Int>()
+        for (e in list) m[e.cat] = (m[e.cat] ?: 0) + 1
+        m["err"] = list.count { !it.ok && it.cat != CAT_CACHE }
+        return m
     }
 
     fun text(filter: String?): String = snapshot(filter).joinToString("\n")

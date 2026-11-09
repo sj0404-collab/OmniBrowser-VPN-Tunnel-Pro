@@ -306,7 +306,11 @@ fun FindInPageBar(
     }
 }
 
-data class OmniNavItem(val label: String, val icon: ImageVector)
+/**
+ * v4.34.0: пункт нижней навигации может вести в свой раздел ([section]).
+ * Нужно, чтобы «Загрузки» и «Приложения» стояли в удобном порядке, но не зависели от номера раздела.
+ */
+data class OmniNavItem(val label: String, val icon: ImageVector, val section: Int? = null)
 
 @Composable
 fun OmniBottomBar(selected: Int, items: List<OmniNavItem>, onSelect: (Int) -> Unit) {
@@ -314,9 +318,10 @@ fun OmniBottomBar(selected: Int, items: List<OmniNavItem>, onSelect: (Int) -> Un
         HorizontalDivider(thickness = 0.5.dp, color = Omni.Outline)
         Row(Modifier.fillMaxWidth().height(58.dp)) {
             items.forEachIndexed { index, item ->
-                val isSelected = index == selected
+                val target = item.section ?: index
+                val isSelected = target == selected
                 Column(
-                    Modifier.weight(1f).fillMaxHeight().clickable { onSelect(index) },
+                    Modifier.weight(1f).fillMaxHeight().clickable { onSelect(target) },
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {

@@ -684,6 +684,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     fun isLocalTorrentUri(uriStr: String): Boolean {
         val lower = uriStr.lowercase()
         if (lower.contains(".torrent")) return true
+        // по URI файла тип определяем только если он явно торрентный: иначе любой content://
+        // (картинка, apk, документ) уходил бы в торрент-движок
         return try {
             val type = context.contentResolver.getType(Uri.parse(uriStr))?.lowercase().orEmpty()
             type.contains("bittorrent")
@@ -1733,10 +1735,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         val u = pendingExternal ?: return@LaunchedEffect
         com.winwasm64.ExternalIntents.pendingUrl = null
         if (u == initialIntentUri) return@LaunchedEffect
-        if (u.startsWith("magnet:", ignoreCase = true) || isTorrentLink(u, null, null)) {
-            torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
-        } else if ((u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(u)) {
+        // v4.34.0: файл .torrent (content:// или file://) идёт в свой клиент ПЕРВОЙ проверкой.
+        // Раньше такой URI уходил в startFromMagnetOrUrl и превращался в ошибку
+        // «unknown protocol: content» — ровно как на скриншоте с catorrent.net.
+        if ((u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(u)) {
             openTorrentFromUri(u); currentSection = 1
+        } else if (u.startsWith("magnet:", ignoreCase = true) || isTorrentLink(u, null, null)) {
+            torrentEngine.startFromMagnetOrUrl(u); currentSection = 1
         } else if (u.startsWith("http", ignoreCase = true) || u.startsWith("content:", ignoreCase = true) || u.startsWith("file:", ignoreCase = true)) {
             openNewTab(u); currentSection = 0
         } else {
@@ -1758,13 +1763,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     LaunchedEffect(initialIntentUri) {
         if (!initialIntentUri.isNullOrBlank()) {
-            if (initialIntentUri.startsWith("magnet:", ignoreCase = true) ||
+            if ((initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(initialIntentUri)) {
+                openTorrentFromUri(initialIntentUri)
+                currentSection = 1
+            } else if (initialIntentUri.startsWith("magnet:", ignoreCase = true) ||
                 isTorrentLink(initialIntentUri, null, null)
             ) {
                 torrentEngine.startFromMagnetOrUrl(initialIntentUri)
-                currentSection = 1
-            } else if ((initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) && isLocalTorrentUri(initialIntentUri)) {
-                openTorrentFromUri(initialIntentUri)
                 currentSection = 1
             } else if (initialIntentUri.startsWith("http", ignoreCase = true) || initialIntentUri.startsWith("content:", ignoreCase = true) || initialIntentUri.startsWith("file:", ignoreCase = true)) {
                 navigateTab(activeTab, initialIntentUri)
@@ -2766,7 +2771,35 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                 }
 
                                 "settings" -> {
-                                    Text("Настройки", color = Omni.Text, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                                    // v4.34.0: необязательные настройки VPN спрятаны. Пять нажатий на заголовок —
+                                    // и появляется блок «для разработчика». Смысл: в обычной работе нужны
+                                    // только сервер/страна и журнал, а не десяток переключателей.
+                                    var devUnlock by remember { mutableStateOf(prefs.getBoolean("dev_vpn_unlocked", false)) }
+                                    var devTaps by remember { mutableIntStateOf(0) }
+                                    Text(
+                                        "Настройки" + if (devUnlock) " · режим разработчика" else "",
+                                        color = Omni.Text,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 18.sp,
+                                        modifier = Modifier.clickable {
+                                            if (devUnlock) return@clickable
+                                            devTaps++
+                                            if (devTaps >= 5) {
+                                                devUnlock = true
+                                                prefs.edit().putBoolean("dev_vpn_unlocked", true).apply()
+                                                Toast.makeText(context, "Показаны настройки для разработчика", Toast.LENGTH_SHORT).show()
+                                            } else if (devTaps >= 3) {
+                                                Toast.makeText(context, "Ещё ${5 - devTaps} нажатия — настройки для разработчика", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    )
+                                    if (!devUnlock) {
+                                        Text(
+                                            "Дополнительные настройки VPN, WebRTC и резервных каналов скрыты: нажмите 5 раз на этот заголовок, чтобы показать.",
+                                            color = Omni.TextDim,
+                                            fontSize = 10.sp
+                                        )
+                                    }
                                     // v4.4.0: обновления из GitHub Releases
                                     var updateCheckOn by remember { mutableStateOf(prefs.getBoolean("update_check_on", true)) }
                                     var updateStatus by remember { mutableStateOf("") }
@@ -2804,7 +2837,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         prefs.edit().putBoolean("hide_media_button", v).apply()
                                     }
                                     // v4.12.0: один сервер на сессию и обход чужого VPN
-                                    SettingSwitchRow(
+                                    if (devUnlock) {
+                                        SettingSwitchRow(
                                         "Держать один сервер Browsec (IP не меняется)",
                                         "Все соединения браузера идут через один сервер сессии; смена — только если он не ответил за 4 с (в журнале)",
                                         pinSessionServer
@@ -2813,7 +2847,9 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         com.winwasm64.extensions.ExtensionProxy.pinSessionServer = v
                                         prefs.edit().putBoolean("pin_session_server", v).apply()
                                     }
-                                    SettingSwitchRow(
+                                    }
+                                    if (devUnlock) {
+                                        SettingSwitchRow(
                                         "Обходить чужой VPN на телефоне",
                                         "Наши сокеты привязываются к Wi-Fi/мобильной сети и идут мимо другого VPN — тогда выход только через Browsec, а «домашний IP» настоящий",
                                         bypassForeignVpn
@@ -2822,6 +2858,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         com.winwasm64.vpn.NetworkBypass.enabled = v
                                         if (v) com.winwasm64.vpn.NetworkBypass.ensure() else com.winwasm64.vpn.NetworkBypass.unbindProcess()
                                         prefs.edit().putBoolean("bypass_foreign_vpn", v).apply()
+                                    }
                                     }
                                     // v4.4.0: экспорт / импорт настроек
                                     var backupStatus by remember { mutableStateOf("") }
@@ -2854,7 +2891,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                     // v4.30.0: резервные VPN — на случай, когда у основного канала и у Psiphon лимит
                                     var reserveStatus by remember { mutableStateOf(com.winwasm64.vpn.ReserveChain.statusLine()) }
                                     var reserveBusy by remember { mutableStateOf(false) }
-                                    Surface(color = Omni.Surface, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                    if (devUnlock) {
+                                        Surface(color = Omni.Surface, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
                                         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                             Text("Резервные VPN", color = Color.White, fontSize = 12.sp)
                                             Text(
@@ -2942,6 +2980,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                             }
                                         }
                                     }
+                                    }
                                     SettingSwitchRow("Не отслеживать (DNT и GPC)", "Отправлять сайтам запрет на отслеживание", doNotTrackEnabled) { v ->
                                         doNotTrackEnabled = v
                                         persistBrowserSettings()
@@ -2951,10 +2990,12 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         com.winwasm64.ui.MediaPositions.autoNext = v
                                         prefs.edit().putBoolean("auto_next_video", v).apply()
                                     }
-                                    SettingSwitchRow("WebRTC через прокси (TCP) на всех сайтах", "Как «блокировка WebRTC» в Browsec: медиапоток не уходит с домашнего IP по UDP, а идёт через сервер VPN. Для GeForce NOW/NVIDIA включено всегда; звонки на других сайтах могут стать медленнее", webrtcTcpAll) { v ->
+                                    if (devUnlock) {
+                                        SettingSwitchRow("WebRTC через прокси (TCP) на всех сайтах", "Как «блокировка WebRTC» в Browsec: медиапоток не уходит с домашнего IP по UDP, а идёт через сервер VPN. Для GeForce NOW/NVIDIA включено всегда; звонки на других сайтах могут стать медленнее", webrtcTcpAll) { v ->
                                         webrtcTcpAll = v
                                         com.winwasm64.ui.MediaPositions.webrtcTcpAll = v
                                         prefs.edit().putBoolean("webrtc_tcp_all", v).apply()
+                                    }
                                     }
                                     SettingSwitchRow("Блокировать сторонние cookies", "Меньше слежки; вход через Google/VK на некоторых сайтах может сломаться", blockThirdPartyCookies) { v ->
                                         blockThirdPartyCookies = v
@@ -2972,9 +3013,11 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                                         activeTab.webView?.let { injectActiveExtensions(it) }
                                         persistBrowserSettings()
                                     }
-                                    SettingSwitchRow("Консоль разработчика (Eruda)", "Загружается с jsdelivr на текущую страницу", devToolsEnabled) { v ->
+                                    if (devUnlock) {
+                                        SettingSwitchRow("Консоль разработчика (Eruda)", "Загружается с jsdelivr на текущую страницу", devToolsEnabled) { v ->
                                         devToolsEnabled = v
                                         activeTab.webView?.let { injectActiveExtensions(it) }
+                                    }
                                     }
                                     // 1. Search Engine Selector
                                     Row(
@@ -3302,6 +3345,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
             if (currentSection == 2 && !inPip) {
                 HistoryAndDownloadsSection(
+                    initialSubTab = 1,
+                    lockSubTab = true,
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     historyList = historyList,
                     torrentEngine = torrentEngine,
@@ -3315,6 +3360,25 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         historyList.clear()
                         persistBrowserSettings()
                     },
+                    onRequestStorageAccess = { requestFullStorageAccess() }
+                )
+            }
+
+            // ===================== SECTION 4: DOWNLOADS (отдельная вкладка) =====================
+            if (currentSection == 4 && !inPip) {
+                HistoryAndDownloadsSection(
+                    initialSubTab = 0,
+                    lockSubTab = true,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    historyList = historyList,
+                    torrentEngine = torrentEngine,
+                    nativeAppsManager = nativeAppsManager,
+                    onOpenUrlInBrowser = { u ->
+                        val cleanUrl = u.substringAfter("| ").trim()
+                        navigateTab(activeTab, cleanUrl)
+                        currentSection = 0
+                    },
+                    onClearHistory = { historyList.clear(); persistBrowserSettings() },
                     onRequestStorageAccess = { requestFullStorageAccess() }
                 )
             }
@@ -3527,6 +3591,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         OmniNavItem("Браузер", OmniIcons.Globe),
                         OmniNavItem("Торренты", OmniIcons.Torrent),
                         OmniNavItem("История", OmniIcons.History),
+                        // v4.34.0: загрузки — отдельная вкладка, а не подраздел истории
+                        OmniNavItem("Загрузки", OmniIcons.Download, section = 4),
                         OmniNavItem("Приложения", OmniIcons.Apps)
                     ),
                     onSelect = { currentSection = it }
@@ -3923,6 +3989,8 @@ private fun TorrentClientSection(
 @Composable
 private fun HistoryAndDownloadsSection(
     modifier: Modifier,
+    initialSubTab: Int = 0,
+    lockSubTab: Boolean = false,
     historyList: List<String>,
     torrentEngine: BitTorrentEngine,
     nativeAppsManager: NativeAppsManager,
@@ -3931,7 +3999,9 @@ private fun HistoryAndDownloadsSection(
     onRequestStorageAccess: () -> Unit
 ) {
     val context = LocalContext.current
-    var subTab by remember { mutableIntStateOf(0) } // 0 = Загрузки, 1 = История
+    // v4.34.0: 0 = Загрузки, 1 = История. Раздел можно открыть сразу на нужной вкладке,
+    // а переключатель сверху спрятать — так «История» и «Загрузки» стали отдельными вкладками.
+    var subTab by remember { mutableIntStateOf(initialSubTab.coerceIn(0, 1)) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
     val downloadedFiles = remember(refreshTrigger, subTab) {
@@ -3955,23 +4025,33 @@ private fun HistoryAndDownloadsSection(
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { subTab = 0; refreshTrigger++ },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 0) Omni.AccentContainer else Omni.SurfaceHighest)
+        if (lockSubTab) {
+            // отдельная вкладка: заголовок вместо переключателя
+            Text(
+                text = if (subTab == 0) "Загрузки (${downloadedFiles.size})" else "История (${historyList.size})",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp
+            )
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text("Загрузки (${downloadedFiles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            }
-            Button(
-                onClick = { subTab = 1 },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 1) Omni.AccentContainer else Omni.SurfaceHighest)
-            ) {
-                Text("История (${historyList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                Button(
+                    onClick = { subTab = 0; refreshTrigger++ },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 0) Omni.AccentContainer else Omni.SurfaceHighest)
+                ) {
+                    Text("Загрузки (${downloadedFiles.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+                Button(
+                    onClick = { subTab = 1 },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = if (subTab == 1) Omni.AccentContainer else Omni.SurfaceHighest)
+                ) {
+                    Text("История (${historyList.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
             }
         }
 
