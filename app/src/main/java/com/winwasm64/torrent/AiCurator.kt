@@ -152,7 +152,8 @@ object AiCurator {
             Ответ строго JSON-массивом строк, без пояснений.
         """.trimIndent()
         mark(State.ASKING, "варианты для «${query.take(24)}»")
-        val raw = ask(prompt, context)
+        // v4.59.0: сначала «быстрая» — она отвечает мгновенно; «умная» думает ~23 с и не успевала
+        val raw = askWith(prompt, listOf("openai-fast", model(context), "openai"), 8_000)
         if (raw == null) {
             setStatus(context, "нет ответа · варианты не получены")
             mark(State.ERROR, "нет ответа от шлюза")
@@ -170,6 +171,26 @@ object AiCurator {
         setStatus(context, "OK · вариантов ${out.size}")
         mark(State.DONE, "вариантов ${out.size} · ${modelLabel(context)}")
         return out
+    }
+
+    /**
+     * v4.59.0: варианты с жёстким дедлайном.
+     *
+     * Раньше поиск ЖДАЛ модель: пока «умная» думала 20–25 с, список раздач оставался пустым и
+     * человек видел «Список раздач пуст». Теперь ждём не дольше [deadlineMs]; не успела — ищем без
+     * её вариантов (свои синонимы/транслит остаются), а модель договаривает уже в фоне.
+     */
+    fun expandWithin(context: Context, query: String, limit: Int = 2, deadlineMs: Long = 7_000): List<String> {
+        if (!isEnabled(context)) return emptyList()
+        val task = java.util.concurrent.FutureTask { expand(context, query, limit) }
+        val thread = Thread(task, "AiExpand").apply { isDaemon = true; start() }
+        return try {
+            task.get(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+            task.cancel(true)
+            mark(State.DONE, "работал · модель думает дольше ${deadlineMs / 1000} с — ищу без её вариантов")
+            emptyList()
+        }
     }
 
     /**
@@ -217,18 +238,28 @@ object AiCurator {
 
     /* ===================== транспорт ===================== */
 
-    /** Запрос к модели: выбранная первой, при отказе — «умная» как запасная. */
-    private fun ask(prompt: String, context: Context? = null): String? {
+    /**
+     * Запрос к модели: выбранная первой, при отказе — запасная.
+     * v4.59.0: таймаут на чтение стал параметром. Раньше было жёстко 20 с, а «умная» модель на
+     * длинном промпте отвечает ~23 с — отсюда «🔴 нет ответа от шлюза» на каждом поиске.
+     */
+    private fun ask(prompt: String, context: Context? = null, readTimeoutMs: Int = 30_000): String? {
         val preferred = context?.let { model(it) } ?: "openai"
         val order = (listOf(preferred) + MODELS.map { it.first }).distinct()
-        for (id in order) {
-            val answer = post(id, prompt)
+        val budget = (readTimeoutMs / order.size).coerceAtLeast(6_000)
+        return askWith(prompt, order, budget)
+    }
+
+    /** Спросить модели по порядку: первая ответившая и выигрывает. */
+    private fun askWith(prompt: String, ids: List<String>, perModelMs: Int): String? {
+        for (id in ids.distinct()) {
+            val answer = post(id, prompt, perModelMs)
             if (!answer.isNullOrBlank()) return answer
         }
         return null
     }
 
-    private fun post(modelId: String, prompt: String): String? {
+    private fun post(modelId: String, prompt: String, readTimeoutMs: Int = 30_000): String? {
         val body = JSONObject().apply {
             put("model", modelId)
             put(
@@ -244,7 +275,7 @@ object AiCurator {
             val conn = (URL(TEXT_ENDPOINT).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 10_000
-                readTimeout = 20_000
+                readTimeout = readTimeoutMs
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("User-Agent", "OmniBrowser/4.58 (Android)")
@@ -254,8 +285,9 @@ object AiCurator {
                 null
             } else {
                 val text = conn.inputStream.bufferedReader().use { it.readText() }
-                JSONObject(text).optJSONArray("choices")?.optJSONObject(0)
-                    ?.optJSONObject("message")?.optString("content")
+                val msg = JSONObject(text).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+                val content = msg?.optString("content").orEmpty()
+                if (content.isNotBlank()) content else msg?.optString("reasoning").orEmpty().ifBlank { null }
             }
         } catch (_: Throwable) {
             null

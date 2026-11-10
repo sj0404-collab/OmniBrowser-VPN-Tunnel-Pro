@@ -202,7 +202,8 @@ object TorrentSearchAgent {
         val intent = parseIntent(query)
         // v4.44.0: сайтам отдаём название БЕЗ качества/формата («шерлок», а не «шерлок 360p»),
         // иначе поиск по трекерам возвращает пустоту, а фильтр по качеству убивает всё остальное
-        val q = stripQueryNoise(intent.title.ifBlank { query.trim() })
+        // v4.59.0: двойные пробелы («карлик  нос») больше не ломают запрос к трекерам
+        val q = stripQueryNoise(intent.title.ifBlank { query.trim() }).replace(Regex("\\s+"), " ").trim()
         if (q.isBlank()) return emptyList()
         val encoded = URLEncoder.encode(q, "UTF-8")
         val out = java.util.Collections.synchronizedList(ArrayList<Found>())
@@ -255,7 +256,9 @@ object TorrentSearchAgent {
      * Строки таблицы разбираем как есть: magnet, название, размер, «зелёные» сиды, «красные» пиры.
      */
     private fun searchRutor(query: String, timeoutMs: Int): List<Found> {
-        val url = "https://rutor.info/search/0/0/000/0/" + URLEncoder.encode(query, "UTF-8")
+        // v4.59.0: в пути пробел должен быть %20, а не «+» — иначе rutor искал «карлик+нос» и молчал
+        val url = "https://rutor.info/search/0/0/000/0/" +
+            URLEncoder.encode(query, "UTF-8").replace("+", "%20")
         val html = httpGet(url, timeoutMs) ?: return emptyList()
         val rows = Regex("<tr class=\"(?:gai|tum)\">(.*?)</tr>", RegexOption.DOT_MATCHES_ALL)
             .findAll(html).take(24).toList()

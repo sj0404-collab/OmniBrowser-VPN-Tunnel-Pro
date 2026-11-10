@@ -3749,7 +3749,8 @@ private fun TorrentClientSection(
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        val aiExtra = com.winwasm64.torrent.AiCurator.expand(context, query, 2)
+        // v4.59.0: ждём модель не дольше 7 с — поиск не должен стоять из-за неё
+        val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
         torrentEngine.searchPublicTorrents(query, searchDepth, aiExtra) { res ->
             mainHandler.post {
                 catalogItems = res
@@ -4148,12 +4149,36 @@ private fun TorrentClientSection(
                         border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
                     ) {
                         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("Список раздач пуст", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text(
-                                "Откройте .torrent по ссылке на сайте или файлом — он запустится в этом клиенте. Или вставьте magnet-ссылку выше. Встроенных демонстрационных раздач больше нет.",
-                                color = Omni.TextDim,
-                                fontSize = 11.sp
-                            )
+                            // v4.59.0: пока идёт поиск — «ищу», а не «пусто»; после — причина, а не заглушка
+                            if (isSearching) {
+                                Text(
+                                    "Ищу «${searchQuery.trim()}» на всех трекерах…",
+                                    color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
+                                )
+                                Text(
+                                    "Rutor, apibay/TPB, nnmclub, nyaa, открытые индексы. Результаты появятся сами — жать ничего не нужно.",
+                                    color = Omni.TextDim, fontSize = 11.sp
+                                )
+                            } else if (searchQuery.isNotBlank()) {
+                                Text(
+                                    "По «${searchQuery.trim()}» ничего не нашлось",
+                                    color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp
+                                )
+                                Text(
+                                    "Проверено: rutor, apibay (The Pirate Bay), nnmclub, nyaa, открытые индексы и Archive.org. " +
+                                        "Бывает, что трекеры не отвечают на кириллицу — попробуйте латиницу (karlik nos) " +
+                                        "или короткое название, и нажмите «Найти» ещё раз.",
+                                    color = Omni.TextDim,
+                                    fontSize = 11.sp
+                                )
+                            } else {
+                                Text("Список раздач пуст", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text(
+                                    "Введите название и нажмите «Найти», вставьте magnet-ссылку выше или откройте .torrent файлом.",
+                                    color = Omni.TextDim,
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -5979,7 +6004,8 @@ private fun DirectFilesSection(
         if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
             // v4.55.0: асинхронно — что нашлось, то сразу и показываем
-            val aiExtra = com.winwasm64.torrent.AiCurator.expand(context, query, 2)
+            // v4.59.0: ждём модель не дольше 7 с — поиск не должен стоять из-за неё
+        val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
             val res = try {
                 com.winwasm64.torrent.DirectSearch.searchAll(
                     query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra
