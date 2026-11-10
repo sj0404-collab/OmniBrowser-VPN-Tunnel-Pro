@@ -1,17 +1,25 @@
 package com.winwasm64.torrent
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -19,112 +27,158 @@ import android.widget.TextView
 import android.widget.Toast
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Collections
 
 /**
- * v4.50.0: «Видео» — такая же вкладка, как «Файлы»: список карточек с превью и тремя действиями
- * (смотреть / открыть / скачать). Поиск по названию, по ссылке и ВНУТРИ выбранного канала.
+ * v4.51.0: «Видео» переписана под ту же схему, что «Файлы» и «Торренты».
  *
- * Что было не так в 4.49.0 (по скриншотам):
- *  • вместо названий попадали подписи таймингов — «В ЭФИРЕ», «2:10:25», «1:33:55», потому что
- *    брался `innerText` первой ссылки-превью. Теперь название берётся из aria-label/title и
- *    отбраковывается, если это просто время или служебная подпись;
- *  • ссылки были с мусором (`&pp=ygUI0JjRgNC10L3QsNC60...`) — теперь вырезаем чистый ID ролика;
- *  • не было превью — теперь тянем обложку по ID (i.ytimg.com);
- *  • не было подписок — теперь есть, с поиском внутри канала.
+ * Что было сломано в 4.50.0 и что сделано:
+ *  • выбор «VK Видео» всё равно искал в YouTube — строка «VK Видео» не совпадала с «VK» в when;
+ *    теперь источник нормализуется и РЕАЛЬНО используется при загрузке;
+ *  • «⬇ Скачать» была заглушкой — теперь это внутренний аналог кнопки «Скачать видео» из браузера:
+ *    ролик открывается в скрытом WebView, перехватывается поток videoplayback (itag=18, 360p —
+ *    минимальное склеенное качество) и уходит в «Загрузки» приложения;
+ *  • «прокрутка не работает» — поиск YouTube идёт через JSON-интерфейс с токеном продолжения,
+ *    поэтому список пополняется бесконечно, без скролла невидимой страницы;
+ *  • не было плейлистов и каналов — теперь есть категории «Видео / Плейлисты / Каналы / Трансляции»,
+ *    сортировка (новые, популярные, старые) и фильтр по длительности — как фильтры в других вкладках.
  */
 class VideoSearchActivity : Activity() {
-
-    private lateinit var web: WebView
-    private lateinit var resultsBox: LinearLayout
-    private lateinit var status: TextView
-    private lateinit var playerBox: LinearLayout
-    private lateinit var player: WebView
-    private lateinit var pageButton: Button
 
     private var query = ""
     private var channelName = ""
     private var channelQuery = ""
     private var source = "YouTube"
-    private val seenIds = HashSet<String>()
-    private val thumbCache = HashMap<String, Bitmap?>()
+    private var category = "Все"
+    private var sortMode = 0
+    private var duration = "Любая"
 
-    private val sourcesTop = listOf("YouTube", "RuTube", "VK", "Ссылка")
+    private lateinit var status: TextView
+    private lateinit var captureStatus: TextView
+    private lateinit var resultsBox: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var playerBox: LinearLayout
+    private lateinit var player: WebView
+    private lateinit var scrapeWeb: WebView
+    private lateinit var captureWeb: WebView
+
+    private val ytItems = mutableListOf<YouTubeSearch.Item>()
+    private var continuation: String? = null
+    private var loading = false
+    private val thumbCache = HashMap<String, Bitmap?>()
+    private val grabbed = Collections.synchronizedMap(LinkedHashMap<String, String>())
+    private var grabSession = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         query = intent.getStringExtra("query").orEmpty()
         channelName = intent.getStringExtra("channel").orEmpty()
         channelQuery = intent.getStringExtra("channelQuery").orEmpty()
-        source = intent.getStringExtra("source").orEmpty().ifBlank { "YouTube" }
+        source = normalizeSource(intent.getStringExtra("source").orEmpty())
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0E0F12"))
         }
 
-        // ---------- шапка ----------
-        val top = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(12, 12, 12, 4)
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        top.addView(TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = if (channelName.isNotBlank()) "📺 $channelName" else "🎬 Видео"
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(12, 12, 12, 2)
         })
-        root.addView(top)
-
-        val subtitle = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "«${query.ifBlank { "—" }}»" +
-                if (channelName.isNotBlank()) " · поиск внутри канала" else " · по всем площадкам"
+                if (channelName.isNotBlank()) " · только этот канал" else ""
             setTextColor(Color.parseColor("#9AA0A6"))
             textSize = 11f
-            setPadding(12, 0, 12, 4)
-        }
-        root.addView(subtitle)
+            setPadding(12, 0, 12, 6)
+        })
 
-        val sourceRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(8, 0, 8, 4)
-        }
-        for (name in sourcesTop) {
-            sourceRow.addView(Button(this).apply {
-                text = name
-                textSize = 11f
-                setOnClickListener { switchSource(name) }
+        // площадки — реальный выбор, а не декорация
+        val sourceRow = HorizontalScrollView(this)
+        val sourceInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("YouTube", "RuTube", "VK", "Ссылка").forEach { name ->
+            sourceInner.addView(chip(name, source == name) {
+                source = name
+                if (name == "Ссылка") {
+                    if (query.startsWith("http")) playInline(query) else toast("Вставьте ссылку в поле поиска")
+                } else {
+                    reload()
+                }
+                recreateChips()
             })
         }
+        sourceRow.addView(sourceInner)
         root.addView(sourceRow)
+        sourceChipsHolder = sourceInner
+
+        // категории
+        val catRow = HorizontalScrollView(this)
+        val catInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("Все", "🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции").forEach { name ->
+            catInner.addView(chip(name, category == name) {
+                category = name
+                reload()
+                recreateCategoryChips()
+            })
+        }
+        catRow.addView(catInner)
+        root.addView(catRow)
+        categoryChipsHolder = catInner
+
+        // сортировка + длительность
+        val sortRow = HorizontalScrollView(this)
+        val sortInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("По релевантности", "Новые", "Популярные", "Старые").forEachIndexed { idx, label ->
+            sortInner.addView(chip(label, sortMode == idx) {
+                sortMode = idx
+                reload()
+                recreateSortChips()
+            })
+        }
+        listOf("Любая", "До 4 мин", "4–20 мин", "20+ мин").forEach { label ->
+            sortInner.addView(chip(label, duration == label) {
+                duration = label
+                reload()
+                recreateSortChips()
+            })
+        }
+        sortRow.addView(sortInner)
+        root.addView(sortRow)
+        sortChipsHolder = sortInner
 
         status = TextView(this).apply {
-            text = "Открываю поиск видео…"
+            text = "Ищу…"
             setTextColor(Color.parseColor("#FFC107"))
-            textSize = 11f
-            setPadding(12, 2, 12, 6)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(12, 6, 12, 4)
         }
         root.addView(status)
 
-        // ---------- встроенный плеер ----------
+        captureStatus = TextView(this).apply {
+            text = ""
+            setTextColor(Color.parseColor("#8AB4F8"))
+            textSize = 10f
+            setPadding(12, 0, 12, 4)
+        }
+        root.addView(captureStatus)
+
+        // встроенный плеер
         playerBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             setPadding(8, 0, 8, 6)
         }
         playerBox.addView(TextView(this).apply {
-            text = "▶ Воспроизведение внутри приложения"
+            text = "▶ Смотрю внутри приложения"
             setTextColor(Color.WHITE)
             textSize = 11f
         })
-        player = WebView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 560)
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = false
-            settings.userAgentString = MOBILE_UA
-        }
+        player = newWeb()
+        player.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 560)
         playerBox.addView(player)
         playerBox.addView(Button(this).apply {
             text = "✖ Закрыть плеер"
@@ -137,210 +191,274 @@ class VideoSearchActivity : Activity() {
         })
         root.addView(playerBox)
 
-        // ---------- служебный WebView, который приносит выдачу ----------
-        web = WebView(this).apply {
+        // служебные WebView: скрапинг RuTube/VK и перехват потока при скачивании
+        scrapeWeb = newWeb().apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
             visibility = View.GONE
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.userAgentString = MOBILE_UA
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    status.text = "Собираю ролики…"
-                    view?.postDelayed({ collectVideos(false) }, 1200)
-                    view?.postDelayed({ collectVideos(true) }, 3200)
+                    view?.postDelayed({ scrapePage() }, 1200)
                 }
             }
         }
-        root.addView(web)
+        root.addView(scrapeWeb)
 
-        // ---------- страница площадки по запросу (по желанию) ----------
-        pageButton = Button(this).apply {
-            text = "🌐 Показать страницу площадки"
-            textSize = 11f
-            setOnClickListener {
-                if (web.visibility == View.GONE) {
-                    (web.layoutParams as LinearLayout.LayoutParams).height = 520
-                    web.visibility = View.VISIBLE
-                    text = "🙈 Скрыть страницу площадки"
-                } else {
-                    web.visibility = View.GONE
-                    (web.layoutParams as LinearLayout.LayoutParams).height = 1
-                    text = "🌐 Показать страницу площадки"
+        captureWeb = newWeb().apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+            visibility = View.GONE
+            webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    val u = request?.url?.toString().orEmpty()
+                    if (u.contains("googlevideo.com") && u.contains("videoplayback")) {
+                        val itag = Regex("[?&]itag=(\\d+)").find(u)?.groupValues?.get(1).orEmpty()
+                        grabbed[itag.ifBlank { "other" }] = u
+                    }
+                    return super.shouldInterceptRequest(view, request)
                 }
-                web.requestLayout()
             }
         }
-        root.addView(pageButton)
+        root.addView(captureWeb)
 
-        val scroll = ScrollView(this).apply {
+        scroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setOnScrollChangeListener { _, _, top, _, _ ->
+                val child = getChildAt(0) ?: return@setOnScrollChangeListener
+                if (child.height - (top + height) < 320) loadMore()
+            }
         }
         resultsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(resultsBox)
         root.addView(scroll)
 
-        // кнопка «ещё» внизу списка
         root.addView(Button(this).apply {
-            text = "⬇ Показать ещё (прокрутить выдачу)"
+            text = "⬇ Показать ещё"
             textSize = 11f
-            setOnClickListener {
-                web.evaluateJavascript(
-                    "(function(){window.scrollTo(0, document.body.scrollHeight);return 'ok';})();",
-                    null
-                )
-                status.text = "Прокручиваю выдачу, ищу новые ролики…"
-                web.postDelayed({ collectVideos(true) }, 2200)
-            }
+            setOnClickListener { loadMore(manual = true) }
         })
 
         setContentView(root)
 
         if (query.startsWith("http")) {
-            status.text = "Открываю ссылку…"
             playInline(query)
+            status.text = "Открыл ссылку во встроенном плеере"
         } else {
-            switchSource(source)
+            reload()
         }
     }
 
-    private fun switchSource(name: String) {
-        val term = VideoChannels.scopedQuery(
-            query,
-            VideoChannels.Channel(channelName.ifBlank { "YouTube" }, channelQuery.ifBlank { channelName })
-        ).ifBlank { query }
-        val encoded = android.net.Uri.encode(term)
-        val url = when (name) {
-            "RuTube" -> "https://rutube.ru/search/?query=$encoded"
-            "VK" -> "https://m.vk.com/video?q=$encoded"
-            "Ссылка" -> {
-                if (query.startsWith("http")) {
-                    playInline(query)
-                    return
-                }
-                Toast.makeText(this, "Вставьте ссылку в поле поиска", Toast.LENGTH_LONG).show()
-                return
+    /* ===================== чипы ===================== */
+
+    private var sourceChipsHolder: LinearLayout? = null
+    private var categoryChipsHolder: LinearLayout? = null
+    private var sortChipsHolder: LinearLayout? = null
+
+    private fun recreateChips() {
+        val holder = sourceChipsHolder ?: return
+        holder.removeAllViews()
+        listOf("YouTube", "RuTube", "VK", "Ссылка").forEach { name ->
+            holder.addView(chip(name, source == name) {
+                source = name
+                if (name != "Ссылка") reload()
+                recreateChips()
+            })
+        }
+    }
+
+    private fun recreateCategoryChips() {
+        val holder = categoryChipsHolder ?: return
+        holder.removeAllViews()
+        listOf("Все", "🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции").forEach { name ->
+            holder.addView(chip(name, category == name) {
+                category = name
+                reload()
+                recreateCategoryChips()
+            })
+        }
+    }
+
+    private fun recreateSortChips() {
+        val holder = sortChipsHolder ?: return
+        holder.removeAllViews()
+        listOf("По релевантности", "Новые", "Популярные", "Старые").forEachIndexed { idx, label ->
+            holder.addView(chip(label, sortMode == idx) {
+                sortMode = idx
+                reload()
+                recreateSortChips()
+            })
+        }
+        listOf("Любая", "До 4 мин", "4–20 мин", "20+ мин").forEach { label ->
+            holder.addView(chip(label, duration == label) {
+                duration = label
+                reload()
+                recreateSortChips()
+            })
+        }
+    }
+
+    private fun chip(label: String, selected: Boolean, action: () -> Unit): Button =
+        Button(this).apply {
+            text = label
+            textSize = 10f
+            setPadding(dp(8), 0, dp(8), 0)
+            setTextColor(if (selected) Color.WHITE else Color.parseColor("#C7CBD1"))
+            setBackgroundColor(
+                Color.parseColor(if (selected) "#2B4A8B" else "#1E2026")
+            )
+            setOnClickListener { action() }
+        }
+
+    /* ===================== загрузка ===================== */
+
+    private fun normalizeSource(raw: String): String = when {
+        raw.contains("VK", true) -> "VK"
+        raw.contains("RuTube", true) || raw.contains("Рутуб", true) -> "RuTube"
+        raw.contains("Dailymotion", true) -> "YouTube"
+        raw.isBlank() || raw == "Все" -> "YouTube"
+        else -> "YouTube"
+    }
+
+    private fun reload() {
+        ytItems.clear()
+        continuation = null
+        resultsBox.removeAllViews()
+        loading = false
+        if (source == "YouTube") {
+            loadMore(manual = true)
+        } else {
+            // RuTube и VK открытого поиска без ключа не имеют — берём их выдачу через WebView
+            val term = VideoChannels.scopedQuery(
+                query,
+                VideoChannels.Channel(channelName.ifBlank { "все" }, channelQuery.ifBlank { channelName })
+            ).ifBlank { query }
+            val url = when (source) {
+                "RuTube" -> "https://rutube.ru/search/?query=" + Uri.encode(term)
+                else -> "https://m.vk.com/video?q=" + Uri.encode(term)
             }
-            else -> "https://m.youtube.com/results?search_query=$encoded"
+            status.text = "Ищу на $source…"
+            scrapeWeb.loadUrl(url)
         }
-        status.text = "Открываю поиск видео · $name…"
-        web.loadUrl(url)
     }
 
-    private fun playInline(url: String) {
-        playerBox.visibility = View.VISIBLE
-        player.loadUrl(url)
-        status.text = "Играет: ${url.take(60)}"
+    private fun loadMore(manual: Boolean = false) {
+        if (source != "YouTube") {
+            if (manual) {
+                scrapeWeb.evaluateJavascript("window.scrollTo(0, document.body.scrollHeight);", null)
+                scrapeWeb.postDelayed({ scrapePage() }, 2000)
+            }
+            return
+        }
+        if (loading) return
+        if (!manual && continuation == null) return
+        loading = true
+        status.text = if (ytItems.isEmpty()) "Ищу на YouTube…" else "Догружаю ещё…"
+        val term = if (channelName.isBlank()) query else "$query $channelQuery".trim()
+        val next = continuation
+        Thread({
+            val page = try {
+                YouTubeSearch.search(term, category, sortMode, duration, next)
+            } catch (_: Throwable) {
+                YouTubeSearch.Page(emptyList(), null)
+            }
+            runOnUiThread {
+                loading = false
+                continuation = page.continuation
+                if (page.items.isEmpty() && ytItems.isEmpty()) {
+                    status.text = "Ничего не нашлось по «$term» (категория: $category)"
+                } else {
+                    val before = ytItems.size
+                    ytItems.addAll(page.items.filter { new -> ytItems.none { it.id == new.id && it.kind == new.kind } })
+                    for (i in before until ytItems.size) addRow(ytItems[i])
+                    status.text = "Найдено: ${ytItems.size} · $category" +
+                        (if (duration != "Любая") " · $duration" else "") +
+                        (if (continuation == null) " · это всё" else " · листайте дальше")
+                }
+            }
+        }, "YTSearch").also { it.isDaemon = true; it.start() }
     }
 
-    /**
-     * Достаём ролики: сначала ID (чтобы отбросить рекламу и дубли), потом НАЗВАНИЕ из aria-label/title,
-     * а не из innerText — именно из-за innerText в 4.49.0 в списке были одни тайминги.
-     */
-    private fun collectVideos(append: Boolean) {
+    /* ===================== скрапинг RuTube / VK ===================== */
+
+    private fun scrapePage() {
         val js = """
             (function() {
-              function clean(t) {
-                if (!t) return '';
-                t = t.replace(/\s+/g, ' ').trim();
-                t = t.replace(/\s*[-–·]\s*\d+\s*(минут|мин|min|сек|seconds?).*${'$'}/i, '');
-                return t;
-              }
-              function bad(t) {
-                if (!t || t.length < 4) return true;
-                if (/^[\d:.\s]+${'$'}/.test(t)) return true;
-                if (/^(в эфире|shorts|главная|подписки|библиотека|you|вы|на главную|пропустить)${'$'}/i.test(t)) return true;
-                if (/^[\d\s.,]+(тыс\.?|млн|просмотр|views)/i.test(t)) return true;
-                return false;
-              }
-              var out = [];
-              var nodes = document.querySelectorAll('a[href]');
-              for (var i = 0; i < nodes.length; i++) {
-                var a = nodes[i];
-                var h = a.href || '';
-                if (!/(youtube\.com\/watch|youtu\.be\/|rutube\.ru\/video\/|vk\.com\/video|dailymotion\.com\/video)/i.test(h)) continue;
-                var id = '';
-                var m = h.match(/[?&]v=([A-Za-z0-9_-]{11})/);
-                if (m) id = m[1];
-                if (!id) { m = h.match(/youtu\.be\/([A-Za-z0-9_-]{11})/); if (m) id = m[1]; }
-                if (!id) { m = h.match(/rutube\.ru\/video\/([A-Za-z0-9]+)/); if (m) id = 'rt_' + m[1]; }
-                if (!id) { m = h.match(/vk\.com\/video(-?[0-9_]+)/); if (m) id = 'vk_' + m[1]; }
-                if (!id) { m = h.match(/dailymotion\.com\/video\/([A-Za-z0-9]+)/); if (m) id = 'dm_' + m[1]; }
-                if (!id) continue;
-                var t = clean(a.getAttribute('aria-label') || a.getAttribute('title') || '');
-                if (bad(t)) {
-                  var card = a.closest('ytm-media-item, ytd-rich-item-renderer, li, article');
-                  if (card) {
-                    var h2 = card.querySelector('#video-title, h3, .media-item-headline, .video-title');
-                    if (h2) { var t2 = clean(h2.getAttribute('aria-label') || h2.innerText); if (!bad(t2)) t = t2; }
-                    if (bad(t)) {
-                      var lab = card.querySelector('[aria-label]');
-                      var t3 = clean(lab ? lab.getAttribute('aria-label') : '');
-                      if (!bad(t3)) t = t3;
-                    }
-                  }
+              function clean(t){ if(!t) return ''; return t.replace(/\s+/g,' ').trim(); }
+              var out=[]; var nodes=document.querySelectorAll('a[href]');
+              for (var i=0;i<nodes.length;i++){
+                var a=nodes[i], h=a.href||'';
+                if(!/(rutube\.ru\/video\/|vk\.com\/video|vkvideo\.ru)/i.test(h)) continue;
+                var t = clean(a.getAttribute('aria-label')||a.getAttribute('title')||'');
+                if(!t || t.length<4){
+                  var c=a.closest('li,article,div[class]');
+                  var h2=c?c.querySelector('h3,h2,[class*=title]'):null;
+                  if(h2) t=clean(h2.innerText||h2.getAttribute('aria-label'));
                 }
-                if (bad(t)) continue;
-                var src = /rutube/i.test(h) ? 'RuTube' : (/vk\.com/i.test(h) ? 'VK' : (/dailymotion/i.test(h) ? 'Dailymotion' : 'YouTube'));
-                out.push(id + '|' + src + '|' + t.replace(/\|/g, ' ') + '|' + h);
+                if(!t || t.length<4) continue;
+                var src=/rutube/i.test(h)?'RuTube':'VK';
+                out.push(src+'|'+t.replace(/\|/g,' ')+'|'+h);
               }
-              var uniq = {}, res = [];
-              for (var j = 0; j < out.length; j++) {
-                var k = out[j].split('|')[0];
-                if (uniq[k]) continue;
-                uniq[k] = 1; res.push(out[j]);
-              }
-              return res.slice(0, 120).join('\n');
+              var seen={},res=[];
+              for(var j=0;j<out.length;j++){var k=out[j];if(seen[k])continue;seen[k]=1;res.push(k);}
+              return res.slice(0,80).join('\n');
             })();
         """.trimIndent()
-        web.evaluateJavascript(js) { raw ->
-            val text = raw
-                ?.removePrefix("\"")
-                ?.removeSuffix("\"")
-                ?.replace("\\n", "\n")
-                ?.replace("\\\"", "\"")
-                ?.replace("\\\\", "\\")
-                ?: ""
-            val lines = text.split('\n').map { it.trim() }.filter { it.count { ch -> ch == '|' } >= 3 }
+        scrapeWeb.evaluateJavascript(js) { raw ->
+            val text = raw?.removePrefix("\"")?.removeSuffix("\"")
+                ?.replace("\\n", "\n")?.replace("\\\"", "\"")?.replace("\\\\", "\\") ?: ""
+            val lines = text.split("\n").map { it.trim() }.filter { it.count { c -> c == '|' } >= 2 }
             if (lines.isEmpty()) {
-                if (!append) {
-                    status.text = "Роликов не нашлось — попробуйте другую площадку или прокрутите выдачу."
-                }
+                status.text = "На $source ничего не нашлось — попробуйте другой запрос"
                 return@evaluateJavascript
             }
-            var added = 0
+            resultsBox.removeAllViews()
+            ytItems.clear()
             for (line in lines) {
                 val parts = line.split('|')
-                val id = parts[0]
-                val src = parts[1]
-                val title = parts[2]
-                val url = parts[3]
-                if (!seenIds.add(id)) continue
-                added++
-                addVideoRow(id, src, title, url)
+                val src = parts[0]
+                val title = parts[1]
+                val url = parts[2]
+                val item = YouTubeSearch.Item(
+                    id = url.substringAfterLast('/').trimEnd('/'),
+                    kind = YouTubeSearch.KIND_VIDEO,
+                    title = title,
+                    author = src,
+                    lengthText = "",
+                    lengthSec = 0,
+                    views = 0,
+                    viewsText = "",
+                    publishedText = "",
+                    daysAgo = 9999,
+                    thumb = "",
+                    url = url
+                )
+                ytItems.add(item)
+                addRow(item)
             }
-            status.text = "Найдено роликов: ${seenIds.size}" + (if (added == 0) " · новых нет" else "")
+            status.text = "Найдено: ${ytItems.size} · $source"
         }
     }
 
-    private fun addVideoRow(id: String, src: String, title: String, url: String) {
+    /* ===================== карточка ===================== */
+
+    private fun addRow(item: YouTubeSearch.Item) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(12, 8, 12, 8)
         }
-
         val thumb = ImageView(this)
-        val lp = LinearLayout.LayoutParams(dp(110), dp(64))
+        val lp = LinearLayout.LayoutParams(dp(112), dp(66))
         lp.setMargins(0, 0, dp(10), 0)
         thumb.layoutParams = lp
         thumb.scaleType = ImageView.ScaleType.CENTER_CROP
         thumb.setBackgroundColor(Color.parseColor("#1E2026"))
-        val thumbUrl = if (id.length == 11) "https://i.ytimg.com/vi/$id/mqdefault.jpg" else ""
+        val thumbUrl = item.thumb.ifBlank {
+            if (item.id.length == 11) "https://i.ytimg.com/vi/${item.id}/mqdefault.jpg" else ""
+        }
         if (thumbUrl.isNotBlank()) {
             Thread({
-                val cached = synchronized(thumbCache) { thumbCache[thumbUrl] }
-                val bmp = cached ?: loadBitmap(thumbUrl)
+                val bmp = synchronized(thumbCache) { thumbCache[thumbUrl] } ?: loadBitmap(thumbUrl)
                 synchronized(thumbCache) { thumbCache[thumbUrl] = bmp }
                 if (bmp != null) runOnUiThread { thumb.setImageBitmap(bmp) }
             }, "Thumb").also { it.isDaemon = true; it.start() }
@@ -352,63 +470,171 @@ class VideoSearchActivity : Activity() {
 
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply {
-            text = title
+            text = when (item.kind) {
+                YouTubeSearch.KIND_PLAYLIST -> "🎞 " + item.title
+                YouTubeSearch.KIND_CHANNEL -> "📺 " + item.title
+                else -> item.title
+            }
             setTextColor(Color.WHITE)
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             maxLines = 3
         })
-        col.addView(TextView(this).apply {
-            text = src + " · " + url.substringAfter("://").take(42)
-            setTextColor(Color.parseColor("#8AB4F8"))
-            textSize = 10f
-            maxLines = 1
-        })
+        val meta = listOfNotNull(
+            item.author.takeIf { it.isNotBlank() && it != "плейлист" && it != "канал" },
+            item.lengthText.takeIf { it.isNotBlank() },
+            item.viewsText.takeIf { it.isNotBlank() },
+            item.publishedText.takeIf { it.isNotBlank() },
+            item.viewsText.takeIf { item.kind != YouTubeSearch.KIND_VIDEO && it.isNotBlank() }
+        ).distinct().joinToString(" · ")
+        if (meta.isNotBlank()) {
+            col.addView(TextView(this).apply {
+                text = meta
+                setTextColor(Color.parseColor("#9AA0A6"))
+                textSize = 10f
+                maxLines = 2
+            })
+        }
 
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(4), 0, 0)
         }
-        buttons.addView(small("▶ Смотреть") { playInline(url) })
-        buttons.addView(small("🌐 Открыть") {
-            try {
-                startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
-            } catch (_: Throwable) {
+        when (item.kind) {
+            YouTubeSearch.KIND_PLAYLIST -> {
+                buttons.addView(small("▶ Открыть плейлист") { playInline(item.url) })
+                buttons.addView(small("🌐 Открыть") { openExternal(item.url) })
+                buttons.addView(small("📋 Ссылка") { copy(item.url) })
             }
-        })
-        buttons.addView(small("⬇ Скачать") {
-            // честно: у этих площадок нет прямой ссылки без разбора потоков —
-            // открываем страницу в браузере приложения, где есть кнопка «Скачать видео»
-            try {
-                startActivity(
-                    android.content.Intent(
-                        android.content.Intent.ACTION_VIEW,
-                        android.net.Uri.parse(url)
-                    ).setPackage(packageName)
-                )
-                Toast.makeText(
-                    this,
-                    "Открыл страницу в браузере приложения — там кнопка ⬇ «Скачать видео»",
-                    Toast.LENGTH_LONG
-                ).show()
-            } catch (_: Throwable) {
-                Toast.makeText(this, "Не удалось открыть страницу", Toast.LENGTH_SHORT).show()
+            YouTubeSearch.KIND_CHANNEL -> {
+                buttons.addView(small("🎬 Видео канала") {
+                    startActivity(
+                        Intent(this, VideoSearchActivity::class.java)
+                            .putExtra("query", "")
+                            .putExtra("channel", item.title)
+                            .putExtra("channelQuery", item.title)
+                            .putExtra("source", "YouTube")
+                    )
+                })
+                buttons.addView(small("🌐 Канал") { openExternal(item.url) })
             }
-        })
-        buttons.addView(small("📋 Ссылка") {
-            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-            cm.setPrimaryClip(android.content.ClipData.newPlainText("video", url))
-            Toast.makeText(this, "Ссылка скопирована", Toast.LENGTH_SHORT).show()
-        })
+            else -> {
+                buttons.addView(small("▶ Смотреть") { playInline(item.url) })
+                buttons.addView(small("🌐 Открыть") { openExternal(item.url) })
+                buttons.addView(small("⬇ Скачать 360p") { startCapture(item) })
+                buttons.addView(small("📋 Ссылка") { copy(item.url) })
+            }
+        }
         col.addView(buttons)
         row.addView(col)
 
-        val divider = View(this).apply {
+        resultsBox.addView(row)
+        resultsBox.addView(View(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
             setBackgroundColor(Color.parseColor("#23252B"))
+        })
+    }
+
+    /* ===================== действия ===================== */
+
+    private fun playInline(url: String) {
+        playerBox.visibility = View.VISIBLE
+        player.loadUrl(url)
+        status.text = "Смотрю внутри приложения"
+    }
+
+    private fun openExternal(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Throwable) {
+            toast("Не удалось открыть ссылку")
         }
-        resultsBox.addView(row)
-        resultsBox.addView(divider)
+    }
+
+    private fun copy(url: String) {
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("video", url))
+        toast("Ссылка скопирована")
+    }
+
+    /**
+     * Скачивание видео внутри приложения (аналог кнопки «Скачать видео» в браузере).
+     *
+     * Загружаем страницу ролика в скрытый WebView и перехватываем реальный поток videoplayback.
+     * Минимальное склеенное качество — itag=18 (360p mp4 со звуком); если YouTube его не отдал,
+     * берём самый лёгкий mp4, который удалось поймать.
+     */
+    private fun startCapture(item: YouTubeSearch.Item) {
+        if (!item.url.contains("youtube", true)) {
+            // RuTube/VK: прямой поток отдаётся только после входа, честно отправляем в браузер приложения
+            toast("У этой площадки поток только через браузер приложения — открываю")
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.url)).setPackage(packageName))
+            } catch (_: Throwable) {
+            }
+            return
+        }
+        grabSession++
+        val session = grabSession
+        grabbed.clear()
+        captureStatus.text = "⏳ Ищу поток 360p для «${item.title.take(30)}»…"
+        captureWeb.loadUrl("https://m.youtube.com/watch?v=${item.id}&hl=ru")
+        captureWeb.postDelayed({
+            captureWeb.evaluateJavascript(
+                "(function(){var v=document.querySelector('video');if(v){v.muted=true;v.play();}return 'ok';})();",
+                null
+            )
+        }, 1500)
+        captureWeb.postDelayed({ finishCapture(session, item) }, 9_000)
+    }
+
+    private fun finishCapture(session: Int, item: YouTubeSearch.Item) {
+        if (session != grabSession) return
+        val candidates = synchronized(grabbed) { grabbed.toMap() }
+        if (candidates.isEmpty()) {
+            captureStatus.text = "❌ Не удалось поймать поток — откройте ролик в браузере приложения и нажмите ⬇ «Скачать видео»"
+            captureWeb.loadUrl("about:blank")
+            return
+        }
+        // itag 18 — 360p mp4 (видео+звук). Иначе — самый лёгкий из пойманных.
+        val url = candidates["18"]
+            ?: candidates.entries.sortedBy { it.key.toIntOrNull() ?: 999 }.first().value
+        val safeName = item.title.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(70)
+            .ifBlank { item.id } + ".mp4"
+        val cookie = try {
+            CookieManager.getInstance().getCookie("https://www.youtube.com")
+        } catch (_: Throwable) {
+            null
+        }
+        val id = AppDownloads.enqueue(
+            context = this,
+            url = url,
+            fileName = safeName,
+            mimeType = "video/mp4",
+            userAgent = DESKTOP_UA,
+            cookie = cookie,
+            referer = "https://www.youtube.com/watch?v=${item.id}"
+        )
+        captureStatus.text = if (id != null) {
+            "⬇ 360p → Загрузки/${AppDownloads.SUBDIR}/$safeName (видно во вкладке «Загрузки»)"
+        } else {
+            "❌ Не удалось поставить загрузку"
+        }
+        if (id != null) toast("Качаю 360p: $safeName")
+        captureWeb.loadUrl("about:blank")
+    }
+
+    /* ===================== мелочи ===================== */
+
+    private fun newWeb(): WebView = WebView(this).apply {
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.userAgentString = MOBILE_UA
+        // у пользователя выполнен вход в YouTube — сохраняем cookies между запусками
+        CookieManager.getInstance().setAcceptCookie(true)
     }
 
     private fun small(label: String, action: () -> Unit): Button = Button(this).apply {
@@ -420,21 +646,23 @@ class VideoSearchActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun loadBitmap(url: String): Bitmap? {
-        return try {
-            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 8_000
-                readTimeout = 8_000
-                setRequestProperty("User-Agent", MOBILE_UA)
-            }
-            if (conn.responseCode in 200..299) conn.inputStream.use { BitmapFactory.decodeStream(it) } else null
-        } catch (_: Throwable) {
-            null
+    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+
+    private fun loadBitmap(url: String): Bitmap? = try {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            setRequestProperty("User-Agent", MOBILE_UA)
         }
+        if (conn.responseCode in 200..299) conn.inputStream.use { BitmapFactory.decodeStream(it) } else null
+    } catch (_: Throwable) {
+        null
     }
 
     companion object {
         private const val MOBILE_UA =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Mobile Safari/537.36"
+        private const val DESKTOP_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
 }

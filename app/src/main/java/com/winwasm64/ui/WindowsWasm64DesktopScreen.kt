@@ -3709,6 +3709,9 @@ private fun TorrentClientSection(
     var isSearching by remember { mutableStateOf(false) }
     // v4.42.0/v4.49.0: фильтр по категориям — игры/видео/музыка/книги/софт (переживает вкладки)
     var categoryFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentKind) }
+    // v4.51.0: «чистый» запрос пользователя. Категория добавляет уточняющее слово, но не портит базу —
+    // раньше каждое переключение категории дописывало слово к уже дописанному.
+    var baseQuery by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentQuery) }
     // v4.43.0: фильтр по качеству/формату — «хочу 360p» или «только FLAC»
     var qualityFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentQuality) }
     // v4.49.0: сортировка — сначала новые/старые/тяжёлые/лёгкие
@@ -3735,8 +3738,9 @@ private fun TorrentClientSection(
     }
     // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
-    fun runSearch(query: String) {
+    fun runSearch(query: String, keepBase: Boolean = false) {
         isSearching = true
+        if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
         torrentEngine.searchPublicTorrents(query) { res ->
@@ -4149,14 +4153,18 @@ private fun TorrentClientSection(
                                 color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.clickable {
-                                    // v4.50.0: РАНЬШЕ здесь запускался повторный поиск, и из-за
-                                    // экранирования подстановки в запрос уходила строка вида
-                                    // «${searchQuery.trim()} $catWord» — движок ничего не находил и в
-                                    // списке появлялся null. Теперь категория только фильтрует уже
-                                    // найденное (мгновенно), а поиск ВНУТРИ категории — отдельной
-                                    // кнопкой ниже, если под фильтр ничего не подошло.
+                                    // v4.51.0: как во вкладке «Файлы» — категория СРАЗУ ищет внутри
+                                    // себя: к запросу добавляется уточняющее слово («игра», «фильм»),
+                                    // и движок возвращает именно эту категорию. База запроса не
+                                    // портится, поэтому переключение категорий туда-обратно работает.
                                     categoryFilter = cat
                                     com.winwasm64.torrent.SearchCache.torrentKind = cat
+                                    val word = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(cat)
+                                    val effective = if (word.isBlank()) baseQuery.trim()
+                                    else (baseQuery.trim() + " " + word).trim()
+                                    if (baseQuery.isNotBlank()) {
+                                        runSearch(effective, keepBase = true)
+                                    }
                                 }
                             ) {
                                 Text(
@@ -4257,22 +4265,6 @@ private fun TorrentClientSection(
                                 colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
                             ) {
                                 Text("Показать все ${catalogItems.size}", fontSize = 12.sp)
-                            }
-                            if (searchQuery.isNotBlank() && categoryFilter != "Все") {
-                                Button(
-                                    onClick = {
-                                        val word = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(categoryFilter)
-                                        val scoped = listOf(searchQuery.trim(), word)
-                                            .filter { it.isNotBlank() }
-                                            .joinToString(" ")
-                                        runSearch(scoped)
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                                    modifier = Modifier.height(36.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                                ) {
-                                    Text("🔍 Искать «${searchQuery.trim()}» в «$categoryFilter»", fontSize = 12.sp, color = Color.White)
-                                }
                             }
                         }
                     }
@@ -5783,6 +5775,18 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
         }, "DirectSearch").also { it.isDaemon = true; it.start() }
     }
 
+    // v4.51.0: бесконечная прокрутка — как только список докручен до конца, страница грузится сама
+    val filesListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    LaunchedEffect(filesListState, hasMore, busy) {
+        androidx.compose.runtime.snapshotFlow {
+            filesListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+        }.collect { lastIndex ->
+            if (!busy && hasMore && lastIndex >= items.size - 2 && items.isNotEmpty()) {
+                run(kindFilter, sortMode, page + 1, true)
+            }
+        }
+    }
+
     val kindChips = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
     val sortChips = listOf("По релевантности", "Новые", "Старые", "Тяжёлые", "Лёгкие")
     val byKind = items
@@ -5910,7 +5914,11 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
             }
         }
 
-        LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            state = filesListState,
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             items(visible, key = { it.downloadUrl + "|" + it.fileName }) { f ->
                 Surface(color = Omni.Surface, shape = RoundedCornerShape(10.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
                     Row(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5974,6 +5982,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     var images by remember { mutableStateOf<List<com.winwasm64.torrent.GalleryImage>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
     var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoPage) }
+    // страницы кончились — дальше не дёргаем сеть
+    var noMore by remember { mutableStateOf(false) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     val filters = listOf("Фото", "Обложки игр", "Постеры фильмов", "Обложки книг", "Кадры из видео", "Альбомы музыки")
 
@@ -5995,10 +6005,29 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                 emptyList()
             }
             handler.post {
-                images = if (append) (images + res).distinctBy { it.url } else res
+                if (append) {
+                    val before = images.size
+                    images = (images + res).distinctBy { it.url }
+                    if (images.size == before) noMore = true
+                } else {
+                    images = res
+                    noMore = false
+                }
                 busy = false
             }
         }, "Gallery").also { it.isDaemon = true; it.start() }
+    }
+
+    // v4.51.0: галерея тоже докручивается бесконечно
+    val photoListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    LaunchedEffect(photoListState, busy, images.size) {
+        androidx.compose.runtime.snapshotFlow {
+            photoListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+        }.collect { lastIndex ->
+            if (!busy && !noMore && images.isNotEmpty() && lastIndex >= images.size / 2 - 2) {
+                runGallery(query, filter, page + 1, true)
+            }
+        }
     }
 
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -6076,7 +6105,11 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
             color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
         )
 
-        LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            state = photoListState,
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             items(images.chunked(2)) { pair ->
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     pair.forEach { img ->
@@ -6201,7 +6234,14 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
         val intent = Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .putExtra("query", target)
-            .putExtra("source", if (source == "Все") "YouTube" else source)
+            .putExtra(
+                "source",
+                when (source) {
+                    "VK Видео" -> "VK"
+                    "Все" -> "YouTube"
+                    else -> source
+                }
+            )
             .putExtra("channel", channelName)
             .putExtra("channelQuery", ch?.query.orEmpty())
         context.startActivity(intent)
@@ -6212,8 +6252,9 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("🎬 Видео по названию, по ссылке или в канале", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Как во «Файлах»: список роликов с превью и кнопками «Смотреть / Открыть / Скачать». " +
-                        "Можно выбрать канал ниже — тогда поиск идёт только внутри него.",
+                    "Как во «Файлах»: список роликов с превью и кнопками «Смотреть / Открыть / Скачать 360p». " +
+                        "Внутри — категории (видео, плейлисты, каналы, трансляции), сортировка и фильтр по " +
+                        "длительности; список докручивается сам. Канал ниже ограничивает поиск одним каналом.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 CompactDarkTextField(
