@@ -4147,7 +4147,7 @@ private fun TorrentClientSection(
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(
                                 text = "Под этот фильтр ничего не подошло. В выдаче есть ${catalogItems.size} раздач(и) — в других категориях.",
-                                color = Omni.TextSecondary,
+                                color = Omni.TextDim,
                                 fontSize = 12.sp
                             )
                             Button(
