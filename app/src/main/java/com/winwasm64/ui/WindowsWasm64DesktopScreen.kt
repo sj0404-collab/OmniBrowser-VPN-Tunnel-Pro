@@ -4149,16 +4149,14 @@ private fun TorrentClientSection(
                                 color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.clickable {
+                                    // v4.50.0: РАНЬШЕ здесь запускался повторный поиск, и из-за
+                                    // экранирования подстановки в запрос уходила строка вида
+                                    // «${searchQuery.trim()} $catWord» — движок ничего не находил и в
+                                    // списке появлялся null. Теперь категория только фильтрует уже
+                                    // найденное (мгновенно), а поиск ВНУТРИ категории — отдельной
+                                    // кнопкой ниже, если под фильтр ничего не подошло.
                                     categoryFilter = cat
                                     com.winwasm64.torrent.SearchCache.torrentKind = cat
-                                    // v4.49.0: категория — это запрос внутри категории, а не фильтр
-                                    // поверх общего списка: иначе «Игры» показывали бы пустоту
-                                    if (cat != "Все" && searchQuery.isNotBlank() && catalogItems.isNotEmpty()) {
-                                        val catWord = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(cat)
-                                        if (catWord.isNotBlank() && !searchQuery.contains(catWord, true)) {
-                                            runSearch("${'$'}{searchQuery.trim()} ${'$'}catWord".trim())
-                                        }
-                                    }
                                 }
                             ) {
                                 Text(
@@ -4251,12 +4249,30 @@ private fun TorrentClientSection(
                                 onClick = {
                                     categoryFilter = "Все"
                                     qualityFilter = ""
+                                    com.winwasm64.torrent.SearchCache.torrentKind = "Все"
+                                    com.winwasm64.torrent.SearchCache.torrentQuality = ""
                                 },
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                                 modifier = Modifier.height(36.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
                             ) {
                                 Text("Показать все ${catalogItems.size}", fontSize = 12.sp)
+                            }
+                            if (searchQuery.isNotBlank() && categoryFilter != "Все") {
+                                Button(
+                                    onClick = {
+                                        val word = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(categoryFilter)
+                                        val scoped = listOf(searchQuery.trim(), word)
+                                            .filter { it.isNotBlank() }
+                                            .joinToString(" ")
+                                        runSearch(scoped)
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                    modifier = Modifier.height(36.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                ) {
+                                    Text("🔍 Искать «${searchQuery.trim()}» в «$categoryFilter»", fontSize = 12.sp, color = Color.White)
+                                }
                             }
                         }
                     }
@@ -6102,39 +6118,46 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                 }
                             }
                             Text(img.title.ifBlank { img.source }, color = Color.White, fontSize = 10.sp, maxLines = 2)
-                            // v4.49.0: действия с картинкой — скачать, похожие, видео по названию
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    "⬇",
-                                    fontSize = 14.sp,
-                                    modifier = Modifier.clickable {
+                            // v4.50.0: действия подписаны словами, а не мелкими эмодзи —
+                            // раньше было непонятно, что нажимать и что именно произойдёт
+                            val photoTitle = if (img.title.isBlank()) query else img.title.take(48)
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                listOf(
+                                    "⬇ Скачать" to {
                                         enqueueDirectDownload(
                                             context,
                                             img.url,
                                             img.url.substringAfterLast('/').substringBefore('?').ifBlank { "image.jpg" }
                                         )
-                                    }
-                                )
-                                Text(
-                                    "🔎",
-                                    fontSize = 13.sp,
-                                    modifier = Modifier.clickable {
-                                        val q = if (img.title.isBlank()) query else img.title.take(40)
-                                        runGallery(q, "Фото", 0, false)
-                                    }
-                                )
-                                Text(
-                                    "🎬",
-                                    fontSize = 13.sp,
-                                    modifier = Modifier.clickable {
-                                        val q = if (img.title.isBlank()) query else img.title.take(40)
+                                    },
+                                    "🔎 Похожие" to {
+                                        // ищем по самой картинке: берём название этой картинки,
+                                        // а не общий запрос вкладки
+                                        query = photoTitle
+                                        com.winwasm64.torrent.SearchCache.photoQuery = photoTitle
+                                        runGallery(photoTitle, "Фото", 0, false)
+                                    },
+                                    "🎬 Видео" to {
+                                        com.winwasm64.torrent.SearchCache.videoQuery = photoTitle
                                         context.startActivity(
                                             Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
                                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                .putExtra("query", q)
+                                                .putExtra("query", photoTitle)
                                         )
                                     }
-                                )
+                                ).forEach { (label, action) ->
+                                    Button(
+                                        onClick = action,
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(30.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                                    ) {
+                                        Text(label, fontSize = 9.sp, color = Color.White, maxLines = 1)
+                                    }
+                                }
                             }
                         }
                     }
@@ -6157,34 +6180,40 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
 }
 
 /**
- * v4.49.0: «🎬 Видео» — поиск роликов по названию или по ссылке.
- * Площадки: YouTube, RuTube, VK Видео, Dailymotion. Поиск и просмотр идут внутри приложения
- * (VideoSearchActivity с встроенным плеером), поэтому вкладка не сбрасывает запрос при переходах.
+ * v4.50.0: «🎬 Видео» — как «Файлы»: список карточек с тремя действиями, плюс ПОДПИСКИ и поиск
+ * внутри канала (Айвори, LightFox Manga и любые свои).
  */
 @Composable
 private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery }) }
     var source by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoSource) }
+    var channel by remember { mutableStateOf("") }
+    var channels by remember { mutableStateOf(com.winwasm64.torrent.VideoChannels.all(context)) }
+    var newChannel by remember { mutableStateOf("") }
+    var adding by remember { mutableStateOf(false) }
     val sources = listOf("Все", "YouTube", "RuTube", "VK Видео", "Dailymotion")
 
-    fun open(target: String) {
+    fun open(target: String, channelName: String = "") {
         com.winwasm64.torrent.SearchCache.videoQuery = target
         com.winwasm64.torrent.SearchCache.videoSource = source
+        val ch = channels.firstOrNull { it.name == channelName }
         val intent = Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .putExtra("query", target)
-            .putExtra("source", source)
+            .putExtra("source", if (source == "Все") "YouTube" else source)
+            .putExtra("channel", channelName)
+            .putExtra("channelQuery", ch?.query.orEmpty())
         context.startActivity(intent)
     }
 
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("🎬 Видео по названию или по ссылке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("🎬 Видео по названию, по ссылке или в канале", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Введите название («я злой бог») или вставьте ссылку на ролик — откроется встроенный плеер. " +
-                        "Площадки: YouTube, RuTube, VK Видео, Dailymotion.",
+                    "Как во «Файлах»: список роликов с превью и кнопками «Смотреть / Открыть / Скачать». " +
+                        "Можно выбрать канал ниже — тогда поиск идёт только внутри него.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 CompactDarkTextField(
@@ -6193,9 +6222,9 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
                         query = it
                         com.winwasm64.torrent.SearchCache.videoQuery = it
                     },
-                    placeholder = "Название фильма/ролика или ссылка https://…",
+                    placeholder = "Название: «я злой бог», шрек, манга… или ссылка https://",
                     modifier = Modifier.fillMaxWidth(),
-                    onGo = { if (query.isNotBlank()) open(query.trim()) }
+                    onGo = { if (query.isNotBlank()) open(query.trim(), channel) }
                 )
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     sources.forEach { src ->
@@ -6212,14 +6241,116 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
                     }
                 }
                 Button(
-                    onClick = { if (query.isNotBlank()) open(query.trim()) },
+                    onClick = { if (query.isNotBlank()) open(query.trim(), channel) },
                     modifier = Modifier.fillMaxWidth().height(42.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
                 ) {
                     Text(
-                        if (query.startsWith("http")) "▶ Смотреть ссылку в приложении" else "🔍 Искать видео«$source»",
+                        when {
+                            query.startsWith("http") -> "▶ Смотреть ссылку в приложении"
+                            channel.isNotBlank() -> "🔍 Искать «${query.take(18)}» в канале «$channel»"
+                            else -> "🔍 Искать видео · $source"
+                        },
                         fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White
                     )
+                }
+            }
+        }
+
+        // ---------- ПОДПИСКИ ----------
+        Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("📺 Подписки (${channels.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(
+                        if (adding) "Отмена" else "➕ Добавить",
+                        color = Omni.Accent, fontSize = 11.sp,
+                        modifier = Modifier.clickable { adding = !adding }
+                    )
+                }
+                Text(
+                    if (channel.isBlank()) "Канал не выбран — поиск идёт по всем площадкам."
+                    else "Выбран канал «$channel» — поиск только в нём.",
+                    color = if (channel.isBlank()) Omni.TextDim else Omni.Success, fontSize = 11.sp
+                )
+                if (adding) {
+                    CompactDarkTextField(
+                        value = newChannel,
+                        onValueChange = { newChannel = it },
+                        placeholder = "Название канала (например, LightFox Manga)",
+                        modifier = Modifier.fillMaxWidth(),
+                        onGo = {
+                            if (newChannel.isNotBlank()) {
+                                com.winwasm64.torrent.VideoChannels.add(context, newChannel)
+                                channels = com.winwasm64.torrent.VideoChannels.all(context)
+                                Toast.makeText(context, "Канал «${newChannel.trim()}» в подписках", Toast.LENGTH_SHORT).show()
+                                newChannel = ""
+                                adding = false
+                            }
+                        }
+                    )
+                    Button(
+                        onClick = {
+                            if (newChannel.isNotBlank()) {
+                                com.winwasm64.torrent.VideoChannels.add(context, newChannel)
+                                channels = com.winwasm64.torrent.VideoChannels.all(context)
+                                Toast.makeText(context, "Канал «${newChannel.trim()}» в подписках", Toast.LENGTH_SHORT).show()
+                                newChannel = ""
+                                adding = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(38.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                    ) {
+                        Text("Подписаться", fontSize = 12.sp, color = Color.White)
+                    }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    channels.chunked(2).forEach { pair ->
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            pair.forEach { ch ->
+                                val selected = ch.name == channel
+                                Surface(
+                                    color = if (selected) Omni.AccentContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(9.dp),
+                                    modifier = Modifier.weight(1f).clickable {
+                                        channel = if (selected) "" else ch.name
+                                        if (query.isNotBlank()) open(query.trim(), channel)
+                                    }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            ch.name,
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (ch.custom) {
+                                            Text(
+                                                "✕",
+                                                color = Omni.TextDim,
+                                                fontSize = 12.sp,
+                                                modifier = Modifier.clickable {
+                                                    com.winwasm64.torrent.VideoChannels.remove(context, ch.name)
+                                                    channels = com.winwasm64.torrent.VideoChannels.all(context)
+                                                    if (channel == ch.name) channel = ""
+                                                }
+                                            )
+                                        } else {
+                                            Text("▶", fontSize = 10.sp, color = Omni.Accent)
+                                        }
+                                    }
+                                }
+                            }
+                            if (pair.size == 1) Box(modifier = Modifier.weight(1f))
+                        }
+                    }
                 }
             }
         }
@@ -6236,16 +6367,10 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
                 shape = RoundedCornerShape(10.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
                 modifier = Modifier.fillMaxWidth().clickable {
-                    val q = query.ifBlank { torrentLastQueryFallback() }
-                    if (q.isBlank()) {
+                    if (query.isBlank()) {
                         Toast.makeText(context, "Сначала введите название", Toast.LENGTH_SHORT).show()
                     } else {
-                        context.startActivity(
-                            Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                .putExtra("query", q)
-                                .putExtra("source", name)
-                        )
+                        open(query.trim(), channel)
                     }
                 }
             ) {

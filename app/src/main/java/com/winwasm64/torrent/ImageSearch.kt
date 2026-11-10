@@ -72,13 +72,22 @@ object ImageSearch {
         if (clean.isBlank()) return emptyList()
         val out = mutableListOf<GalleryImage>()
         val variants = listOf(clean) + aliasesFor(clean)
+        // Википедия идёт первой: она единственная нормально ищет по-русски
+        out.addAll(wikipedia(clean, filter, page))
         for (v in variants) {
             out.addAll(itunes(v, filter, page))
         }
         for (v in variants.take(2)) {
             out.addAll(commons(v, filter, page))
         }
-        return out.distinctBy { it.url }.take(60)
+        val filtered = out.distinctBy { it.url }
+        // v4.50.0: если под узкий фильтр почти ничего нет — добираем общими картинками,
+        // чтобы вкладка не выглядела «пустой» на русских названиях
+        if (filter != "Фото" && filtered.size < 6) {
+            val extra = wikipedia(clean, "Фото", page) + itunes(clean, "Фото", page)
+            return (filtered + extra).distinctBy { it.url }.take(60)
+        }
+        return filtered.take(60)
     }
 
     /* ===================== iTunes (обложки и постеры) ===================== */
@@ -177,7 +186,7 @@ object ImageSearch {
                 connectTimeout = 10_000
                 readTimeout = 12_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "OmniBrowser/4.48 (Android)")
+                setRequestProperty("User-Agent", "OmniBrowser/4.50 (Android)")
                 setRequestProperty("Accept", "application/json")
             }
             if (conn.responseCode in 200..299) conn.inputStream.bufferedReader().use { it.readText() } else null
