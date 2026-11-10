@@ -32,7 +32,9 @@ data class DirectFile(
     val kind: String,
     val description: String,
     /** v4.47.1: чем полезнее файл, тем выше — карточка показывает главное, а не превью-картинку. */
-    val weight: Int = 0
+    val weight: Int = 0,
+    /** v4.49.0: год — для сортировки «сначала новые / старые». */
+    val year: Int = 0
 )
 
 object DirectSearch {
@@ -62,49 +64,91 @@ object DirectSearch {
         "sqlite3", "xml.gz", "meta", "ffp", "afp", "asc", "sfv", "nfo", "url"
     )
 
-    fun search(query: String, timeoutMs: Int = 12_000): List<DirectFile> {
+    /** Ответ на страницу: 24 записи + признак «есть ли следующая». */
+    data class Page(val files: List<DirectFile>, val hasMore: Boolean)
+
+    /**
+     * v4.49.0: поиск по страницам и по КАТЕГОРИИ.
+     *
+     * Раньше фильтр только отсекал уже найденное: выбрал «🎮 Игры» — и оставалось огрызок выдачи.
+     * Теперь категория идёт в сам запрос Archive.org (`mediatype:`), поэтому «Игры» ищутся в играх,
+     * «Книги» — в книгах, а манга — в текстах. Плюс страницы 1, 2, 3… как в поисковике.
+     */
+    fun search(
+        query: String,
+        kind: String = "Все",
+        page: Int = 0,
+        sort: Int = 0,
+        timeoutMs: Int = 12_000
+    ): Page {
         val clean = query.trim()
-        if (clean.isBlank()) return emptyList()
-        // v4.48.0: «черепашки» должны находить и TMNT — ищем и по синониму, и по оригиналу
+        if (clean.isBlank()) return Page(emptyList(), false)
         val variants = (listOf(clean) + ImageSearch.aliasesFor(clean)).distinct()
         val raw = mutableListOf<DirectFile>()
-        for (v in variants.take(2)) {
-            raw.addAll(searchArchive(v, timeoutMs))
+        val q = when (kind) {
+            "📖 Манга" -> "$clean manga"
+            else -> clean
         }
-        raw.addAll(searchGitHub(clean, timeoutMs))
+        for (v in variants.take(2)) {
+            raw.addAll(searchArchive(if (kind == "📖 Манга") "$v manga" else v, kind, page, sort, timeoutMs))
+        }
+        if (page == 0 && (kind == "Все" || kind == "💾 Софт")) {
+            raw.addAll(searchGitHub(clean, timeoutMs))
+        }
         val unfiltered = raw.distinctBy { it.downloadUrl }
-        // релевантность: в названии должно быть слово запроса (или синонима).
-        // Раньше в «черепашки» попадали «Кэллахен» и «Red Wolf Channel» — просто потому, что
-        // Archive.org нашёл их по описанию.
         val tokens = variants.flatMap { v ->
-            v.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 }
+            q.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 }
         }.toSet()
         fun relevant(f: DirectFile): Boolean {
             val t = f.title.lowercase()
             return tokens.any { t.contains(it) }
         }
         val good = unfiltered.filter { relevant(it) }
-        val list = if (good.size >= 5) good else unfiltered.sortedByDescending { relevant(it) }
-        // без дублей и без бесконечной простыни: 60 карточек — уже большой список
-        return list.take(60)
+        val list = (if (good.size >= 5) good else unfiltered.sortedByDescending { relevant(it) })
+            .let { base ->
+                when (sort) {
+                    1 -> base.sortedByDescending { it.year }          // сначала новые
+                    2 -> base.sortedBy { it.year }                    // сначала старые
+                    3 -> base.sortedByDescending { parseSize(it.sizeLabel) } // сначала тяжёлые
+                    4 -> base.sortedBy { parseSize(it.sizeLabel) }     // сначала лёгкие
+                    else -> base
+                }
+            }
+        return Page(list.take(60), list.size >= 20)
     }
 
     /* ===================== Internet Archive ===================== */
 
-    private fun searchArchive(query: String, timeoutMs: Int): List<DirectFile> {
+    private fun searchArchive(query: String, kind: String, page: Int, sort: Int, timeoutMs: Int): List<DirectFile> {
         val q = URLEncoder.encode(query, "UTF-8")
-        val url = "https://archive.org/advancedsearch.php?q=($q)&fl[]=identifier,title,mediatype,item_size,description" +
-            "&rows=24&page=1&output=json"
+        // категория — прямо в запрос, а не фильтром поверх готового списка
+        val media = when (kind) {
+            "🎮 Игры" -> "+AND+mediatype:(software+OR+games)"
+            "🎬 Видео" -> "+AND+mediatype:(movies+OR+tv)"
+            "🎵 Музыка" -> "+AND+mediatype:(audio+OR+etree)"
+            "📚 Книги", "📖 Манга" -> "+AND+mediatype:(texts)"
+            "💾 Софт" -> "+AND+mediatype:(software)"
+            else -> ""
+        }
+        val sortClause = when (sort) {
+            1 -> "&sort[]=addeddate+desc"
+            2 -> "&sort[]=addeddate+asc"
+            3 -> "&sort[]=item_size+desc"
+            4 -> "&sort[]=item_size+asc"
+            else -> ""
+        }
+        val url = "https://archive.org/advancedsearch.php?q=($q$media)&fl[]=identifier,title,mediatype,item_size,year" +
+            "&rows=24&page=${page + 1}$sortClause&output=json"
         val body = httpGet(url, timeoutMs) ?: return emptyList()
         val result = mutableListOf<DirectFile>()
         try {
             val docs = JSONObject(body).optJSONObject("response")?.optJSONArray("docs") ?: return emptyList()
-            val items = mutableListOf<Triple<String, String, String>>() // id, title, mediatype
+            val items = mutableListOf<Quad>() // id, title, mediatype, year
             for (i in 0 until docs.length()) {
                 val d = docs.getJSONObject(i)
                 val id = d.optString("identifier")
                 if (id.isBlank()) continue
-                items.add(Triple(id, d.optString("title", id), d.optString("mediatype", "")))
+                items.add(Quad(id, d.optString("title", id), d.optString("mediatype", ""), d.optInt("year", 0)))
             }
             // файлы и форматы забираем параллельно — иначе 24 записи ждут друг друга
             val bag = java.util.Collections.synchronizedList(result)
@@ -112,9 +156,9 @@ object DirectSearch {
             val workers = (1..6).map {
                 Thread({
                     while (true) {
-                        val (id, title, mediaType) = queue.poll() ?: break
+                        val next = queue.poll() ?: break
                         try {
-                            bag.addAll(filesOfItem(id, title, mediaType, timeoutMs))
+                            bag.addAll(filesOfItem(next.id, next.title, next.mediaType, next.year, timeoutMs))
                         } catch (_: Throwable) {
                         }
                     }
@@ -126,7 +170,9 @@ object DirectSearch {
         return result
     }
 
-    private fun filesOfItem(id: String, title: String, mediaType: String, timeoutMs: Int): List<DirectFile> {
+    private data class Quad(val id: String, val title: String, val mediaType: String, val year: Int)
+
+    private fun filesOfItem(id: String, title: String, mediaType: String, year: Int, timeoutMs: Int): List<DirectFile> {
         val body = httpGet("https://archive.org/metadata/$id", timeoutMs) ?: return emptyList()
         val json = JSONObject(body)
         val files = json.optJSONArray("files") ?: return emptyList()
@@ -154,8 +200,9 @@ object DirectSearch {
                     sizeLabel = if (size > 0) BitTorrentEngine.formatSize(size) else "размер неизвестен",
                     poster = "https://archive.org/services/img/$id",
                     kind = kind,
-                    description = "Archive.org · $id",
-                    weight = weight
+                    description = "Archive.org · $id" + (if (year > 0) " · $year" else ""),
+                    weight = weight,
+                    year = year
                 )
             )
         }

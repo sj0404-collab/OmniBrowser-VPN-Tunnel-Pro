@@ -66,16 +66,17 @@ object ImageSearch {
         return extra.take(2)
     }
 
-    fun search(query: String, filter: String): List<GalleryImage> {
+    /** v4.49.0: страницы — «показать ещё», как в поисковике. */
+    fun search(query: String, filter: String, page: Int = 0): List<GalleryImage> {
         val clean = query.trim()
         if (clean.isBlank()) return emptyList()
         val out = mutableListOf<GalleryImage>()
         val variants = listOf(clean) + aliasesFor(clean)
         for (v in variants) {
-            out.addAll(itunes(v, filter))
+            out.addAll(itunes(v, filter, page))
         }
         for (v in variants.take(2)) {
-            out.addAll(commons(v, filter))
+            out.addAll(commons(v, filter, page))
         }
         return out.distinctBy { it.url }.take(60)
     }
@@ -91,11 +92,14 @@ object ImageSearch {
         else -> listOf("album", "ebook", "software", "tvSeason")
     }
 
-    private fun itunes(query: String, filter: String): List<GalleryImage> {
+    private fun itunes(query: String, filter: String, page: Int): List<GalleryImage> {
         val out = mutableListOf<GalleryImage>()
         val q = URLEncoder.encode(query, "UTF-8")
+        val offset = page * 12
         for (entity in entityFor(filter).take(2)) {
-            val body = httpGet("https://itunes.apple.com/search?term=$q&entity=$entity&limit=12&country=us")
+            val body = httpGet(
+                "https://itunes.apple.com/search?term=$q&entity=$entity&limit=12&offset=$offset&country=us"
+            )
                 ?: continue
             try {
                 val results = JSONObject(body).optJSONArray("results") ?: continue
@@ -125,7 +129,7 @@ object ImageSearch {
 
     /* ===================== Wikimedia Commons (обычные фото) ===================== */
 
-    private fun commons(query: String, filter: String): List<GalleryImage> {
+    private fun commons(query: String, filter: String, page: Int): List<GalleryImage> {
         val suffix = when (filter) {
             "Обложки игр" -> " video game cover"
             "Постеры фильмов" -> " film poster"
@@ -136,7 +140,8 @@ object ImageSearch {
         }
         val q = URLEncoder.encode(query + suffix, "UTF-8")
         val url = "https://commons.wikimedia.org/w/api.php?action=query&generator=search" +
-            "&gsrsearch=$q&gsrnamespace=6&gsrlimit=24&prop=imageinfo&iiprop=url&iiurlwidth=600&format=json"
+            "&gsrsearch=$q&gsrnamespace=6&gsrlimit=24&gsroffset=${page * 24}" +
+            "&prop=imageinfo&iiprop=url&iiurlwidth=600&format=json"
         val body = httpGet(url) ?: return emptyList()
         val out = mutableListOf<GalleryImage>()
         try {

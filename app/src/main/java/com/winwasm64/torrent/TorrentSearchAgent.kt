@@ -510,7 +510,7 @@ object TorrentSearchAgent {
     /* ===================== категории ===================== */
 
     /** Категории для фильтра в списке результатов. */
-    val CATEGORIES = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "💾 Софт")
+    val CATEGORIES = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
 
     private val VIDEO_EXT = listOf("mkv", "mp4", "avi", "bdrip", "webrip", "web-dl", "dvdrip", "hdtv", "x264", "x265", "hevc", "1080p", "720p", "2160p", "camrip", "bdremux")
     private val MUSIC_EXT = listOf("flac", "mp3", "lossless", "aac", "wav", "album", "discography", "ost", "soundtrack", "m4a", "opus")
@@ -599,9 +599,20 @@ object TorrentSearchAgent {
         "🎮 Игры" -> category == "game"
         "🎬 Видео" -> category == "video"
         "🎵 Музыка" -> category == "music"
-        "📚 Книги" -> category == "book"
+        "📚 Книги", "📖 Манга" -> category == "book" || category == "manga"
         "💾 Софт" -> category == "soft"
         else -> true
+    }
+
+    /** v4.49.0: слово-уточнение для повторного поиска внутри категории. */
+    fun categoryWord(chip: String): String = when (chip) {
+        "🎮 Игры" -> "игра"
+        "🎬 Видео" -> "фильм"
+        "🎵 Музыка" -> "музыка"
+        "📚 Книги" -> "книга"
+        "📖 Манга" -> "манга"
+        "💾 Софт" -> "программа"
+        else -> ""
     }
 
     /* ===================== качество и форматы ===================== */

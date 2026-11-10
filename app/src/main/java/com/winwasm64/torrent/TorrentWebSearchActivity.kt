@@ -69,7 +69,16 @@ class TorrentWebSearchActivity : Activity() {
         "$query site:rutor-games.com",
         "$query site:stoigr.org",
         "$query site:kickasstorrents.to",
-        "$query site:archive.org"
+        "$query site:archive.org",
+        // v4.49.0: манга — официальные русскоязычные библиотеки
+        "$query манга читать онлайн",
+        "$query site:mangalib.me",
+        "$query site:mangabuff.ru",
+        "$query site:remanga.org",
+        "$query site:readmanga.live",
+        "$query site:mintmanga.live",
+        "$query site:acomics.ru",
+        "$query site:lib.knigomir.ru"
     )
     private val seen = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -287,7 +296,8 @@ class TorrentWebSearchActivity : Activity() {
         val host = url.substringAfter("://").substringBefore('/').lowercase()
         return Regex(
             "seasonvar|anilibria|anidub|yummyanime|anistar|doramy|spaces[.]im|hdrezka|kinogo|filmix|" +
-                "kinopoisk|rutube|vk[.]com|ok[.]ru|anime|dorama|online|serial|kino",
+                "kinopoisk|rutube|vk[.]com|ok[.]ru|anime|dorama|online|serial|kino|" +
+                "mangalib|mangabuff|remanga|readmanga|mintmanga|acomics|manga",
             RegexOption.IGNORE_CASE
         ).containsMatchIn(host)
     }

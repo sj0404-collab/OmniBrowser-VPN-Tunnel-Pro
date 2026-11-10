@@ -642,24 +642,27 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 }
             }
             else -> {
-                try {
-                    val req = DownloadManager.Request(Uri.parse(url)).apply {
-                        if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
-                        if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
-                        if (!tab.isIncognito) {
-                            CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
-                        }
-                        val ref = tab.webView?.url
-                        if (ref != null && ref.startsWith("http")) addRequestHeader("Referer", ref)
-                        setTitle(fileName)
-                        setDescription("OmniBrowser")
-                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                    }
-                    (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
-                    Toast.makeText(context, "Загрузка началась: $fileName", Toast.LENGTH_LONG).show()
-                } catch (e: Exception) {
-                    Toast.makeText(context, "Не удалось начать загрузку: ${e.message}", Toast.LENGTH_LONG).show()
+                // v4.49.0: качаем в папку приложения и регистрируем загрузку, чтобы её было видно
+                // во вкладке «Загрузки», а не только в шторке системного загрузчика
+                val ref = tab.webView?.url
+                val cookie = if (!tab.isIncognito) CookieManager.getInstance().getCookie(url) else null
+                val id = com.winwasm64.torrent.AppDownloads.enqueue(
+                    context = context,
+                    url = url,
+                    fileName = fileName,
+                    mimeType = mimeType,
+                    userAgent = userAgent,
+                    cookie = cookie,
+                    referer = ref
+                )
+                if (id == null) {
+                    Toast.makeText(context, "Не удалось начать загрузку: $fileName", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(
+                        context,
+                        "⬇ $fileName → Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
@@ -3314,18 +3317,22 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             // ===================== SECTION 1: TORRENT CLIENT + BROWSEC VPN + MEMORY ACCESS =====================
             if (currentSection == 1 && !inPip) {
                 // v4.47.0: в «Торрентах» теперь три режима — торренты, файлы напрямую и фото/обложки
-                var searchMode by remember { mutableIntStateOf(0) }
+                // v4.49.0: режим тоже переживает переходы между вкладками
+                var searchMode by remember { mutableIntStateOf(com.winwasm64.torrent.SearchCache.mode) }
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp)
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    listOf("🧲 Торренты", "📦 Файлы", "🖼 Фото").forEachIndexed { idx, label ->
+                    listOf("🧲 Торренты", "📦 Файлы", "🖼 Фото", "🎬 Видео").forEachIndexed { idx, label ->
                         Surface(
                             color = if (searchMode == idx) Omni.AccentContainer else Omni.SurfaceHighest,
                             shape = RoundedCornerShape(9.dp),
-                            modifier = Modifier.clickable { searchMode = idx }
+                            modifier = Modifier.clickable {
+                                searchMode = idx
+                                com.winwasm64.torrent.SearchCache.mode = idx
+                            }
                         ) {
                             Text(
                                 label,
@@ -3337,7 +3344,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         }
                     }
                 }
-                if (searchMode == 2) {
+                if (searchMode == 3) {
+                    VideoSearchSection(
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        initialQuery = com.winwasm64.torrent.SearchCache.videoQuery
+                            .ifBlank { torrentEngine.cachedSearchQuery }
+                    )
+                } else if (searchMode == 2) {
                     PhotoSection(
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                         initialQuery = torrentEngine.cachedSearchQuery
@@ -3694,10 +3707,12 @@ private fun TorrentClientSection(
         )
     }
     var isSearching by remember { mutableStateOf(false) }
-    // v4.42.0: фильтр по категориям — игры/видео/музыка/книги/софт
-    var categoryFilter by remember { mutableStateOf("Все") }
+    // v4.42.0/v4.49.0: фильтр по категориям — игры/видео/музыка/книги/софт (переживает вкладки)
+    var categoryFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentKind) }
     // v4.43.0: фильтр по качеству/формату — «хочу 360p» или «только FLAC»
-    var qualityFilter by remember { mutableStateOf("") }
+    var qualityFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentQuality) }
+    // v4.49.0: сортировка — сначала новые/старые/тяжёлые/лёгкие
+    var sortMode by remember { mutableIntStateOf(com.winwasm64.torrent.SearchCache.torrentSort) }
     val byCategory = remember(catalogItems, categoryFilter) {
         if (categoryFilter == "Все") catalogItems
         else catalogItems.filter {
@@ -3708,13 +3723,21 @@ private fun TorrentClientSection(
     val qualityOptions = remember(byCategory) {
         byCategory.map { it.quality }.filter { it.isNotBlank() }.distinct()
     }
-    val visibleItems = remember(byCategory, qualityFilter) {
-        if (qualityFilter.isBlank()) byCategory else byCategory.filter { it.quality == qualityFilter }
+    val visibleItems = remember(byCategory, qualityFilter, sortMode) {
+        val base = if (qualityFilter.isBlank()) byCategory else byCategory.filter { it.quality == qualityFilter }
+        when (sortMode) {
+            1 -> base.sortedByDescending { it.seeders }
+            2 -> base.sortedBy { it.seeders }
+            3 -> base.sortedByDescending { it.estimatedSizeBytes }
+            4 -> base.sortedBy { it.estimatedSizeBytes }
+            else -> base
+        }
     }
     // поиск выполняется в фоне, поэтому состояние обновляем на главном потоке
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     fun runSearch(query: String) {
         isSearching = true
+        com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
         torrentEngine.searchPublicTorrents(query) { res ->
             mainHandler.post {
@@ -4125,7 +4148,18 @@ private fun TorrentClientSection(
                             Surface(
                                 color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.clickable { categoryFilter = cat }
+                                modifier = Modifier.clickable {
+                                    categoryFilter = cat
+                                    com.winwasm64.torrent.SearchCache.torrentKind = cat
+                                    // v4.49.0: категория — это запрос внутри категории, а не фильтр
+                                    // поверх общего списка: иначе «Игры» показывали бы пустоту
+                                    if (cat != "Все" && searchQuery.isNotBlank() && catalogItems.isNotEmpty()) {
+                                        val catWord = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(cat)
+                                        if (catWord.isNotBlank() && !searchQuery.contains(catWord, true)) {
+                                            runSearch("${'$'}{searchQuery.trim()} ${'$'}catWord".trim())
+                                        }
+                                    }
+                                }
                             ) {
                                 Text(
                                     cat, color = Color.White, fontSize = 11.sp,
@@ -4148,7 +4182,10 @@ private fun TorrentClientSection(
                                 Surface(
                                     color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                     shape = RoundedCornerShape(8.dp),
-                                    modifier = Modifier.clickable { qualityFilter = q }
+                                    modifier = Modifier.clickable {
+                                        qualityFilter = q
+                                        com.winwasm64.torrent.SearchCache.torrentQuality = q
+                                    }
                                 ) {
                                     Text(
                                         if (q.isBlank()) "Любое качество" else q,
@@ -4159,6 +4196,32 @@ private fun TorrentClientSection(
                                 }
                             }
                         }
+                    }
+                }
+                item {
+                    // v4.49.0: сортировка — новые/старые (по сидам), тяжёлые/лёгкие (по весу)
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("По релевантности", "🔥 Популярные", "❄ Старые", "⬇ Тяжёлые", "⬆ Лёгкие")
+                            .forEachIndexed { idx, label ->
+                                val sel = sortMode == idx
+                                Surface(
+                                    color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.clickable {
+                                        sortMode = idx
+                                        com.winwasm64.torrent.SearchCache.torrentSort = idx
+                                    }
+                                ) {
+                                    Text(
+                                        label, color = Color.White, fontSize = 10.sp,
+                                        fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
                     }
                 }
                 item {
@@ -4267,6 +4330,19 @@ private fun TorrentClientSection(
     }
 }
 
+/** v4.49.0: человеческий размер — «1.2 ГБ», а не «1288490188». */
+private fun fmtBytes(bytes: Long): String {
+    if (bytes <= 0L) return "0 Б"
+    val units = listOf("Б", "КБ", "МБ", "ГБ", "ТБ")
+    var value = bytes.toDouble()
+    var idx = 0
+    while (value >= 1024 && idx < units.lastIndex) {
+        value /= 1024
+        idx++
+    }
+    return String.format(java.util.Locale.US, if (value >= 100 || idx == 0) "%.0f %s" else "%.1f %s", value, units[idx])
+}
+
 @Composable
 private fun HistoryAndDownloadsSection(
     modifier: Modifier,
@@ -4284,6 +4360,20 @@ private fun HistoryAndDownloadsSection(
     // а переключатель сверху спрятать — так «История» и «Загрузки» стали отдельными вкладками.
     var subTab by remember { mutableIntStateOf(initialSubTab.coerceIn(0, 1)) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    // v4.49.0: живые загрузки приложения (DownloadManager) и торрент-сессии — с прогрессом
+    var systemDownloads by remember { mutableStateOf<List<com.winwasm64.torrent.AppDownloads.Item>>(emptyList()) }
+    var downloadTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(subTab) {
+        while (subTab == 0) {
+            systemDownloads = try {
+                com.winwasm64.torrent.AppDownloads.list(context)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            kotlinx.coroutines.delay(1000)
+            downloadTick++
+        }
+    }
 
     val downloadedFiles = remember(refreshTrigger, subTab) {
         val list = mutableListOf<File>()
@@ -4348,8 +4438,14 @@ private fun HistoryAndDownloadsSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Скачанные файлы (/Download/OmniTorrents)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Text("Файлы синхронизированы с системной папкой Загрузки Android", color = Omni.Success, fontSize = 11.sp)
+                        Text(
+                            "Скачанные файлы · Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
+                            color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        Text(
+                            "Торренты: папка приложения · прямые ссылки и браузер: Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
+                            color = Omni.Success, fontSize = 11.sp
+                        )
                     }
                     Button(
                         onClick = onRequestStorageAccess,
@@ -4357,6 +4453,100 @@ private fun HistoryAndDownloadsSection(
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         Text("Доступ к памяти", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+
+            // v4.49.0: загрузки, которые раньше были видны только в шторке уведомлений
+            if (systemDownloads.isNotEmpty()) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.AccentContainer)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "Загрузки приложения (${systemDownloads.size}) · Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
+                            color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        for (d in systemDownloads.take(20)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    d.name.ifBlank { "файл ${d.id}" },
+                                    color = Color.White, fontSize = 12.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    when {
+                                        d.isDone -> "✅ готово · ${fmtBytes(d.total)}"
+                                        d.isFailed -> "❌ ошибка (${d.reason}) · ${fmtBytes(d.bytes)} из ${fmtBytes(d.total)}"
+                                        else -> "⏳ качается ${d.progress}% · ${fmtBytes(d.bytes)} из ${fmtBytes(d.total)}"
+                                    },
+                                    color = when {
+                                        d.isDone -> Omni.Success
+                                        d.isFailed -> Omni.Danger
+                                        else -> Omni.Warning
+                                    },
+                                    fontSize = 11.sp
+                                )
+                                if (d.isActive) {
+                                    androidx.compose.material3.LinearProgressIndicator(
+                                        progress = { d.progress / 100f },
+                                        modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+                                        color = Omni.Accent, trackColor = Omni.SurfaceHighest
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            "Всё складывается в одну папку приложения, а не в общий котёл /Download.",
+                            color = Omni.TextDim, fontSize = 10.sp
+                        )
+                    }
+                }
+            }
+
+            // v4.49.0: торрент-задачи прямо здесь — раньше скачанный торрент нигде не показывался
+            val torrentRows = try {
+                torrentEngine.getAllStatuses()
+            } catch (_: Throwable) {
+                emptyList<com.winwasm64.torrent.TorrentSessionStatus>()
+            }
+            if (torrentRows.isNotEmpty()) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "Торрент-задачи (${torrentRows.size})",
+                            color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        for (t in torrentRows.take(20)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    t.name.ifBlank { t.id },
+                                    color = Color.White, fontSize = 12.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    "🧲 ${t.state.labelRu} · ${fmtBytes(t.downloadedBytes)} из ${fmtBytes(t.totalBytes)}" +
+                                        if (t.connectedPeers > 0) " · пиров ${t.connectedPeers}" else "",
+                                    color = if (t.state == com.winwasm64.torrent.TorrentState.COMPLETED) Omni.Success
+                                    else if (t.state == com.winwasm64.torrent.TorrentState.ERROR) Omni.Danger
+                                    else Omni.Warning,
+                                    fontSize = 11.sp
+                                )
+                                if (t.totalBytes > 0) {
+                                    androidx.compose.material3.LinearProgressIndicator(
+                                        progress = { (t.downloadedBytes.toFloat() / t.totalBytes).coerceIn(0f, 1f) },
+                                        modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+                                        color = Omni.Accent, trackColor = Omni.SurfaceHighest
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5518,94 +5708,94 @@ private fun resultCover(posterUrl: String, kind: String = "other") {
 }
 
 /* ============================================================================
- * v4.47.0: «Файлы» — поиск БЕЗ торрентов (прямые ссылки) и «Фото» — галерея
- * только по текущему названию, а не по всему кэшу сразу.
+ * v4.47.0 / v4.49.0: «Файлы» — прямые ссылки, «Фото» — галерея, «Видео» — ролики.
+ * v4.49.0: поиск запоминается между вкладками, категория уходит в сам запрос,
+ * есть страницы («показать ещё»), сортировка и единая папка загрузок.
  * ============================================================================ */
 
-/** Скачать прямую ссылку системным менеджером загрузок. */
+/** Скачать прямую ссылку в папку приложения и показать её во вкладке «Загрузки». */
 private fun enqueueDirectDownload(context: android.content.Context, url: String, fileName: String) {
-    try {
-        val safe = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "file" }
-        val request = DownloadManager.Request(Uri.parse(url))
-            .setTitle(safe)
-            .setDescription("OmniBrowser · прямая загрузка")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safe)
-            .addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 14) OmniBrowser/4.47")
-        (context.getSystemService(android.content.Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-        Toast.makeText(context, "⬇ Скачивание: $safe", Toast.LENGTH_SHORT).show()
-    } catch (e: Throwable) {
-        Toast.makeText(context, "Не удалось начать скачивание: ${e.message}", Toast.LENGTH_LONG).show()
+    val id = com.winwasm64.torrent.AppDownloads.enqueue(context, url, fileName)
+    if (id == null) {
+        Toast.makeText(context, "Не удалось начать скачивание", Toast.LENGTH_LONG).show()
+    } else {
+        Toast.makeText(
+            context,
+            "⬇ $fileName → Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
+            Toast.LENGTH_LONG
+        ).show()
     }
 }
 
 @Composable
 private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
-    var query by remember { mutableStateOf(initialQuery) }
+    // v4.49.0: состояние живёт в SearchCache — переключение вкладок больше ничего не сбрасывает
+    var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directQuery.ifBlank { initialQuery }) }
     var items by remember { mutableStateOf<List<com.winwasm64.torrent.DirectFile>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
-    var kindFilter by remember { mutableStateOf("Все") }
-    var formatFilter by remember { mutableStateOf("") }
+    var kindFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directKind) }
+    var formatFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directFormat) }
+    var sortMode by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directSort) }
+    var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directPage) }
+    var hasMore by remember { mutableStateOf(false) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
-    fun runDirect(q: String) {
-        if (q.isBlank()) {
+    fun run(kind: String, sort: Int, nextPage: Int, append: Boolean) {
+        if (query.isBlank()) {
             Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
             return
         }
         busy = true
-        items = emptyList()
+        if (!append) items = emptyList()
+        com.winwasm64.torrent.SearchCache.directQuery = query
+        com.winwasm64.torrent.SearchCache.directKind = kind
+        com.winwasm64.torrent.SearchCache.directSort = sort
+        com.winwasm64.torrent.SearchCache.directPage = nextPage
+        page = nextPage
         Thread({
             val res = try {
-                com.winwasm64.torrent.DirectSearch.search(q)
+                com.winwasm64.torrent.DirectSearch.search(query, kind, nextPage, sort)
             } catch (_: Throwable) {
-                emptyList()
+                com.winwasm64.torrent.DirectSearch.Page(emptyList(), false)
             }
             handler.post {
-                items = res
+                items = if (append) (items + res.files).distinctBy { it.downloadUrl } else res.files
+                hasMore = res.hasMore
                 busy = false
             }
         }, "DirectSearch").also { it.isDaemon = true; it.start() }
     }
 
-    val kindChips = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "💾 Софт")
-    val byKind = items.filter { f ->
-        when (kindFilter) {
-            "Все" -> true
-            "🎮 Игры" -> f.kind == "game"
-            "🎬 Видео" -> f.kind == "video"
-            "🎵 Музыка" -> f.kind == "music"
-            "📚 Книги" -> f.kind == "book"
-            "💾 Софт" -> f.kind == "soft" || f.kind == "other"
-            else -> true
-        }
-    }
+    val kindChips = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
+    val sortChips = listOf("По релевантности", "Новые", "Старые", "Тяжёлые", "Лёгкие")
+    val byKind = items
     val formats = byKind.map { it.format }.distinct().sorted()
     val visible = if (formatFilter.isBlank()) byKind else byKind.filter { it.format == formatFilter }
 
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("📦 Файлы без торрентов — прямые ссылки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "📦 Файлы без торрентов — прямые ссылки",
-                    color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
-                )
-                Text(
-                    "Ищет по Archive.org и GitHub Releases: игры (XCI, NSP, ISO), книги (EPUB, CBR, FB2), " +
-                        "программы (EXE, APK, ZIP) и музыку (FLAC, MP3). Скачивание идёт обычной ссылкой, пиры не нужны.",
+                    "Archive.org и GitHub Releases. Категория уходит прямо в запрос: «Игры» ищутся в играх, " +
+                        "«Манга» — в текстах. Скачивание идёт в Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR} " +
+                        "и видно во вкладке «Загрузки».",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     CompactDarkTextField(
                         value = query,
-                        onValueChange = { query = it },
-                        placeholder = "Название: черепашки ниндзя, doom, манга…",
+                        onValueChange = {
+                            query = it
+                            com.winwasm64.torrent.SearchCache.directQuery = it
+                        },
+                        placeholder = "Название: черепашки ниндзя, манга, doom…",
                         modifier = Modifier.weight(1f),
-                        onGo = { runDirect(query) }
+                        onGo = { run(kindFilter, sortMode, 0, false) }
                     )
                     Button(
-                        onClick = { runDirect(query) },
+                        onClick = { run(kindFilter, sortMode, 0, false) },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
@@ -5625,9 +5815,32 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                 Surface(
                     color = if (kindFilter == chip) Omni.AccentContainer else Omni.SurfaceHighest,
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.clickable { kindFilter = chip }
+                    modifier = Modifier.clickable {
+                        kindFilter = chip
+                        formatFilter = ""
+                        // выбранная категория — это НОВЫЙ запрос по этой категории, а не фильтр поверх
+                        if (items.isNotEmpty() || query.isNotBlank()) run(chip, sortMode, 0, false)
+                    }
                 ) {
                     Text(chip, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            sortChips.forEachIndexed { idx, label ->
+                Surface(
+                    color = if (sortMode == idx) Omni.AccentContainer else Omni.SurfaceHighest,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.clickable {
+                        sortMode = idx
+                        if (query.isNotBlank()) run(kindFilter, idx, 0, false)
+                    }
+                ) {
+                    Text(label, color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
                 }
             }
         }
@@ -5641,7 +5854,10 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                     Surface(
                         color = if (formatFilter == fmt) Omni.AccentContainer else Omni.SurfaceHighest,
                         shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.clickable { formatFilter = fmt }
+                        modifier = Modifier.clickable {
+                            formatFilter = fmt
+                            com.winwasm64.torrent.SearchCache.directFormat = fmt
+                        }
                     ) {
                         Text(
                             if (fmt.isBlank()) "Любой формат" else fmt,
@@ -5655,24 +5871,20 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
 
         Text(
             when {
-                busy -> "Ищу прямые ссылки…"
+                busy -> "Ищу прямые ссылки… (страница ${page + 1})"
                 items.isEmpty() -> "Введите название и нажмите «Найти»"
-                else -> "Найдено файлов: ${visible.size}" + (if (visible.size != items.size) " из ${items.size}" else "")
+                else -> "Найдено файлов: ${visible.size} · ${kindFilter}" + (if (visible.size != items.size) " · фильтр формата" else "")
             },
             color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
         )
-        // v4.48.0: если фильтр всё отсёк — не оставляем пустой экран без объяснения
         if (visible.isEmpty() && items.isNotEmpty() && !busy) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
-                    "Под этот фильтр ничего не подошло. Всего файлов: ${items.size} — в других категориях или форматах.",
+                    "Под этот формат ничего не подошло. Всего файлов: ${items.size}.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 Button(
-                    onClick = {
-                        kindFilter = "Все"
-                        formatFilter = ""
-                    },
+                    onClick = { formatFilter = "" },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                     modifier = Modifier.height(34.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
@@ -5691,11 +5903,11 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                             Text(f.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 2)
                             Text(
                                 "${f.format} · ${f.sizeLabel} · ${f.source}" +
-                                    (if (f.kind.isNotBlank()) " · ${com.winwasm64.torrent.TorrentSearchAgent.kindEmoji(f.kind)}" else ""),
+                                    (if (f.year > 0) " · ${f.year}" else "") +
+                                    " · ${com.winwasm64.torrent.TorrentSearchAgent.kindEmoji(f.kind)}",
                                 color = Omni.Accent, fontSize = 11.sp
                             )
                             Text(f.fileName, color = Omni.TextDim, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(f.description, color = Omni.TextDim, fontSize = 10.sp, maxLines = 2)
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Button(
                                     onClick = { enqueueDirectDownload(context, f.downloadUrl, f.fileName) },
@@ -5710,7 +5922,6 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                                         try {
                                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(f.pageUrl)))
                                         } catch (_: Throwable) {
-                                            Toast.makeText(context, "Не удалось открыть страницу", Toast.LENGTH_SHORT).show()
                                         }
                                     },
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
@@ -5724,6 +5935,17 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                     }
                 }
             }
+            if (hasMore) {
+                item {
+                    Button(
+                        onClick = { run(kindFilter, sortMode, page + 1, true) },
+                        modifier = Modifier.fillMaxWidth().height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                    ) {
+                        Text(if (busy) "Загружаю…" else "⬇ Показать ещё (страница ${page + 2})", fontSize = 12.sp, color = Color.White)
+                    }
+                }
+            }
         }
     }
 }
@@ -5731,28 +5953,33 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
 @Composable
 private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
-    var query by remember { mutableStateOf(initialQuery) }
-    var filter by remember { mutableStateOf("Фото") }
+    var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoQuery.ifBlank { initialQuery }) }
+    var filter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoFilter) }
     var images by remember { mutableStateOf<List<com.winwasm64.torrent.GalleryImage>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
+    var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoPage) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     val filters = listOf("Фото", "Обложки игр", "Постеры фильмов", "Обложки книг", "Кадры из видео", "Альбомы музыки")
 
-    fun runGallery(q: String, f: String) {
+    fun runGallery(q: String, f: String, nextPage: Int, append: Boolean) {
         if (q.isBlank()) {
             Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
             return
         }
         busy = true
-        images = emptyList()
+        if (!append) images = emptyList()
+        com.winwasm64.torrent.SearchCache.photoQuery = q
+        com.winwasm64.torrent.SearchCache.photoFilter = f
+        com.winwasm64.torrent.SearchCache.photoPage = nextPage
+        page = nextPage
         Thread({
             val res = try {
-                com.winwasm64.torrent.ImageSearch.search(q, f)
+                com.winwasm64.torrent.ImageSearch.search(q, f, nextPage)
             } catch (_: Throwable) {
                 emptyList()
             }
             handler.post {
-                images = res
+                images = if (append) (images + res).distinctBy { it.url } else res
                 busy = false
             }
         }, "Gallery").also { it.isDaemon = true; it.start() }
@@ -5763,17 +5990,19 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("🖼 Фото и обложки — прямо в этой вкладке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Никаких Google и Яндекса: картинки берутся из открытых каталогов (iTunes — постеры, обложки книг, " +
-                        "альбомы, иконки игр; Wikimedia Commons — обычные фото) и показываются здесь же. " +
-                        "Кэш живёт только под этот запрос.",
+                    "Картинки из iTunes и Wikimedia Commons под выбранную категорию. Тап — во весь экран, " +
+                        "кнопки под картинкой: скачать, похожие, видео по этому названию.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 CompactDarkTextField(
                     value = query,
-                    onValueChange = { query = it },
+                    onValueChange = {
+                        query = it
+                        com.winwasm64.torrent.SearchCache.photoQuery = it
+                    },
                     placeholder = "Название: черепашки ниндзя…",
                     modifier = Modifier.fillMaxWidth(),
-                    onGo = { runGallery(query, filter) }
+                    onGo = { runGallery(query, filter, 0, false) }
                 )
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     filters.forEach { f ->
@@ -5782,7 +6011,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.clickable {
                                 filter = f
-                                if (images.isNotEmpty()) runGallery(query, f)
+                                com.winwasm64.torrent.SearchCache.photoFilter = f
+                                runGallery(query, f, 0, false)
                             }
                         ) {
                             Text(f, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
@@ -5791,7 +6021,7 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button(
-                        onClick = { runGallery(query, filter) },
+                        onClick = { runGallery(query, filter, 0, false) },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
@@ -5823,7 +6053,7 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
 
         Text(
             when {
-                busy -> "Ищу картинки…"
+                busy -> "Ищу картинки… (страница ${page + 1})"
                 images.isEmpty() -> "Введите название и нажмите «Найти»"
                 else -> "Картинок: ${images.size} · $filter"
             },
@@ -5872,16 +6102,164 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                 }
                             }
                             Text(img.title.ifBlank { img.source }, color = Color.White, fontSize = 10.sp, maxLines = 2)
-                            Text(
-                                img.source,
-                                color = Omni.TextDim, fontSize = 9.sp, maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                            // v4.49.0: действия с картинкой — скачать, похожие, видео по названию
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    "⬇",
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.clickable {
+                                        enqueueDirectDownload(
+                                            context,
+                                            img.url,
+                                            img.url.substringAfterLast('/').substringBefore('?').ifBlank { "image.jpg" }
+                                        )
+                                    }
+                                )
+                                Text(
+                                    "🔎",
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.clickable {
+                                        val q = if (img.title.isBlank()) query else img.title.take(40)
+                                        runGallery(q, "Фото", 0, false)
+                                    }
+                                )
+                                Text(
+                                    "🎬",
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.clickable {
+                                        val q = if (img.title.isBlank()) query else img.title.take(40)
+                                        context.startActivity(
+                                            Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                .putExtra("query", q)
+                                        )
+                                    }
+                                )
+                            }
                         }
                     }
                     if (pair.size == 1) Box(modifier = Modifier.weight(1f))
                 }
             }
+            if (images.isNotEmpty()) {
+                item {
+                    Button(
+                        onClick = { runGallery(query, filter, page + 1, true) },
+                        modifier = Modifier.fillMaxWidth().height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                    ) {
+                        Text(if (busy) "Загружаю…" else "⬇ Показать ещё (страница ${page + 2})", fontSize = 12.sp, color = Color.White)
+                    }
+                }
+            }
         }
     }
 }
+
+/**
+ * v4.49.0: «🎬 Видео» — поиск роликов по названию или по ссылке.
+ * Площадки: YouTube, RuTube, VK Видео, Dailymotion. Поиск и просмотр идут внутри приложения
+ * (VideoSearchActivity с встроенным плеером), поэтому вкладка не сбрасывает запрос при переходах.
+ */
+@Composable
+private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
+    val context = LocalContext.current
+    var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery }) }
+    var source by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoSource) }
+    val sources = listOf("Все", "YouTube", "RuTube", "VK Видео", "Dailymotion")
+
+    fun open(target: String) {
+        com.winwasm64.torrent.SearchCache.videoQuery = target
+        com.winwasm64.torrent.SearchCache.videoSource = source
+        val intent = Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .putExtra("query", target)
+            .putExtra("source", source)
+        context.startActivity(intent)
+    }
+
+    Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("🎬 Видео по названию или по ссылке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    "Введите название («я злой бог») или вставьте ссылку на ролик — откроется встроенный плеер. " +
+                        "Площадки: YouTube, RuTube, VK Видео, Dailymotion.",
+                    color = Omni.TextDim, fontSize = 11.sp
+                )
+                CompactDarkTextField(
+                    value = query,
+                    onValueChange = {
+                        query = it
+                        com.winwasm64.torrent.SearchCache.videoQuery = it
+                    },
+                    placeholder = "Название фильма/ролика или ссылка https://…",
+                    modifier = Modifier.fillMaxWidth(),
+                    onGo = { if (query.isNotBlank()) open(query.trim()) }
+                )
+                Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    sources.forEach { src ->
+                        Surface(
+                            color = if (source == src) Omni.AccentContainer else Omni.SurfaceHighest,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.clickable {
+                                source = src
+                                com.winwasm64.torrent.SearchCache.videoSource = src
+                            }
+                        ) {
+                            Text(src, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                        }
+                    }
+                }
+                Button(
+                    onClick = { if (query.isNotBlank()) open(query.trim()) },
+                    modifier = Modifier.fillMaxWidth().height(42.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                ) {
+                    Text(
+                        if (query.startsWith("http")) "▶ Смотреть ссылку в приложении" else "🔍 Искать видео«$source»",
+                        fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White
+                    )
+                }
+            }
+        }
+
+        Text("Быстрый переход по площадкам", color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        listOf(
+            "YouTube" to "https://m.youtube.com/results?search_query=",
+            "RuTube" to "https://rutube.ru/search/?query=",
+            "VK Видео" to "https://m.vk.com/video?q=",
+            "Dailymotion" to "https://www.dailymotion.com/search/"
+        ).forEach { (name, base) ->
+            Surface(
+                color = Omni.Surface,
+                shape = RoundedCornerShape(10.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
+                modifier = Modifier.fillMaxWidth().clickable {
+                    val q = query.ifBlank { torrentLastQueryFallback() }
+                    if (q.isBlank()) {
+                        Toast.makeText(context, "Сначала введите название", Toast.LENGTH_SHORT).show()
+                    } else {
+                        context.startActivity(
+                            Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                .putExtra("query", q)
+                                .putExtra("source", name)
+                        )
+                    }
+                }
+            ) {
+                Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("▶", fontSize = 16.sp)
+                    Column(modifier = Modifier.weight(1f).padding(start = 8.dp)) {
+                        Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Text(base.take(46), color = Omni.TextDim, fontSize = 10.sp, maxLines = 1)
+                    }
+                    Text("Искать →", color = Omni.Accent, fontSize = 11.sp)
+                }
+            }
+        }
+    }
+}
+
+private fun torrentLastQueryFallback(): String = com.winwasm64.torrent.SearchCache.videoQuery.trim()
