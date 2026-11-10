@@ -5661,6 +5661,26 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
             },
             color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
         )
+        // v4.48.0: если фильтр всё отсёк — не оставляем пустой экран без объяснения
+        if (visible.isEmpty() && items.isNotEmpty() && !busy) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "Под этот фильтр ничего не подошло. Всего файлов: ${items.size} — в других категориях или форматах.",
+                    color = Omni.TextDim, fontSize = 11.sp
+                )
+                Button(
+                    onClick = {
+                        kindFilter = "Все"
+                        formatFilter = ""
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier.height(34.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                ) {
+                    Text("Показать все ${items.size}", fontSize = 11.sp, color = Color.White)
+                }
+            }
+        }
 
         LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(visible, key = { it.downloadUrl + "|" + it.fileName }) { f ->
@@ -5713,14 +5733,39 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
     var query by remember { mutableStateOf(initialQuery) }
     var filter by remember { mutableStateOf("Фото") }
+    var images by remember { mutableStateOf<List<com.winwasm64.torrent.GalleryImage>>(emptyList()) }
+    var busy by remember { mutableStateOf(false) }
+    val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     val filters = listOf("Фото", "Обложки игр", "Постеры фильмов", "Обложки книг", "Кадры из видео", "Альбомы музыки")
-    Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+
+    fun runGallery(q: String, f: String) {
+        if (q.isBlank()) {
+            Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
+            return
+        }
+        busy = true
+        images = emptyList()
+        Thread({
+            val res = try {
+                com.winwasm64.torrent.ImageSearch.search(q, f)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            handler.post {
+                images = res
+                busy = false
+            }
+        }, "Gallery").also { it.isDaemon = true; it.start() }
+    }
+
+    Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("🖼 Фото и обложки по текущему названию", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("🖼 Фото и обложки — прямо в этой вкладке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Галерея строится ТОЛЬКО под этот запрос — чужие картинки в кэш не попадают. " +
-                        "Фильтры отсекают лишнее: обложки игр, постеры, обложки книг, кадры, альбомы.",
+                    "Никаких Google и Яндекса: картинки берутся из открытых каталогов (iTunes — постеры, обложки книг, " +
+                        "альбомы, иконки игр; Wikimedia Commons — обычные фото) и показываются здесь же. " +
+                        "Кэш живёт только под этот запрос.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 CompactDarkTextField(
@@ -5728,37 +5773,113 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                     onValueChange = { query = it },
                     placeholder = "Название: черепашки ниндзя…",
                     modifier = Modifier.fillMaxWidth(),
-                    onGo = { }
+                    onGo = { runGallery(query, filter) }
                 )
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     filters.forEach { f ->
                         Surface(
                             color = if (filter == f) Omni.AccentContainer else Omni.SurfaceHighest,
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.clickable { filter = f }
+                            modifier = Modifier.clickable {
+                                filter = f
+                                if (images.isNotEmpty()) runGallery(query, f)
+                            }
                         ) {
                             Text(f, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
                         }
                     }
                 }
-                Button(
-                    onClick = {
-                        if (query.isBlank()) {
-                            Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
-                        } else {
-                            context.startActivity(
-                                Intent(context, com.winwasm64.torrent.ImageSearchActivity::class.java)
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    .putExtra("query", query)
-                                    .putExtra("filter", filter)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { runGallery(query, filter) },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                    ) {
+                        Text(if (busy) "⏳…" else "🖼 Найти «$filter»", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                    Button(
+                        onClick = {
+                            if (query.isBlank()) {
+                                Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
+                            } else {
+                                context.startActivity(
+                                    Intent(context, com.winwasm64.torrent.ImageSearchActivity::class.java)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        .putExtra("query", query)
+                                        .putExtra("filter", filter)
+                                )
+                            }
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                    ) {
+                        Text("🖱 Веб-поиск", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+        }
+
+        Text(
+            when {
+                busy -> "Ищу картинки…"
+                images.isEmpty() -> "Введите название и нажмите «Найти»"
+                else -> "Картинок: ${images.size} · $filter"
+            },
+            color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
+        )
+
+        LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(images.chunked(2)) { pair ->
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    pair.forEach { img ->
+                        Column(modifier = Modifier.weight(1f)) {
+                            var bmp by remember(img.url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+                            LaunchedEffect(img.url) {
+                                if (bmp == null) {
+                                    bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                        com.winwasm64.ui.browser.CoverCache.load(img.url)
+                                    }
+                                }
+                            }
+                            val bitmap = bmp
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(150.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Omni.SurfaceHighest)
+                                    .clickable {
+                                        context.startActivity(
+                                            Intent(context, com.winwasm64.torrent.ImagePreviewActivity::class.java)
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                .putExtra("url", img.url)
+                                                .putExtra("title", img.title)
+                                        )
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (bitmap != null) {
+                                    Image(
+                                        bitmap = bitmap.asImageBitmap(),
+                                        contentDescription = null,
+                                        contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Text("🖼", fontSize = 24.sp)
+                                }
+                            }
+                            Text(img.title.ifBlank { img.source }, color = Color.White, fontSize = 10.sp, maxLines = 2)
+                            Text(
+                                img.source,
+                                color = Omni.TextDim, fontSize = 9.sp, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                    },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(40.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                ) {
-                    Text("🖼 Открыть галерею «$filter»", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                    if (pair.size == 1) Box(modifier = Modifier.weight(1f))
                 }
             }
         }

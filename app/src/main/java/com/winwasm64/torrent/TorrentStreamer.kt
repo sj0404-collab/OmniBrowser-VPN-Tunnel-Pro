@@ -27,6 +27,14 @@ object TorrentStreamer {
         private set
     @Volatile var statusText: String = "Подготовка…"
         private set
+    /**
+     * v4.48.0: текущий этап подготовки словами и время ожидания. Раньше плеер висел на
+     * «Получение метаданных…» без единого признака жизни, пока шёл опрос пиров.
+     */
+    @Volatile var stageText: String = ""
+        private set
+    @Volatile var stageElapsedSec: Long = 0
+        private set
     @Volatile var speedBytesPerSec: Long = 0L
         private set
     @Volatile var fileName: String = ""
@@ -47,6 +55,7 @@ object TorrentStreamer {
 
     // v4.46.0: метаданные и пиры запоминаем по magnet/.torrent. Переключение файла внутри раздачи
     // больше не перекачивает метаданные заново — иначе выбор второго файла «зависал».
+    @Volatile private var preparingMetadata: Boolean = false
     private var cachedKey: String = ""
     private var cachedSource: BitTorrentEngine.StreamSource? = null
     private var worker: Thread? = null
@@ -72,12 +81,28 @@ object TorrentStreamer {
         availableBytes = 0L
         speedBytesPerSec = 0L
         statusText = "Получение метаданных…"
+        preparingMetadata = true
+        // следим за этапами движка, пока идут метаданные и пиры
+        val stageWatch = Thread({
+            val startedAt = System.currentTimeMillis()
+            while (true) {
+                stageText = engine.prepareStage
+                stageElapsedSec = (System.currentTimeMillis() - startedAt) / 1000
+                if (!preparingMetadata) break
+                try {
+                    Thread.sleep(400)
+                } catch (_: Throwable) {
+                    break
+                }
+            }
+        }, "StreamStage").also { it.isDaemon = true; it.start() }
         val key = magnetUri.orEmpty() + "|" + torrentUrl.orEmpty()
         val cached = cachedSource?.takeIf { cachedKey == key }
         val source = cached ?: engine.prepareStream(magnetUri, torrentUrl, referer)?.also {
             cachedKey = key
             cachedSource = it
         }
+        preparingMetadata = false
         if (source == null) {
             // v4.44.0: говорим, НА КАКОМ шаге всё встало, а не «не удалось» одной фразой
             statusText = "Метаданные не получены. Этап: " + engine.prepareStage +

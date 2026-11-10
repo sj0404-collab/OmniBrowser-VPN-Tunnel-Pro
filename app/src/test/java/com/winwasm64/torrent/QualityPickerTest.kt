@@ -147,3 +147,27 @@ class DirectSearchFormatTest {
         assertEquals("video", TorrentSearchAgent.kindForArchive("TMNT 1990 BDRip mkv", "movies"))
     }
 }
+
+/** v4.48.0: HTML-сущности и синонимы названий. */
+class TextAndAliasesTest {
+
+    @Test
+    fun `сущности из catorrent не попадают в название`() {
+        val raw = "PC TMNT&nbsp;&nbsp;•&nbsp;&nbsp;Пиратка &quot;Лицензия&quot; &#039;Beat-Em-Up&#039;"
+        val clean = TorrentSearchAgent.decodeEntities(raw)
+        assertFalse(clean.contains("&nbsp;"))
+        assertFalse(clean.contains("&#039;"))
+        assertTrue(clean.contains("Beat-Em-Up"))
+    }
+
+    @Test
+    fun `черепашки ищутся и как tmnt`() {
+        val aliases = com.winwasm64.torrent.ImageSearch.aliasesFor("черепашки ниндзя")
+        assertTrue(aliases.any { it.contains("tmnt") })
+    }
+
+    @Test
+    fun `незнакомое название не получает лишних синонимов`() {
+        assertTrue(com.winwasm64.torrent.ImageSearch.aliasesFor("совершенно случайный запрос").isEmpty())
+    }
+}

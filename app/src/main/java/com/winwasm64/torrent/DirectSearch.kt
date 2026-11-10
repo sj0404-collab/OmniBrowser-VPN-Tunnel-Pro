@@ -65,11 +65,28 @@ object DirectSearch {
     fun search(query: String, timeoutMs: Int = 12_000): List<DirectFile> {
         val clean = query.trim()
         if (clean.isBlank()) return emptyList()
-        val out = mutableListOf<DirectFile>()
-        out.addAll(searchArchive(clean, timeoutMs))
-        out.addAll(searchGitHub(clean, timeoutMs))
+        // v4.48.0: «черепашки» должны находить и TMNT — ищем и по синониму, и по оригиналу
+        val variants = (listOf(clean) + ImageSearch.aliasesFor(clean)).distinct()
+        val raw = mutableListOf<DirectFile>()
+        for (v in variants.take(2)) {
+            raw.addAll(searchArchive(v, timeoutMs))
+        }
+        raw.addAll(searchGitHub(clean, timeoutMs))
+        val unfiltered = raw.distinctBy { it.downloadUrl }
+        // релевантность: в названии должно быть слово запроса (или синонима).
+        // Раньше в «черепашки» попадали «Кэллахен» и «Red Wolf Channel» — просто потому, что
+        // Archive.org нашёл их по описанию.
+        val tokens = variants.flatMap { v ->
+            v.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 }
+        }.toSet()
+        fun relevant(f: DirectFile): Boolean {
+            val t = f.title.lowercase()
+            return tokens.any { t.contains(it) }
+        }
+        val good = unfiltered.filter { relevant(it) }
+        val list = if (good.size >= 5) good else unfiltered.sortedByDescending { relevant(it) }
         // без дублей и без бесконечной простыни: 60 карточек — уже большой список
-        return out.distinctBy { it.downloadUrl }.take(60)
+        return list.take(60)
     }
 
     /* ===================== Internet Archive ===================== */
@@ -128,7 +145,7 @@ object DirectSearch {
                 name.split('/').joinToString("/") { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
             out.add(
                 DirectFile(
-                    title = title,
+                    title = TorrentSearchAgent.decodeEntities(title),
                     source = "Archive.org",
                     pageUrl = "https://archive.org/details/$id",
                     downloadUrl = direct,
@@ -142,9 +159,14 @@ object DirectSearch {
                 )
             )
         }
-        // сначала самое «полезное» (игра/архив/книга), внутри — по размеру
-        return out.sortedWith(compareByDescending<DirectFile> { it.weight }.thenByDescending { parseSize(it.sizeLabel) })
-            .take(3)
+        // сначала самое «полезное» (игра/архив/книга), внутри — по размеру.
+        // v4.48.0: превью-картинки (jpg/png/png-обложки) показываем только если больше нечего дать,
+        // иначе карточка «Мега игры» показывала PNG вместо самого образа игры.
+        val sorted = out.sortedWith(
+            compareByDescending<DirectFile> { it.weight }.thenByDescending { parseSize(it.sizeLabel) }
+        )
+        val meaningful = sorted.filter { it.weight > 20 }
+        return (if (meaningful.isNotEmpty()) meaningful else sorted).take(3)
     }
 
     private fun parseSize(label: String): Long {

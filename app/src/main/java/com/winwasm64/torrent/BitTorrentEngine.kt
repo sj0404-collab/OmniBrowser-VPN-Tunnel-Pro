@@ -672,10 +672,11 @@ class BitTorrentEngine(private val context: Context? = null) {
                 if (intent.quality.isNotBlank() || intent.audio.isNotBlank()) {
                     ranked = TorrentSearchAgent.filterByQuality(ranked, intent.quality)
                 }
-                for (f in ranked.take(12)) {
+                for (f in ranked.take(40)) {
                     results.add(
                         CatalogTorrentItem(
-                            title = f.name,
+                            // v4.48.0: &nbsp; и &#039; из catorrent/nnmclub больше не попадают в карточку
+                            title = TorrentSearchAgent.decodeEntities(f.name),
                             category = "Найдено агентом · ${f.source}" + (if (f.platform.isNotBlank()) " · ${f.platform}" else ""),
                             sizeLabel = f.sizeLabel,
                             description = f.reason.ifBlank { "найдено по запросу «$cleanQuery»" },
@@ -719,7 +720,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                             val d = docs.getJSONObject(i)
                             val id = d.optString("identifier")
                             if (id.isBlank()) continue
-                            val title = d.optString("title", id)
+                            val title = TorrentSearchAgent.decodeEntities(d.optString("title", id))
                             val mediaType = d.optString("mediatype", "archive")
                             val sizeBytes = d.optLong("item_size", 0L).coerceAtLeast(0L)
                             val sizeMb = if (sizeBytes > 0L) String.format("%.1f МБ", sizeBytes / (1024.0 * 1024.0)) else "размер неизвестен"

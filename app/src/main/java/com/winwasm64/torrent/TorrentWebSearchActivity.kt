@@ -1,3 +1,23 @@
+    private val queries: List<String> get() = listOf(
+        "$query torrent",
+        "$query скачать торрент",
+        "$query смотреть онлайн",
+        "\"$query\" site:rutracker.org",
+        "$query site:nnmclub.to",
+        "$query site:rutor.info",
+        "$query site:kinozal.tv",
+        "$query site:seasonvar.ru",
+        "$query site:anilibria.tv",
+        "$query site:anidub.com",
+        "$query site:yummyanime.tv",
+        "$query site:anistar.org",
+        "$query site:spaces.im",
+        "$query site:doramy.club",
+        "$query site:rutor-games.com",
+        "$query site:stoigr.org",
+        "$query site:kickasstorrents.to",
+        "$query site:archive.org"
+    )
 package com.winwasm64.torrent
 
 import android.app.Activity
@@ -213,6 +233,7 @@ class TorrentWebSearchActivity : Activity() {
             status.text = "Проверяю ${magnets.size + pages.size} ссылок из «${engines[engineIndex].first}»…"
             Thread({
                 var added = 0
+                var onlineAdded = 0
                 for ((_, url, title) in magnets) {
                     if (added >= 80) break
                     val found = TorrentSearchAgent.Found(
@@ -234,7 +255,16 @@ class TorrentWebSearchActivity : Activity() {
                                 TorrentSearchAgent.fromPageUrl(next.first, next.second)
                             } catch (_: Throwable) {
                                 null
-                            } ?: continue
+                            }
+                            if (found == null) {
+                                // v4.48.0: у онлайн-кинотек и аниме-сайтов (seasonvar, anilibria, spaces.im…)
+                                // .torrent нет вовсе — не выбрасываем их, а даём кнопку «Открыть страницу».
+                                if (looksOnline(next.first) && onlineAdded < 15) {
+                                    onlineAdded++
+                                    runOnUiThread { addPageRow(next.first, next.second) }
+                                }
+                                continue
+                            }
                             val key = found.magnet.ifBlank { found.torrentUrl }
                             val fresh = synchronized(seen) { key.isBlank() || seen.add(key) }
                             if (!fresh) continue
@@ -259,6 +289,48 @@ class TorrentWebSearchActivity : Activity() {
         }
     }
 
+    /** Сайты, где смотрят онлайн и торрента может не быть вовсе. */
+    private fun looksOnline(url: String): Boolean {
+        val host = url.substringAfter("://").substringBefore('/').lowercase()
+        return Regex(
+            "seasonvar|anilibria|anidub|yummyanime|anistar|doramy|spaces[.]im|hdrezka|kinogo|filmix|" +
+                "kinopoisk|rutube|vk[.]com|ok[.]ru|anime|dorama|online|serial|kino",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(host)
+    }
+
+    /** Строка «сайт без торрента»: открыть страницу, а не «Скачать/Смотреть». */
+    private fun addPageRow(url: String, title: String) {
+        val host = url.substringAfter("://").substringBefore('/')
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(12, 8, 12, 8)
+        }
+        box.addView(TextView(this).apply {
+            text = title.ifBlank { host }.take(90)
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        box.addView(TextView(this).apply {
+            text = "$host · онлайн без торрента"
+            setTextColor(Color.parseColor("#8AB4F8"))
+            textSize = 10f
+        })
+        box.addView(Button(this).apply {
+            text = "🌐 Открыть страницу"
+            textSize = 11f
+            setOnClickListener {
+                try {
+                    startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                } catch (_: Throwable) {
+                    Toast.makeText(this@TorrentWebSearchActivity, "Не удалось открыть", Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
+        resultsBox.addView(box)
+    }
+
     /** Похоже ли на трекер/киносайт — только такие страницы стоит разбирать. */
     private fun looksLikeTracker(url: String): Boolean {
         val host = url.substringAfter("://").substringBefore('/').lowercase()
@@ -267,7 +339,9 @@ class TorrentWebSearchActivity : Activity() {
                 "bitru|igruha|zooqle|yts|1337x|kickass|limetorrent|magnet|btdig|galaxy|rustorrent|bt[.-]|" +
                 "kino|film|movie|toloka|mazepa|hdrezka|seasonvar|mega|unionpeer|lasttorrent|ximepa|" +
                 "stoigr|gofrag|seedpeer|glotorrents|torrentfunk|torlock|bitsearch|nyaa|aniliberty|" +
-                "archive[.]org|cinema|serial|mult|dl-torrent|torrent-games|gamestracker)",
+                "archive[.]org|cinema|serial|mult|dl-torrent|torrent-games|gamestracker|" +
+                "spaces[.]im|seasonvar|anilibria|anidub|yummyanime|anistar|doramy|anime|dorama|" +
+                "kino|serial|online|hdrezka|kinogo|filmix|rustorrent|nnm|toloka|mazepa)",
             RegexOption.IGNORE_CASE
         ).containsMatchIn(host)
     }

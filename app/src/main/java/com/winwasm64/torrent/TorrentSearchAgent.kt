@@ -338,10 +338,12 @@ object TorrentSearchAgent {
         val seen = HashSet<String>()
         for (m in re.findAll(html)) {
             val url = m.groupValues[1].trim()
-            val title = m.groupValues[2]
-                .replace(Regex("<[^>]+>"), " ")
-                .replace(Regex("\\s+"), " ")
-                .trim()
+            val title = decodeEntities(
+                m.groupValues[2]
+                    .replace(Regex("<[^>]+>"), " ")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+            )
             if (url.isBlank() || title.length < 3) continue
             if (!seen.add(url)) continue
             if (!sharesWord(title, query)) continue
@@ -552,6 +554,32 @@ object TorrentSearchAgent {
             "software", "games" -> "soft"
             else -> "other"
         }
+    }
+
+    /**
+     * v4.48.0: HTML-сущности в названиях. На catorrent/nnmclub в заголовках приходят &nbsp;, &amp;,
+     * &#039; — раньше они попадали в карточку как есть («&nbsp;&nbsp;•&nbsp;&nbsp;Пиратка»).
+     */
+    fun decodeEntities(input: String): String {
+        if (input.isBlank()) return input
+        var out = input
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#039;", "'")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&laquo;", "«")
+            .replace("&raquo;", "»")
+            .replace("&mdash;", "—")
+            .replace("&ndash;", "–")
+            .replace("&hellip;", "…")
+        // числовые сущности вида &#1234;
+        out = Regex("""&#(\d{2,5});""").replace(out) { m ->
+            m.groupValues[1].toIntOrNull()?.let { code -> String(Character.toChars(code)) } ?: ""
+        }
+        return out.replace(Regex("""[ \t]{2,}"""), " ").trim()
     }
 
     /** Подпись и иконка категории для карточки: у каждой категории своя. */

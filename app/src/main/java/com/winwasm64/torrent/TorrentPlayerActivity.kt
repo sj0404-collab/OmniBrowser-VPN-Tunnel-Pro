@@ -262,7 +262,11 @@ class TorrentPlayerActivity : Activity() {
 
     private fun updateStatus() {
         if (!prepared) {
-            status.text = TorrentStreamer.statusText
+            // v4.48.0: пока идут метаданные — видно этап и сколько секунд ждём
+            val stage = TorrentStreamer.stageText
+            val secs = TorrentStreamer.stageElapsedSec
+            status.text = TorrentStreamer.statusText +
+                (if (stage.isNotBlank() && stage != TorrentStreamer.statusText) "\nэтап: $stage · ${secs} с" else "")
             return
         }
         val have = BitTorrentEngine.formatSize(TorrentStreamer.availableBytes)
