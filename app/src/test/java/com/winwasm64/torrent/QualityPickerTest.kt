@@ -128,3 +128,22 @@ class MediaSelectionTest {
         assertTrue(TorrentStreamer.isMedia("voice.m4a"))
     }
 }
+
+/** v4.47.0: формат файла и тип содержимого для карточек Archive.org. */
+class DirectSearchFormatTest {
+
+    @Test
+    fun `формат файла виден на карточке`() {
+        assertEquals("XCI", com.winwasm64.torrent.DirectSearch.formatOf("TMNT.xci"))
+        assertEquals("EPUB", com.winwasm64.torrent.DirectSearch.formatOf("manga-epub.epub"))
+        assertEquals("EXE", com.winwasm64.torrent.DirectSearch.formatOf("setup.EXE"))
+        assertEquals("FILE", com.winwasm64.torrent.DirectSearch.formatOf("README"))
+    }
+
+    @Test
+    fun `тип содержимого архивной записи`() {
+        assertEquals("book", TorrentSearchAgent.kindForArchive("Черепашки-ниндзя. Комикс", "texts"))
+        assertEquals("music", TorrentSearchAgent.kindForArchive("Неизвестный релиз", "audio"))
+        assertEquals("video", TorrentSearchAgent.kindForArchive("TMNT 1990 BDRip mkv", "movies"))
+    }
+}

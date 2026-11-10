@@ -704,7 +704,7 @@ class BitTorrentEngine(private val context: Context? = null) {
 
             try {
                 val encoded = java.net.URLEncoder.encode(cleanQuery, "UTF-8")
-                val apiUrl = "https://archive.org/advancedsearch.php?q=($encoded)+AND+mediatype:(movies+OR+software+OR+audio)&fl[]=identifier,title,mediatype,item_size,description&rows=12&page=1&output=json"
+                val apiUrl = "https://archive.org/advancedsearch.php?q=($encoded)+AND+mediatype:(movies+OR+software+OR+audio)&fl[]=identifier,title,mediatype,item_size,description&rows=40&page=1&output=json"
                 val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 8000
                     readTimeout = 8000
@@ -734,7 +734,11 @@ class BitTorrentEngine(private val context: Context? = null) {
                                     magnetUri = "",
                                     directWebSeedUrl = "",
                                     fileName = "$id.torrent",
-                                    estimatedSizeBytes = sizeBytes
+                                    estimatedSizeBytes = sizeBytes,
+                                    // v4.47.0: обложка прямо с Archive.org и свой тип содержимого,
+                                    // чтобы карточка не была «одной на всех»
+                                    poster = "https://archive.org/services/img/$id",
+                                    kind = TorrentSearchAgent.kindForArchive(title, mediaType)
                                 )
                             )
                         }

@@ -537,6 +537,34 @@ object TorrentSearchAgent {
         }
     }
 
+    /**
+     * v4.47.0: тип содержимого для записей Archive.org. Сначала смотрим на название,
+     * и только если оно ничего не сказало — на mediatype самого сайта.
+     */
+    fun kindForArchive(title: String, mediaType: String): String {
+        val byName = classify(title)
+        if (byName != "other") return byName
+        return when (mediaType.lowercase()) {
+            "movies", "video", "tv" -> "video"
+            "audio", "etree", "podcast" -> "music"
+            "texts", "text" -> "book"
+            "image", "images" -> "photo"
+            "software", "games" -> "soft"
+            else -> "other"
+        }
+    }
+
+    /** Подпись и иконка категории для карточки: у каждой категории своя. */
+    fun kindEmoji(kind: String): String = when (kind) {
+        "game" -> "🎮"
+        "video" -> "🎬"
+        "music" -> "🎵"
+        "book" -> "📚"
+        "soft" -> "💾"
+        "photo" -> "🖼"
+        else -> "📦"
+    }
+
     /** Категория → подпись чипа. */
     fun categoryMatches(chip: String, category: String): Boolean = when (chip) {
         "Все" -> true
