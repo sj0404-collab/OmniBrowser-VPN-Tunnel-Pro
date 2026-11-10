@@ -23,6 +23,23 @@ import java.net.Socket
  */
 object MagnetMetadata {
 
+    /**
+     * v4.47.1: диагностика — без неё было не понять, где обрыв: пиры не подключаются (сеть) или
+     * подключаются, но не отдают метаданные (протокол). Эти числа показываются в плеере.
+     */
+    @Volatile var triedPeers: Int = 0
+    @Volatile var connectedPeers: Int = 0
+    @Volatile var handshakePeers: Int = 0
+    @Volatile var lastPieces: String = ""
+
+    fun resetStats() {
+        triedPeers = 0; connectedPeers = 0; handshakePeers = 0; lastPieces = ""
+    }
+
+    fun statsLine(): String =
+        "подключились $connectedPeers из $triedPeers · прислали ut_metadata $handshakePeers" +
+            (if (lastPieces.isNotBlank()) " · куски: $lastPieces" else "")
+
     private const val EXT_ID = 20
     private const val PIECE_SIZE = 16 * 1024
     private const val OUR_UT_METADATA = 1
@@ -48,8 +65,10 @@ object MagnetMetadata {
             }
         }
         if (peers.isEmpty()) return null
-        val parallel = 8
+        resetStats()
+        val parallel = 10
         val slice = peers.take(parallel)
+        triedPeers = slice.size
         val result = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
         val threads = slice.map { peer ->
             Thread({
@@ -117,6 +136,7 @@ object MagnetMetadata {
         } catch (_: Throwable) {
             return null
         }
+        connectedPeers += 1
         socket.use { s ->
             s.soTimeout = 8000
             val out = DataOutputStream(s.getOutputStream())
@@ -164,6 +184,8 @@ object MagnetMetadata {
                 metadataSize = (dict.entries["metadata_size"] as? BencodeValue.BInt)?.value?.toInt() ?: 0
             }
             if (theirUtMetadata == 0 || metadataSize <= 0 || metadataSize > 32 * 1024 * 1024) return null
+            handshakePeers += 1
+            lastPieces = "$metadataSize байт"
 
             val pieces = (metadataSize + PIECE_SIZE - 1) / PIECE_SIZE
             val buffer = ByteArray(metadataSize)

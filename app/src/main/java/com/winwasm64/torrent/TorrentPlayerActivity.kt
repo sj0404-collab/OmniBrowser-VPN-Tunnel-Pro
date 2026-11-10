@@ -29,6 +29,9 @@ class TorrentPlayerActivity : Activity() {
 
     private lateinit var video: VideoView
     private lateinit var status: TextView
+    /** v4.47.1: кнопка «найти живую копию» — появляется, когда раздача не отдаёт данные. */
+    private var retryButton: Button? = null
+    private var titleText: String = ""
     private val handler = Handler(Looper.getMainLooper())
     private var prepared = false
 
@@ -61,6 +64,7 @@ class TorrentPlayerActivity : Activity() {
     }
 
     private fun buildView(titleText: String) {
+        this.titleText = titleText
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0E0F12"))
@@ -102,6 +106,12 @@ class TorrentPlayerActivity : Activity() {
             text = "⏯ Пауза"
             setOnClickListener { if (video.isPlaying) video.pause() else video.start() }
         })
+        retryButton = Button(this).apply {
+            text = "🔁 Найти другую раздачу"
+            visibility = android.view.View.GONE
+            setOnClickListener { findAnotherCopy() }
+        }
+        controls.addView(retryButton)
         controls.addView(Button(this).apply {
             text = "📂 Файлы"
             setOnClickListener {
@@ -121,7 +131,11 @@ class TorrentPlayerActivity : Activity() {
             val dir = File(cacheDir, "stream").apply { mkdirs() }
             val ok = TorrentStreamer.start(engine, magnetArg, torrentUrlArg, refererArg, dir, preferredFile)
             if (!ok) {
-                handler.post { status.text = TorrentStreamer.statusText }
+                handler.post {
+                    status.text = TorrentStreamer.statusText
+                    // v4.47.1: правило «мёртвую раздачу не качать» — предлагаем найти живую копию сами
+                    retryButton?.visibility = android.view.View.VISIBLE
+                }
                 return@Thread
             }
             val all = TorrentStreamer.files
@@ -163,6 +177,45 @@ class TorrentPlayerActivity : Activity() {
                 }
             }
         }, "StreamPrepare").also { it.isDaemon = true; it.start() }
+    }
+
+    /**
+     * v4.47.1: раздача не отдаёт данные (нет метаданных / нет пиров) — ищем ту же вещь с сидами
+     * и запускаем её. Это и есть правило «мёртвую раздачу не качать».
+     */
+    private fun findAnotherCopy() {
+        val query = titleText.ifBlank { status.text.toString() }
+        status.text = "🔁 Ищу другую раздачу с сидами: «${query.take(50)}»…"
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val best = arrayOfNulls<CatalogTorrentItem>(1)
+        Thread({
+            val engine = BitTorrentEngine(applicationContext)
+            engine.searchPublicTorrents(query) { res ->
+                best[0] = res.filter {
+                    (it.magnetUri.isNotBlank() || it.torrentUrl.isNotBlank()) && it.seeders > 0
+                }.maxByOrNull { it.seeders }
+                latch.countDown()
+            }
+        }, "FindAnother").also { it.isDaemon = true; it.start() }
+        Thread({
+            val finished = latch.await(70, java.util.concurrent.TimeUnit.SECONDS)
+            val pick = best[0]
+            handler.post {
+                if (!finished || pick == null) {
+                    status.text = "Живой копии с сидами не нашлось. Попробуйте другое название или вкладку «📦 Файлы»."
+                    return@post
+                }
+                magnetArg = pick.magnetUri.ifBlank { null }
+                torrentUrlArg = pick.torrentUrl.ifBlank { null }
+                refererArg = pick.referer.ifBlank { null }
+                preferredFile = null
+                TorrentStreamer.stop()
+                TorrentStreamServer.stop()
+                buildView(pick.title)
+                startStream()
+                handler.post(ticker)
+            }
+        }, "FindAnotherWait").also { it.isDaemon = true; it.start() }
     }
 
     /** Список файлов раздачи: выбрать один — остальное даже не будет качаться. */

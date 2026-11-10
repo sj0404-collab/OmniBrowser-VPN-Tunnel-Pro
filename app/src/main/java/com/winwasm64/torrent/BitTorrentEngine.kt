@@ -925,6 +925,10 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
                 prepareStage = "пиров ${magPeers.size} · забираю метаданные у пиров (ut_metadata)…"
                 val fetched = MagnetMetadata.fetch(mag.infoHash, mag.infoHashHex, magPeers.toList())
+                if (fetched == null) {
+                    // v4.47.1: показываем, ГДЕ обрыв — подключились ли вообще и ответили ли по протоколу
+                    prepareStage = "пиров ${magPeers.size} · " + MagnetMetadata.statsLine()
+                }
                 metadata = fetched ?: return null
             }
         } else {
