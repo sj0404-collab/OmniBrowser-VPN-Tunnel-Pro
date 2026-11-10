@@ -890,14 +890,19 @@ class BitTorrentEngine(private val context: Context? = null) {
         } else if (!magnetUri.isNullOrBlank()) {
             val mag = BitTorrentParser.parseMagnetUri(magnetUri)
             prepareStage = "спрашиваю кэши метаданных…"
+            // v4.46.0: кэшей несколько, и хеш нужен в обоих регистрах — раньше проверялся только
+            // один адрес в верхнем регистре, и при промахе сразу шли к пирам.
             val cacheUrls = listOf(
                 "https://itorrents.org/torrent/${mag.infoHashHex.uppercase()}.torrent",
-                "https://watercache.libertycorp.org/get/${mag.infoHashHex.lowercase()}"
+                "https://itorrents.org/torrent/${mag.infoHashHex.lowercase()}.torrent",
+                "https://watercache.libertycorp.org/get/${mag.infoHashHex.lowercase()}",
+                "https://btcache.me/torrent/${mag.infoHashHex.uppercase()}",
+                "https://btcache.me/torrent/${mag.infoHashHex.lowercase()}"
             )
             var got: ByteArray? = null
             for (u in cacheUrls) {
                 val f = fetchUrlBytes(u)
-                if (f != null && f.isNotEmpty() && f[0] == 'd'.code.toByte()) {
+                if (f != null && f.size > 100 && f[0] == 'd'.code.toByte()) {
                     got = f
                     break
                 }
@@ -910,8 +915,8 @@ class BitTorrentEngine(private val context: Context? = null) {
                 prepareStage = "ищу пиров по трекерам…"
                 val magTrackers = (mag.trackers + TorrentRescue.EXTRA_TRACKERS).distinct()
                 val magPeers = LinkedHashSet<PeerEndpoint>()
-                for (tr in magTrackers.take(8)) {
-                    if (magPeers.size >= 40) break
+                for (tr in magTrackers.take(12)) {
+                    if (magPeers.size >= 60) break
                     magPeers.addAll(announceTracker(tr, mag.infoHash, mag.exactLength.coerceAtLeast(10_485_760L)))
                 }
                 prepareStage = "пиров ${magPeers.size} · забираю метаданные у пиров (ut_metadata)…"
@@ -924,8 +929,8 @@ class BitTorrentEngine(private val context: Context? = null) {
 
         val peers = LinkedHashSet<PeerEndpoint>()
         val trackers = (metadata.trackers + TorrentRescue.EXTRA_TRACKERS).distinct()
-        for (tr in trackers.take(8)) {
-            if (peers.size >= 40) break
+        for (tr in trackers.take(14)) {
+            if (peers.size >= 80) break
             peers.addAll(announceTracker(tr, metadata.infoHash, metadata.totalSize))
         }
         com.winwasm64.vpn.ConnTrace.torrent(

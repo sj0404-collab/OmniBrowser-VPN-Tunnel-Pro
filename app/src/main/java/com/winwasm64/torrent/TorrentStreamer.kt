@@ -44,6 +44,11 @@ object TorrentStreamer {
     @Volatile private var rangeStart: Long = 0L
     @Volatile private var rangeEnd: Long = 0L
     private val stopFlag = AtomicBoolean(false)
+
+    // v4.46.0: метаданные и пиры запоминаем по magnet/.torrent. Переключение файла внутри раздачи
+    // больше не перекачивает метаданные заново — иначе выбор второго файла «зависал».
+    private var cachedKey: String = ""
+    private var cachedSource: BitTorrentEngine.StreamSource? = null
     private var worker: Thread? = null
 
     fun isRunning(): Boolean = playing
@@ -67,7 +72,12 @@ object TorrentStreamer {
         availableBytes = 0L
         speedBytesPerSec = 0L
         statusText = "Получение метаданных…"
-        val source = engine.prepareStream(magnetUri, torrentUrl, referer)
+        val key = magnetUri.orEmpty() + "|" + torrentUrl.orEmpty()
+        val cached = cachedSource?.takeIf { cachedKey == key }
+        val source = cached ?: engine.prepareStream(magnetUri, torrentUrl, referer)?.also {
+            cachedKey = key
+            cachedSource = it
+        }
         if (source == null) {
             // v4.44.0: говорим, НА КАКОМ шаге всё встало, а не «не удалось» одной фразой
             statusText = "Метаданные не получены. Этап: " + engine.prepareStage +
@@ -78,10 +88,13 @@ object TorrentStreamer {
         files = meta.files
         // v4.42.0: если файлов несколько — берём выбранный, иначе самый крупный.
         // Так раздачи с папками (сезон сериала, дискография) не превращаются в «первый попавшийся» файл.
+        // v4.46.0: по умолчанию берём самый крупный ВИДЕО/аудио-файл, а не самый крупный вообще.
+        // В раздачах рядом лежат .iso, .img и .txt — раньше выбирался именно такой файл, и плеер
+        // показывал чёрный экран, хотя кино в раздаче есть.
         val biggest = when {
             preferredFile != null -> meta.files.firstOrNull { it.relativePath == preferredFile }
-                ?: meta.files.maxByOrNull { it.length }
-            else -> meta.files.maxByOrNull { it.length }
+                ?: pickDefaultFile(meta.files)
+            else -> pickDefaultFile(meta.files)
         }
         selectedFile = biggest
         fileName = biggest?.relativePath?.substringAfterLast('/') ?: meta.name
@@ -101,6 +114,20 @@ object TorrentStreamer {
             else "Подключение к пирам…"
         worker = Thread({ pump(source, target, biggest) }, "TorrentStreamer").also { it.isDaemon = true; it.start() }
         return true
+    }
+
+    /** Видео/аудио по расширению — такие файлы плеер точно умеет открывать. */
+    fun isMedia(name: String): Boolean {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return ext in setOf(
+            "mp4", "mkv", "avi", "webm", "m4v", "mov", "ts", "mpg", "mpeg", "flv", "ogv", "3gp",
+            "mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "ape", "alac", "ac3", "dts"
+        )
+    }
+
+    private fun pickDefaultFile(files: List<TorrentFileEntry>): TorrentFileEntry? {
+        val media = files.filter { isMedia(it.relativePath) }
+        return (if (media.isNotEmpty()) media else files).maxByOrNull { it.length }
     }
 
     fun stop() {

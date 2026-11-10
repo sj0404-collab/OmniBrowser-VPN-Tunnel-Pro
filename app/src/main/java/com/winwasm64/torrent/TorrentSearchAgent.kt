@@ -682,7 +682,7 @@ object TorrentSearchAgent {
      *   • download.php / dl.php / d.rutor.info/download/N / gettorrent (rutor, kinozal, nnmclub).
      * Ссылки-редиректы поисковиков (google /url?q=, DDG uddg=, Bing a1…base64) разворачиваются.
      */
-    fun fromPageUrl(pageUrl: String, title: String = "", timeoutMs: Int = 8000): Found? {
+    fun fromPageUrl(pageUrl: String, title: String = "", timeoutMs: Int = 8000, depth: Int = 0): Found? {
         val url = resolveSearchRedirect(pageUrl)
         if (!url.startsWith("http")) return null
         val page = httpGet(url, timeoutMs) ?: return null
@@ -690,7 +690,20 @@ object TorrentSearchAgent {
 
         val magnet = Regex("""magnet:\?xt=urn:btih:[A-Fa-f0-9]{20,}[^"'<\s]*""").find(page)?.value
         val torrentUrl = if (magnet != null) "" else (findTorrentLink(page, url) ?: "")
-        if (magnet.isNullOrBlank() && torrentUrl.isBlank()) return null
+        // v4.46.0: поисковик часто приводит на СТРАНИЦУ-СПИСОК сайта (mbkino, catorrent, byxatab),
+        // где ссылок на .torrent ещё нет — они на странице самой раздачи. Заходим на один уровень глубже.
+        if (magnet.isNullOrBlank() && torrentUrl.isBlank()) {
+            if (depth >= 1) return null
+            for (topic in topicLinks(page, url, title, 2)) {
+                val deeper = try {
+                    fromPageUrl(topic, title, timeoutMs, depth + 1)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (deeper != null) return deeper
+            }
+            return null
+        }
 
         // v4.45.0: «11 КБ» на странице — это размер самой страницы, а не раздачи.
         // Меньше 1 МБ считаем «размер неизвестен», чтобы не показывать выдуманные цифры.
@@ -716,31 +729,80 @@ object TorrentSearchAgent {
         )
     }
 
-    /** Найти на странице ссылку на сам .torrent (все известные варианты оформления). */
+    /**
+     * Ссылки на страницы раздач внутри страницы-списка. Берём те, чей текст похож на наш заголовок
+     * (по словам), — чтобы не уйти на «соседний» фильм или на архив новостей.
+     */
+    private fun topicLinks(page: String, pageUrl: String, title: String, limit: Int): List<String> {
+        val host = pageUrl.substringAfter("://").substringBefore('/')
+        val topicPattern = Regex(
+            """href=["']([^"']*(?:/torrent/\d+|viewtopic\.php\?t=\d+|/topic/\d+|/view/\d+|/\d+-[a-z0-9-]+\.html|do=view&id=\d+)[^"']*)["'][^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        val wanted = title.lowercase().split(Regex("""[^a-zа-я0-9]+"""))
+            .filter { it.length > 3 }.toSet()
+        if (wanted.isEmpty()) return emptyList()
+        val scored = mutableListOf<Pair<Int, String>>()
+        for (m in topicPattern.findAll(page)) {
+            val href = m.groupValues[1].replace("&amp;", "&")
+            val text = m.groupValues[2].replace(Regex("<[^>]+>"), " ").lowercase()
+            val hits = wanted.count { text.contains(it) }
+            if (hits < 2) continue
+            val abs = when {
+                href.startsWith("http") -> href
+                href.startsWith("//") -> "https:$href"
+                href.startsWith("/") -> "https://$host$href"
+                else -> "https://$host/$href"
+            }
+            scored.add(hits to abs)
+        }
+        return scored.sortedByDescending { it.first }.map { it.second }.distinct().take(limit)
+    }
+
+    /**
+     * Найти на странице ссылку на сам .torrent. v4.46.0: кандидаты оцениваются — прямой адрес
+     * `.../file.torrent` лучше, чем `download.php?id=N`, а «обёртки» вида `?u=<ссылка>` хуже всех
+     * (по ним сначала идёт редирект через чужой сайт и часто отдаётся HTML вместо торрента).
+     */
     private fun findTorrentLink(page: String, pageUrl: String): String? {
         val host = pageUrl.substringAfter("://").substringBefore('/')
         val hrefs = Regex("""(?:href|data-href|data-url)\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .findAll(page).map { it.groupValues[1].replace("&amp;", "&") }.toList()
-        val patterns = listOf(
-            Regex("""\.torrent(?:[?#]|$)""", RegexOption.IGNORE_CASE),
-            Regex("""do=download""", RegexOption.IGNORE_CASE),
-            Regex("""download\.php""", RegexOption.IGNORE_CASE),
-            Regex("""dl\.php""", RegexOption.IGNORE_CASE),
-            Regex("""gettorrent""", RegexOption.IGNORE_CASE),
-            Regex("""/download/\d+""", RegexOption.IGNORE_CASE),
-            Regex("""/download\.php\?""", RegexOption.IGNORE_CASE)
+        val topic = Regex(
+            """\.torrent(?:[?#]|$)|do=download|download\.php|dl\.php|gettorrent|/download/\d+""",
+            RegexOption.IGNORE_CASE
         )
+        var best: String? = null
+        var bestScore = -1
         for (h in hrefs) {
             if (h.startsWith("javascript") || h.startsWith("#")) continue
-            if (patterns.none { it.containsMatchIn(h) }) continue
-            return when {
+            if (!topic.containsMatchIn(h)) continue
+            var score = 0
+            val path = h.substringBefore('?').substringBefore('#')
+            if (path.endsWith(".torrent", true)) score += 3
+            if (Regex("""do=download|download\.php|dl\.php|gettorrent""", RegexOption.IGNORE_CASE).containsMatchIn(h)) score += 2
+            if (Regex("""[?&]u=https?://""").containsMatchIn(h)) {
+                score -= 2
+                // в обёртке может лежать прямая ссылка — достаём её
+                val inner = Regex("""[?&]u=(https?://[^&]+)""").find(h)?.groupValues?.get(1)
+                if (inner != null) {
+                    val dec = try { java.net.URLDecoder.decode(inner, "UTF-8") } catch (_: Throwable) { inner }
+                    if (dec.endsWith(".torrent", true)) return dec
+                }
+            }
+            if (h.startsWith("magnet:")) continue
+            val abs = when {
                 h.startsWith("http") -> h
                 h.startsWith("//") -> "https:$h"
                 h.startsWith("/") -> "https://$host$h"
                 else -> "https://$host/$h"
             }
+            if (score > bestScore) {
+                bestScore = score
+                best = abs
+            }
         }
-        return null
+        return best
     }
 
     /** Развернуть ссылку-редирект поисковика в настоящий адрес. */

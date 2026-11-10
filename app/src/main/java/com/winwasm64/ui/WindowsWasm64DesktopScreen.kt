@@ -4128,8 +4128,11 @@ private fun TorrentClientSection(
                     }
                 }
                 item {
+                    // v4.46.0: считаем то, что реально видно. Раньше писалось «13», а список после
+                    // фильтра был пуст — цифра и экран противоречили друг другу.
                     Text(
-                        text = "Найдено раздач: ${catalogItems.size}" +
+                        text = "Найдено раздач: ${visibleItems.size}" +
+                            (if (visibleItems.size != catalogItems.size) " из ${catalogItems.size}" else "") +
                             (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
                             (if (isSearching) " · ищу…" else "") +
                             (if (categoryFilter != "Все") " · фильтр: $categoryFilter" else "") +
@@ -4138,6 +4141,28 @@ private fun TorrentClientSection(
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
+                }
+                if (visibleItems.isEmpty() && catalogItems.isNotEmpty()) {
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "Под этот фильтр ничего не подошло. В выдаче есть ${catalogItems.size} раздач(и) — в других категориях.",
+                                color = Omni.TextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Button(
+                                onClick = {
+                                    categoryFilter = "Все"
+                                    qualityFilter = ""
+                                },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                modifier = Modifier.height(36.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                            ) {
+                                Text("Показать все ${catalogItems.size}", fontSize = 12.sp)
+                            }
+                        }
+                    }
                 }
             }
 

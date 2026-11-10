@@ -147,6 +147,9 @@ class TorrentPlayerActivity : Activity() {
                     return@post
                 }
                 prepared = true
+                if (!TorrentStreamer.isMedia(TorrentStreamer.fileName)) {
+                    status.text = "«${TorrentStreamer.fileName}» — не видео и не аудио, плеер покажет чёрный экран. Нажмите «📂 Файлы» и выберите фильм или трек."
+                }
                 video.setMediaController(MediaController(this))
                 video.setVideoPath(url)
                 video.setOnPreparedListener { mp ->
@@ -180,9 +183,17 @@ class TorrentPlayerActivity : Activity() {
         })
         val scroll = ScrollView(this)
         val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        files.sortedByDescending { it.length }.take(80).forEach { f ->
+        // v4.46.0: видео/аудио — первыми и с иконкой; текущий файл помечен галочкой,
+        // чтобы было видно, что именно играет (раньше список выглядел «не обновляющимся»).
+        val sorted = files.sortedWith(
+            compareByDescending<TorrentFileEntry> { TorrentStreamer.isMedia(it.relativePath) }
+                .thenByDescending { it.length }
+        )
+        sorted.take(120).forEach { f ->
+            val media = TorrentStreamer.isMedia(f.relativePath)
+            val mark = if (f.relativePath == preferredFile) "✔ " else if (media) (if (f.relativePath.contains('.')) "🎬 " else "") else "📄 "
             list.addView(Button(this).apply {
-                text = "${f.relativePath.substringAfterLast('/')}  ·  ${BitTorrentEngine.formatSize(f.length)}"
+                text = "$mark${f.relativePath.substringAfterLast('/')}  ·  ${BitTorrentEngine.formatSize(f.length)}"
                 textSize = 12f
                 setOnClickListener {
                     preferredFile = f.relativePath

@@ -27,43 +27,79 @@ object MagnetMetadata {
     private const val PIECE_SIZE = 16 * 1024
     private const val OUR_UT_METADATA = 1
 
-    /** Скачать метаданные у первого пира, который согласится. Возвращает разобранный .torrent. */
+    /**
+     * v4.46.0: метаданные ищем ПАРАЛЛЕЛЬНО — сначала в HTTP-кэшах по infoHash (это быстро и работает
+     * даже там, где пиры не отвечают), затем у первых [parallel] пиров одновременно.
+     * Раньше пиры опрашивались по одному: 11 пиров × 8 секунд = минута ожидания и «не получено».
+     */
     fun fetch(
         infoHash: ByteArray,
         infoHashHex: String,
         peers: List<PeerEndpoint>,
-        timeoutMs: Int = 25_000
+        timeoutMs: Int = 20_000,
+        cacheBytes: ByteArray? = null
     ): TorrentMetadata? {
-        if (peers.isEmpty()) return null
-        val deadline = System.currentTimeMillis() + timeoutMs
-        for (peer in peers.take(12)) {
-            if (System.currentTimeMillis() > deadline) break
-            val raw = try {
-                fetchFromPeer(peer, infoHash)
+        // 0) то, что уже скачали по HTTP раньше в этом же вызове
+        if (cacheBytes != null && cacheBytes.isNotEmpty()) {
+            val ok = sha1(cacheBytes).contentEquals(infoHash)
+            if (ok) try {
+                return BitTorrentParser.parseTorrentBytes(wrapInfo(infoBytesOf(cacheBytes) ?: cacheBytes))
             } catch (_: Throwable) {
-                null
             }
-            if (raw != null && BitTorrentParser.sha1(raw).contentEquals(infoHash)) {
-                com.winwasm64.vpn.ConnTrace.torrent(
-                    "метаданные с пира ${peer.ip}:${peer.port}",
-                    "получено ${raw.size} байт · sha1 совпал",
-                    true
-                )
-                return try {
-                    BitTorrentParser.parseTorrentBytes(wrapInfo(raw))
+        }
+        if (peers.isEmpty()) return null
+        val parallel = 8
+        val slice = peers.take(parallel)
+        val result = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
+        val threads = slice.map { peer ->
+            Thread({
+                if (result.get() != null) return@Thread
+                val raw = try {
+                    fetchFromPeer(peer, infoHash)
                 } catch (_: Throwable) {
                     null
                 }
+                if (raw != null && sha1(raw).contentEquals(infoHash)) {
+                    result.compareAndSet(null, raw)
+                    com.winwasm64.vpn.ConnTrace.torrent(
+                        "метаданные с пира ${peer.ip}:${peer.port}",
+                        "получено ${raw.size} байт · sha1 совпал",
+                        true
+                    )
+                }
+            }, "MetaPeer").also { it.isDaemon = true; it.start() }
+        }
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline && result.get() == null) Thread.sleep(150)
+        val raw = result.get()
+        if (raw != null) {
+            return try {
+                BitTorrentParser.parseTorrentBytes(wrapInfo(raw))
+            } catch (_: Throwable) {
+                null
             }
         }
         com.winwasm64.vpn.ConnTrace.torrent(
             "метаданные $infoHashHex",
-            "ни один пир не отдал метаданные",
+            "ни один из ${slice.size} пиров не отдал метаданные",
             ok = false,
-            note = "раздача без .torrent: нужен хотя бы один сид с упиранием в ut_metadata"
+            note = "проверены ut_metadata и кэши по infoHash"
         )
         return null
     }
+
+    /** Достать из .torrent сырые байты словаря info (для сверки с infoHash). */
+    private fun infoBytesOf(torrent: ByteArray): ByteArray? = try {
+        val decoded = BencodeCodec.decode(torrent) as? BencodeValue.BDict ?: return null
+        val info = decoded.entries["info"] as? BencodeValue.BDict ?: return null
+        if (info.rawEnd > info.rawStart && info.rawEnd <= torrent.size) {
+            torrent.copyOfRange(info.rawStart, info.rawEnd)
+        } else null
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun sha1(data: ByteArray): ByteArray = BitTorrentParser.sha1(data)
 
     /** Обернуть словарь info в полноценный .torrent — так его разбирает наш парсер. */
     private fun wrapInfo(infoBytes: ByteArray): ByteArray {
@@ -115,12 +151,17 @@ object MagnetMetadata {
             val until = System.currentTimeMillis() + 6000
             while ((theirUtMetadata == 0 || metadataSize == 0) && System.currentTimeMillis() < until) {
                 val msg = readMessage(inp) ?: return null
-                if (msg.first == EXT_ID) {
-                    val dict = decodeDict(msg.second) ?: continue
-                    val m = dict.entries["m"] as? BencodeValue.BDict
-                    theirUtMetadata = (m?.entries?.get("ut_metadata") as? BencodeValue.BInt)?.value?.toInt() ?: 0
-                    metadataSize = (dict.entries["metadata_size"] as? BencodeValue.BInt)?.value?.toInt() ?: 0
-                }
+                if (msg.first < 0) continue // keep-alive
+                if (msg.first != EXT_ID) continue
+                // v4.46.0: тело расширенного сообщения начинается с НОМЕРА расширения.
+                // Здесь это 0 = расширенное рукопожатие; раньше код разбирал бенкод вместе с этим
+                // байтом, разбор падал, и метаданные «не приходили» даже при 11 пирах.
+                val body = msg.second
+                if (body.isEmpty() || (body[0].toInt() and 0xFF) != 0) continue
+                val dict = decodeDict(body.copyOfRange(1, body.size)) ?: continue
+                val m = dict.entries["m"] as? BencodeValue.BDict
+                theirUtMetadata = (m?.entries?.get("ut_metadata") as? BencodeValue.BInt)?.value?.toInt() ?: 0
+                metadataSize = (dict.entries["metadata_size"] as? BencodeValue.BInt)?.value?.toInt() ?: 0
             }
             if (theirUtMetadata == 0 || metadataSize <= 0 || metadataSize > 32 * 1024 * 1024) return null
 
@@ -133,6 +174,7 @@ object MagnetMetadata {
                 val pieceDeadline = System.currentTimeMillis() + 6000
                 while (!ok && System.currentTimeMillis() < pieceDeadline) {
                     val msg = readMessage(inp) ?: return null
+                    if (msg.first < 0) continue // keep-alive, не повод обрывать
                     if (msg.first != EXT_ID) continue
                     val payload = msg.second
                     if (payload.isEmpty() || (payload[0].toInt() and 0xFF) != OUR_UT_METADATA) continue
@@ -140,6 +182,7 @@ object MagnetMetadata {
                     val dict = decodeDict(body) ?: continue
                     val msgType = (dict.entries["msg_type"] as? BencodeValue.BInt)?.value?.toInt() ?: -1
                     val idx = (dict.entries["piece"] as? BencodeValue.BInt)?.value?.toInt() ?: -1
+                    if (msgType == 2) return null // пир отказал — сразу к следующему
                     if (msgType != 1 || idx != piece) continue
                     val dataStart = dict.rawEnd
                     if (dataStart <= 0 || dataStart > body.size) continue
@@ -166,11 +209,15 @@ object MagnetMetadata {
         out.flush()
     }
 
-    /** Прочитать одно сообщение целиком: (id, тело). */
+    /**
+     * Прочитать одно сообщение целиком: (id, тело). Keep-alive (нулевая длина) — это не ошибка,
+     * v4.46.0 возвращаем id = -1, чтобы вызывающий просто пропустил его.
+     */
     private fun readMessage(inp: DataInputStream): Pair<Int, ByteArray>? {
         return try {
             val len = inp.readInt()
-            if (len <= 0 || len > 2 * 1024 * 1024) return null
+            if (len == 0) return -1 to ByteArray(0)
+            if (len < 0 || len > 2 * 1024 * 1024) return null
             val id = inp.readUnsignedByte()
             val body = ByteArray(len - 1)
             if (body.isNotEmpty()) inp.readFully(body)

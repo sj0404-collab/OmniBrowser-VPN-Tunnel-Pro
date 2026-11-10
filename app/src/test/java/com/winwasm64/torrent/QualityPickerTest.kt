@@ -1,6 +1,7 @@
 package com.winwasm64.torrent
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -105,5 +106,25 @@ class SearchRedirectTest {
             "https://byxatab.com/igry/12345-sherlock.html",
             TorrentSearchAgent.resolveSearchRedirect("https://byxatab.com/igry/12345-sherlock.html")
         )
+    }
+}
+
+/** v4.46.0: по умолчанию открываем видео/аудио, а не .iso/.img/.txt из той же раздачи. */
+class MediaSelectionTest {
+
+    @Test
+    fun `образы и тексты не считаются медиа`() {
+        assertFalse(TorrentStreamer.isMedia("Holmes.img"))
+        assertFalse(TorrentStreamer.isMedia("LIVANOV1.ISO"))
+        assertFalse(TorrentStreamer.isMedia("6"))
+        assertFalse(TorrentStreamer.isMedia("readme.txt"))
+    }
+
+    @Test
+    fun `видео и музыка считаются медиа`() {
+        assertTrue(TorrentStreamer.isMedia("film.mkv"))
+        assertTrue(TorrentStreamer.isMedia("serial.S01E01.mp4"))
+        assertTrue(TorrentStreamer.isMedia("track.FLAC"))
+        assertTrue(TorrentStreamer.isMedia("voice.m4a"))
     }
 }
