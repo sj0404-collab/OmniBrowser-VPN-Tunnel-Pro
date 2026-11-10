@@ -64,57 +64,95 @@ object DirectSearch {
         "sqlite3", "xml.gz", "meta", "ffp", "afp", "asc", "sfv", "nfo", "url"
     )
 
-    /** Ответ на страницу: 24 записи + признак «есть ли следующая». */
-    data class Page(val files: List<DirectFile>, val hasMore: Boolean)
+    /** Категории, по которым идём ПАРАЛЛЕЛЬНО одним запросом. */
+    val CHIPS = listOf("🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
 
     /**
-     * v4.49.0: поиск по страницам и по КАТЕГОРИИ.
+     * v4.52.0: результат одного поиска сразу по ВСЕМ категориям.
      *
-     * Раньше фильтр только отсекал уже найденное: выбрал «🎮 Игры» — и оставалось огрызок выдачи.
-     * Теперь категория идёт в сам запрос Archive.org (`mediatype:`), поэтому «Игры» ищутся в играх,
-     * «Книги» — в книгах, а манга — в текстах. Плюс страницы 1, 2, 3… как в поисковике.
+     * Раньше категория склеивалась с запросом («чип игра») и каждый раз гонялся новый поиск — отсюда
+     * и мусор в названии, и ожидание при каждом нажатии. Теперь один поиск запускает все категории
+     * параллельно, а переключение категорий — мгновенная фильтрация уже собранного.
      */
-    fun search(
+    data class Buckets(
+        val all: List<DirectFile>,
+        val byChip: Map<String, List<DirectFile>>,
+        val more: Map<String, Boolean>
+    ) {
+        fun count(chip: String): Int = if (chip == "Все") all.size else byChip[chip]?.size ?: 0
+        fun hasMore(chip: String): Boolean = if (chip == "Все") more.values.any { it } else more[chip] == true
+    }
+
+    private const val ROWS_PER_CHIP = 24
+
+    /** Один поиск — все категории сразу, параллельно. */
+    fun searchAll(query: String, sort: Int = 0, page: Int = 0, timeoutMs: Int = 12_000): Buckets {
+        val clean = query.trim()
+        if (clean.isBlank()) return Buckets(emptyList(), emptyMap(), emptyMap())
+        val byChip = java.util.concurrent.ConcurrentHashMap<String, List<DirectFile>>()
+        val more = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        val threads = CHIPS.map { chip ->
+            Thread({
+                try {
+                    val files = searchChip(clean, chip, page, sort, timeoutMs)
+                    byChip[chip] = rank(files, clean, sort)
+                    more[chip] = files.size >= ROWS_PER_CHIP
+                } catch (_: Throwable) {
+                    byChip[chip] = emptyList()
+                    more[chip] = false
+                }
+            }, "Direct-$chip").also { it.isDaemon = true; it.start() }
+        }
+        threads.forEach { it.join(25_000) }
+        val union = byChip.values.flatten().distinctBy { it.downloadUrl }
+        return Buckets(union, byChip.toMap(), more.toMap())
+    }
+
+    /** Поиск внутри одной категории (для «показать ещё» по конкретному фильтру). */
+    fun searchChip(
         query: String,
-        kind: String = "Все",
+        chip: String,
         page: Int = 0,
         sort: Int = 0,
         timeoutMs: Int = 12_000
-    ): Page {
-        val clean = query.trim()
-        if (clean.isBlank()) return Page(emptyList(), false)
-        val variants = (listOf(clean) + ImageSearch.aliasesFor(clean)).distinct()
+    ): List<DirectFile> {
+        val variants = (listOf(query) + ImageSearch.aliasesFor(query)).distinct()
         val raw = mutableListOf<DirectFile>()
-        val q = when (kind) {
-            "📖 Манга" -> "$clean manga"
-            else -> clean
-        }
         for (v in variants.take(2)) {
-            raw.addAll(searchArchive(if (kind == "📖 Манга") "$v manga" else v, kind, page, sort, timeoutMs))
+            raw.addAll(searchArchive(v, chip, page, sort, timeoutMs))
         }
-        if (page == 0 && (kind == "Все" || kind == "💾 Софт")) {
-            raw.addAll(searchGitHub(clean, timeoutMs))
+        if (page == 0 && (chip == "💾 Софт" || chip == "🎮 Игры")) {
+            raw.addAll(searchGitHub(query, timeoutMs))
         }
-        val unfiltered = raw.distinctBy { it.downloadUrl }
-        val tokens = variants.flatMap { v ->
-            q.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 }
-        }.toSet()
-        fun relevant(f: DirectFile): Boolean {
-            val t = f.title.lowercase()
-            return tokens.any { t.contains(it) }
+        return raw.distinctBy { it.downloadUrl }
+    }
+
+    /** Совместимость: старый вызов одной категории (используется «показать ещё»). */
+    fun search(query: String, kind: String = "Все", page: Int = 0, sort: Int = 0, timeoutMs: Int = 12_000): Page {
+        val chips = if (kind == "Все") CHIPS else listOf(kind)
+        val files = chips.flatMap { searchChip(query, it, page, sort, timeoutMs) }
+            .distinctBy { it.downloadUrl }
+        val ranked = rank(files, query, sort)
+        return Page(ranked.take(100), ranked.size >= ROWS_PER_CHIP)
+    }
+
+    data class Page(val files: List<DirectFile>, val hasMore: Boolean)
+
+    /** Сортировка + отсев нерелевантного (но без потери объёма: если релевантных мало — отдаём всё). */
+    private fun rank(files: List<DirectFile>, query: String, sort: Int): List<DirectFile> {
+        val tokens = (listOf(query) + ImageSearch.aliasesFor(query))
+            .flatMap { v -> v.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 } }
+            .toSet()
+        fun relevant(f: DirectFile) = tokens.any { f.title.lowercase().contains(it) }
+        val good = files.filter { relevant(it) }
+        val base = if (good.size >= 5) good else files.sortedByDescending { relevant(it) }
+        return when (sort) {
+            1 -> base.sortedByDescending { it.year }
+            2 -> base.sortedBy { it.year }
+            3 -> base.sortedByDescending { parseSize(it.sizeLabel) }
+            4 -> base.sortedBy { parseSize(it.sizeLabel) }
+            else -> base.sortedByDescending { it.weight }
         }
-        val good = unfiltered.filter { relevant(it) }
-        val list = (if (good.size >= 5) good else unfiltered.sortedByDescending { relevant(it) })
-            .let { base ->
-                when (sort) {
-                    1 -> base.sortedByDescending { it.year }          // сначала новые
-                    2 -> base.sortedBy { it.year }                    // сначала старые
-                    3 -> base.sortedByDescending { parseSize(it.sizeLabel) } // сначала тяжёлые
-                    4 -> base.sortedBy { parseSize(it.sizeLabel) }     // сначала лёгкие
-                    else -> base
-                }
-            }
-        return Page(list.take(60), list.size >= 20)
     }
 
     /* ===================== Internet Archive ===================== */
@@ -123,8 +161,8 @@ object DirectSearch {
         val q = URLEncoder.encode(query, "UTF-8")
         // категория — прямо в запрос, а не фильтром поверх готового списка
         val media = when (kind) {
-            "🎮 Игры" -> "+AND+mediatype:(software+OR+games)"
-            "🎬 Видео" -> "+AND+mediatype:(movies+OR+tv)"
+            "🎮 Игры" -> "+AND+mediatype:(software)"
+            "🎬 Видео" -> "+AND+mediatype:(movies)"
             "🎵 Музыка" -> "+AND+mediatype:(audio+OR+etree)"
             "📚 Книги", "📖 Манга" -> "+AND+mediatype:(texts)"
             "💾 Софт" -> "+AND+mediatype:(software)"
@@ -137,8 +175,9 @@ object DirectSearch {
             4 -> "&sort[]=item_size+asc"
             else -> ""
         }
-        val url = "https://archive.org/advancedsearch.php?q=($q$media)&fl[]=identifier,title,mediatype,item_size,year" +
-            "&rows=24&page=${page + 1}$sortClause&output=json"
+        val url = "https://archive.org/advancedsearch.php?q=($q$media)" +
+            "&fl[]=identifier,title,mediatype,item_size,year" +
+            "&rows=$ROWS_PER_CHIP&page=${page + 1}$sortClause&output=json"
         val body = httpGet(url, timeoutMs) ?: return emptyList()
         val result = mutableListOf<DirectFile>()
         try {

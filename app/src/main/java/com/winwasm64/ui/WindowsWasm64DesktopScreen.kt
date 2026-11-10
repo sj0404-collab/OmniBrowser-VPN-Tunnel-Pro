@@ -4153,22 +4153,21 @@ private fun TorrentClientSection(
                                 color = if (sel) Omni.AccentContainer else Omni.SurfaceHighest,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.clickable {
-                                    // v4.51.0: как во вкладке «Файлы» — категория СРАЗУ ищет внутри
-                                    // себя: к запросу добавляется уточняющее слово («игра», «фильм»),
-                                    // и движок возвращает именно эту категорию. База запроса не
-                                    // портится, поэтому переключение категорий туда-обратно работает.
+                                    // v4.52.0: НИКАКОГО повторного поиска и никаких слов в запросе —
+                                    // одна выдача уже размечена по категориям, переключение мгновенное.
                                     categoryFilter = cat
                                     com.winwasm64.torrent.SearchCache.torrentKind = cat
-                                    val word = com.winwasm64.torrent.TorrentSearchAgent.categoryWord(cat)
-                                    val effective = if (word.isBlank()) baseQuery.trim()
-                                    else (baseQuery.trim() + " " + word).trim()
-                                    if (baseQuery.isNotBlank()) {
-                                        runSearch(effective, keepBase = true)
-                                    }
                                 }
                             ) {
+                                // счётчик прямо в чипе: видно, сколько раздач в каждой категории
+                                val chipCount = if (cat == "Все") catalogItems.size else {
+                                    catalogItems.count {
+                                        com.winwasm64.torrent.TorrentSearchAgent.categoryMatches(cat, it.kind)
+                                    }
+                                }
                                 Text(
-                                    cat, color = Color.White, fontSize = 11.sp,
+                                    "$cat" + (if (catalogItems.isNotEmpty()) " $chipCount" else ""),
+                                    color = Color.White, fontSize = 11.sp,
                                     fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                                 )
@@ -4238,7 +4237,7 @@ private fun TorrentClientSection(
                             (if (visibleItems.size != catalogItems.size) " из ${catalogItems.size}" else "") +
                             (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
                             (if (isSearching) " · ищу…" else "") +
-                            (if (categoryFilter != "Все") " · фильтр: $categoryFilter" else "") +
+                            (if (categoryFilter != "Все") " · категория: $categoryFilter" else "") +
                             (if (qualityFilter.isNotBlank()) " · качество: $qualityFilter" else ""),
                         color = Omni.Warning,
                         fontWeight = FontWeight.Bold,
@@ -4264,7 +4263,7 @@ private fun TorrentClientSection(
                                 modifier = Modifier.height(36.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
                             ) {
-                                Text("Показать все ${catalogItems.size}", fontSize = 12.sp)
+                                Text("Показать все категории (${catalogItems.size})", fontSize = 12.sp)
                             }
                         }
                     }
@@ -5738,69 +5737,88 @@ private fun enqueueDirectDownload(context: android.content.Context, url: String,
 @Composable
 private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
-    // v4.49.0: состояние живёт в SearchCache — переключение вкладок больше ничего не сбрасывает
+    // v4.52.0: состояние живёт в SearchCache — переключение вкладок ничего не сбрасывает
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directQuery.ifBlank { initialQuery }) }
-    var items by remember { mutableStateOf<List<com.winwasm64.torrent.DirectFile>>(emptyList()) }
+    var buckets by remember { mutableStateOf<com.winwasm64.torrent.DirectSearch.Buckets?>(null) }
     var busy by remember { mutableStateOf(false) }
     var kindFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directKind) }
     var formatFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directFormat) }
     var sortMode by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directSort) }
     var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directPage) }
-    var hasMore by remember { mutableStateOf(false) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
-    fun run(kind: String, sort: Int, nextPage: Int, append: Boolean) {
+    /**
+     * Один поиск — сразу все категории параллельно. Категория больше НЕ дописывается в запрос
+     * («чип игра» больше не появится в названии) и при переключении фильтра повторного поиска нет.
+     */
+    fun run(nextSort: Int, nextPage: Int, append: Boolean) {
         if (query.isBlank()) {
             Toast.makeText(context, "Введите название", Toast.LENGTH_SHORT).show()
             return
         }
         busy = true
-        if (!append) items = emptyList()
         com.winwasm64.torrent.SearchCache.directQuery = query
-        com.winwasm64.torrent.SearchCache.directKind = kind
-        com.winwasm64.torrent.SearchCache.directSort = sort
+        com.winwasm64.torrent.SearchCache.directSort = nextSort
         com.winwasm64.torrent.SearchCache.directPage = nextPage
+        sortMode = nextSort
         page = nextPage
+        val prev = if (append) buckets else null
         Thread({
             val res = try {
-                com.winwasm64.torrent.DirectSearch.search(query, kind, nextPage, sort)
+                com.winwasm64.torrent.DirectSearch.searchAll(query, nextSort, nextPage)
             } catch (_: Throwable) {
-                com.winwasm64.torrent.DirectSearch.Page(emptyList(), false)
+                com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
             }
             handler.post {
-                items = if (append) (items + res.files).distinctBy { it.downloadUrl } else res.files
-                hasMore = res.hasMore
+                buckets = if (prev == null) res else {
+                    val merged = mutableMapOf<String, List<com.winwasm64.torrent.DirectFile>>()
+                    val chips = (prev.byChip.keys + res.byChip.keys).distinct()
+                    for (chip in chips) {
+                        merged[chip] = ((prev.byChip[chip] ?: emptyList()) + (res.byChip[chip] ?: emptyList()))
+                            .distinctBy { it.downloadUrl }
+                    }
+                    com.winwasm64.torrent.DirectSearch.Buckets(
+                        all = merged.values.flatten().distinctBy { it.downloadUrl },
+                        byChip = merged,
+                        more = res.more
+                    )
+                }
                 busy = false
             }
-        }, "DirectSearch").also { it.isDaemon = true; it.start() }
+        }, "DirectAll").also { it.isDaemon = true; it.start() }
     }
 
-    // v4.51.0: бесконечная прокрутка — как только список докручен до конца, страница грузится сама
+    val kindChips = com.winwasm64.torrent.DirectSearch.CHIPS
+    val sortChips = listOf("По релевантности", "Новые", "Старые", "Тяжёлые", "Лёгкие")
+    val current = buckets
+    val byKind = when {
+        current == null -> emptyList()
+        kindFilter == "Все" -> current.all
+        else -> current.byChip[kindFilter] ?: emptyList()
+    }
+    val formats = byKind.map { it.format }.distinct().sorted()
+    val visible = if (formatFilter.isBlank()) byKind else byKind.filter { it.format == formatFilter }
     val filesListState = androidx.compose.foundation.lazy.rememberLazyListState()
-    LaunchedEffect(filesListState, hasMore, busy) {
+    LaunchedEffect(filesListState, busy, kindFilter, visible.size) {
         androidx.compose.runtime.snapshotFlow {
             filesListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
         }.collect { lastIndex ->
-            if (!busy && hasMore && lastIndex >= items.size - 2 && items.isNotEmpty()) {
-                run(kindFilter, sortMode, page + 1, true)
+            if (!busy && visible.isNotEmpty() && current != null &&
+                current.hasMore(kindFilter) && lastIndex >= visible.size - 2
+            ) {
+                run(sortMode, page + 1, append = true)
             }
         }
     }
-
-    val kindChips = listOf("Все", "🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
-    val sortChips = listOf("По релевантности", "Новые", "Старые", "Тяжёлые", "Лёгкие")
-    val byKind = items
-    val formats = byKind.map { it.format }.distinct().sorted()
-    val visible = if (formatFilter.isBlank()) byKind else byKind.filter { it.format == formatFilter }
 
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("📦 Файлы без торрентов — прямые ссылки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Archive.org и GitHub Releases. Категория уходит прямо в запрос: «Игры» ищутся в играх, " +
-                        "«Манга» — в текстах. Скачивание идёт в Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR} " +
-                        "и видно во вкладке «Загрузки».",
+                    "Один поиск сразу по всем категориям (параллельно): игры, видео, музыка, книги, манга, софт. " +
+                        "Переключение категорий — мгновенное, без повторного сканирования. " +
+                        "Скачивание идёт в Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR} и видно во вкладке «Загрузки».",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5812,10 +5830,10 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                         },
                         placeholder = "Название: черепашки ниндзя, манга, doom…",
                         modifier = Modifier.weight(1f),
-                        onGo = { run(kindFilter, sortMode, 0, false) }
+                        onGo = { run(sortMode, 0, false) }
                     )
                     Button(
-                        onClick = { run(kindFilter, sortMode, 0, false) },
+                        onClick = { run(sortMode, 0, false) },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                         modifier = Modifier.height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
@@ -5826,23 +5844,49 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
             }
         }
 
+        // категории с количеством найденного — переключение мгновенное
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val allChip = "Все"
+            val allCount = current?.all?.size ?: 0
+            Surface(
+                color = if (kindFilter == allChip) Omni.AccentContainer else Omni.SurfaceHighest,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.clickable {
+                    kindFilter = allChip
+                    formatFilter = ""
+                    com.winwasm64.torrent.SearchCache.directKind = allChip
+                    com.winwasm64.torrent.SearchCache.directFormat = ""
+                }
+            ) {
+                Text(
+                    "Все" + if (allCount > 0) " $allCount" + (if (current?.hasMore(allChip) == true) "+" else "") else "",
+                    color = Color.White, fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                )
+            }
             kindChips.forEach { chip ->
+                val count = current?.count(chip) ?: 0
+                val more = current?.hasMore(chip) == true
                 Surface(
                     color = if (kindFilter == chip) Omni.AccentContainer else Omni.SurfaceHighest,
                     shape = RoundedCornerShape(8.dp),
                     modifier = Modifier.clickable {
+                        // никакого нового поиска — только фильтрация уже собранного
                         kindFilter = chip
                         formatFilter = ""
-                        // выбранная категория — это НОВЫЙ запрос по этой категории, а не фильтр поверх
-                        if (items.isNotEmpty() || query.isNotBlank()) run(chip, sortMode, 0, false)
+                        com.winwasm64.torrent.SearchCache.directKind = chip
+                        com.winwasm64.torrent.SearchCache.directFormat = ""
                     }
                 ) {
-                    Text(chip, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
+                    Text(
+                        chip + if (current != null) " $count" + (if (more) "+" else "") else "",
+                        color = Color.White, fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                    )
                 }
             }
         }
@@ -5856,8 +5900,16 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                     color = if (sortMode == idx) Omni.AccentContainer else Omni.SurfaceHighest,
                     shape = RoundedCornerShape(8.dp),
                     modifier = Modifier.clickable {
+                        // сортировка уже собранного — тоже без похода в сеть
                         sortMode = idx
-                        if (query.isNotBlank()) run(kindFilter, idx, 0, false)
+                        com.winwasm64.torrent.SearchCache.directSort = idx
+                        buckets = buckets?.let { b ->
+                            com.winwasm64.torrent.DirectSearch.Buckets(
+                                all = sortFiles(b.all, idx),
+                                byChip = b.byChip.mapValues { sortFiles(it.value, idx) },
+                                more = b.more
+                            )
+                        }
                     }
                 ) {
                     Text(label, color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
@@ -5871,6 +5923,7 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 listOf("").plus(formats).forEach { fmt ->
+                    val count = if (fmt.isBlank()) byKind.size else byKind.count { it.format == fmt }
                     Surface(
                         color = if (formatFilter == fmt) Omni.AccentContainer else Omni.SurfaceHighest,
                         shape = RoundedCornerShape(8.dp),
@@ -5880,7 +5933,7 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                         }
                     ) {
                         Text(
-                            if (fmt.isBlank()) "Любой формат" else fmt,
+                            (if (fmt.isBlank()) "Любой формат" else "$fmt") + " $count",
                             color = Color.White, fontSize = 10.sp,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                         )
@@ -5891,28 +5944,14 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
 
         Text(
             when {
-                busy -> "Ищу прямые ссылки… (страница ${page + 1})"
-                items.isEmpty() -> "Введите название и нажмите «Найти»"
-                else -> "Найдено файлов: ${visible.size} · ${kindFilter}" + (if (visible.size != items.size) " · фильтр формата" else "")
+                busy && current == null -> "Ищу сразу во всех категориях…"
+                busy -> "Догружаю страницу ${page + 1}…"
+                visible.isEmpty() -> "Введите название и нажмите «Найти»"
+                else -> "Показано ${visible.size} · $kindFilter" +
+                    (if (current != null && current.hasMore(kindFilter)) " · есть ещё" else "")
             },
             color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
         )
-        if (visible.isEmpty() && items.isNotEmpty() && !busy) {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    "Под этот формат ничего не подошло. Всего файлов: ${items.size}.",
-                    color = Omni.TextDim, fontSize = 11.sp
-                )
-                Button(
-                    onClick = { formatFilter = "" },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                    modifier = Modifier.height(34.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
-                ) {
-                    Text("Показать все ${items.size}", fontSize = 11.sp, color = Color.White)
-                }
-            }
-        }
 
         LazyColumn(
             state = filesListState,
@@ -5959,10 +5998,10 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                     }
                 }
             }
-            if (hasMore) {
+            if (visible.isNotEmpty() && current?.hasMore(kindFilter) == true) {
                 item {
                     Button(
-                        onClick = { run(kindFilter, sortMode, page + 1, true) },
+                        onClick = { run(sortMode, page + 1, append = true) },
                         modifier = Modifier.fillMaxWidth().height(40.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
                     ) {
@@ -5971,6 +6010,28 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                 }
             }
         }
+    }
+}
+
+/** Локальная сортировка уже найденного — без обращения к сети. */
+private fun sortFiles(list: List<com.winwasm64.torrent.DirectFile>, mode: Int): List<com.winwasm64.torrent.DirectFile> {
+    fun size(f: com.winwasm64.torrent.DirectFile): Long {
+        val num = Regex("""([\d.,]+)""").find(f.sizeLabel)?.groupValues?.get(1)
+            ?.replace(',', '.')?.toDoubleOrNull() ?: 0.0
+        val mult = when {
+            f.sizeLabel.contains("ГБ", true) || f.sizeLabel.contains("GB", true) -> 1024.0 * 1024 * 1024
+            f.sizeLabel.contains("МБ", true) || f.sizeLabel.contains("MB", true) -> 1024.0 * 1024
+            f.sizeLabel.contains("КБ", true) || f.sizeLabel.contains("KB", true) -> 1024.0
+            else -> 1.0
+        }
+        return (num * mult).toLong()
+    }
+    return when (mode) {
+        1 -> list.sortedByDescending { it.year }
+        2 -> list.sortedBy { it.year }
+        3 -> list.sortedByDescending { size(it) }
+        4 -> list.sortedBy { size(it) }
+        else -> list
     }
 }
 
@@ -6225,7 +6286,7 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
     var channels by remember { mutableStateOf(com.winwasm64.torrent.VideoChannels.all(context)) }
     var newChannel by remember { mutableStateOf("") }
     var adding by remember { mutableStateOf(false) }
-    val sources = listOf("Все", "YouTube", "RuTube", "VK Видео", "Dailymotion")
+    val sources = listOf("Все", "YouTube", "RuTube", "VK Видео")
 
     fun open(target: String, channelName: String = "") {
         com.winwasm64.torrent.SearchCache.videoQuery = target
@@ -6252,9 +6313,9 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("🎬 Видео по названию, по ссылке или в канале", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Text(
-                    "Как во «Файлах»: список роликов с превью и кнопками «Смотреть / Открыть / Скачать 360p». " +
-                        "Внутри — категории (видео, плейлисты, каналы, трансляции), сортировка и фильтр по " +
-                        "длительности; список докручивается сам. Канал ниже ограничивает поиск одним каналом.",
+                    "Один поиск — сразу все категории (видео, плейлисты, каналы, трансляции) с количеством " +
+                        "на каждом чипе; переключение мгновенное, без повторного поиска. Кнопка «⬇ Скачать» " +
+                        "работает и для VK/RuTube (перехват прямого mp4). Канал ниже ограничивает поиск.",
                     color = Omni.TextDim, fontSize = 11.sp
                 )
                 CompactDarkTextField(
@@ -6400,8 +6461,7 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
         listOf(
             "YouTube" to "https://m.youtube.com/results?search_query=",
             "RuTube" to "https://rutube.ru/search/?query=",
-            "VK Видео" to "https://m.vk.com/video?q=",
-            "Dailymotion" to "https://www.dailymotion.com/search/"
+            "VK Видео" to "https://m.vk.com/video?q="
         ).forEach { (name, base) ->
             Surface(
                 color = Omni.Surface,

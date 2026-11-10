@@ -75,8 +75,9 @@ object YouTubeSearch {
     ): Page {
         val body = JSONObject().apply { put("context", context()) }
         if (continuation.isNullOrBlank()) {
+            // v4.52.0: категорию НЕ отправляем серверу — один запрос сразу отдаёт видео, плейлисты
+            // и каналы, а фильтрация по категориям идёт локально и мгновенно (без нового сканирования)
             body.put("query", query)
-            categoryParam(category)?.let { body.put("params", it) }
         } else {
             body.put("continuation", continuation)
         }
@@ -105,6 +106,9 @@ object YouTubeSearch {
                 ?: v.optJSONObject("longBylineText")?.let { runsText(it) }.orEmpty()
             val views = v.optJSONObject("viewCountText")?.optString("simpleText").orEmpty()
             val published = v.optJSONObject("publishedTimeText")?.optString("simpleText").orEmpty()
+            // прямой эфир: значок LIVE в разметке
+            val live = v.toString().contains("LIVE", true) ||
+                v.toString().contains("прямой эфир", true)
             val thumb = bestThumb(v.optJSONObject("thumbnail"))
                 .ifBlank { "https://i.ytimg.com/vi/$id/mqdefault.jpg" }
             items.add(
@@ -120,7 +124,8 @@ object YouTubeSearch {
                     publishedText = published,
                     daysAgo = parseDays(published),
                     thumb = thumb,
-                    url = "https://m.youtube.com/watch?v=$id"
+                    url = "https://m.youtube.com/watch?v=$id",
+                    extra = if (live) "live" else ""
                 )
             )
         }
@@ -183,13 +188,8 @@ object YouTubeSearch {
             )
         }
 
-        // категория: в «Все» показываем сначала видео, потом плейлисты и каналы
-        val merged = when (category) {
-            "🎞 Плейлисты" -> playlists.ifEmpty { items.filter { it.kind == KIND_PLAYLIST } }
-            "📺 Каналы" -> items.filter { it.kind == KIND_CHANNEL }
-            "🔴 Трансляции", "▶ Прямые эфиры" -> items.filter { it.kind == KIND_VIDEO }
-            else -> items + playlists
-        }
+        // v4.52.0: категория — локальный фильтр, а не параметр запроса
+        val merged = items + playlists
         val filtered = applyDuration(merged, duration)
         val sorted = applySort(filtered, sort)
 

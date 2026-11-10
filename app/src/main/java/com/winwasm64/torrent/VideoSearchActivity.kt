@@ -10,7 +10,6 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -30,18 +29,15 @@ import java.net.URL
 import java.util.Collections
 
 /**
- * v4.51.0: «Видео» переписана под ту же схему, что «Файлы» и «Торренты».
+ * v4.52.0: «Видео» — один поиск, все категории сразу, переключение мгновенное.
  *
- * Что было сломано в 4.50.0 и что сделано:
- *  • выбор «VK Видео» всё равно искал в YouTube — строка «VK Видео» не совпадала с «VK» в when;
- *    теперь источник нормализуется и РЕАЛЬНО используется при загрузке;
- *  • «⬇ Скачать» была заглушкой — теперь это внутренний аналог кнопки «Скачать видео» из браузера:
- *    ролик открывается в скрытом WebView, перехватывается поток videoplayback (itag=18, 360p —
- *    минимальное склеенное качество) и уходит в «Загрузки» приложения;
- *  • «прокрутка не работает» — поиск YouTube идёт через JSON-интерфейс с токеном продолжения,
- *    поэтому список пополняется бесконечно, без скролла невидимой страницы;
- *  • не было плейлистов и каналов — теперь есть категории «Видео / Плейлисты / Каналы / Трансляции»,
- *    сортировка (новые, популярные, старые) и фильтр по длительности — как фильтры в других вкладках.
+ * Изменения по сравнению с 4.51.0:
+ *  • категория больше не уходит в запрос — один ответ приносит видео, плейлисты, каналы и эфиры,
+ *    а переключение категорий/сортировки/длительности фильтрует УЖЕ СОБРАННОЕ (без сети);
+ *  • на каждом чипе категории видно количество найденного («🎬 Видео 34»);
+ *  • список сам дозагружается токеном продолжения, пока в выбранной категории не наберётся достаточно;
+ *  • «⬇ Скачать» умеет не только YouTube: у VK/RuTube перехватывается прямой mp4 из плеера
+ *    (эти площадки отдают его и без входа), а если поток только HLS — честно отправляем в браузер.
  */
 class VideoSearchActivity : Activity() {
 
@@ -49,9 +45,14 @@ class VideoSearchActivity : Activity() {
     private var channelName = ""
     private var channelQuery = ""
     private var source = "YouTube"
+
     private var category = "Все"
     private var sortMode = 0
     private var duration = "Любая"
+
+    private val allItems = mutableListOf<YouTubeSearch.Item>()
+    private var continuation: String? = null
+    private var loading = false
 
     private lateinit var status: TextView
     private lateinit var captureStatus: TextView
@@ -61,10 +62,9 @@ class VideoSearchActivity : Activity() {
     private lateinit var player: WebView
     private lateinit var scrapeWeb: WebView
     private lateinit var captureWeb: WebView
+    private lateinit var catRow: LinearLayout
+    private lateinit var sortRow: LinearLayout
 
-    private val ytItems = mutableListOf<YouTubeSearch.Item>()
-    private var continuation: String? = null
-    private var loading = false
     private val thumbCache = HashMap<String, Bitmap?>()
     private val grabbed = Collections.synchronizedMap(LinkedHashMap<String, String>())
     private var grabSession = 0
@@ -89,72 +89,42 @@ class VideoSearchActivity : Activity() {
             setPadding(12, 12, 12, 2)
         })
         root.addView(TextView(this).apply {
-            text = "«${query.ifBlank { "—" }}»" +
-                if (channelName.isNotBlank()) " · только этот канал" else ""
+            text = "«${query.ifBlank { "—" }}»" + if (channelName.isNotBlank()) " · только этот канал" else ""
             setTextColor(Color.parseColor("#9AA0A6"))
             textSize = 11f
-            setPadding(12, 0, 12, 6)
+            setPadding(12, 0, 12, 4)
         })
 
-        // площадки — реальный выбор, а не декорация
-        val sourceRow = HorizontalScrollView(this)
-        val sourceInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        listOf("YouTube", "RuTube", "VK", "Ссылка").forEach { name ->
-            sourceInner.addView(chip(name, source == name) {
+        // площадки
+        val srcScroll = HorizontalScrollView(this)
+        val srcRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("YouTube", "RuTube", "VK").forEach { name ->
+            srcRow.addView(chip(name, source == name) {
                 source = name
-                if (name == "Ссылка") {
-                    if (query.startsWith("http")) playInline(query) else toast("Вставьте ссылку в поле поиска")
-                } else {
-                    reload()
-                }
-                recreateChips()
+                reload()
             })
         }
-        sourceRow.addView(sourceInner)
-        root.addView(sourceRow)
-        sourceChipsHolder = sourceInner
+        srcScroll.addView(srcRow)
+        root.addView(srcScroll)
 
-        // категории
-        val catRow = HorizontalScrollView(this)
-        val catInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        listOf("Все", "🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции").forEach { name ->
-            catInner.addView(chip(name, category == name) {
-                category = name
-                reload()
-                recreateCategoryChips()
-            })
-        }
-        catRow.addView(catInner)
-        root.addView(catRow)
-        categoryChipsHolder = catInner
+        // категории (со счётчиками)
+        val catScroll = HorizontalScrollView(this)
+        catRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        catScroll.addView(catRow)
+        root.addView(catScroll)
 
-        // сортировка + длительность
-        val sortRow = HorizontalScrollView(this)
-        val sortInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        listOf("По релевантности", "Новые", "Популярные", "Старые").forEachIndexed { idx, label ->
-            sortInner.addView(chip(label, sortMode == idx) {
-                sortMode = idx
-                reload()
-                recreateSortChips()
-            })
-        }
-        listOf("Любая", "До 4 мин", "4–20 мин", "20+ мин").forEach { label ->
-            sortInner.addView(chip(label, duration == label) {
-                duration = label
-                reload()
-                recreateSortChips()
-            })
-        }
-        sortRow.addView(sortInner)
-        root.addView(sortRow)
-        sortChipsHolder = sortInner
+        // сортировка и длительность
+        val sortScroll = HorizontalScrollView(this)
+        sortRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        sortScroll.addView(sortRow)
+        root.addView(sortScroll)
 
         status = TextView(this).apply {
             text = "Ищу…"
             setTextColor(Color.parseColor("#FFC107"))
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(12, 6, 12, 4)
+            setPadding(12, 6, 12, 2)
         }
         root.addView(status)
 
@@ -166,7 +136,7 @@ class VideoSearchActivity : Activity() {
         }
         root.addView(captureStatus)
 
-        // встроенный плеер
+        // плеер
         playerBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -191,13 +161,14 @@ class VideoSearchActivity : Activity() {
         })
         root.addView(playerBox)
 
-        // служебные WebView: скрапинг RuTube/VK и перехват потока при скачивании
+        // служебные WebView
         scrapeWeb = newWeb().apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
             visibility = View.GONE
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     view?.postDelayed({ scrapePage() }, 1200)
+                    view?.postDelayed({ scrapePage() }, 3200)
                 }
             }
         }
@@ -214,7 +185,11 @@ class VideoSearchActivity : Activity() {
                     val u = request?.url?.toString().orEmpty()
                     if (u.contains("googlevideo.com") && u.contains("videoplayback")) {
                         val itag = Regex("[?&]itag=(\\d+)").find(u)?.groupValues?.get(1).orEmpty()
-                        grabbed[itag.ifBlank { "other" }] = u
+                        grabbed["yt" + itag.ifBlank { "x" }] = u
+                    } else if (u.contains(".mp4", true) && !u.startsWith("data:")) {
+                        grabbed["mp4"] = u
+                    } else if (u.contains(".m3u8", true)) {
+                        grabbed["hls"] = u
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
@@ -240,6 +215,7 @@ class VideoSearchActivity : Activity() {
         })
 
         setContentView(root)
+        rebuildChips()
 
         if (query.startsWith("http")) {
             playInline(query)
@@ -249,51 +225,68 @@ class VideoSearchActivity : Activity() {
         }
     }
 
-    /* ===================== чипы ===================== */
+    /* ===================== чипы и локальная фильтрация ===================== */
 
-    private var sourceChipsHolder: LinearLayout? = null
-    private var categoryChipsHolder: LinearLayout? = null
-    private var sortChipsHolder: LinearLayout? = null
+    private fun normalizeSource(raw: String): String = when {
+        raw.contains("VK", true) -> "VK"
+        raw.contains("RuTube", true) -> "RuTube"
+        else -> "YouTube"
+    }
 
-    private fun recreateChips() {
-        val holder = sourceChipsHolder ?: return
-        holder.removeAllViews()
-        listOf("YouTube", "RuTube", "VK", "Ссылка").forEach { name ->
-            holder.addView(chip(name, source == name) {
-                source = name
-                if (name != "Ссылка") reload()
-                recreateChips()
-            })
+    /** Пункты выбранной категории — из уже собранного. */
+    private fun filtered(): List<YouTubeSearch.Item> {
+        val base = when (category) {
+            "🎬 Видео" -> allItems.filter { it.kind == YouTubeSearch.KIND_VIDEO && it.extra != "live" }
+            "🎞 Плейлисты" -> allItems.filter { it.kind == YouTubeSearch.KIND_PLAYLIST }
+            "📺 Каналы" -> allItems.filter { it.kind == YouTubeSearch.KIND_CHANNEL }
+            "🔴 Трансляции" -> allItems.filter { it.extra == "live" }
+            else -> allItems
+        }
+        val byDuration = when (duration) {
+            "До 4 мин" -> base.filter { it.kind != YouTubeSearch.KIND_VIDEO || it.lengthSec in 1..240 }
+            "4–20 мин" -> base.filter { it.kind != YouTubeSearch.KIND_VIDEO || it.lengthSec in 241..1200 }
+            "20+ мин" -> base.filter { it.kind != YouTubeSearch.KIND_VIDEO || it.lengthSec > 1200 }
+            else -> base
+        }
+        return when (sortMode) {
+            1 -> byDuration.sortedBy { it.daysAgo }
+            2 -> byDuration.sortedByDescending { it.views }
+            3 -> byDuration.sortedByDescending { it.daysAgo }
+            else -> byDuration
         }
     }
 
-    private fun recreateCategoryChips() {
-        val holder = categoryChipsHolder ?: return
-        holder.removeAllViews()
-        listOf("Все", "🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции").forEach { name ->
-            holder.addView(chip(name, category == name) {
+    private fun rebuildChips() {
+        catRow.removeAllViews()
+        val categories = listOf("Все", "🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции")
+        for (name in categories) {
+            val count = when (name) {
+                "Все" -> allItems.size
+                "🎬 Видео" -> allItems.count { it.kind == YouTubeSearch.KIND_VIDEO && it.extra != "live" }
+                "🎞 Плейлисты" -> allItems.count { it.kind == YouTubeSearch.KIND_PLAYLIST }
+                "📺 Каналы" -> allItems.count { it.kind == YouTubeSearch.KIND_CHANNEL }
+                else -> allItems.count { it.extra == "live" }
+            }
+            catRow.addView(chip("$name" + if (count > 0) " $count" else "", category == name) {
                 category = name
-                reload()
-                recreateCategoryChips()
+                rebuildChips()
+                renderList()   // без сети — данные уже есть
             })
         }
-    }
 
-    private fun recreateSortChips() {
-        val holder = sortChipsHolder ?: return
-        holder.removeAllViews()
+        sortRow.removeAllViews()
         listOf("По релевантности", "Новые", "Популярные", "Старые").forEachIndexed { idx, label ->
-            holder.addView(chip(label, sortMode == idx) {
+            sortRow.addView(chip(label, sortMode == idx) {
                 sortMode = idx
-                reload()
-                recreateSortChips()
+                rebuildChips()
+                renderList()
             })
         }
         listOf("Любая", "До 4 мин", "4–20 мин", "20+ мин").forEach { label ->
-            holder.addView(chip(label, duration == label) {
+            sortRow.addView(chip(label, duration == label) {
                 duration = label
-                reload()
-                recreateSortChips()
+                rebuildChips()
+                renderList()
             })
         }
     }
@@ -304,31 +297,21 @@ class VideoSearchActivity : Activity() {
             textSize = 10f
             setPadding(dp(8), 0, dp(8), 0)
             setTextColor(if (selected) Color.WHITE else Color.parseColor("#C7CBD1"))
-            setBackgroundColor(
-                Color.parseColor(if (selected) "#2B4A8B" else "#1E2026")
-            )
+            setBackgroundColor(Color.parseColor(if (selected) "#2B4A8B" else "#1E2026"))
             setOnClickListener { action() }
         }
 
-    /* ===================== загрузка ===================== */
-
-    private fun normalizeSource(raw: String): String = when {
-        raw.contains("VK", true) -> "VK"
-        raw.contains("RuTube", true) || raw.contains("Рутуб", true) -> "RuTube"
-        raw.contains("Dailymotion", true) -> "YouTube"
-        raw.isBlank() || raw == "Все" -> "YouTube"
-        else -> "YouTube"
-    }
+    /* ===================== загрузка данных ===================== */
 
     private fun reload() {
-        ytItems.clear()
+        allItems.clear()
         continuation = null
-        resultsBox.removeAllViews()
         loading = false
+        resultsBox.removeAllViews()
+        rebuildChips()
         if (source == "YouTube") {
             loadMore(manual = true)
         } else {
-            // RuTube и VK открытого поиска без ключа не имеют — берём их выдачу через WebView
             val term = VideoChannels.scopedQuery(
                 query,
                 VideoChannels.Channel(channelName.ifBlank { "все" }, channelQuery.ifBlank { channelName })
@@ -353,30 +336,42 @@ class VideoSearchActivity : Activity() {
         if (loading) return
         if (!manual && continuation == null) return
         loading = true
-        status.text = if (ytItems.isEmpty()) "Ищу на YouTube…" else "Догружаю ещё…"
+        status.text = if (allItems.isEmpty()) "Ищу на YouTube…" else "Догружаю…"
         val term = if (channelName.isBlank()) query else "$query $channelQuery".trim()
         val next = continuation
         Thread({
             val page = try {
-                YouTubeSearch.search(term, category, sortMode, duration, next)
+                YouTubeSearch.search(term, "Все", 0, "Любая", next)
             } catch (_: Throwable) {
                 YouTubeSearch.Page(emptyList(), null)
             }
             runOnUiThread {
                 loading = false
                 continuation = page.continuation
-                if (page.items.isEmpty() && ytItems.isEmpty()) {
-                    status.text = "Ничего не нашлось по «$term» (категория: $category)"
-                } else {
-                    val before = ytItems.size
-                    ytItems.addAll(page.items.filter { new -> ytItems.none { it.id == new.id && it.kind == new.kind } })
-                    for (i in before until ytItems.size) addRow(ytItems[i])
-                    status.text = "Найдено: ${ytItems.size} · $category" +
-                        (if (duration != "Любая") " · $duration" else "") +
-                        (if (continuation == null) " · это всё" else " · листайте дальше")
-                }
+                allItems.addAll(page.items.filter { new -> allItems.none { it.id == new.id && it.kind == new.kind } })
+                rebuildChips()
+                renderList()
+                status.text = "Найдено: ${allItems.size} · $category" +
+                    (if (duration != "Любая") " · $duration" else "") +
+                    (if (continuation == null) " · это всё" else " · листайте — догружу")
+                // добираем автоматически, если в выбранной категории пока пусто
+                if (filtered().isEmpty() && continuation != null) loadMore()
             }
         }, "YTSearch").also { it.isDaemon = true; it.start() }
+    }
+
+    private fun renderList() {
+        resultsBox.removeAllViews()
+        val items = filtered()
+        if (items.isEmpty()) {
+            status.text = if (allItems.isEmpty()) "Ничего не нашлось по «$query»"
+            else "В категории «$category» пусто — переключитесь на «Все»"
+            return
+        }
+        for (item in items) addRow(item)
+        status.text = "Показано: ${items.size} · $category" +
+            (if (duration != "Любая") " · $duration" else "") +
+            (if (continuation != null) " · есть ещё" else "")
     }
 
     /* ===================== скрапинг RuTube / VK ===================== */
@@ -384,8 +379,8 @@ class VideoSearchActivity : Activity() {
     private fun scrapePage() {
         val js = """
             (function() {
-              function clean(t){ if(!t) return ''; return t.replace(/\s+/g,' ').trim(); }
-              var out=[]; var nodes=document.querySelectorAll('a[href]');
+              function clean(t){ return t ? t.replace(/\s+/g,' ').trim() : ''; }
+              var out=[], nodes=document.querySelectorAll('a[href]');
               for (var i=0;i<nodes.length;i++){
                 var a=nodes[i], h=a.href||'';
                 if(!/(rutube\.ru\/video\/|vk\.com\/video|vkvideo\.ru)/i.test(h)) continue;
@@ -396,12 +391,14 @@ class VideoSearchActivity : Activity() {
                   if(h2) t=clean(h2.innerText||h2.getAttribute('aria-label'));
                 }
                 if(!t || t.length<4) continue;
+                var ttl = clean(a.getAttribute('title')||'');
+                if (ttl.length > t.length) t = ttl;
                 var src=/rutube/i.test(h)?'RuTube':'VK';
                 out.push(src+'|'+t.replace(/\|/g,' ')+'|'+h);
               }
               var seen={},res=[];
               for(var j=0;j<out.length;j++){var k=out[j];if(seen[k])continue;seen[k]=1;res.push(k);}
-              return res.slice(0,80).join('\n');
+              return res.slice(0,150).join('\n');
             })();
         """.trimIndent()
         scrapeWeb.evaluateJavascript(js) { raw ->
@@ -412,18 +409,13 @@ class VideoSearchActivity : Activity() {
                 status.text = "На $source ничего не нашлось — попробуйте другой запрос"
                 return@evaluateJavascript
             }
-            resultsBox.removeAllViews()
-            ytItems.clear()
             for (line in lines) {
                 val parts = line.split('|')
-                val src = parts[0]
-                val title = parts[1]
-                val url = parts[2]
                 val item = YouTubeSearch.Item(
-                    id = url.substringAfterLast('/').trimEnd('/'),
+                    id = parts[2].substringAfterLast('/').trimEnd('/'),
                     kind = YouTubeSearch.KIND_VIDEO,
-                    title = title,
-                    author = src,
+                    title = parts[1],
+                    author = parts[0],
                     lengthText = "",
                     lengthSec = 0,
                     views = 0,
@@ -431,12 +423,12 @@ class VideoSearchActivity : Activity() {
                     publishedText = "",
                     daysAgo = 9999,
                     thumb = "",
-                    url = url
+                    url = parts[2]
                 )
-                ytItems.add(item)
-                addRow(item)
+                if (allItems.none { it.id == item.id }) allItems.add(item)
             }
-            status.text = "Найдено: ${ytItems.size} · $source"
+            rebuildChips()
+            renderList()
         }
     }
 
@@ -473,7 +465,7 @@ class VideoSearchActivity : Activity() {
             text = when (item.kind) {
                 YouTubeSearch.KIND_PLAYLIST -> "🎞 " + item.title
                 YouTubeSearch.KIND_CHANNEL -> "📺 " + item.title
-                else -> item.title
+                else -> if (item.extra == "live") "🔴 " + item.title else item.title
             }
             setTextColor(Color.WHITE)
             textSize = 12f
@@ -484,8 +476,7 @@ class VideoSearchActivity : Activity() {
             item.author.takeIf { it.isNotBlank() && it != "плейлист" && it != "канал" },
             item.lengthText.takeIf { it.isNotBlank() },
             item.viewsText.takeIf { it.isNotBlank() },
-            item.publishedText.takeIf { it.isNotBlank() },
-            item.viewsText.takeIf { item.kind != YouTubeSearch.KIND_VIDEO && it.isNotBlank() }
+            item.publishedText.takeIf { it.isNotBlank() }
         ).distinct().joinToString(" · ")
         if (meta.isNotBlank()) {
             col.addView(TextView(this).apply {
@@ -502,7 +493,7 @@ class VideoSearchActivity : Activity() {
         }
         when (item.kind) {
             YouTubeSearch.KIND_PLAYLIST -> {
-                buttons.addView(small("▶ Открыть плейлист") { playInline(item.url) })
+                buttons.addView(small("▶ Плейлист") { playInline(item.url) })
                 buttons.addView(small("🌐 Открыть") { openExternal(item.url) })
                 buttons.addView(small("📋 Ссылка") { copy(item.url) })
             }
@@ -520,14 +511,13 @@ class VideoSearchActivity : Activity() {
             }
             else -> {
                 buttons.addView(small("▶ Смотреть") { playInline(item.url) })
+                buttons.addView(small("⬇ Скачать") { startCapture(item) })
                 buttons.addView(small("🌐 Открыть") { openExternal(item.url) })
-                buttons.addView(small("⬇ Скачать 360p") { startCapture(item) })
                 buttons.addView(small("📋 Ссылка") { copy(item.url) })
             }
         }
         col.addView(buttons)
         row.addView(col)
-
         resultsBox.addView(row)
         resultsBox.addView(View(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
@@ -558,51 +548,49 @@ class VideoSearchActivity : Activity() {
     }
 
     /**
-     * Скачивание видео внутри приложения (аналог кнопки «Скачать видео» в браузере).
-     *
-     * Загружаем страницу ролика в скрытый WebView и перехватываем реальный поток videoplayback.
-     * Минимальное склеенное качество — itag=18 (360p mp4 со звуком); если YouTube его не отдал,
-     * берём самый лёгкий mp4, который удалось поймать.
+     * Скачивание внутри приложения. Для YouTube берём itag=18 (360p mp4 со звуком), для VK/RuTube —
+     * прямой mp4, который отдаёт их же плеер (эти площадки не требуют входа для просмотра).
+     * HLS (m3u8) скачать одним файлом нельзя — в этом случае честно открываем браузер приложения.
      */
     private fun startCapture(item: YouTubeSearch.Item) {
-        if (!item.url.contains("youtube", true)) {
-            // RuTube/VK: прямой поток отдаётся только после входа, честно отправляем в браузер приложения
-            toast("У этой площадки поток только через браузер приложения — открываю")
-            try {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.url)).setPackage(packageName))
-            } catch (_: Throwable) {
-            }
-            return
-        }
         grabSession++
         val session = grabSession
         grabbed.clear()
-        captureStatus.text = "⏳ Ищу поток 360p для «${item.title.take(30)}»…"
-        captureWeb.loadUrl("https://m.youtube.com/watch?v=${item.id}&hl=ru")
+        captureStatus.text = "⏳ Ищу поток для «${item.title.take(28)}»…"
+        captureWeb.loadUrl(item.url)
         captureWeb.postDelayed({
             captureWeb.evaluateJavascript(
                 "(function(){var v=document.querySelector('video');if(v){v.muted=true;v.play();}return 'ok';})();",
                 null
             )
-        }, 1500)
-        captureWeb.postDelayed({ finishCapture(session, item) }, 9_000)
+        }, 1800)
+        captureWeb.postDelayed({ finishCapture(session, item) }, 10_000)
     }
 
     private fun finishCapture(session: Int, item: YouTubeSearch.Item) {
         if (session != grabSession) return
         val candidates = synchronized(grabbed) { grabbed.toMap() }
-        if (candidates.isEmpty()) {
-            captureStatus.text = "❌ Не удалось поймать поток — откройте ролик в браузере приложения и нажмите ⬇ «Скачать видео»"
+        val url = candidates["yt18"]
+            ?: candidates["mp4"]
+            ?: candidates.entries.firstOrNull { it.key.startsWith("yt") }?.value
+        if (url.isNullOrBlank()) {
+            captureStatus.text = if (candidates["hls"] != null) {
+                "ℹ Поток только HLS (m3u8) — открываю страницу в браузере приложения, там кнопка ⬇"
+            } else {
+                "❌ Поток не поймался — откройте ролик в браузере приложения и нажмите ⬇ «Скачать видео»"
+            }
             captureWeb.loadUrl("about:blank")
+            if (candidates["hls"] != null) {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(item.url)).setPackage(packageName))
+                } catch (_: Throwable) {
+                }
+            }
             return
         }
-        // itag 18 — 360p mp4 (видео+звук). Иначе — самый лёгкий из пойманных.
-        val url = candidates["18"]
-            ?: candidates.entries.sortedBy { it.key.toIntOrNull() ?: 999 }.first().value
-        val safeName = item.title.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(70)
-            .ifBlank { item.id } + ".mp4"
+        val safeName = item.title.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(70).ifBlank { item.id } + ".mp4"
         val cookie = try {
-            CookieManager.getInstance().getCookie("https://www.youtube.com")
+            CookieManager.getInstance().getCookie(item.url)
         } catch (_: Throwable) {
             null
         }
@@ -613,14 +601,14 @@ class VideoSearchActivity : Activity() {
             mimeType = "video/mp4",
             userAgent = DESKTOP_UA,
             cookie = cookie,
-            referer = "https://www.youtube.com/watch?v=${item.id}"
+            referer = item.url
         )
         captureStatus.text = if (id != null) {
-            "⬇ 360p → Загрузки/${AppDownloads.SUBDIR}/$safeName (видно во вкладке «Загрузки»)"
+            "⬇ → Загрузки/${AppDownloads.SUBDIR}/$safeName (видно во вкладке «Загрузки»)"
         } else {
             "❌ Не удалось поставить загрузку"
         }
-        if (id != null) toast("Качаю 360p: $safeName")
+        if (id != null) toast("Качаю: $safeName")
         captureWeb.loadUrl("about:blank")
     }
 
@@ -633,7 +621,6 @@ class VideoSearchActivity : Activity() {
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
         settings.userAgentString = MOBILE_UA
-        // у пользователя выполнен вход в YouTube — сохраняем cookies между запусками
         CookieManager.getInstance().setAcceptCookie(true)
     }
 
