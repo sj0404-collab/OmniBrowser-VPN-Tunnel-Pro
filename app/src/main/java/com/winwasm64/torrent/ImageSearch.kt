@@ -90,6 +90,68 @@ object ImageSearch {
         return filtered.take(60)
     }
 
+    /* ===================== Википедия (русские названия) ===================== */
+
+    /**
+     * v4.50.0: главная причина, почему «Фото» работало только на «Все фото». В iTunes у фильтров
+     * `movie`/`tvSeason` для русских названий НОЛЬ результатов (Apple не продаёт фильмы в RU-сторе),
+     * а Commons по «шрек film poster» тоже пусто. Здесь поиск статьи по-русски → картинка статьи
+     * (постер фильма, обложка игры/книги/альбома/манги).
+     */
+    private fun wikiSuffix(filter: String): String = when (filter) {
+        "Обложки игр" -> "игра"
+        "Постеры фильмов" -> "фильм"
+        "Обложки книг" -> "книга"
+        "Кадры из видео" -> "телесериал"
+        "Альбомы музыки" -> "альбом"
+        else -> ""
+    }
+
+    private fun wikipedia(query: String, filter: String, page: Int): List<GalleryImage> {
+        val suffix = wikiSuffix(filter)
+        val term = if (suffix.isBlank()) query else "$query $suffix"
+        val q = URLEncoder.encode(term, "UTF-8")
+        val searchUrl = "https://ru.wikipedia.org/w/api.php?action=query&list=search" +
+            "&srsearch=$q&srlimit=8&sroffset=${page * 8}&format=json&utf8=1"
+        val body = httpGet(searchUrl) ?: return emptyList()
+        val titles = mutableListOf<String>()
+        try {
+            val arr = JSONObject(body).optJSONObject("query")?.optJSONArray("search") ?: return emptyList()
+            for (i in 0 until arr.length()) {
+                val t = arr.getJSONObject(i).optString("title")
+                if (t.isNotBlank()) titles.add(t)
+            }
+        } catch (_: Throwable) {
+            return emptyList()
+        }
+        if (titles.isEmpty()) return emptyList()
+        val out = java.util.Collections.synchronizedList(mutableListOf<GalleryImage>())
+        val threads = titles.take(6).map { title ->
+            Thread({
+                try {
+                    val u = "https://ru.wikipedia.org/api/rest_v1/page/summary/" + URLEncoder.encode(title, "UTF-8")
+                    val b = httpGet(u) ?: return@Thread
+                    val obj = JSONObject(b)
+                    val image = obj.optJSONObject("originalimage")?.optString("source").orEmpty()
+                        .ifBlank { obj.optJSONObject("thumbnail")?.optString("source").orEmpty() }
+                    if (image.isBlank()) return@Thread
+                    val cleanUrl = image.substringBefore("?utm_source")
+                    out.add(
+                        GalleryImage(
+                            url = cleanUrl,
+                            title = TorrentSearchAgent.decodeEntities(obj.optString("title").ifBlank { title }),
+                            source = "Википедия · " + (if (suffix.isBlank()) "статья" else suffix),
+                            pageUrl = "https://ru.wikipedia.org/wiki/" + URLEncoder.encode(title, "UTF-8")
+                        )
+                    )
+                } catch (_: Throwable) {
+                }
+            }, "WikiImg").also { it.isDaemon = true; it.start() }
+        }
+        threads.forEach { it.join(9_000) }
+        return out.toList()
+    }
+
     /* ===================== iTunes (обложки и постеры) ===================== */
 
     private fun entityFor(filter: String): List<String> = when (filter) {
