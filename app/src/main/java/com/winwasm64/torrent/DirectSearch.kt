@@ -72,7 +72,8 @@ object DirectSearch {
             val items = mutableListOf<Triple<String, String, String>>() // id, title, mediatype
             for (i in 0 until docs.length()) {
                 val d = docs.getJSONObject(i)
-                val id = d.optString("identifier").ifBlank { continue }
+                val id = d.optString("identifier")
+                if (id.isBlank()) continue
                 items.add(Triple(id, d.optString("title", id), d.optString("mediatype", "")))
             }
             // файлы и форматы забираем параллельно — иначе 24 записи ждут друг друга
@@ -105,7 +106,8 @@ object DirectSearch {
         var biggest = -1L
         for (i in 0 until files.length()) {
             val f = files.getJSONObject(i)
-            val name = f.optString("name").ifBlank { continue }
+            val name = f.optString("name")
+            if (name.isBlank()) continue
             val ext = name.substringAfterLast('.', "").lowercase()
             if (ext.isBlank() || ext in JUNK_EXT) continue
             val size = f.optString("size").toLongOrNull() ?: 0L
@@ -160,7 +162,8 @@ object DirectSearch {
             for (i in 0 until items.length()) {
                 if (out.size >= 8) break
                 val repo = items.getJSONObject(i)
-                val full = repo.optString("full_name").ifBlank { continue }
+                val full = repo.optString("full_name")
+                if (full.isBlank()) continue
                 val desc = repo.optString("description", "")
                 val stars = repo.optInt("stargazers_count", 0)
                 val avatar = repo.optJSONObject("owner")?.optString("avatar_url", "").orEmpty()
@@ -174,8 +177,9 @@ object DirectSearch {
                 for (a in 0 until assets.length()) {
                     if (out.size >= 8) break
                     val asset = assets.getJSONObject(a)
-                    val name = asset.optString("name").ifBlank { continue }
-                    val url = asset.optString("browser_download_url").ifBlank { continue }
+                    val name = asset.optString("name")
+                    val url = asset.optString("browser_download_url")
+                    if (name.isBlank() || url.isBlank()) continue
                     val size = asset.optLong("size", 0L)
                     out.add(
                         DirectFile(
