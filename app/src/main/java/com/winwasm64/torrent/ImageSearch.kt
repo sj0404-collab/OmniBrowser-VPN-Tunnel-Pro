@@ -72,7 +72,10 @@ object ImageSearch {
         if (clean.isBlank()) return emptyList()
         val out = mutableListOf<GalleryImage>()
         val variants = listOf(clean) + aliasesFor(clean)
-        // Википедия идёт первой: она единственная нормально ищет по-русски
+        // v4.55.0: Яндекс идёт первым — у него исходники (origUrl), а не превью 100×100,
+        // и он нормально ищет по-русски («манга страж» находит обложки, а не чужие фото)
+        out.addAll(YandexImages.search(clean, page))
+        if (filter != "Фото") out.addAll(YandexImages.search("$clean " + wikiSuffix(filter), page))
         out.addAll(wikipedia(clean, filter, page))
         for (v in variants) {
             out.addAll(itunes(v, filter, page))

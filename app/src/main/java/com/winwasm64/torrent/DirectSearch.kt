@@ -91,7 +91,9 @@ object DirectSearch {
         sort: Int = 0,
         page: Int = 0,
         timeoutMs: Int = 12_000,
-        depth: Int = 3
+        depth: Int = 3,
+        aiVariants: List<String> = emptyList(),
+        onChip: ((String, List<DirectFile>) -> Unit)? = null
     ): Buckets {
         val clean = query.trim()
         if (clean.isBlank()) return Buckets(emptyList(), emptyMap(), emptyMap())
@@ -100,9 +102,15 @@ object DirectSearch {
         val threads = CHIPS.map { chip ->
             Thread({
                 try {
-                    val files = searchChip(clean, chip, page, sort, timeoutMs, depth)
-                    byChip[chip] = rank(files, clean, sort)
+                    val files = searchChip(clean, chip, page, sort, timeoutMs, depth, aiVariants)
+                    val rankedChip = rank(files, clean, sort)
+                    byChip[chip] = rankedChip
                     more[chip] = files.size >= ROWS_PER_CHIP
+                    // v4.55.0: категорию отдаём сразу, как только она ответила — не ждём остальные
+                    try {
+                        onChip?.invoke(chip, rankedChip)
+                    } catch (_: Throwable) {
+                    }
                 } catch (_: Throwable) {
                     byChip[chip] = emptyList()
                     more[chip] = false
@@ -121,11 +129,12 @@ object DirectSearch {
         page: Int = 0,
         sort: Int = 0,
         timeoutMs: Int = 12_000,
-        depth: Int = 3
+        depth: Int = 3,
+        aiVariants: List<String> = emptyList()
     ): List<DirectFile> {
         // v4.53.0: ищем не одну словоформу, а упоминания («винт» → «гребной винт», winter и т. п.).
         // v4.54.0: сколько именно вариантов — задаёт человек («глубина поиска»).
-        val variants = QueryExpander.variants(query, depth.coerceIn(1, 6))
+        val variants = QueryExpander.variants(query, depth.coerceIn(1, 6), aiVariants)
         val raw = mutableListOf<DirectFile>()
         variants.forEachIndexed { idx, v ->
             val term = if (chip == "📖 Манга") "$v comic" else v

@@ -3744,10 +3744,24 @@ private fun TorrentClientSection(
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        torrentEngine.searchPublicTorrents(query, searchDepth) { res ->
+        val aiExtra = com.winwasm64.torrent.AiCurator.expand(context, query, 2)
+        torrentEngine.searchPublicTorrents(query, searchDepth, aiExtra) { res ->
             mainHandler.post {
                 catalogItems = res
                 isSearching = false
+            }
+            // v4.55.0: ИИ-куратор отбраковывает явно не то (если включён)
+            if (res.isNotEmpty() && com.winwasm64.torrent.AiCurator.isEnabled(context)) {
+                Thread({
+                    val keep = com.winwasm64.torrent.AiCurator.keepIndices(
+                        context, query, res.map { it.title }, 30
+                    )
+                    if (keep != null) {
+                        mainHandler.post {
+                            catalogItems = res.filterIndexed { idx, _ -> idx in keep || idx >= 30 }
+                        }
+                    }
+                }, "AiFilter").also { it.isDaemon = true; it.start() }
             }
         }
     }
@@ -4374,10 +4388,18 @@ private fun HistoryAndDownloadsSection(
     // v4.49.0: живые загрузки приложения (DownloadManager) и торрент-сессии — с прогрессом
     var systemDownloads by remember { mutableStateOf<List<com.winwasm64.torrent.AppDownloads.Item>>(emptyList()) }
     var downloadTick by remember { mutableIntStateOf(0) }
+    var ownDownloads by remember { mutableStateOf<List<com.winwasm64.torrent.StreamDownloader.Item>>(emptyList()) }
     LaunchedEffect(subTab) {
         while (subTab == 0) {
             systemDownloads = try {
                 com.winwasm64.torrent.AppDownloads.list(context)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            // v4.55.0: собственный загрузчик (видео с YouTube/VK/RuTube)
+            ownDownloads = try {
+                val live = com.winwasm64.torrent.StreamDownloader.snapshot()
+                live.ifEmpty { com.winwasm64.torrent.StreamDownloader.history(context) }
             } catch (_: Throwable) {
                 emptyList()
             }
@@ -4464,6 +4486,52 @@ private fun HistoryAndDownloadsSection(
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         Text("Доступ к памяти", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+            }
+
+            // v4.55.0: видео, скачанное своим загрузчиком (с проверкой размера)
+            if (ownDownloads.isNotEmpty()) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.AccentContainer)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "Скачано приложением (${ownDownloads.size})",
+                            color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                        for (d in ownDownloads.take(10)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    d.name, color = Color.White, fontSize = 12.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    when (d.state) {
+                                        com.winwasm64.torrent.StreamDownloader.STATE_DONE ->
+                                            "✅ готово · ${fmtBytes(d.bytes)}"
+                                        com.winwasm64.torrent.StreamDownloader.STATE_ERROR ->
+                                            "❌ ${d.note}"
+                                        else -> "⏳ ${d.note} · ${d.progress}% · ${fmtBytes(d.bytes)}"
+                                    },
+                                    color = when (d.state) {
+                                        com.winwasm64.torrent.StreamDownloader.STATE_DONE -> Omni.Success
+                                        com.winwasm64.torrent.StreamDownloader.STATE_ERROR -> Omni.Danger
+                                        else -> Omni.Warning
+                                    },
+                                    fontSize = 11.sp
+                                )
+                                if (d.state == com.winwasm64.torrent.StreamDownloader.STATE_RUNNING && d.total > 0) {
+                                    androidx.compose.material3.LinearProgressIndicator(
+                                        progress = { d.progress / 100f },
+                                        modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+                                        color = Omni.Accent, trackColor = Omni.SurfaceHighest
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5768,6 +5836,16 @@ private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
                     },
                     color = Omni.TextDim, fontSize = 9.sp
                 )
+                // v4.55.0: ИИ-куратор (Pollinations) — придумывает варианты и отбраковывает мусор
+                val aiOn = com.winwasm64.torrent.AiCurator.isEnabled(context)
+                Text(
+                    "🤖 ИИ-куратор: " + if (aiOn) "ВКЛ" else "выкл",
+                    color = if (aiOn) Omni.Success else Omni.TextDim,
+                    fontSize = 9.sp,
+                    modifier = Modifier.clickable {
+                        com.winwasm64.torrent.AiCurator.setEnabled(context, !aiOn)
+                    }
+                )
             }
             Text("−", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable {
                 val next = (depth - 1).coerceAtLeast(com.winwasm64.torrent.SearchSettings.MIN)
@@ -5815,9 +5893,27 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
         sortMode = nextSort
         page = nextPage
         val prev = if (append) buckets else null
+        if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
+            // v4.55.0: асинхронно — что нашлось, то сразу и показываем
+            val aiExtra = com.winwasm64.torrent.AiCurator.expand(context, query, 2)
             val res = try {
-                com.winwasm64.torrent.DirectSearch.searchAll(query, nextSort, nextPage, depth = searchDepth)
+                com.winwasm64.torrent.DirectSearch.searchAll(
+                    query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra
+                ) { chip, files ->
+                    handler.post {
+                        val cur = buckets ?: com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
+                        val mergedChip = if (append) {
+                            ((cur.byChip[chip] ?: emptyList()) + files).distinctBy { it.downloadUrl }
+                        } else files
+                        val newChips = cur.byChip.toMutableMap().apply { put(chip, mergedChip) }
+                        buckets = com.winwasm64.torrent.DirectSearch.Buckets(
+                            all = newChips.values.flatten().distinctBy { it.downloadUrl },
+                            byChip = newChips,
+                            more = cur.more
+                        )
+                    }
+                }
             } catch (_: Throwable) {
                 com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
             }

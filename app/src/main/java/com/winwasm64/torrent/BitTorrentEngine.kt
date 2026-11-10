@@ -643,6 +643,7 @@ class BitTorrentEngine(private val context: Context? = null) {
     fun searchPublicTorrents(
         query: String,
         depth: Int = 3,
+        aiVariants: List<String> = emptyList(),
         onResults: (List<CatalogTorrentItem>) -> Unit
     ) {
         val cleanQuery = query.trim()
@@ -662,7 +663,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 // v4.53.0: ищем не только точную словоформу, но и упоминания/ассоциации
                 // (винт → «гребной винт», «воздушный винт», «винтер» → winter), как это делает галерея.
                 // Варианты обходятся ПАРАЛЛЕЛЬНО, поэтому общее время почти не растёт.
-                val variants = QueryExpander.variants(cleanQuery, depth.coerceIn(1, 6))
+                val variants = QueryExpander.variants(cleanQuery, depth.coerceIn(1, 6), aiVariants)
                 val found = java.util.Collections.synchronizedList(mutableListOf<TorrentSearchAgent.Found>())
                 val searchers = variants.map { variant ->
                     Thread({

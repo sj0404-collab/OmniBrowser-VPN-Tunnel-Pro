@@ -21,7 +21,7 @@ import java.net.URLEncoder
 object QueryExpander {
 
     /** Все варианты запроса: первый — сам запрос. */
-    fun variants(query: String, max: Int = 4): List<String> {
+    fun variants(query: String, max: Int = 4, extra: List<String> = emptyList()): List<String> {
         val clean = query.trim()
         if (clean.isBlank()) return emptyList()
         val out = mutableListOf(clean)
@@ -34,6 +34,8 @@ object QueryExpander {
         ImageSearch.aliasesFor(clean).forEach { add(it) }
         add(translit(clean))
         related(clean).forEach { add(it) }
+        // v4.55.0: варианты от ИИ-куратора (если он включён и ответил)
+        extra.forEach { add(it) }
         return out.take(max)
     }
 

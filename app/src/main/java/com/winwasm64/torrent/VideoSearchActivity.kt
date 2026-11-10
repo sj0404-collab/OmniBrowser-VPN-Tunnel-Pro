@@ -381,6 +381,20 @@ class VideoSearchActivity : Activity() {
                 allItems.addAll(page.items.filter { new -> allItems.none { it.id == new.id && it.kind == new.kind } })
                 rebuildChips()
                 renderList()
+                // v4.55.0: ИИ-куратор убирает из выдачи посторонние ролики (если включён)
+                if (AiCurator.isEnabled(this) && allItems.size > 6) {
+                    val snapshotTitles = allItems.map { it.title }
+                    Thread({
+                        val keep = AiCurator.keepIndices(this, query.ifBlank { channelName }, snapshotTitles, 30)
+                        if (keep != null) runOnUiThread {
+                            val kept = allItems.filterIndexed { idx, _ -> idx in keep || idx >= 30 }
+                            allItems.clear()
+                            allItems.addAll(kept)
+                            rebuildChips()
+                            renderList()
+                        }
+                    }, "AiVideoFilter").also { it.isDaemon = true; it.start() }
+                }
                 status.text = (if (variantIndex > 0) "Упоминания по «${extraTerms.getOrNull(variantIndex - 1).orEmpty()}» · " else "") +
                     "Найдено: ${allItems.size} · $category" +
                     (if (duration != "Любая") " · $duration" else "") +
@@ -659,21 +673,27 @@ class VideoSearchActivity : Activity() {
         } catch (_: Throwable) {
             null
         }
-        val id = AppDownloads.enqueue(
+        // v4.55.0: свой загрузчик вместо DownloadManager — он проверяет код ответа и размер.
+        // Раньше DownloadManager сохранял ответ об ошибке (31 байт) и рапортовал «готово».
+        captureStatus.text = "⬇ Качаю «${item.title.take(30)}» → Загрузки/${AppDownloads.SUBDIR}"
+        StreamDownloader.start(
             context = this,
             url = url,
             fileName = safeName,
-            mimeType = "video/mp4",
             userAgent = DESKTOP_UA,
             cookie = cookie,
-            referer = item.url
-        )
-        captureStatus.text = if (id != null) {
-            "⬇ → Загрузки/${AppDownloads.SUBDIR}/$safeName (видно во вкладке «Загрузки»)"
-        } else {
-            "❌ Не удалось поставить загрузку"
+            referer = item.url,
+            minBytes = 50 * 1024
+        ) { ok, note ->
+            runOnUiThread {
+                captureStatus.text = if (ok) {
+                    "✅ Готово: $safeName · $note"
+                } else {
+                    "❌ Не скачалось: $note (поток устарел — попробуйте ещё раз)"
+                }
+            }
         }
-        if (id != null) toast("Качаю: $safeName")
+        toast("Качаю: $safeName")
         captureWeb.loadUrl("about:blank")
     }
 
