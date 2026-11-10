@@ -1,23 +1,3 @@
-    private val queries: List<String> get() = listOf(
-        "$query torrent",
-        "$query скачать торрент",
-        "$query смотреть онлайн",
-        "\"$query\" site:rutracker.org",
-        "$query site:nnmclub.to",
-        "$query site:rutor.info",
-        "$query site:kinozal.tv",
-        "$query site:seasonvar.ru",
-        "$query site:anilibria.tv",
-        "$query site:anidub.com",
-        "$query site:yummyanime.tv",
-        "$query site:anistar.org",
-        "$query site:spaces.im",
-        "$query site:doramy.club",
-        "$query site:rutor-games.com",
-        "$query site:stoigr.org",
-        "$query site:kickasstorrents.to",
-        "$query site:archive.org"
-    )
 package com.winwasm64.torrent
 
 import android.app.Activity
@@ -66,13 +46,26 @@ class TorrentWebSearchActivity : Activity() {
     private var queryIndex = 0
     private var rounds = 0
     private var totalAdded = 0
+    /**
+     * v4.48.0: список запросов, по которым идём подряд. Сюда добавлены и трекеры, и онлайн-сайты:
+     * seasonvar, anilibria, anidub, yummyanime, anistar, spaces.im (и зеркала), doramy — для тех
+     * случаев, когда торрента нет вовсе, а посмотреть/скачать всё равно надо.
+     */
     private val queries: List<String> get() = listOf(
         "$query torrent",
         "$query скачать торрент",
+        "$query смотреть онлайн",
         "\"$query\" site:rutracker.org",
         "$query site:nnmclub.to",
         "$query site:rutor.info",
         "$query site:kinozal.tv",
+        "$query site:seasonvar.ru",
+        "$query site:anilibria.tv",
+        "$query site:anidub.com",
+        "$query site:yummyanime.tv",
+        "$query site:anistar.org",
+        "$query site:spaces.im",
+        "$query site:doramy.club",
         "$query site:rutor-games.com",
         "$query site:stoigr.org",
         "$query site:kickasstorrents.to",

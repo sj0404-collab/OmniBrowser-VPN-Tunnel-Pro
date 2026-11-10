@@ -101,7 +101,8 @@ object ImageSearch {
                 val results = JSONObject(body).optJSONArray("results") ?: continue
                 for (i in 0 until results.length()) {
                     val r = results.getJSONObject(i)
-                    val art = r.optString("artworkUrl100").ifBlank { continue }
+                    val art = r.optString("artworkUrl100")
+                    if (art.isBlank()) continue
                     // 100x100 → 600x600: та же картинка, но пригодная для просмотра
                     val big = art.replace("100x100bb", "600x600bb").replace("/100x100/", "/600x600/")
                     val name = r.optString("trackName").ifBlank {
