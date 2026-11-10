@@ -142,7 +142,12 @@ class DirectSearchFormatTest {
 
     @Test
     fun `тип содержимого архивной записи`() {
-        assertEquals("book", TorrentSearchAgent.kindForArchive("Черепашки-ниндзя. Комикс", "texts"))
+        // v4.53.0: комиксы — отдельная категория «манга», а не книги (раньше одна раздача
+        // попадала сразу в два чипа: «Книги» и «Манга»)
+        assertEquals("manga", TorrentSearchAgent.kindForArchive("Черепашки-ниндзя. Комикс", "texts"))
+        assertEquals("manga", TorrentSearchAgent.kindForArchive("One Piece том 1 [CBZ]", "texts"))
+        assertEquals("book", TorrentSearchAgent.kindForArchive("Авиация. Воздушный винт [PDF]", "texts"))
+        assertEquals("book", TorrentSearchAgent.kindForArchive("Роман «Винтер» [FB2]", "texts"))
         assertEquals("music", TorrentSearchAgent.kindForArchive("Неизвестный релиз", "audio"))
         assertEquals("video", TorrentSearchAgent.kindForArchive("TMNT 1990 BDRip mkv", "movies"))
     }
