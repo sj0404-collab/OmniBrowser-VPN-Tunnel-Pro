@@ -34,7 +34,12 @@ data class DirectFile(
     /** v4.47.1: чем полезнее файл, тем выше — карточка показывает главное, а не превью-картинку. */
     val weight: Int = 0,
     /** v4.49.0: год — для сортировки «сначала новые / старые». */
-    val year: Int = 0
+    val year: Int = 0,
+    /**
+     * v4.57.0: обычная ссылка (страница сериала/каталога), а не файл.
+     * «Скачать» у такой карточки нет — только открыть внутри приложения.
+     */
+    val linkOnly: Boolean = false
 )
 
 object DirectSearch {
@@ -149,6 +154,11 @@ object DirectSearch {
         if (page == 0 && (chip == "💾 Софт" || chip == "🎮 Игры")) {
             raw.addAll(searchGitHub(query, timeoutMs))
         }
+        // v4.57.0: «а сезонвар и прочие — ни торрент-ссылки, ни обычные ссылки не ищет».
+        // Видео ищем ещё и на сайтах-каталогах, которые отдают обычные страницы (не торренты).
+        if (page == 0 && chip == "🎬 Видео") {
+            raw.addAll(searchSeasonvar(query, timeoutMs))
+        }
         val unique = raw.distinctBy { it.downloadUrl }
         // v4.53.0: одна запись — одна категория. Манга только cbr/cbz/cb7, книги без комиксов.
         return when (chip) {
@@ -160,6 +170,47 @@ object DirectSearch {
             "💾 Софт" -> unique.filter { it.kind == "soft" }
             else -> unique
         }
+    }
+
+    /**
+     * v4.57.0: Seasonvar — сериалы обычными ссылками (без торрентов).
+     * Отдаём карточку-страницу: открывается внутри приложения, скачивать там нечего.
+     */
+    private fun searchSeasonvar(query: String, timeoutMs: Int): List<DirectFile> {
+        val term = query.replace(Regex("(?i)(найди|найти|покажи|скачать|смотреть)\\s+"), "").trim()
+        if (term.isBlank()) return emptyList()
+        val body = httpGet(
+            "https://seasonvar.ru/search?query=" + URLEncoder.encode(term, "UTF-8"),
+            timeoutMs
+        ) ?: return emptyList()
+        val out = mutableListOf<DirectFile>()
+        val seen = mutableSetOf<String>()
+        val re = Regex("href=\"(/serial-\\d+-[^\"]+\\.html)\"[^>]*>([^<]{2,120})<")
+        for (m in re.findAll(body)) {
+            val href = m.groupValues[1]
+            val title = TorrentSearchAgent.decodeEntities(m.groupValues[2]).trim()
+            if (title.length < 2) continue
+            if (!seen.add(href)) continue
+            val pageUrl = "https://seasonvar.ru" + href
+            out.add(
+                DirectFile(
+                    title = title,
+                    source = "Seasonvar",
+                    pageUrl = pageUrl,
+                    downloadUrl = pageUrl,
+                    fileName = "сериал",
+                    format = "сериал",
+                    sizeLabel = "онлайн",
+                    poster = "",
+                    kind = "video",
+                    description = "обычная ссылка · сериалы онлайн",
+                    weight = 55,
+                    linkOnly = true
+                )
+            )
+            if (out.size >= 20) break
+        }
+        return out
     }
 
     /** Совместимость: старый вызов одной категории (используется «показать ещё»). */
@@ -176,7 +227,9 @@ object DirectSearch {
     /** Сортировка + отсев нерелевантного (но без потери объёма: если релевантных мало — отдаём всё). */
     private fun rank(files: List<DirectFile>, query: String, sort: Int): List<DirectFile> {
         // v4.56.0: сначала «точно про это», потом ассоциации
-        val byRelevance = files.sortedByDescending { Relevance.score(query, it.title) }
+        val byRelevance = files.sortedByDescending {
+            Relevance.scoreFields(query, emptyList(), it.title, it.description)
+        }
         val tokens = (listOf(query) + ImageSearch.aliasesFor(query))
             .flatMap { v -> v.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 } }
             .toSet()

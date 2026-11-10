@@ -38,6 +38,8 @@ object TorrentSearchAgent {
         val referer: String = "",
         val sizeBytes: Long = 0L,
         val seeders: Int = 0,
+        /** v4.57.0: пиры (ливеры) — «раздают / качают / здоровье» человеку видно сразу в карточке. */
+        val leechers: Int = 0,
         val source: String = "",
         val platform: String = "",
         val poster: String = "",
@@ -142,12 +144,6 @@ object TorrentSearchAgent {
 
     private val MAGNET_SITES = listOf(
         MagnetSite(
-            "rutor",
-            { q -> "https://rutor.info/search/0/0/000/0/?q=$q" },
-            Regex("href=\"(/torrent/\\d+)\"[^>]*>(.*?)</a>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)),
-            "https://rutor.info"
-        ),
-        MagnetSite(
             "kickass",
             { q -> "https://kickasstorrents.to/usearch/$q/" },
             Regex("href=\"(/[a-z0-9\\-]+-t\\d+\\.html)\"[^>]*>(.*?)</a>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)),
@@ -221,6 +217,8 @@ object TorrentSearchAgent {
                 tasks.add(site.name to exec.submit(Callable { searchMagnet(site, encoded, q, timeoutMs) }))
             }
             tasks.add("индексы" to exec.submit(Callable { searchOpenIndexes(q, timeoutMs) }))
+            // v4.57.0: rutor — раздаёт сиды/пиры/размер прямо в списке поиска, без лишних запросов
+            tasks.add("rutor" to exec.submit(Callable { searchRutor(q, timeoutMs) }))
 
             val deadline = System.currentTimeMillis() + timeoutMs * 2L + 3000L
             for ((name, f) in tasks) {
@@ -246,8 +244,47 @@ object TorrentSearchAgent {
     /** Открытые индексы: apibay (TPB), torrents-csv, nyaa — через готовый поиск TorrentRescue. */
     private fun searchOpenIndexes(query: String, timeoutMs: Int): List<Found> =
         TorrentRescue.searchBlocking(query, timeoutMs).map {
-            Found(it.name, magnet = it.magnet, sizeBytes = it.sizeBytes, seeders = it.seeders, source = it.source)
+            Found(
+                it.name, magnet = it.magnet, sizeBytes = it.sizeBytes,
+                seeders = it.seeders, leechers = it.leechers, source = it.source
+            )
         }
+
+    /**
+     * v4.57.0: rutor — один из немногих, кто отдаёт в поиске и сиды, и пиров, и размер сразу.
+     * Строки таблицы разбираем как есть: magnet, название, размер, «зелёные» сиды, «красные» пиры.
+     */
+    private fun searchRutor(query: String, timeoutMs: Int): List<Found> {
+        val url = "https://rutor.info/search/0/0/000/0/" + URLEncoder.encode(query, "UTF-8")
+        val html = httpGet(url, timeoutMs) ?: return emptyList()
+        val rows = Regex("<tr class=\"(?:gai|tum)\">(.*?)</tr>", RegexOption.DOT_MATCHES_ALL)
+            .findAll(html).take(24).toList()
+        val out = ArrayList<Found>()
+        for (m in rows) {
+            val row = m.groupValues[1]
+            val magnet = Regex("magnet:\\?xt=urn:btih:[A-Fa-f0-9]{20,}[^\"'<\\s]*").find(row)?.value ?: continue
+            val link = Regex("href=\"(/torrent/\\d+/[^\"]+)\"[^>]*>([^<]{3,240})<").find(row) ?: continue
+            val title = decodeEntities(link.groupValues[2]).trim()
+            if (title.length < 3) continue
+            val sizeRaw = Regex("<td align=\"right\">([0-9]+(?:[.,][0-9]+)?)&nbsp;([KMGT]?B)</td>")
+                .find(row)?.let { it.groupValues[1].replace(',', '.') + " " + it.groupValues[2] } ?: ""
+            val seeds = Regex("<span class=\"green\">.*?([0-9]+)</span>", RegexOption.DOT_MATCHES_ALL)
+                .find(row)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val peers = Regex("<span class=\"red\">.*?([0-9]+)</span>", RegexOption.DOT_MATCHES_ALL)
+                .find(row)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            out.add(
+                Found(
+                    name = title,
+                    magnet = magnet,
+                    sizeBytes = TorrentRescue.parseSizeLabel(sizeRaw),
+                    seeders = seeds,
+                    leechers = peers,
+                    source = "rutor"
+                )
+            )
+        }
+        return out
+    }
 
     private fun searchDle(site: DleSite, encoded: String, query: String, timeoutMs: Int): List<Found> {
         val html = httpGet(site.searchUrl(encoded), timeoutMs) ?: return emptyList()

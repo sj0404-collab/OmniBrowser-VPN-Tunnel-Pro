@@ -71,6 +71,8 @@ class VideoSearchActivity : Activity() {
     private lateinit var captureWeb: WebView
     private lateinit var catRow: LinearLayout
     private lateinit var sortRow: LinearLayout
+    /** v4.57.0: ряд площадок перерисовывается при выборе — раньше подсветка оставалась на YouTube. */
+    private lateinit var srcRow: LinearLayout
 
     private val thumbCache = HashMap<String, Bitmap?>()
     private val grabbed = Collections.synchronizedMap(LinkedHashMap<String, String>())
@@ -105,15 +107,10 @@ class VideoSearchActivity : Activity() {
 
         // площадки
         val srcScroll = HorizontalScrollView(this)
-        val srcRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        listOf("YouTube", "RuTube", "VK").forEach { name ->
-            srcRow.addView(chip(name, source == name) {
-                source = name
-                reload()
-            })
-        }
+        srcRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         srcScroll.addView(srcRow)
         root.addView(srcScroll)
+        rebuildSources()
 
         // категории (со счётчиками)
         val catScroll = HorizontalScrollView(this)
@@ -261,6 +258,23 @@ class VideoSearchActivity : Activity() {
             2 -> byDuration.sortedByDescending { it.views }
             3 -> byDuration.sortedByDescending { it.daysAgo }
             else -> byDuration
+        }
+    }
+
+    /** v4.57.0: выбранная площадка подсвечивается сразу (был баг: «выбрал VK, а заливка на YouTube»). */
+    private fun rebuildSources() {
+        if (!::srcRow.isInitialized) return
+        srcRow.removeAllViews()
+        for (name in listOf("YouTube", "RuTube", "VK")) {
+            srcRow.addView(
+                chip(name, source == name) {
+                    if (source != name) {
+                        source = name
+                        rebuildSources()
+                        reload()
+                    }
+                }
+            )
         }
     }
 
@@ -468,7 +482,11 @@ class VideoSearchActivity : Activity() {
                 }
                 if(badTitle(t)) continue;
                 var src=/rutube/i.test(h)?'RuTube':'VK';
-                out.push(src+'|'+t.replace(/\|/g,' ')+'|'+h);
+                // v4.57.0: «он не ищет описанием» — берём ещё и текст блока рядом с ссылкой
+                // (подпись канала, дату, краткое описание), чтобы проверять тему не только по заголовку
+                var box=a.closest('li,article,div[class*="video"],div[class*="item"]')||a.parentElement;
+                var snip=clean(box?box.innerText:'').replace(/\|/g,' ').slice(0,220);
+                out.push(src+'|'+t.replace(/\|/g,' ')+'|'+h+'|'+snip);
               }
               var seen={},res=[];
               for(var j=0;j<out.length;j++){var k=out[j];if(seen[k])continue;seen[k]=1;res.push(k);}
@@ -484,10 +502,13 @@ class VideoSearchActivity : Activity() {
                 return@evaluateJavascript
             }
             var offTopic = 0
+            val needle = query.ifBlank { channelName }
             for (line in lines) {
                 val parts = line.split('|')
                 // v4.56.0: VK/RuTube отдают «первые попавшиеся» блоки — оставляем только про запрос
-                if (Relevance.score(query.ifBlank { channelName }, parts[1]) == 0) {
+                // v4.57.0: проверяем ещё и описание блока, а не один заголовок
+                val snippet = parts.getOrNull(3).orEmpty()
+                if (Relevance.scoreFields(needle, emptyList(), parts[1], snippet) == 0) {
                     offTopic++
                     continue
                 }

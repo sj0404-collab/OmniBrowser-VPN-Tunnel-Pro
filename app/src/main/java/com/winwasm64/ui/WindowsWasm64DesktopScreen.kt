@@ -3358,7 +3358,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 } else if (searchMode == 1) {
                     DirectFilesSection(
                         modifier = Modifier.weight(1f).fillMaxWidth(),
-                        initialQuery = torrentEngine.cachedSearchQuery
+                        initialQuery = torrentEngine.cachedSearchQuery,
+                        onOpenUrlInBrowser = { u -> navigateTab(activeTab, u) }
                     )
                 } else TorrentClientSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -3784,18 +3785,12 @@ private fun TorrentClientSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
+                        // v4.57.0: «лишний текст сверху» мешал листать — оставили только счётчики
                         Text(
-                            text = "BitTorrent Клиент + Browsec VPN ($browsecCountry)",
+                            text = "BitTorrent + Browsec VPN ($browsecCountry)",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp
-                        )
-                        Text(
-                            text = "Папка: ${torrentEngine.getPublicDisplayPath()}",
-                            color = Omni.Success,
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
                         )
                         // v4.38.0: автопоиск живой копии вместо пустышки — видно и отключаемо
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -4250,13 +4245,19 @@ private fun TorrentClientSection(
                 item {
                     // v4.46.0: считаем то, что реально видно. Раньше писалось «13», а список после
                     // фильтра был пуст — цифра и экран противоречили друг другу.
+                    // v4.57.0: краткая сводка — лучшая раздача и сколько у неё сидов/пиров/вес
+                    val topSeed = visibleItems.maxByOrNull { it.seeders }
+                    val topLine = if (topSeed != null && (topSeed.seeders > 0 || topSeed.leechers > 0)) {
+                        " · лучшая: 🌱 ${topSeed.seeders} / 👤 ${topSeed.leechers} · ${topSeed.sizeLabel} · ${topSeed.category.substringAfterLast('·').trim()}"
+                    } else ""
                     Text(
                         text = "Найдено раздач: ${visibleItems.size}" +
                             (if (visibleItems.size != catalogItems.size) " из ${catalogItems.size}" else "") +
                             (if (searchQuery.isNotBlank()) " по «${searchQuery.trim()}»" else "") +
                             (if (isSearching) " · ищу…" else "") +
                             (if (categoryFilter != "Все") " · категория: $categoryFilter" else "") +
-                            (if (qualityFilter.isNotBlank()) " · качество: $qualityFilter" else ""),
+                            (if (qualityFilter.isNotBlank()) " · качество: $qualityFilter" else "") +
+                            topLine,
                         color = Omni.Warning,
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
@@ -4308,12 +4309,17 @@ private fun TorrentClientSection(
 
                         Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
                             Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            // v4.57.0: «раз это ИИ — покажи сид, пиры, раздают кратко»
+                            val seedsLine = if (item.seeders > 0 || item.leechers > 0) {
+                                "🌱 ${item.seeders} · 👤 ${item.leechers}"
+                            } else "🌱 нет данных"
                             Text(
-                                "${item.category} • Размер: ${item.sizeLabel}" +
-                                    (if (item.seeders > 0) " • Сидов: ${item.seeders}" else "") +
-                                    (if (item.quality.isNotBlank()) " • ${item.quality}" else "") +
-                                    (if (item.codec.isNotBlank()) " • ${item.codec}" else ""),
-                                color = Omni.Accent, fontSize = 11.sp
+                                seedsLine + " · " + item.sizeLabel +
+                                    (if (item.quality.isNotBlank()) " · ${item.quality}" else "") +
+                                    (if (item.codec.isNotBlank()) " · ${item.codec}" else "") +
+                                    " · " + item.category,
+                                color = Omni.Accent, fontSize = 11.sp, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                             Text(item.description, color = Omni.TextDim, fontSize = 11.sp, maxLines = 2)
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -5880,7 +5886,12 @@ private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
 }
 
 @Composable
-private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
+private fun DirectFilesSection(
+    modifier: Modifier,
+    initialQuery: String,
+    // v4.57.0: обычные ссылки (Seasonvar и подобные) открываем ВНУТРИ приложения, а не наружу
+    onOpenUrlInBrowser: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     // v4.52.0: состояние живёт в SearchCache — переключение вкладок ничего не сбрасывает
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directQuery.ifBlank { initialQuery }) }
@@ -5978,13 +5989,8 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("📦 Файлы без торрентов — прямые ссылки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Text(
-                    "Один поиск сразу по всем категориям (параллельно): игры, видео, музыка, книги, манга, софт. " +
-                        "Переключение категорий — мгновенное, без повторного сканирования. " +
-                        "Скачивание идёт в Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR} и видно во вкладке «Загрузки».",
-                    color = Omni.TextDim, fontSize = 11.sp
-                )
+                // v4.57.0: «удали лишний текст сверху, а то листать места мало» — вместо абзаца одна строка
+                Text("📦 Файлы — прямые ссылки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     CompactDarkTextField(
                         value = query,
@@ -6169,18 +6175,22 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                             )
                             Text(f.fileName, color = Omni.TextDim, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Button(
-                                    onClick = { enqueueDirectDownload(context, f.downloadUrl, f.fileName) },
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                                    modifier = Modifier.height(34.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                                ) {
-                                    Text("⬇ Скачать", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                // v4.57.0: у обычной ссылки (сериал/страница) качать нечего
+                                if (!f.linkOnly) {
+                                    Button(
+                                        onClick = { enqueueDirectDownload(context, f.downloadUrl, f.fileName) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(34.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                    ) {
+                                        Text("⬇ Скачать", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    }
                                 }
                                 Button(
                                     onClick = {
+                                        // v4.57.0: страница открывается в этой же вкладке приложения
                                         try {
-                                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(f.pageUrl)))
+                                            onOpenUrlInBrowser(f.pageUrl)
                                         } catch (_: Throwable) {
                                         }
                                     },
@@ -6300,13 +6310,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("🖼 Фото и обложки — прямо в этой вкладке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("🖼 Фото и обложки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 SearchDepthRow("photo") { galleryDepth = it }
-                Text(
-                    "Картинки из iTunes и Wikimedia Commons под выбранную категорию. Тап — во весь экран, " +
-                        "кнопки под картинкой: скачать, похожие, видео по этому названию.",
-                    color = Omni.TextDim, fontSize = 11.sp
-                )
                 CompactDarkTextField(
                     value = query,
                     onValueChange = {

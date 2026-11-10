@@ -16,7 +16,9 @@ object Relevance {
         "the", "and", "for", "with", "mp4", "mkv", "avi", "webm", "mp3", "flac", "pdf", "epub", "fb2",
         "cbr", "cbz", "zip", "rar", "torrent", "скачать", "торрент", "смотреть", "онлайн", "сезон",
         "серия", "серии", "часть", "фильм", "игра", "книга", "манга", "web", "rip", "bdrip", "webrip",
-        "x264", "x265", "hevc", "aac", "ac3", "dts", "рус", "rus", "eng", "лицензия", "пиратка"
+        "x264", "x265", "hevc", "aac", "ac3", "dts", "рус", "rus", "eng", "лицензия", "пиратка",
+        // v4.57.0: служебные слова ввода — «найди рпг» должно искать «рпг», а не «найди»
+        "найди", "найти", "покажи", "поиск", "ищи", "мне", "пожалуйста", "ещё", "еще"
     )
 
     /** Значимые слова запроса и его вариантов. */
@@ -42,6 +44,23 @@ object Relevance {
         var hits = 0
         for (token in tokens(query, variants)) {
             if (t.contains(token)) hits++
+        }
+        return hits
+    }
+
+    /**
+     * v4.57.0: «он не ищет описанием и прочим».
+     *
+     * Смотрим не только название, но и все текстовые поля карточки: описание, канал/автор, теги,
+     * источник. Иногда нужного слова в заголовке нет, а в описании оно есть — раньше такой результат
+     * считался «не по теме» и выбрасывался.
+     */
+    fun scoreFields(query: String, variants: List<String> = emptyList(), vararg fields: String): Int {
+        val text = fields.joinToString(" ").lowercase()
+        if (text.isBlank()) return 0
+        var hits = 0
+        for (token in tokens(query, variants)) {
+            if (text.contains(token)) hits++
         }
         return hits
     }

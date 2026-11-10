@@ -83,7 +83,14 @@ object ImageSearch {
         for (v in variants.take(2)) {
             out.addAll(commons(v, filter, page))
         }
-        val filtered = out.distinctBy { it.url }
+        val filtered0 = out.distinctBy { it.url }
+        // v4.57.0: по «рпг» галерея выдавала «Жизнь — игра», «Психикон», «Иллюзия бесконечности» —
+        // картинки вообще не про запрос. Отбраковываем не по теме, но только если релевантных
+        // набралось хотя бы три: иначе галерея станет пустой (у картинок подписи часто не совпадают).
+        val relevantPics = filtered0.filter {
+            Relevance.scoreFields(clean, aliasesFor(clean), it.title, it.source) > 0
+        }
+        val filtered = if (relevantPics.size >= 3) relevantPics else filtered0
         // v4.50.0: если под узкий фильтр почти ничего нет — добираем общими картинками,
         // чтобы вкладка не выглядела «пустой» на русских названиях
         if (filter != "Фото" && filtered.size < 6) {

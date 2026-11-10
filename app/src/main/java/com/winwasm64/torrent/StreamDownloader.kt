@@ -190,15 +190,25 @@ object StreamDownloader {
             val o = arr.optJSONObject(i) ?: continue
             val path = o.optString("path")
             val file = File(path)
+            var state = o.optString("state")
+            var note = o.optString("note")
+            val size = if (file.exists()) file.length() else 0L
+            // v4.57.0: в истории оставались «готово · 31 Б» — старые записи не перепроверялись.
+            // Теперь статус сверяется с файлом: пусто/мало/нет файла — это не «готово».
+            if (state == STATE_DONE && size < 50 * 1024) {
+                state = STATE_ERROR
+                note = if (!file.exists()) "файла нет — скачайте заново"
+                else "файл всего $size Б — это не видео"
+            }
             out.add(
                 Item(
                     id = o.optLong("id"),
                     name = o.optString("name"),
                     path = path,
-                    bytes = if (file.exists()) file.length() else 0,
-                    total = if (file.exists()) file.length() else 0,
-                    state = o.optString("state"),
-                    note = o.optString("note")
+                    bytes = size,
+                    total = size,
+                    state = state,
+                    note = note
                 )
             )
         }

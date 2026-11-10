@@ -225,6 +225,8 @@ data class CatalogTorrentItem(
     val estimatedSizeBytes: Long,
     /** v4.39.0: сколько сидов нашёл агент и почему он это предложил. */
     val seeders: Int = 0,
+    /** v4.57.0: пиры (качают) — видно рядом с сидами, как на трекере. */
+    val leechers: Int = 0,
     val reason: String = "",
     /** Some сайты (catorrent) отдают .torrent только с Referer страницы. */
     val referer: String = "",
@@ -682,12 +684,16 @@ class BitTorrentEngine(private val context: Context? = null) {
                 searchers.forEach { it.join(25_000) }
                 val deduped = found.toList().distinctBy { it.magnet.ifBlank { it.torrentUrl }.ifBlank { it.name } }
                 // v4.56.0: отбраковываем «не про то» (по «трали» больше не будет Truck World)
-                val relevantIdx = Relevance.filter(
-                    cleanQuery, deduped.map { it.name }, variants.drop(1)
-                ).toSet()
-                val relevanceKept = deduped
-                    .filterIndexed { idx, _ -> idx in relevantIdx }
-                    .sortedByDescending { Relevance.score(cleanQuery, it.name, variants.drop(1)) }
+                // v4.57.0: смотрим не только название, но и описание/категорию —
+                // «ищет описанием и прочим»: слово может быть не в заголовке, а в описании раздачи
+                val relevantIdx = deduped.mapIndexedNotNull { idx, f ->
+                    if (Relevance.scoreFields(cleanQuery, variants.drop(1), f.name, f.reason, f.category) > 0) idx else null
+                }.toSet()
+                val relevanceKept = (if (relevantIdx.isEmpty()) deduped.indices.toSet() else relevantIdx)
+                    .mapNotNull { deduped.getOrNull(it) }
+                    .sortedByDescending {
+                        Relevance.scoreFields(cleanQuery, variants.drop(1), it.name, it.reason, it.category)
+                    }
                 val rankedAll = TorrentSearchAgent.rank(relevanceKept, intent)
                 // если человек уточнил платформу/формат — подходящее поднимаем наверх, но не выбрасываем
                 // остальное: иногда в названии платформы нет, а внутри она та самая
@@ -718,6 +724,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                             fileName = f.name.take(60) + ".torrent",
                             estimatedSizeBytes = f.sizeBytes,
                             seeders = f.seeders,
+                            leechers = f.leechers,
                             reason = f.reason,
                             referer = f.referer,
                             poster = f.poster,

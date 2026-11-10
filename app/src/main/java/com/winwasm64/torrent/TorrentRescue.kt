@@ -31,6 +31,8 @@ object TorrentRescue {
         val magnet: String,
         val sizeBytes: Long,
         val seeders: Int,
+        /** v4.57.0: пиры (качают) — показываем рядом с сидами. */
+        val leechers: Int = 0,
         val source: String
     )
 
@@ -185,12 +187,16 @@ object TorrentRescue {
                 val hash = o.optString("info_hash")
                 val name = o.optString("name")
                 if (hash.isBlank() || name.isBlank() || name == "No results returned") continue
+                // v4.57.0: TPB отдаёт всё подряд, включая порно-раздел (категории 5xx) — это не поиск
+                val cat = o.optString("category").toIntOrNull() ?: 0
+                if (cat in 500..599) continue
                 out.add(
                     Candidate(
                         name = name,
                         magnet = magnetOf(hash, name),
                         sizeBytes = o.optString("size").toLongOrNull() ?: 0L,
                         seeders = o.optString("seeders").toIntOrNull() ?: 0,
+                        leechers = o.optString("leechers").toIntOrNull() ?: 0,
                         source = "apibay"
                     )
                 )
@@ -218,6 +224,7 @@ object TorrentRescue {
                         magnet = magnetOf(hash, name),
                         sizeBytes = o.optLong("size_bytes", 0L),
                         seeders = o.optInt("seeders", 0),
+                        leechers = o.optInt("leechers", 0),
                         source = "torrents-csv"
                     )
                 )
@@ -242,6 +249,8 @@ object TorrentRescue {
             val hash = Regex("<nyaa:infoHash>(.*?)</nyaa:infoHash>").find(block)?.groupValues?.get(1)?.trim()
             val seeders = Regex("<nyaa:seeders>(.*?)</nyaa:seeders>").find(block)?.groupValues?.get(1)
                 ?.trim()?.toIntOrNull() ?: 0
+            val leechers = Regex("<nyaa:leechers>(.*?)</nyaa:leechers>").find(block)?.groupValues?.get(1)
+                ?.trim()?.toIntOrNull() ?: 0
             val size = Regex("<nyaa:size>(.*?)</nyaa:size>").find(block)?.groupValues?.get(1)?.trim() ?: ""
             if (hash.isNullOrBlank()) continue
             out.add(
@@ -250,6 +259,7 @@ object TorrentRescue {
                     magnet = magnetOf(hash, title),
                     sizeBytes = parseSizeLabel(size),
                     seeders = seeders,
+                    leechers = leechers,
                     source = "nyaa"
                 )
             )
