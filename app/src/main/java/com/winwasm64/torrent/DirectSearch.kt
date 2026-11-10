@@ -30,24 +30,36 @@ data class DirectFile(
     val sizeLabel: String,
     val poster: String,
     val kind: String,
-    val description: String
+    val description: String,
+    /** v4.47.1: чем полезнее файл, тем выше — карточка показывает главное, а не превью-картинку. */
+    val weight: Int = 0
 )
 
 object DirectSearch {
 
-    /** Расширения, которые считаем «полезным файлом», а не служебной мелочью архива. */
-    private val USEFUL_EXT = setOf(
-        "xci", "nsp", "nsz", "iso", "img", "nro", "wbfs", "wad", "rvz", "gcm",
-        "exe", "msi", "apk", "apks", "xapk", "dmg", "pkg", "deb", "rpm", "appimage", "ipa",
-        "rar", "zip", "7z", "tar", "gz", "torrent", "bin", "cue",
-        "epub", "fb2", "mobi", "azw3", "djvu", "pdf", "cbr", "cbz", "cb7",
-        "mp3", "flac", "m4a", "aac", "ogg", "opus", "wav",
-        "mp4", "mkv", "avi", "webm", "mov"
+    /**
+     * Расширения, которые считаем «полезным файлом», с весом: сначала образы игр и архивы,
+     * потом установщики, книги, музыку и видео. Обложки (jpg/png) — в самом конце, чтобы карточка
+     * не подменяла игру картинкой.
+     */
+    private val USEFUL_WEIGHT = mapOf(
+        "xci" to 100, "nsp" to 100, "nsz" to 100, "nro" to 95, "wbfs" to 95, "rvz" to 95,
+        "wad" to 90, "iso" to 90, "gcm" to 90, "img" to 85, "mdf" to 85, "mds" to 60,
+        "nrg" to 85, "ccd" to 60, "bin" to 70, "cue" to 40,
+        "rar" to 80, "zip" to 78, "7z" to 78, "tar" to 60, "gz" to 55,
+        "exe" to 85, "msi" to 80, "apk" to 88, "apks" to 88, "xapk" to 88,
+        "dmg" to 80, "pkg" to 78, "deb" to 70, "rpm" to 70, "appimage" to 80, "ipa" to 80,
+        "epub" to 82, "fb2" to 82, "mobi" to 78, "azw3" to 78, "djvu" to 75, "pdf" to 72,
+        "cbr" to 80, "cbz" to 80, "cb7" to 78,
+        "flac" to 76, "mp3" to 70, "m4a" to 65, "aac" to 60, "ogg" to 60, "opus" to 60, "wav" to 55,
+        "mkv" to 74, "mp4" to 70, "avi" to 62, "webm" to 62, "mov" to 60, "vob" to 58,
+        "jpg" to 20, "jpeg" to 20, "png" to 20, "webp" to 18
     )
 
     /** Служебные файлы Archive.org, которые не нужны человеку. */
     private val JUNK_EXT = setOf(
-        "xml", "sqlite", "txt", "json", "log", "md5", "sha1", "torrent", "js", "css", "html"
+        "xml", "sqlite", "txt", "json", "log", "md5", "sha1", "torrent", "js", "css", "html",
+        "sqlite3", "xml.gz", "meta", "ffp", "afp", "asc", "sfv", "nfo", "url"
     )
 
     fun search(query: String, timeoutMs: Int = 12_000): List<DirectFile> {
@@ -56,7 +68,8 @@ object DirectSearch {
         val out = mutableListOf<DirectFile>()
         out.addAll(searchArchive(clean, timeoutMs))
         out.addAll(searchGitHub(clean, timeoutMs))
-        return out
+        // без дублей и без бесконечной простыни: 60 карточек — уже большой список
+        return out.distinctBy { it.downloadUrl }.take(60)
     }
 
     /* ===================== Internet Archive ===================== */
@@ -102,41 +115,36 @@ object DirectSearch {
         val files = json.optJSONArray("files") ?: return emptyList()
         val kind = TorrentSearchAgent.kindForArchive(title, mediaType)
         val out = mutableListOf<DirectFile>()
-        var main: DirectFile? = null
-        var biggest = -1L
         for (i in 0 until files.length()) {
             val f = files.getJSONObject(i)
             val name = f.optString("name")
             if (name.isBlank()) continue
             val ext = name.substringAfterLast('.', "").lowercase()
             if (ext.isBlank() || ext in JUNK_EXT) continue
+            val weight = USEFUL_WEIGHT[ext] ?: continue
             val size = f.optString("size").toLongOrNull() ?: 0L
-            if (size in 1..20_000L) continue
+            if (size in 1..50_000L) continue
             val direct = "https://archive.org/download/$id/" +
                 name.split('/').joinToString("/") { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
-            val item = DirectFile(
-                title = title,
-                source = "Archive.org",
-                pageUrl = "https://archive.org/details/$id",
-                downloadUrl = direct,
-                fileName = name.substringAfterLast('/'),
-                format = formatOf(name),
-                sizeLabel = if (size > 0) BitTorrentEngine.formatSize(size) else "размер неизвестен",
-                poster = "https://archive.org/services/img/$id",
-                kind = kind,
-                description = "Archive.org · $id"
+            out.add(
+                DirectFile(
+                    title = title,
+                    source = "Archive.org",
+                    pageUrl = "https://archive.org/details/$id",
+                    downloadUrl = direct,
+                    fileName = name.substringAfterLast('/'),
+                    format = formatOf(name),
+                    sizeLabel = if (size > 0) BitTorrentEngine.formatSize(size) else "размер неизвестен",
+                    poster = "https://archive.org/services/img/$id",
+                    kind = kind,
+                    description = "Archive.org · $id",
+                    weight = weight
+                )
             )
-            if (ext in USEFUL_EXT) {
-                if (out.size < 3) out.add(item)
-                if (size > biggest) {
-                    biggest = size
-                    main = item
-                }
-            }
         }
-        // самое крупное и полезное — первым
-        val sorted = out.sortedByDescending { parseSize(it.sizeLabel) }
-        return if (sorted.isNotEmpty()) sorted else listOfNotNull(main)
+        // сначала самое «полезное» (игра/архив/книга), внутри — по размеру
+        return out.sortedWith(compareByDescending<DirectFile> { it.weight }.thenByDescending { parseSize(it.sizeLabel) })
+            .take(3)
     }
 
     private fun parseSize(label: String): Long {

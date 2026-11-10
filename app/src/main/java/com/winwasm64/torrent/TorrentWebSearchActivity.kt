@@ -145,7 +145,7 @@ class TorrentWebSearchActivity : Activity() {
 
     /** Следующий запрос (по другому сайту), потом — другой поисковик. */
     private fun nextRound(): Boolean {
-        if (rounds >= 10) return false
+        if (rounds >= 20) return false
         rounds++
         if (queryIndex < queries.lastIndex) {
             queryIndex++
@@ -197,7 +197,7 @@ class TorrentWebSearchActivity : Activity() {
                 if (!looksLikeTracker(real)) continue
                 val key = real.substringBefore('#')
                 if (!pages.containsKey(key)) pages[key] = title
-                if (pages.size >= 24) break
+                if (pages.size >= 60) break
             }
 
             if (magnets.isEmpty() && pages.isEmpty()) {
@@ -214,7 +214,7 @@ class TorrentWebSearchActivity : Activity() {
             Thread({
                 var added = 0
                 for ((_, url, title) in magnets) {
-                    if (added >= 24) break
+                    if (added >= 80) break
                     val found = TorrentSearchAgent.Found(
                         name = title.ifBlank { "magnet" },
                         magnet = url,
@@ -229,7 +229,7 @@ class TorrentWebSearchActivity : Activity() {
                     Thread({
                         while (true) {
                             val next = queue.poll() ?: break
-                            if (added >= 24) break
+                            if (added >= 80) break
                             val found = try {
                                 TorrentSearchAgent.fromPageUrl(next.first, next.second)
                             } catch (_: Throwable) {
@@ -246,7 +246,7 @@ class TorrentWebSearchActivity : Activity() {
                 workers.forEach { it.join(45_000) }
                 totalAdded += added
                 runOnUiThread {
-                    if (totalAdded < 24 && nextRound()) {
+                    if (totalAdded < 80 && nextRound()) {
                         status.text = "Нашлось $totalAdded — добираю по другим сайтам («${queries.getOrElse(queryIndex) { "" }.take(40)}»)…"
                     } else {
                         status.text = when {
