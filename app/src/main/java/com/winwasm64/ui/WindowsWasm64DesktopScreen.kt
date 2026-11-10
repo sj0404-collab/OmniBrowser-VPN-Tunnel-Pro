@@ -3712,6 +3712,7 @@ private fun TorrentClientSection(
     // v4.51.0: «чистый» запрос пользователя. Категория добавляет уточняющее слово, но не портит базу —
     // раньше каждое переключение категории дописывало слово к уже дописанному.
     var baseQuery by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentQuery) }
+    var searchDepth by remember { mutableStateOf(com.winwasm64.torrent.SearchSettings.depth(context, "torrents")) }
     // v4.43.0: фильтр по качеству/формату — «хочу 360p» или «только FLAC»
     var qualityFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.torrentQuality) }
     // v4.49.0: сортировка — сначала новые/старые/тяжёлые/лёгкие
@@ -3743,7 +3744,7 @@ private fun TorrentClientSection(
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        torrentEngine.searchPublicTorrents(query) { res ->
+        torrentEngine.searchPublicTorrents(query, searchDepth) { res ->
             mainHandler.post {
                 catalogItems = res
                 isSearching = false
@@ -3956,6 +3957,8 @@ private fun TorrentClientSection(
                         Text(if (isSearching) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
+                // v4.54.0: сколько запросов отправлять — выбирает человек
+                SearchDepthRow("torrents") { searchDepth = it }
             }
         }
 
@@ -4167,7 +4170,8 @@ private fun TorrentClientSection(
                                 }
                                 Text(
                                     "$cat" + (if (catalogItems.isNotEmpty()) " $chipCount" else ""),
-                                    color = Color.White, fontSize = 11.sp,
+                                    color = if (!sel && chipCount == 0) Omni.TextDim else Color.White,
+                                    fontSize = 11.sp,
                                     fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                                 )
@@ -5734,6 +5738,53 @@ private fun enqueueDirectDownload(context: android.content.Context, url: String,
     }
 }
 
+
+/**
+ * v4.54.0: ручная «глубина поиска» — сколько запросов/страниц отправлять.
+ * 1 — быстро (только точное слово), до 8 — долго, но с синонимами, ассоциациями и листанием.
+ */
+@Composable
+private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
+    val context = LocalContext.current
+    var depth by remember {
+        mutableStateOf(com.winwasm64.torrent.SearchSettings.depth(context, scope))
+    }
+    Surface(
+        color = Omni.SurfaceHighest,
+        shape = RoundedCornerShape(9.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Глубина поиска: $depth", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                Text(
+                    when {
+                        depth <= 1 -> "1 запрос · быстро, но меньше ссылок"
+                        depth <= 3 -> "$depth запроса · с синонимами и ассоциациями"
+                        else -> "$depth запросов · долго, но максимально полно"
+                    },
+                    color = Omni.TextDim, fontSize = 9.sp
+                )
+            }
+            Text("−", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable {
+                val next = (depth - 1).coerceAtLeast(com.winwasm64.torrent.SearchSettings.MIN)
+                depth = next
+                com.winwasm64.torrent.SearchSettings.setDepth(context, next, scope)
+                onDepth(next)
+            })
+            Text("+", color = Color.White, fontSize = 16.sp, modifier = Modifier.clickable {
+                val next = (depth + 1).coerceAtMost(com.winwasm64.torrent.SearchSettings.MAX)
+                depth = next
+                com.winwasm64.torrent.SearchSettings.setDepth(context, next, scope)
+                onDepth(next)
+            })
+        }
+    }
+}
+
 @Composable
 private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
@@ -5745,6 +5796,7 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
     var formatFilter by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directFormat) }
     var sortMode by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directSort) }
     var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.directPage) }
+    var searchDepth by remember { mutableStateOf(com.winwasm64.torrent.SearchSettings.depth(context, "files")) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
     /**
@@ -5765,7 +5817,7 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
         val prev = if (append) buckets else null
         Thread({
             val res = try {
-                com.winwasm64.torrent.DirectSearch.searchAll(query, nextSort, nextPage)
+                com.winwasm64.torrent.DirectSearch.searchAll(query, nextSort, nextPage, depth = searchDepth)
             } catch (_: Throwable) {
                 com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
             }
@@ -5841,6 +5893,7 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                         Text(if (busy) "⏳..." else "🔍 Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                 }
+                SearchDepthRow("files") { searchDepth = it }
             }
         }
 
@@ -5884,7 +5937,8 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
                 ) {
                     Text(
                         chip + if (current != null) " $count" + (if (more) "+" else "") else "",
-                        color = Color.White, fontSize = 11.sp,
+                        color = if (kindFilter != chip && count == 0) Omni.TextDim else Color.White,
+                        fontSize = 11.sp,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                     )
                 }
@@ -5942,16 +5996,47 @@ private fun DirectFilesSection(modifier: Modifier, initialQuery: String) {
             }
         }
 
+        val biggestChip = current?.byChip?.maxByOrNull { it.value.size }
         Text(
             when {
                 busy && current == null -> "Ищу сразу во всех категориях…"
                 busy -> "Догружаю страницу ${page + 1}…"
-                visible.isEmpty() -> "Введите название и нажмите «Найти»"
+                current == null -> "Введите название и нажмите «Найти»"
+                visible.isEmpty() && formatFilter.isNotBlank() -> "Под формат $formatFilter в «$kindFilter» ничего нет"
+                visible.isEmpty() && kindFilter != "Все" ->
+                    "В категории «$kindFilter» пусто" +
+                        (biggestChip?.let { " · больше всего в «${it.key}» (${it.value.size})" } ?: "")
+                visible.isEmpty() -> "По «${query.trim()}» ничего не нашлось — попробуйте другое слово"
                 else -> "Показано ${visible.size} · $kindFilter" +
-                    (if (current != null && current.hasMore(kindFilter)) " · есть ещё" else "")
+                    (if (current.hasMore(kindFilter)) " · есть ещё" else "")
             },
             color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp
         )
+        if (current != null && visible.isEmpty() && kindFilter != "Все") {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Button(
+                    onClick = {
+                        kindFilter = "Все"
+                        formatFilter = ""
+                        com.winwasm64.torrent.SearchCache.directKind = "Все"
+                    },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier.height(32.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                ) { Text("Показать все (${current.all.size})", fontSize = 11.sp, color = Color.White) }
+                biggestChip?.let { best ->
+                    Button(
+                        onClick = {
+                            kindFilter = best.key
+                            com.winwasm64.torrent.SearchCache.directKind = best.key
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.height(32.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest)
+                    ) { Text("${best.key} (${best.value.size})", fontSize = 11.sp, color = Color.White) }
+                }
+            }
+        }
 
         LazyColumn(
             state = filesListState,
@@ -6045,6 +6130,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     var page by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoPage) }
     // страницы кончились — дальше не дёргаем сеть
     var noMore by remember { mutableStateOf(false) }
+    // v4.54.0: глубина = сколько страниц галереи забирать за один поиск (1…8)
+    var galleryDepth by remember { mutableStateOf(com.winwasm64.torrent.SearchSettings.depth(context, "photo")) }
     val handler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     val filters = listOf("Фото", "Обложки игр", "Постеры фильмов", "Обложки книг", "Кадры из видео", "Альбомы музыки")
 
@@ -6060,11 +6147,18 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
         com.winwasm64.torrent.SearchCache.photoPage = nextPage
         page = nextPage
         Thread({
-            val res = try {
-                com.winwasm64.torrent.ImageSearch.search(q, f, nextPage)
-            } catch (_: Throwable) {
-                emptyList()
+            // забираем столько страниц, сколько задал человек (глубина поиска)
+            val collected = mutableListOf<com.winwasm64.torrent.GalleryImage>()
+            for (i in 0 until galleryDepth) {
+                val pageRes = try {
+                    com.winwasm64.torrent.ImageSearch.search(q, f, nextPage + i)
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+                if (pageRes.isEmpty()) break
+                collected.addAll(pageRes)
             }
+            val res = collected.distinctBy { it.url }
             handler.post {
                 if (append) {
                     val before = images.size
@@ -6095,6 +6189,7 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("🖼 Фото и обложки — прямо в этой вкладке", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                SearchDepthRow("photo") { galleryDepth = it }
                 Text(
                     "Картинки из iTunes и Wikimedia Commons под выбранную категорию. Тап — во весь экран, " +
                         "кнопки под картинкой: скачать, похожие, видео по этому названию.",
@@ -6328,6 +6423,7 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
                     modifier = Modifier.fillMaxWidth(),
                     onGo = { if (query.isNotBlank()) open(query.trim(), channel) }
                 )
+                SearchDepthRow("video") { }
                 Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     sources.forEach { src ->
                         Surface(

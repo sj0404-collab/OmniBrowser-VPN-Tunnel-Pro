@@ -86,7 +86,13 @@ object DirectSearch {
     private const val ROWS_PER_CHIP = 32
 
     /** Один поиск — все категории сразу, параллельно. */
-    fun searchAll(query: String, sort: Int = 0, page: Int = 0, timeoutMs: Int = 12_000): Buckets {
+    fun searchAll(
+        query: String,
+        sort: Int = 0,
+        page: Int = 0,
+        timeoutMs: Int = 12_000,
+        depth: Int = 3
+    ): Buckets {
         val clean = query.trim()
         if (clean.isBlank()) return Buckets(emptyList(), emptyMap(), emptyMap())
         val byChip = java.util.concurrent.ConcurrentHashMap<String, List<DirectFile>>()
@@ -94,7 +100,7 @@ object DirectSearch {
         val threads = CHIPS.map { chip ->
             Thread({
                 try {
-                    val files = searchChip(clean, chip, page, sort, timeoutMs)
+                    val files = searchChip(clean, chip, page, sort, timeoutMs, depth)
                     byChip[chip] = rank(files, clean, sort)
                     more[chip] = files.size >= ROWS_PER_CHIP
                 } catch (_: Throwable) {
@@ -114,15 +120,22 @@ object DirectSearch {
         chip: String,
         page: Int = 0,
         sort: Int = 0,
-        timeoutMs: Int = 12_000
+        timeoutMs: Int = 12_000,
+        depth: Int = 3
     ): List<DirectFile> {
-        // v4.53.0: ищем не одну словоформу, а упоминания («винт» → «гребной винт», winter и т. п.)
-        val variants = QueryExpander.variants(query, 3)
+        // v4.53.0: ищем не одну словоформу, а упоминания («винт» → «гребной винт», winter и т. п.).
+        // v4.54.0: сколько именно вариантов — задаёт человек («глубина поиска»).
+        val variants = QueryExpander.variants(query, depth.coerceIn(1, 6))
         val raw = mutableListOf<DirectFile>()
         variants.forEachIndexed { idx, v ->
             val term = if (chip == "📖 Манга") "$v comic" else v
             // первый вариант — основная выдача, остальные (ассоциации) — добивка
-            raw.addAll(searchArchive(term, chip, page, sort, timeoutMs, maxDocs = if (idx == 0) 20 else 10))
+            raw.addAll(
+                searchArchive(
+                    term, chip, page, sort, timeoutMs,
+                    maxDocs = if (idx == 0) (12 + 4 * depth) else 8
+                )
+            )
         }
         if (page == 0 && (chip == "💾 Софт" || chip == "🎮 Игры")) {
             raw.addAll(searchGitHub(query, timeoutMs))

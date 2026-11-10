@@ -640,7 +640,11 @@ class BitTorrentEngine(private val context: Context? = null) {
         conn.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8")
     }
 
-    fun searchPublicTorrents(query: String, onResults: (List<CatalogTorrentItem>) -> Unit) {
+    fun searchPublicTorrents(
+        query: String,
+        depth: Int = 3,
+        onResults: (List<CatalogTorrentItem>) -> Unit
+    ) {
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) {
             onResults(getBuiltInVerifiedTorrents())
@@ -658,7 +662,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 // v4.53.0: ищем не только точную словоформу, но и упоминания/ассоциации
                 // (винт → «гребной винт», «воздушный винт», «винтер» → winter), как это делает галерея.
                 // Варианты обходятся ПАРАЛЛЕЛЬНО, поэтому общее время почти не растёт.
-                val variants = QueryExpander.variants(cleanQuery, 3)
+                val variants = QueryExpander.variants(cleanQuery, depth.coerceIn(1, 6))
                 val found = java.util.Collections.synchronizedList(mutableListOf<TorrentSearchAgent.Found>())
                 val searchers = variants.map { variant ->
                     Thread({
@@ -692,7 +696,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 if (intent.quality.isNotBlank() || intent.audio.isNotBlank()) {
                     ranked = TorrentSearchAgent.filterByQuality(ranked, intent.quality)
                 }
-                for (f in ranked.take(80)) {
+                for (f in ranked.take(20 + 20 * depth.coerceIn(1, 6))) {
                     results.add(
                         CatalogTorrentItem(
                             // v4.48.0: &nbsp; и &#039; из catorrent/nnmclub больше не попадают в карточку

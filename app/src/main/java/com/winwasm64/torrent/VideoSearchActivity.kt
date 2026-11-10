@@ -56,6 +56,10 @@ class VideoSearchActivity : Activity() {
     // v4.53.0: если по точному названию нашлось мало — пробуем упоминания/ассоциации
     private var variantIndex = 0
     private var extraTerms: List<String> = emptyList()
+    // v4.54.0: глубина — сколько страниц YouTube забирать за один заход и сколько раз
+    // прокручивать выдачу RuTube/VK (1…8), задаёт человек
+    private var depth = 3
+    private var scrapePass = 0
 
     private lateinit var status: TextView
     private lateinit var captureStatus: TextView
@@ -78,6 +82,7 @@ class VideoSearchActivity : Activity() {
         channelName = intent.getStringExtra("channel").orEmpty()
         channelQuery = intent.getStringExtra("channelQuery").orEmpty()
         source = normalizeSource(intent.getStringExtra("source").orEmpty())
+        depth = SearchSettings.depth(this, "video")
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -171,7 +176,7 @@ class VideoSearchActivity : Activity() {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     view?.postDelayed({ scrapePage() }, 1200)
-                    view?.postDelayed({ scrapePage() }, 3200)
+                    view?.postDelayed({ scrapePage() }, 3000)
                 }
             }
         }
@@ -334,6 +339,7 @@ class VideoSearchActivity : Activity() {
                 else -> "https://m.vk.com/video?q=" + Uri.encode(term)
             }
             status.text = "Ищу на $source…"
+            scrapePass = 0
             scrapeWeb.loadUrl(url)
         }
     }
@@ -363,6 +369,15 @@ class VideoSearchActivity : Activity() {
             runOnUiThread {
                 loading = false
                 continuation = page.continuation
+                // по глубине добираем первые страницы сразу, чтобы категории было чем наполнить
+                if (allItems.size < depth * 8 && page.continuation != null) {
+                    allItems.addAll(page.items.filter { new -> allItems.none { it.id == new.id && it.kind == new.kind } })
+                    rebuildChips()
+                    renderList()
+                    loading = false
+                    loadMore(manual = true)
+                    return@runOnUiThread
+                }
                 allItems.addAll(page.items.filter { new -> allItems.none { it.id == new.id && it.kind == new.kind } })
                 rebuildChips()
                 renderList()
@@ -399,22 +414,45 @@ class VideoSearchActivity : Activity() {
     /* ===================== скрапинг RuTube / VK ===================== */
 
     private fun scrapePage() {
+        // несколько проходов (глубина): каждый следующий прокручивает выдачу ниже
+        if (scrapePass > 0) {
+            scrapeWeb.evaluateJavascript(
+                "window.scrollBy(0, Math.round(window.innerHeight*0.9));",
+                null
+            )
+        }
         val js = """
             (function() {
               function clean(t){ return t ? t.replace(/\s+/g,' ').trim() : ''; }
+              function isVideoLink(h){
+                // RuTube: /video/<hex-id>/   VK: /video-123_456 или /video123_456
+                return /rutube\.ru\/video\/[0-9a-f]{8,}/i.test(h) ||
+                       /vk(video)?\.(com|ru)\/video-?\d+_\d+/i.test(h) ||
+                       /vk\.com\/clip-?\d+_\d+/i.test(h);
+              }
+              function badTitle(t){
+                if (!t || t.length < 5) return true;
+                if (/^club\d+$/i.test(t)) return true;
+                if (/^(на главную|поиск|видео|музыка|клипы|главная|ещё|показать все|все видео|vk видео)/i.test(t)) return true;
+                if (/^[\d\s:.,]+$/.test(t)) return true;
+                if (/^(short|reel|shorts)$/i.test(t)) return true;
+                return false;
+              }
               var out=[], nodes=document.querySelectorAll('a[href]');
               for (var i=0;i<nodes.length;i++){
                 var a=nodes[i], h=a.href||'';
-                if(!/(rutube\.ru\/video\/|vk\.com\/video|vkvideo\.ru)/i.test(h)) continue;
+                if(!isVideoLink(h)) continue;
                 var t = clean(a.getAttribute('aria-label')||a.getAttribute('title')||'');
-                if(!t || t.length<4){
-                  var c=a.closest('li,article,div[class]');
+                if(badTitle(t)){
+                  var c=a.closest('li,article,div[class*="video"],div[class*="item"]');
                   var h2=c?c.querySelector('h3,h2,[class*=title]'):null;
-                  if(h2) t=clean(h2.innerText||h2.getAttribute('aria-label'));
+                  if(h2) t=clean(h2.innerText||h2.getAttribute('aria-label')||h2.getAttribute('title'));
                 }
-                if(!t || t.length<4) continue;
-                var ttl = clean(a.getAttribute('title')||'');
-                if (ttl.length > t.length) t = ttl;
+                if(badTitle(t)){
+                  var img=a.querySelector('img[alt]')||(c?a.closest('div,li').querySelector('img[alt]'):null);
+                  if(img) t=clean(img.getAttribute('alt'));
+                }
+                if(badTitle(t)) continue;
                 var src=/rutube/i.test(h)?'RuTube':'VK';
                 out.push(src+'|'+t.replace(/\|/g,' ')+'|'+h);
               }
@@ -451,6 +489,11 @@ class VideoSearchActivity : Activity() {
             }
             rebuildChips()
             renderList()
+            // глубина: пока не набрали достаточно и не исчерпали проходы — прокручиваем дальше
+            scrapePass++
+            if (scrapePass < depth && allItems.size < depth * 8) {
+                scrapeWeb.postDelayed({ scrapePage() }, 1800)
+            }
         }
     }
 
