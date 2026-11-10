@@ -5848,7 +5848,7 @@ private fun AiAgentRow() {
             "🤖 Агент: $line",
             color = when {
                 !enabled -> Omni.TextDim
-                line.startsWith("🔴") -> android.graphics.Color.parseColor("#FF6B6B")
+                line.startsWith("🔴") -> Color(0xFFFF6B6B)
                 line.startsWith("🟢") -> Omni.Success
                 else -> Omni.Warning
             },
