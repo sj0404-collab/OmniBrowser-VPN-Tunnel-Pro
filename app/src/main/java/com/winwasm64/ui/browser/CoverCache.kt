@@ -14,19 +14,29 @@ import java.net.URL
  */
 object CoverCache {
 
+    private const val UA =
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Mobile Safari/537.36"
+
     private val cache = LruCache<String, Bitmap>(48)
 
-    /** Загрузить обложку. Блокирующий вызов — только из фонового потока. */
-    fun load(url: String, maxSide: Int = 320): Bitmap? {
+    /**
+     * Загрузить обложку. Блокирующий вызов — только из фонового потока.
+     *
+     * v4.56.0: с [referer]. Часть сайтов (в первую очередь Яндекс Картинки) отдают исходник только
+     * при «своём» referer — без него приходили пустые заглушки вместо картинок.
+     */
+    fun load(url: String, maxSide: Int = 320, referer: String? = null): Bitmap? {
         if (url.isBlank()) return null
-        cache.get(url)?.let { return it }
+        val key = if (referer.isNullOrBlank()) url else "$url|$referer"
+        cache.get(key)?.let { return it }
         return try {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 6000
-                readTimeout = 6000
+                connectTimeout = 8000
+                readTimeout = 8000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) OmniBrowser")
+                setRequestProperty("User-Agent", UA)
                 setRequestProperty("Accept", "image/*")
+                if (!referer.isNullOrBlank()) setRequestProperty("Referer", referer)
             }
             if (conn.responseCode !in 200..299) return null
             val bytes = conn.inputStream.use { it.readBytes() }
@@ -37,7 +47,7 @@ object CoverCache {
             while (bounds.outWidth / sample > maxSide || bounds.outHeight / sample > maxSide) sample *= 2
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
                 ?: return null
-            cache.put(url, bmp)
+            cache.put(key, bmp)
             bmp
         } catch (_: Throwable) {
             null

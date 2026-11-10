@@ -483,8 +483,14 @@ class VideoSearchActivity : Activity() {
                 status.text = "На $source ничего не нашлось — попробуйте другой запрос"
                 return@evaluateJavascript
             }
+            var offTopic = 0
             for (line in lines) {
                 val parts = line.split('|')
+                // v4.56.0: VK/RuTube отдают «первые попавшиеся» блоки — оставляем только про запрос
+                if (Relevance.score(query.ifBlank { channelName }, parts[1]) == 0) {
+                    offTopic++
+                    continue
+                }
                 val item = YouTubeSearch.Item(
                     id = parts[2].substringAfterLast('/').trimEnd('/'),
                     kind = YouTubeSearch.KIND_VIDEO,
@@ -503,6 +509,9 @@ class VideoSearchActivity : Activity() {
             }
             rebuildChips()
             renderList()
+            if (allItems.isEmpty()) {
+                status.text = "На $source ничего по теме (отброшено $offTopic не по теме) — попробуйте YouTube"
+            }
             // глубина: пока не набрали достаточно и не исчерпали проходы — прокручиваем дальше
             scrapePass++
             if (scrapePass < depth && allItems.size < depth * 8) {

@@ -175,12 +175,14 @@ object DirectSearch {
 
     /** Сортировка + отсев нерелевантного (но без потери объёма: если релевантных мало — отдаём всё). */
     private fun rank(files: List<DirectFile>, query: String, sort: Int): List<DirectFile> {
+        // v4.56.0: сначала «точно про это», потом ассоциации
+        val byRelevance = files.sortedByDescending { Relevance.score(query, it.title) }
         val tokens = (listOf(query) + ImageSearch.aliasesFor(query))
             .flatMap { v -> v.lowercase().split(Regex("""[^a-zа-яё0-9]+""")).filter { it.length > 2 } }
             .toSet()
         fun relevant(f: DirectFile) = tokens.any { f.title.lowercase().contains(it) }
-        val good = files.filter { relevant(it) }
-        val base = if (good.size >= 5) good else files.sortedByDescending { relevant(it) }
+        val good = byRelevance.filter { relevant(it) }
+        val base = if (good.size >= 5) good else byRelevance.sortedByDescending { relevant(it) }
         return when (sort) {
             1 -> base.sortedByDescending { it.year }
             2 -> base.sortedBy { it.year }

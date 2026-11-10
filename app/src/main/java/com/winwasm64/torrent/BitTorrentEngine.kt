@@ -681,7 +681,14 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
                 searchers.forEach { it.join(25_000) }
                 val deduped = found.toList().distinctBy { it.magnet.ifBlank { it.torrentUrl }.ifBlank { it.name } }
-                val rankedAll = TorrentSearchAgent.rank(deduped, intent)
+                // v4.56.0: отбраковываем «не про то» (по «трали» больше не будет Truck World)
+                val relevantIdx = Relevance.filter(
+                    cleanQuery, deduped.map { it.name }, variants.drop(1)
+                ).toSet()
+                val relevanceKept = deduped
+                    .filterIndexed { idx, _ -> idx in relevantIdx }
+                    .sortedByDescending { Relevance.score(cleanQuery, it.name, variants.drop(1)) }
+                val rankedAll = TorrentSearchAgent.rank(relevanceKept, intent)
                 // если человек уточнил платформу/формат — подходящее поднимаем наверх, но не выбрасываем
                 // остальное: иногда в названии платформы нет, а внутри она та самая
                 val strict = if (intent.platform.isNotBlank() || intent.format.isNotBlank()) {

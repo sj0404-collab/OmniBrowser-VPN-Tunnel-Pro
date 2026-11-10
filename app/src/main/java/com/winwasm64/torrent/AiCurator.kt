@@ -23,8 +23,27 @@ object AiCurator {
     private const val KEY_ENABLED = "enabled"
     private const val TEXT_ENDPOINT = "https://text.pollinations.ai/openai"
 
+    // v4.56.0: по умолчанию ВКЛ — раньше человек не понимал, включился ли куратор вообще
     fun isEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, false)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
+
+    private const val KEY_STATUS = "status"
+
+    /** Что было в прошлый раз: «OK · вариантов 3» или текст ошибки. Видно в интерфейсе. */
+    fun status(context: Context): String =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_STATUS, "ещё не проверялся").orEmpty()
+
+    private fun setStatus(context: Context, value: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_STATUS, value).apply()
+    }
+
+    /** Проверка связи с ИИ: возвращает true, если шлюз ответил. */
+    fun selfTest(context: Context): Boolean {
+        val answer = ask("Ответь одним словом: работает")
+        val ok = !answer.isNullOrBlank()
+        setStatus(context, if (ok) "OK · " + answer!!.take(40) else "нет ответа от шлюза")
+        return ok
+    }
 
     fun setEnabled(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, value).apply()
@@ -41,13 +60,18 @@ object AiCurator {
             (синонимы, оригинальное/английское название, уточнение по типу: манга, фильм, игра, книга).
             Ответ строго JSON-массивом строк, без пояснений.
         """.trimIndent()
-        val raw = ask(prompt) ?: return emptyList()
+        val raw = ask(prompt)
+        if (raw == null) {
+            setStatus(context, "нет ответа · варианты не получены")
+            return emptyList()
+        }
         val arr = extractJsonArray(raw) ?: return emptyList()
         val out = mutableListOf<String>()
         for (i in 0 until arr.length()) {
             val v = arr.optString(i).trim()
             if (v.length in 3..60 && out.none { it.equals(v, true) } && !v.equals(query, true)) out.add(v)
         }
+        setStatus(context, "OK · вариантов ${out.size}")
         return out
     }
 
@@ -65,14 +89,23 @@ object AiCurator {
             Ответ строго JSON-массивом номеров, которые оставить, без пояснений.
             $indexed
         """.trimIndent()
-        val raw = ask(prompt) ?: return null
+        val raw = ask(prompt)
+        if (raw == null) {
+            setStatus(context, "нет ответа · фильтр не применён")
+            return null
+        }
         val arr = extractJsonArray(raw) ?: return null
         val out = mutableSetOf<Int>()
         for (i in 0 until arr.length()) {
             val idx = arr.optInt(i, -1)
             if (idx >= 0 && idx < titles.size) out.add(idx)
         }
-        return out.ifEmpty { null }
+        val result = out.ifEmpty { null }
+        setStatus(
+            context,
+            if (result == null) "OK · всё релевантно" else "OK · оставил ${result.size} из ${minOf(titles.size, limit)}"
+        )
+        return result
     }
 
     /* ===================== транспорт ===================== */

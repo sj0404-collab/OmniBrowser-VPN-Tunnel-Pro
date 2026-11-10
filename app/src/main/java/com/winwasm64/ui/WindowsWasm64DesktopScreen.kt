@@ -5836,16 +5836,32 @@ private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
                     },
                     color = Omni.TextDim, fontSize = 9.sp
                 )
-                // v4.55.0: ИИ-куратор (Pollinations) — придумывает варианты и отбраковывает мусор
-                val aiOn = com.winwasm64.torrent.AiCurator.isEnabled(context)
-                Text(
-                    "🤖 ИИ-куратор: " + if (aiOn) "ВКЛ" else "выкл",
-                    color = if (aiOn) Omni.Success else Omni.TextDim,
-                    fontSize = 9.sp,
-                    modifier = Modifier.clickable {
-                        com.winwasm64.torrent.AiCurator.setEnabled(context, !aiOn)
-                    }
-                )
+                // v4.56.0: ИИ-куратор включён по умолчанию, видно его статус и кнопку проверки
+                var aiOn by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.isEnabled(context)) }
+                var aiStatus by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.status(context)) }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "🤖 ИИ-куратор: " + if (aiOn) "ВКЛ" else "выкл",
+                        color = if (aiOn) Omni.Success else Omni.TextDim,
+                        fontSize = 9.sp,
+                        modifier = Modifier.clickable {
+                            aiOn = !aiOn
+                            com.winwasm64.torrent.AiCurator.setEnabled(context, aiOn)
+                        }
+                    )
+                    Text(
+                        "· проверить",
+                        color = Omni.Accent, fontSize = 9.sp,
+                        modifier = Modifier.clickable {
+                            aiStatus = "проверяю…"
+                            Thread({
+                                val ok = com.winwasm64.torrent.AiCurator.selfTest(context)
+                                aiStatus = if (ok) com.winwasm64.torrent.AiCurator.status(context) else "нет связи с ИИ"
+                            }, "AiPing").also { it.isDaemon = true; it.start() }
+                        }
+                    )
+                }
+                Text("статус: $aiStatus", color = Omni.TextDim, fontSize = 8.sp, maxLines = 1)
             }
             Text("−", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable {
                 val next = (depth - 1).coerceAtLeast(com.winwasm64.torrent.SearchSettings.MIN)
@@ -6370,7 +6386,11 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                             LaunchedEffect(img.url) {
                                 if (bmp == null) {
                                     bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                        com.winwasm64.ui.browser.CoverCache.load(img.url)
+                                        // v4.56.0: с referer — Яндекс отдаёт исходник только «своим»
+                                        com.winwasm64.ui.browser.CoverCache.load(
+                                            img.url,
+                                            referer = img.pageUrl.ifBlank { null }
+                                        ) ?: com.winwasm64.ui.browser.CoverCache.load(img.url)
                                     }
                                 }
                             }
