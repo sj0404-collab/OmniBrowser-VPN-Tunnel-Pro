@@ -83,7 +83,7 @@ object DirectSearch {
         fun hasMore(chip: String): Boolean = if (chip == "Все") more.values.any { it } else more[chip] == true
     }
 
-    private const val ROWS_PER_CHIP = 24
+    private const val ROWS_PER_CHIP = 32
 
     /** Один поиск — все категории сразу, параллельно. */
     fun searchAll(query: String, sort: Int = 0, page: Int = 0, timeoutMs: Int = 12_000): Buckets {
@@ -116,15 +116,28 @@ object DirectSearch {
         sort: Int = 0,
         timeoutMs: Int = 12_000
     ): List<DirectFile> {
-        val variants = (listOf(query) + ImageSearch.aliasesFor(query)).distinct()
+        // v4.53.0: ищем не одну словоформу, а упоминания («винт» → «гребной винт», winter и т. п.)
+        val variants = QueryExpander.variants(query, 3)
         val raw = mutableListOf<DirectFile>()
-        for (v in variants.take(2)) {
-            raw.addAll(searchArchive(v, chip, page, sort, timeoutMs))
+        variants.forEachIndexed { idx, v ->
+            val term = if (chip == "📖 Манга") "$v comic" else v
+            // первый вариант — основная выдача, остальные (ассоциации) — добивка
+            raw.addAll(searchArchive(term, chip, page, sort, timeoutMs, maxDocs = if (idx == 0) 20 else 10))
         }
         if (page == 0 && (chip == "💾 Софт" || chip == "🎮 Игры")) {
             raw.addAll(searchGitHub(query, timeoutMs))
         }
-        return raw.distinctBy { it.downloadUrl }
+        val unique = raw.distinctBy { it.downloadUrl }
+        // v4.53.0: одна запись — одна категория. Манга только cbr/cbz/cb7, книги без комиксов.
+        return when (chip) {
+            "📖 Манга" -> unique.filter { it.kind == "manga" }
+            "📚 Книги" -> unique.filter { it.kind == "book" }
+            "🎮 Игры" -> unique.filter { it.kind == "game" || it.kind == "soft" }
+            "🎬 Видео" -> unique.filter { it.kind == "video" }
+            "🎵 Музыка" -> unique.filter { it.kind == "music" }
+            "💾 Софт" -> unique.filter { it.kind == "soft" }
+            else -> unique
+        }
     }
 
     /** Совместимость: старый вызов одной категории (используется «показать ещё»). */
@@ -157,7 +170,14 @@ object DirectSearch {
 
     /* ===================== Internet Archive ===================== */
 
-    private fun searchArchive(query: String, kind: String, page: Int, sort: Int, timeoutMs: Int): List<DirectFile> {
+    private fun searchArchive(
+        query: String,
+        kind: String,
+        page: Int,
+        sort: Int,
+        timeoutMs: Int,
+        maxDocs: Int = ROWS_PER_CHIP
+    ): List<DirectFile> {
         val q = URLEncoder.encode(query, "UTF-8")
         // категория — прямо в запрос, а не фильтром поверх готового списка
         val media = when (kind) {
@@ -189,9 +209,13 @@ object DirectSearch {
                 if (id.isBlank()) continue
                 items.add(Quad(id, d.optString("title", id), d.optString("mediatype", ""), d.optInt("year", 0)))
             }
-            // файлы и форматы забираем параллельно — иначе 24 записи ждут друг друга
+            // на каждый вариант запроса — свой лимит записей, иначе 3 варианта × 6 категорий
+            // генерируют сотни запросов метаданных и поиск начинает «жевать»
+            val limited = items.take(maxDocs)
+            val bagItems = limited
+            // файлы и форматы забираем параллельно — иначе записи ждут друг друга
             val bag = java.util.Collections.synchronizedList(result)
-            val queue = java.util.concurrent.LinkedBlockingQueue(items)
+            val queue = java.util.concurrent.LinkedBlockingQueue(bagItems)
             val workers = (1..6).map {
                 Thread({
                     while (true) {

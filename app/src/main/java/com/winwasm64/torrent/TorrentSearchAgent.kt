@@ -514,7 +514,12 @@ object TorrentSearchAgent {
 
     private val VIDEO_EXT = listOf("mkv", "mp4", "avi", "bdrip", "webrip", "web-dl", "dvdrip", "hdtv", "x264", "x265", "hevc", "1080p", "720p", "2160p", "camrip", "bdremux")
     private val MUSIC_EXT = listOf("flac", "mp3", "lossless", "aac", "wav", "album", "discography", "ost", "soundtrack", "m4a", "opus")
-    private val BOOK_EXT = listOf("epub", "fb2", "pdf", "mobi", "djvu", "cbz", "cbr", "manga", "манга", "книга", "novel", "роман", "аудиокнига", "lib")
+    // v4.53.0: книги — это книги. Комиксы вынесены в отдельную категорию «манга»,
+    // иначе один и тот же PDF попадал и в «Книги», и в «Манга» (дубликат в двух чипах).
+    private val BOOK_EXT = listOf("epub", "fb2", "pdf", "mobi", "djvu", "книга", "novel", "роман", "аудиокнига", "lib")
+    private val MANGA_EXT = listOf(
+        "cbr", "cbz", "cb7", "manga", "манга", "манхва", "manhwa", "manhua", "комикс", "comic", "ранобэ", "ranobe"
+    )
     private val SOFT_EXT = listOf("exe", "msi", "apk", "iso", "dmg", "portable", "лицензия", "office", "windows", "photoshop", "kms")
     // «game»/«игра» из признаков убраны: в названиях фильмов они встречаются чаще, чем в играх
     private val GAME_EXT = listOf("repack", "репак", "nsz", "nsp", "xci", "switch", "ps4", "ps5", "xbox", "steam", "gog", "лицензия")
@@ -532,6 +537,8 @@ object TorrentSearchAgent {
         return when {
             has(VIDEO_EXT) -> "video"
             has(MUSIC_EXT) -> "music"
+            // манга/комиксы проверяются до книг: cbr/cbz — это не PDF
+            has(MANGA_EXT) -> "manga"
             has(BOOK_EXT) -> "book"
             has(GAME_EXT) || platform.isNotBlank() || source in CATALOG_SOURCES -> "game"
             has(SOFT_EXT) -> "soft"
@@ -584,6 +591,7 @@ object TorrentSearchAgent {
 
     /** Подпись и иконка категории для карточки: у каждой категории своя. */
     fun kindEmoji(kind: String): String = when (kind) {
+        "manga" -> "📖"
         "game" -> "🎮"
         "video" -> "🎬"
         "music" -> "🎵"
@@ -599,7 +607,8 @@ object TorrentSearchAgent {
         "🎮 Игры" -> category == "game"
         "🎬 Видео" -> category == "video"
         "🎵 Музыка" -> category == "music"
-        "📚 Книги", "📖 Манга" -> category == "book" || category == "manga"
+        "📚 Книги" -> category == "book"
+        "📖 Манга" -> category == "manga"
         "💾 Софт" -> category == "soft"
         else -> true
     }

@@ -655,8 +655,28 @@ class BitTorrentEngine(private val context: Context? = null) {
                 // v4.41.0: намерение — из СЫРОГО запроса. Раньше cleanQuery выбрасывал «pc»/«switch»,
                 // и «scarlet» с «scarlet pc» давали один и тот же список: уточнение просто терялось.
                 val intent = TorrentSearchAgent.parseIntent(query)
-                val found = TorrentSearchAgent.searchAll(cleanQuery)
-                val rankedAll = TorrentSearchAgent.rank(found, intent)
+                // v4.53.0: ищем не только точную словоформу, но и упоминания/ассоциации
+                // (винт → «гребной винт», «воздушный винт», «винтер» → winter), как это делает галерея.
+                // Варианты обходятся ПАРАЛЛЕЛЬНО, поэтому общее время почти не растёт.
+                val variants = QueryExpander.variants(cleanQuery, 3)
+                val found = java.util.Collections.synchronizedList(mutableListOf<TorrentSearchAgent.Found>())
+                val searchers = variants.map { variant ->
+                    Thread({
+                        try {
+                            val part = TorrentSearchAgent.searchAll(variant)
+                            for (f in part) {
+                                val marked = if (QueryExpander.isAssociation(cleanQuery, variant)) {
+                                    f.copy(reason = "по ассоциации: «$variant»" + (if (f.reason.isNotBlank()) " · ${f.reason}" else ""))
+                                } else f
+                                found.add(marked)
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }, "TorrentVariant").also { it.isDaemon = true; it.start() }
+                }
+                searchers.forEach { it.join(25_000) }
+                val deduped = found.toList().distinctBy { it.magnet.ifBlank { it.torrentUrl }.ifBlank { it.name } }
+                val rankedAll = TorrentSearchAgent.rank(deduped, intent)
                 // если человек уточнил платформу/формат — подходящее поднимаем наверх, но не выбрасываем
                 // остальное: иногда в названии платформы нет, а внутри она та самая
                 val strict = if (intent.platform.isNotBlank() || intent.format.isNotBlank()) {
@@ -672,7 +692,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 if (intent.quality.isNotBlank() || intent.audio.isNotBlank()) {
                     ranked = TorrentSearchAgent.filterByQuality(ranked, intent.quality)
                 }
-                for (f in ranked.take(40)) {
+                for (f in ranked.take(80)) {
                     results.add(
                         CatalogTorrentItem(
                             // v4.48.0: &nbsp; и &#039; из catorrent/nnmclub больше не попадают в карточку
@@ -697,7 +717,7 @@ class BitTorrentEngine(private val context: Context? = null) {
                 }
                 com.winwasm64.vpn.ConnTrace.torrent(
                     "агент: «$cleanQuery»",
-                    "найдено ${found.size}, показано ${results.size}",
+                    "найдено ${deduped.size} (варианты: ${variants.size}), показано ${results.size}",
                     results.isNotEmpty()
                 )
             } catch (_: Throwable) {

@@ -53,6 +53,9 @@ class VideoSearchActivity : Activity() {
     private val allItems = mutableListOf<YouTubeSearch.Item>()
     private var continuation: String? = null
     private var loading = false
+    // v4.53.0: если по точному названию нашлось мало — пробуем упоминания/ассоциации
+    private var variantIndex = 0
+    private var extraTerms: List<String> = emptyList()
 
     private lateinit var status: TextView
     private lateinit var captureStatus: TextView
@@ -307,6 +310,16 @@ class VideoSearchActivity : Activity() {
         allItems.clear()
         continuation = null
         loading = false
+        variantIndex = 0
+        extraTerms = if (source == "YouTube") {
+            try {
+                QueryExpander.variants(query, 3).drop(1)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        } else {
+            emptyList()
+        }
         resultsBox.removeAllViews()
         rebuildChips()
         if (source == "YouTube") {
@@ -337,7 +350,9 @@ class VideoSearchActivity : Activity() {
         if (!manual && continuation == null) return
         loading = true
         status.text = if (allItems.isEmpty()) "Ищу на YouTube…" else "Догружаю…"
-        val term = if (channelName.isBlank()) query else "$query $channelQuery".trim()
+        val base = if (channelName.isBlank()) query else "$query $channelQuery".trim()
+        val term = if (variantIndex == 0 || variantIndex > extraTerms.size) base
+        else extraTerms[variantIndex - 1]
         val next = continuation
         Thread({
             val page = try {
@@ -351,9 +366,16 @@ class VideoSearchActivity : Activity() {
                 allItems.addAll(page.items.filter { new -> allItems.none { it.id == new.id && it.kind == new.kind } })
                 rebuildChips()
                 renderList()
-                status.text = "Найдено: ${allItems.size} · $category" +
+                status.text = (if (variantIndex > 0) "Упоминания по «${extraTerms.getOrNull(variantIndex - 1).orEmpty()}» · " else "") +
+                    "Найдено: ${allItems.size} · $category" +
                     (if (duration != "Любая") " · $duration" else "") +
                     (if (continuation == null) " · это всё" else " · листайте — догружу")
+                // если по точному запросу почти ничего — идём по ассоциациям
+                if (continuation == null && allItems.size < 8 && variantIndex <= extraTerms.size) {
+                    variantIndex++
+                    loadMore(manual = true)
+                    return@runOnUiThread
+                }
                 // добираем автоматически, если в выбранной категории пока пусто
                 if (filtered().isEmpty() && continuation != null) loadMore()
             }
