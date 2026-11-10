@@ -13,7 +13,7 @@ import org.junit.Test
 class TorrentRescueTest {
 
     private fun c(name: String, seeders: Int, size: Long = 111L * 1024 * 1024, src: String = "apibay") =
-        TorrentRescue.Candidate(name, "magnet:?xt=urn:btih:abc&dn=x", size, seeders, src)
+        TorrentRescue.Candidate(name, "magnet:?xt=urn:btih:abc&dn=x", size, seeders, 0, src)
 
     @Test
     fun `имя раздачи чистится до поискового запроса`() {
