@@ -5,6 +5,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * v4.55.0: «кто всё это время ищет» — теперь есть ИИ-куратор.
@@ -15,38 +17,123 @@ import java.net.URL
  *  • он придумывает дополнительные варианты запроса (синонимы, оригинальные названия);
  *  • он проверяет найденное и отбраковывает явно не то («пятая стража» YouTube ≠ манга «Страж»).
  *
+ * v4.58.0: «нету индикации — работает агент, спит или размышляет, и нет кнопки выключить/заменить».
+ * Теперь у агента есть настоящее состояние, которое видно в интерфейсе каждые полсекунды:
+ *  💤 спит (ждёт запроса) → 🤔 размышляет (придумывает варианты) → ⏳ спрашивает модель →
+ *  🟢 работал (что именно сделал) → 🔴 ошибка; и ⛔ выключен, если человек его выключил.
+ * Модель можно заменить прямо из интерфейса: «умный» (openai) ↔ «быстрый» (openai-fast).
+ *
  * Куратор необязателен: если сеть/шлюз недоступны, поиск работает по-старому, без пауз.
  */
 object AiCurator {
 
     private const val PREFS = "omni_ai"
     private const val KEY_ENABLED = "enabled"
+    private const val KEY_STATUS = "status"
+    private const val KEY_MODEL = "model"
     private const val TEXT_ENDPOINT = "https://text.pollinations.ai/openai"
+
+    /** Состояние агента — то, что человек видит строкой в интерфейсе. */
+    enum class State { OFF, SLEEPING, THINKING, ASKING, DONE, ERROR }
+
+    private val state = AtomicReference(State.SLEEPING)
+    private val stateNote = AtomicReference("")
+    private val stateSince = AtomicLong(System.currentTimeMillis())
+
+    /** Доступные модели на бесплатном шлюзе (проверены: отвечают без ключа). */
+    val MODELS = listOf("openai" to "умный", "openai-fast" to "быстрый")
 
     // v4.56.0: по умолчанию ВКЛ — раньше человек не понимал, включился ли куратор вообще
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
 
-    private const val KEY_STATUS = "status"
-
     /** Что было в прошлый раз: «OK · вариантов 3» или текст ошибки. Видно в интерфейсе. */
     fun status(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_STATUS, "ещё не проверялся").orEmpty()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_STATUS, "ещё не проверялся")
+            .orEmpty()
 
     private fun setStatus(context: Context, value: String) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_STATUS, value).apply()
     }
 
-    /** Проверка связи с ИИ: возвращает true, если шлюз ответил. */
-    fun selfTest(context: Context): Boolean {
-        val answer = ask("Ответь одним словом: работает")
-        val ok = !answer.isNullOrBlank()
-        setStatus(context, if (ok) "OK · " + answer!!.take(40) else "нет ответа от шлюза")
-        return ok
-    }
-
     fun setEnabled(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, value).apply()
+        if (value) mark(State.SLEEPING, "включён — ждёт запроса") else mark(State.OFF, "выключен человеком")
+    }
+
+    /** Текущая модель (id для шлюза). */
+    fun model(context: Context): String =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MODEL, "openai")
+            .orEmpty().ifBlank { "openai" }
+
+    /** Человеческое имя модели: «умный» / «быстрый». */
+    fun modelLabel(context: Context): String {
+        val id = model(context)
+        return MODELS.firstOrNull { it.first == id }?.second ?: id
+    }
+
+    fun setModel(context: Context, id: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_MODEL, id).apply()
+        mark(State.SLEEPING, "модель заменена: ${modelLabel(context)}")
+    }
+
+    /** Заменить агента на другого: переключаем модель по кругу и возвращаем её имя. */
+    fun cycleModel(context: Context): String {
+        val ids = MODELS.map { it.first }
+        val next = ids[(ids.indexOf(model(context)).let { if (it < 0) 0 else it } + 1) % ids.size]
+        setModel(context, next)
+        return modelLabel(context)
+    }
+
+    /* ===================== состояние агента ===================== */
+
+    fun mark(value: State, note: String) {
+        state.set(value)
+        stateNote.set(note)
+        stateSince.set(System.currentTimeMillis())
+    }
+
+    fun currentState(): State = state.get()
+
+    /**
+     * Живая строка состояния — её рисует интерфейс (обновляется каждые 0.5 с).
+     * Именно этого не хватало: «работает / спит / размышляет» было не видно.
+     */
+    fun liveLine(context: Context, now: Long = System.currentTimeMillis()): String {
+        if (!isEnabled(context)) return "⛔ выключен — нажмите «Включить»"
+        val st = state.get()
+        val note = stateNote.get()
+        val secs = ((now - stateSince.get()) / 1000L).coerceAtLeast(0L)
+        fun tail(): String = if (secs >= 3) " · ${secs} с" else ""
+        return when (st) {
+            State.THINKING -> "🤔 размышляет · ${note.ifBlank { "готовит запрос" }}" + tail()
+            State.ASKING -> "⏳ спрашивает модель · ${note.ifBlank { "запрос к ИИ" }}" + tail()
+            State.DONE -> if (secs < 120) {
+                "🟢 работал · ${note.ifBlank { "готово" }}"
+            } else {
+                "💤 спит · последний ответ ${secs / 60} мин назад"
+            }
+            State.ERROR -> if (secs < 120) {
+                "🔴 ошибка · ${note.ifBlank { "нет связи" }}"
+            } else {
+                "💤 спит · последняя ошибка ${secs / 60} мин назад"
+            }
+            State.SLEEPING -> "💤 спит · ждёт запроса" + if (note.isNotBlank()) " ($note)" else ""
+            State.OFF -> "⛔ выключен"
+        }
+    }
+
+    /** Проверка связи с ИИ: возвращает true, если шлюз ответил. */
+    fun selfTest(context: Context): Boolean {
+        mark(State.ASKING, "проверка связи")
+        val answer = ask("Ответь одним словом: работает", context)
+        val ok = !answer.isNullOrBlank()
+        setStatus(context, if (ok) "OK · " + answer!!.take(40) else "нет ответа от шлюза")
+        mark(
+            if (ok) State.DONE else State.ERROR,
+            if (ok) "проверка пройдена · ${modelLabel(context)}" else "шлюз не ответил"
+        )
+        return ok
     }
 
     /**
@@ -54,24 +141,34 @@ object AiCurator {
      * Возвращает пустой список, если выключено или шлюз не ответил.
      */
     fun expand(context: Context, query: String, limit: Int = 3): List<String> {
-        if (!isEnabled(context)) return emptyList()
+        if (!isEnabled(context)) {
+            mark(State.OFF, "выключен")
+            return emptyList()
+        }
+        mark(State.THINKING, "придумываю варианты запроса")
         val prompt = """
             Ты помощник поиска. Для запроса «$query» предложи до $limit коротких поисковых вариантов
             (синонимы, оригинальное/английское название, уточнение по типу: манга, фильм, игра, книга).
             Ответ строго JSON-массивом строк, без пояснений.
         """.trimIndent()
-        val raw = ask(prompt)
+        mark(State.ASKING, "варианты для «${query.take(24)}»")
+        val raw = ask(prompt, context)
         if (raw == null) {
             setStatus(context, "нет ответа · варианты не получены")
+            mark(State.ERROR, "нет ответа от шлюза")
             return emptyList()
         }
-        val arr = extractJsonArray(raw) ?: return emptyList()
+        val arr = extractJsonArray(raw) ?: run {
+            mark(State.ERROR, "ответ не разобран")
+            return emptyList()
+        }
         val out = mutableListOf<String>()
         for (i in 0 until arr.length()) {
             val v = arr.optString(i).trim()
             if (v.length in 3..60 && out.none { it.equals(v, true) } && !v.equals(query, true)) out.add(v)
         }
         setStatus(context, "OK · вариантов ${out.size}")
+        mark(State.DONE, "вариантов ${out.size} · ${modelLabel(context)}")
         return out
     }
 
@@ -81,6 +178,7 @@ object AiCurator {
      */
     fun keepIndices(context: Context, query: String, titles: List<String>, limit: Int = 30): Set<Int>? {
         if (!isEnabled(context) || titles.isEmpty()) return null
+        mark(State.THINKING, "проверяю найденное (${titles.size})")
         val indexed = titles.take(limit).mapIndexed { i, t -> "$i. ${t.take(120)}" }.joinToString("\n")
         val prompt = """
             Запрос пользователя: «$query».
@@ -89,12 +187,17 @@ object AiCurator {
             Ответ строго JSON-массивом номеров, которые оставить, без пояснений.
             $indexed
         """.trimIndent()
-        val raw = ask(prompt)
+        mark(State.ASKING, "отбираю по теме из ${minOf(titles.size, limit)}")
+        val raw = ask(prompt, context)
         if (raw == null) {
             setStatus(context, "нет ответа · фильтр не применён")
+            mark(State.ERROR, "нет ответа · фильтр не применён")
             return null
         }
-        val arr = extractJsonArray(raw) ?: return null
+        val arr = extractJsonArray(raw) ?: run {
+            mark(State.ERROR, "ответ не разобран · фильтр не применён")
+            return null
+        }
         val out = mutableSetOf<Int>()
         for (i in 0 until arr.length()) {
             val idx = arr.optInt(i, -1)
@@ -105,14 +208,29 @@ object AiCurator {
             context,
             if (result == null) "OK · всё релевантно" else "OK · оставил ${result.size} из ${minOf(titles.size, limit)}"
         )
+        mark(
+            State.DONE,
+            if (result == null) "всё релевантно" else "оставил ${result.size} из ${minOf(titles.size, limit)}"
+        )
         return result
     }
 
     /* ===================== транспорт ===================== */
 
-    private fun ask(prompt: String): String? {
+    /** Запрос к модели: выбранная первой, при отказе — «умная» как запасная. */
+    private fun ask(prompt: String, context: Context? = null): String? {
+        val preferred = context?.let { model(it) } ?: "openai"
+        val order = (listOf(preferred) + MODELS.map { it.first }).distinct()
+        for (id in order) {
+            val answer = post(id, prompt)
+            if (!answer.isNullOrBlank()) return answer
+        }
+        return null
+    }
+
+    private fun post(modelId: String, prompt: String): String? {
         val body = JSONObject().apply {
-            put("model", "openai")
+            put("model", modelId)
             put(
                 "messages", JSONArray().put(
                     JSONObject().apply {
@@ -129,7 +247,7 @@ object AiCurator {
                 readTimeout = 20_000
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", "OmniBrowser/4.55 (Android)")
+                setRequestProperty("User-Agent", "OmniBrowser/4.58 (Android)")
                 outputStream.use { it.write(body.toByteArray()) }
             }
             if (conn.responseCode !in 200..299) {

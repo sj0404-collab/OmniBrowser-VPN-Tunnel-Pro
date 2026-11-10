@@ -3742,6 +3742,10 @@ private fun TorrentClientSection(
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     fun runSearch(query: String, keepBase: Boolean = false) {
         isSearching = true
+        // v4.58.0: человек видит, что агент именно сейчас думает, а не «спит»
+        com.winwasm64.torrent.AiCurator.mark(
+            com.winwasm64.torrent.AiCurator.State.THINKING, "поиск «${query.take(20)}»"
+        )
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
@@ -5817,6 +5821,79 @@ private fun enqueueDirectDownload(context: android.content.Context, url: String,
  * v4.54.0: ручная «глубина поиска» — сколько запросов/страниц отправлять.
  * 1 — быстро (только точное слово), до 8 — долго, но с синонимами, ассоциациями и листанием.
  */
+/**
+ * v4.58.0: «нету индикации — работает агент, спит или размышляет, и нет кнопки выключить/заменить».
+ *
+ * Строка обновляется каждые полсекунды и показывает настоящее состояние агента:
+ *  💤 спит · ждёт запроса → 🤔 размышляет · придумываю варианты → ⏳ спрашивает модель →
+ *  🟢 работал · вариантов 3 / оставил 18 из 30 → 🔴 ошибка; ⛔ выключен, если его выключили.
+ * Рядом: «⏻ Выключить агента», «🔁 Заменить (умный/быстрый)», «✓ проверить».
+ */
+@Composable
+private fun AiAgentRow() {
+    val context = LocalContext.current
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    var enabled by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.isEnabled(context)) }
+    var modelLabel by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.modelLabel(context)) }
+    var busy by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(500)
+            now = System.currentTimeMillis()
+        }
+    }
+    val line = com.winwasm64.torrent.AiCurator.liveLine(context, now)
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            "🤖 Агент: $line",
+            color = when {
+                !enabled -> Omni.TextDim
+                line.startsWith("🔴") -> Color.parseColor("#FF6B6B")
+                line.startsWith("🟢") -> Omni.Success
+                else -> Omni.Warning
+            },
+            fontSize = 9.sp,
+            maxLines = 2
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (enabled) "⏻ Выключить" else "▶ Включить",
+                color = Omni.Accent, fontSize = 9.sp,
+                modifier = Modifier.clickable {
+                    enabled = !enabled
+                    com.winwasm64.torrent.AiCurator.setEnabled(context, enabled)
+                    now = System.currentTimeMillis()
+                }
+            )
+            Text(
+                "🔁 Заменить ($modelLabel)",
+                color = Omni.Accent, fontSize = 9.sp,
+                modifier = Modifier.clickable {
+                    modelLabel = com.winwasm64.torrent.AiCurator.cycleModel(context)
+                    now = System.currentTimeMillis()
+                }
+            )
+            Text(
+                if (busy) "⏳ проверяю…" else "✓ проверить",
+                color = Omni.Accent, fontSize = 9.sp,
+                modifier = Modifier.clickable {
+                    if (!busy) {
+                        busy = true
+                        Thread({
+                            com.winwasm64.torrent.AiCurator.selfTest(context)
+                            busy = false
+                        }, "AiPing").also { it.isDaemon = true; it.start() }
+                    }
+                }
+            )
+        }
+        Text(
+            "последний ответ: ${com.winwasm64.torrent.AiCurator.status(context)}",
+            color = Omni.TextDim, fontSize = 8.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
 @Composable
 private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
     val context = LocalContext.current
@@ -5842,32 +5919,8 @@ private fun SearchDepthRow(scope: String, onDepth: (Int) -> Unit) {
                     },
                     color = Omni.TextDim, fontSize = 9.sp
                 )
-                // v4.56.0: ИИ-куратор включён по умолчанию, видно его статус и кнопку проверки
-                var aiOn by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.isEnabled(context)) }
-                var aiStatus by remember { mutableStateOf(com.winwasm64.torrent.AiCurator.status(context)) }
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        "🤖 ИИ-куратор: " + if (aiOn) "ВКЛ" else "выкл",
-                        color = if (aiOn) Omni.Success else Omni.TextDim,
-                        fontSize = 9.sp,
-                        modifier = Modifier.clickable {
-                            aiOn = !aiOn
-                            com.winwasm64.torrent.AiCurator.setEnabled(context, aiOn)
-                        }
-                    )
-                    Text(
-                        "· проверить",
-                        color = Omni.Accent, fontSize = 9.sp,
-                        modifier = Modifier.clickable {
-                            aiStatus = "проверяю…"
-                            Thread({
-                                val ok = com.winwasm64.torrent.AiCurator.selfTest(context)
-                                aiStatus = if (ok) com.winwasm64.torrent.AiCurator.status(context) else "нет связи с ИИ"
-                            }, "AiPing").also { it.isDaemon = true; it.start() }
-                        }
-                    )
-                }
-                Text("статус: $aiStatus", color = Omni.TextDim, fontSize = 8.sp, maxLines = 1)
+                // v4.58.0: живая индикация агента + кнопки «Выключить» и «Заменить»
+                AiAgentRow()
             }
             Text("−", color = Color.White, fontSize = 18.sp, modifier = Modifier.clickable {
                 val next = (depth - 1).coerceAtLeast(com.winwasm64.torrent.SearchSettings.MIN)
@@ -5914,6 +5967,9 @@ private fun DirectFilesSection(
             return
         }
         busy = true
+        com.winwasm64.torrent.AiCurator.mark(
+            com.winwasm64.torrent.AiCurator.State.THINKING, "файлы · «${query.take(20)}»"
+        )
         com.winwasm64.torrent.SearchCache.directQuery = query
         com.winwasm64.torrent.SearchCache.directSort = nextSort
         com.winwasm64.torrent.SearchCache.directPage = nextPage
@@ -6263,6 +6319,9 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
             return
         }
         busy = true
+        com.winwasm64.torrent.AiCurator.mark(
+            com.winwasm64.torrent.AiCurator.State.THINKING, "фото · «${q.take(20)}»"
+        )
         if (!append) images = emptyList()
         com.winwasm64.torrent.SearchCache.photoQuery = q
         com.winwasm64.torrent.SearchCache.photoFilter = f
