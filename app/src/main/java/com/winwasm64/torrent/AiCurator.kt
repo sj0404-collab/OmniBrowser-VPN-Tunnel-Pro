@@ -77,7 +77,7 @@ object AiCurator {
 
     /* ===================== транспорт ===================== */
 
-    private fun ask(prompt: String): String? = try {
+    private fun ask(prompt: String): String? {
         val body = JSONObject().apply {
             put("model", "openai")
             put(
@@ -89,21 +89,26 @@ object AiCurator {
                 )
             )
         }.toString()
-        val conn = (URL(TEXT_ENDPOINT).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 10_000
-            readTimeout = 20_000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json")
-            setRequestProperty("User-Agent", "OmniBrowser/4.55 (Android)")
-            outputStream.use { it.write(body.toByteArray()) }
+        return try {
+            val conn = (URL(TEXT_ENDPOINT).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 10_000
+                readTimeout = 20_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", "OmniBrowser/4.55 (Android)")
+                outputStream.use { it.write(body.toByteArray()) }
+            }
+            if (conn.responseCode !in 200..299) {
+                null
+            } else {
+                val text = conn.inputStream.bufferedReader().use { it.readText() }
+                JSONObject(text).optJSONArray("choices")?.optJSONObject(0)
+                    ?.optJSONObject("message")?.optString("content")
+            }
+        } catch (_: Throwable) {
+            null
         }
-        if (conn.responseCode !in 200..299) return null
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        JSONObject(text).optJSONArray("choices")?.optJSONObject(0)
-            ?.optJSONObject("message")?.optString("content")
-    } catch (_: Throwable) {
-        null
     }
 
     private fun extractJsonArray(raw: String): JSONArray? {
