@@ -1890,9 +1890,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     var torrentStatuses by remember { mutableStateOf(torrentEngine.getAllStatuses()) }
     LaunchedEffect(Unit) {
+        // v4.61.0: сторож главного потока — если интерфейс снова «провалится», это будет видно в журнале
+        com.winwasm64.torrent.MainThreadWatchdog.start()
         while (true) {
-            torrentStatuses = torrentEngine.getAllStatuses()
-            delay(500)
+            // v4.61.0: если торрент-задач нет — не трогаем состояние (иначе перерисовка каждые 0,5 с впустую)
+            val snapshot = torrentEngine.getAllStatuses()
+            if (snapshot.isNotEmpty() || torrentStatuses.isNotEmpty()) torrentStatuses = snapshot
+            delay(800)
         }
     }
 
@@ -3749,8 +3753,10 @@ private fun TorrentClientSection(
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        // v4.59.0: ждём модель не дольше 7 с — поиск не должен стоять из-за неё
-        val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
+        // v4.61.0: вычисления агента — ТОЛЬКО в фоне. Раньше здесь главный поток ждал модель
+        // до 6 секунд, и Android показывал «OmniBrowser & VPN Pro не отвечает».
+        com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
+        val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
         torrentEngine.searchPublicTorrents(query, searchDepth, aiExtra) { res ->
             mainHandler.post {
                 catalogItems = res
@@ -6004,8 +6010,9 @@ private fun DirectFilesSection(
         if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
             // v4.55.0: асинхронно — что нашлось, то сразу и показываем
-            // v4.60.0: агент больше не тормозит поиск (быстрая модель сразу, умная — в фоне)
-            val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
+            // v4.61.0: варианты берём только готовые, расчёт идёт в фоне
+            com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
+            val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
             val res = try {
                 com.winwasm64.torrent.DirectSearch.searchAll(
                     query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra

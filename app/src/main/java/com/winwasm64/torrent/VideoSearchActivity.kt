@@ -60,6 +60,8 @@ class VideoSearchActivity : Activity() {
     // прокручивать выдачу RuTube/VK (1…8), задаёт человек
     private var depth = 3
     private var scrapePass = 0
+    /** v4.61.0: ИИ-фильтр применяется один раз за поиск, а не на каждой догруженной странице. */
+    private var aiFilteredOnce = false
 
     private lateinit var status: TextView
     private lateinit var captureStatus: TextView
@@ -326,6 +328,7 @@ class VideoSearchActivity : Activity() {
     /* ===================== загрузка данных ===================== */
 
     private fun reload() {
+        aiFilteredOnce = false
         allItems.clear()
         continuation = null
         loading = false
@@ -396,7 +399,9 @@ class VideoSearchActivity : Activity() {
                 rebuildChips()
                 renderList()
                 // v4.55.0: ИИ-куратор убирает из выдачи посторонние ролики (если включён)
-                if (AiCurator.isEnabled(this) && allItems.size > 6) {
+                // v4.61.0: один раз на запрос — иначе на каждой странице заново уходил запрос к модели
+                if (AiCurator.isEnabled(this) && allItems.size > 6 && !aiFilteredOnce) {
+                    aiFilteredOnce = true
                     val snapshotTitles = allItems.map { it.title }
                     Thread({
                         val keep = AiCurator.keepIndices(this, query.ifBlank { channelName }, snapshotTitles, 30)
