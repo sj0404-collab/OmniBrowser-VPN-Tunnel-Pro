@@ -30,8 +30,7 @@ import com.winwasm64.ui.theme.OmniTheme
  * @param title Заголовок видео
  * @param thumbnailUrl Обложка (optional)
  */
-@OptIn(androidx.media3.common.util.UnstableApi::class)
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(androidx.media3.common.util.UnstableApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun NativeVideoPlayerScreen(
     videoUrl: String,
@@ -49,10 +48,10 @@ fun NativeVideoPlayerScreen(
     // Создаём ExoPlayer
     LaunchedEffect(videoUrl) {
         val exoPlayer = ExoPlayer.Builder(context)
-            .setMediaItem(MediaItem.fromUri(videoUrl))
             .setAutoPlay(true)
             .setRepeatMode(Player.REPEAT_MODE_OFF)
             .build()
+        exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
         player = exoPlayer
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -116,7 +115,6 @@ fun NativeVideoPlayerScreen(
                             PlayerView(ctx).also { pv ->
                                 pv.player = p
                                 pv.useController = true
-                                pv.resizeMode = PlayerView.RESIZE_MODE_FIT
                                 pv.setOnClickListener {
                                     showControls = !showControls
                                     pv.useController = showControls
