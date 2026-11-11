@@ -47,11 +47,9 @@ fun NativeVideoPlayerScreen(
 
     // Создаём ExoPlayer
     LaunchedEffect(videoUrl) {
-        val exoPlayer = ExoPlayer.Builder(context)
-            .setAutoPlay(true)
-            .setRepeatMode(Player.REPEAT_MODE_OFF)
-            .build()
+        val exoPlayer = ExoPlayer.Builder(context).build()
         exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
+        exoPlayer.setRepeatMode(Player.REPEAT_MODE_OFF)
         player = exoPlayer
         exoPlayer.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
