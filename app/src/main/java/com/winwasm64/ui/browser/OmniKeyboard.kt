@@ -256,7 +256,7 @@ fun OmniKeyPanel(
     }
 
     /** Преобразовать символ в Android keyCode (для доверенной отправки KeyEvent). */
-    private fun charToKeyCode(c: String): Int = when (c.uppercase()) {
+    fun charToKeyCode(c: String): Int = when (c.uppercase()) {
         "A" -> KeyEvent.KEYCODE_A; "B" -> KeyEvent.KEYCODE_B; "C" -> KeyEvent.KEYCODE_C
         "D" -> KeyEvent.KEYCODE_D; "E" -> KeyEvent.KEYCODE_E; "F" -> KeyEvent.KEYCODE_F
         "G" -> KeyEvent.KEYCODE_G; "H" -> KeyEvent.KEYCODE_H; "I" -> KeyEvent.KEYCODE_I
