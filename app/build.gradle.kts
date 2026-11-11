@@ -14,7 +14,7 @@ android {
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber
-        versionName = "4.63.0"
+        versionName = "4.64.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -109,8 +109,16 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.webkit)
+    // Media3 ExoPlayer: native видеоигра вместо WebView (из RupoopFork)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+    implementation(libs.androidx.media3.common)
+    implementation(libs.androidx.media3.exoplayer.hls)
+    implementation(libs.androidx.media3.session)
     // v4.4.3: запасной канал Psiphon
     implementation("ca.psiphon:psiphontunnel:2.0.42")
+    // WireGuard tunnel (portal-wg / AetherWG)
+    implementation(project(":tunnel"))
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
 }

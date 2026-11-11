@@ -18,3 +18,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "WindowsWasm64"
 include(":app")
+include(":tunnel")

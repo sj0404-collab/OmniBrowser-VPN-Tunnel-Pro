@@ -54,6 +54,19 @@
             </intent-filter>
         </service>
         <service
+            android:name=".vpn.WgVpnService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="wireguard_vpn_tunnel" />
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+        <service
             android:name=".vpn.AppsVpnTileService"
             android:exported="true"
             android:icon="@android:drawable/ic_lock_lock"
@@ -192,6 +205,12 @@
             android:name="com.winwasm64.torrent.TorrentPlayerActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+        <activity
+            android:name="com.winwasm64.ui.NativeVideoPlayerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:supportsPictureInPicture="true"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
         <activity
             android:name="com.winwasm64.vpn.VpnLogActivity"

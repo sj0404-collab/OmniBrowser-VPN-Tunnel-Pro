@@ -1,0 +1,39 @@
+name: Attach CI-built termux-elf-cleaner to release
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  attach-program:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GITHUB_REF }}
+      - name: Check version
+        run: |
+          RELEASE_VERSION_NAME="${GITHUB_REF/refs\/tags\//}"
+          if ! printf "%s" "${RELEASE_VERSION_NAME/v/}" | grep -qP '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'; then
+            echo "The versionName '${RELEASE_VERSION_NAME/v/}' is not a valid version as per semantic version '2.0.0' spec in the format 'major.minor.patch(-prerelease)(+buildmetadata)'. https://semver.org/spec/v2.0.0.html."
+            exit 1
+          fi
+      - name: Install required packages
+        run: |
+          sudo apt update
+          sudo apt upgrade
+          sudo apt install cmake ninja-build
+      - name: Build
+        run: |
+          cmake . -Bbuild -GNinja
+          ninja -C build/
+      - name: Test
+        run: |
+          ninja -C build/ test
+      - name: Attach termux-elf-cleaner to release
+        env:
+          GH_TOKEN: ${{ secrets.TERMUXBOT2_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} build/termux-elf-cleaner

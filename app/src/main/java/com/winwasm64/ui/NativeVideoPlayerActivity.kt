@@ -1,0 +1,35 @@
+package com.winwasm64.ui
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+
+/**
+ * Activity для native видеофабрики на Media3 ExoPlayer.
+ *
+ * v4.64.0: запускается из VideoSearchSection вместо WebView-based VideoSearchActivity
+ * для прямого воспроизведения найденных видео (VK/RuTube/YouTube).
+ */
+class NativeVideoPlayerActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+
+        val videoUrl = intent.getStringExtra("url") ?: ""
+        val title = intent.getStringExtra("title") ?: "Видео"
+        val thumbnailUrl = intent.getStringExtra("thumbnail")
+
+        setContent {
+            com.winwasm64.ui.theme.OmniTheme {
+                NativeVideoPlayerScreen(
+                    videoUrl = videoUrl,
+                    title = title,
+                    thumbnailUrl = thumbnailUrl,
+                    onBack = { finish() },
+                    onComplete = { finish() }
+                )
+            }
+        }
+    }
+}

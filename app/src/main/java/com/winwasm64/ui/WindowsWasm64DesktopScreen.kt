@@ -6631,6 +6631,16 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
         context.startActivity(intent)
     }
 
+    /** v4.64.0: воспроизведение видео в native плеере (Media3 ExoPlayer) вместо WebView. */
+    fun playNative(videoUrl: String, title: String, thumbnail: String? = null) {
+        val intent = Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .putExtra("url", videoUrl)
+            .putExtra("title", title)
+            .putExtra("thumbnail", thumbnail)
+        context.startActivity(intent)
+    }
+
     Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
