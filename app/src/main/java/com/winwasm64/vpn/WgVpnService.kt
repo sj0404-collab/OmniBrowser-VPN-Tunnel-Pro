@@ -7,10 +7,9 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
-import android.os.ParcelFileDescriptor
 import com.winwasm64.MainActivity
-import com.winwasm64.R
 import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.Statistics
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 
@@ -24,7 +23,7 @@ import com.wireguard.config.Config
  * 2. WgVpnService запускается с конфигом
  * 3. GoBackend создаёт туннель и перенаправляет трафик
  */
-class WgVpnService : VpnService(), GoBackend.TunnelStateCallback {
+class WgVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.winwasm64.vpn.WG_START"
@@ -34,11 +33,18 @@ class WgVpnService : VpnService(), GoBackend.TunnelStateCallback {
         @Volatile
         var isWgActive: Boolean = false
             private set
+
+        @Volatile
+        var wgConfig: Config? = null
+            private set
+
+        @Volatile
+        var wgStatistics: Statistics? = null
+            private set
     }
 
     private var backend: GoBackend? = null
     private var tunnel: Tunnel? = null
-    private var vpnInterface: ParcelFileDescriptor? = null
     private var notificationManager: NotificationManager? = null
 
     override fun onCreate() {
@@ -64,59 +70,66 @@ class WgVpnService : VpnService(), GoBackend.TunnelStateCallback {
 
     private fun startWgTunnel(configPath: String) {
         try {
-            // Prepare VPN interface
-            val builder = Builder()
-                .setName("OmniBrowser-WG")
-                .addAddress("10.0.0.1", 24)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1")
-            vpnInterface = builder.establish()
-
             // Load WireGuard config
             val configFile = java.io.File(configPath)
-            val config = Config.parse(configFile.inputStream().bufferedReader())
+            if (!configFile.exists()) {
+                VpnLog.e("WireGuard", "Config file not found: $configPath")
+                stopWgTunnel()
+                return
+            }
+            val config = Config.parse(configFile.inputStream())
 
-            // Create GoBackend and tunnel
-            backend = GoBackend(applicationContext, this)
-            tunnel = backend?.newTunnel(config)
+            // Create GoBackend
+            backend = GoBackend(applicationContext)
 
-            tunnel?.up()
-            isWgActive = true
+            // Create tunnel object
+            tunnel = object : Tunnel {
+                override fun getName(): String = "OmniBrowser-WG"
+                override fun onStateChange(newState: State) {
+                    VpnLog.i("WireGuard", "Tunnel state: $newState")
+                    when (newState) {
+                        Tunnel.State.UP -> {
+                            isWgActive = true
+                            showNotification("WireGuard активен", "Туннель WireGuard установлен")
+                        }
+                        Tunnel.State.DOWN -> {
+                            isWgActive = false
+                            showNotification("WireGuard остановлен", "Туннель WireGuard закрыт")
+                        }
+                        Tunnel.State.TOGGLE -> {
+                            if (isWgActive) stopWgTunnel()
+                        }
+                    }
+                }
+            }
 
-            // Show notification
-            showNotification("WireGuard активен", "Туннель WireGuard установлен")
-
+            // Start tunnel via backend
+            wgConfig = config
+            backend?.setState(tunnel!!, Tunnel.State.UP, config)
             VpnLog.i("WireGuard", "Tunnel started: $configPath")
         } catch (e: Exception) {
-            VpnLog.e("WireGuard", "Failed to start tunnel", e)
+            VpnLog.e("WireGuard", "Failed to start tunnel: ${e.message}")
             stopWgTunnel()
         }
     }
 
     private fun stopWgTunnel() {
         try {
-            tunnel?.down()
+            backend?.let { backend ->
+                tunnel?.let { tunnel ->
+                    backend.setState(tunnel, Tunnel.State.DOWN, null)
+                }
+            }
             tunnel = null
             backend = null
-            vpnInterface?.close()
-            vpnInterface = null
+            wgConfig = null
+            wgStatistics = null
             isWgActive = false
             showNotification("WireGuard остановлен", "Туннель WireGuard закрыт")
             VpnLog.i("WireGuard", "Tunnel stopped")
             stopSelf()
         } catch (e: Exception) {
-            VpnLog.e("WireGuard", "Failed to stop tunnel", e)
-        }
-    }
-
-    override fun onTunnelStateChanged(state: Tunnel.State) {
-        VpnLog.i("WireGuard", "Tunnel state: $state")
-        when (state) {
-            Tunnel.State.UP -> isWgActive = true
-            Tunnel.State.DOWN -> {
-                isWgActive = false
-                stopWgTunnel()
-            }
+            VpnLog.e("WireGuard", "Failed to stop tunnel: ${e.message}")
         }
     }
 

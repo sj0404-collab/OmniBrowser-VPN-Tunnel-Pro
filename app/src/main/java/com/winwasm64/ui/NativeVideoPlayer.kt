@@ -2,20 +2,15 @@ package com.winwasm64.ui
 
 import android.app.PictureInPictureParams
 import android.content.Context
-import android.graphics.Color
-import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.os.Bundle
 import android.util.Rational
-import android.view.WindowManager
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -24,8 +19,7 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.winwasm64.ui.browser.OmniIcons
-import com.winwasm64.ui.theme.Omni
-import kotlinx.coroutines.delay
+import com.winwasm64.ui.theme.OmniTheme
 
 /**
  * Native видеофабрика на Media3 ExoPlayer — альтернатива WebView-based VideoSearchActivity.
@@ -37,6 +31,7 @@ import kotlinx.coroutines.delay
  * @param thumbnailUrl Обложка (optional)
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NativeVideoPlayerScreen(
     videoUrl: String,
@@ -54,7 +49,7 @@ fun NativeVideoPlayerScreen(
     // Создаём ExoPlayer
     LaunchedEffect(videoUrl) {
         val exoPlayer = ExoPlayer.Builder(context)
-            .setMediaItem(MediaItem.fromUri(videoUrl))
+            .addMediaItem(MediaItem.fromUri(videoUrl))
             .setAutoPlay(true)
             .setRepeatMode(Player.REPEAT_MODE_OFF)
             .build()
@@ -83,64 +78,69 @@ fun NativeVideoPlayerScreen(
                         .setAspectRatio(Rational(16, 9))
                         .build()
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startPictureInPictureMode(params)
+                        // PiP requires Activity context
+                        (context as? android.app.Activity)?.startPictureInPictureMode(params)
                     }
                 } catch (_: Exception) {}
             }
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(title, color = Color.White, fontWeight = FontWeight.Medium) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(OmniIcons.Back, null, tint = Color.White)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color.Black,
-                    titleContentColor = Color.White,
-                    navigationIconContentColor = Color.White
+    OmniTheme {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(title, color = Color.White, fontWeight = FontWeight.Medium) },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(OmniIcons.Back, null, tint = Color.White)
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Color.Black,
+                        titleContentColor = Color.White,
+                        navigationIconContentColor = Color.White
+                    )
                 )
-            )
-        }
-    ) { padding ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(Color.Black)
-        ) {
-            player?.let { p ->
-                PlayerView(
-                    context = context,
-                    player = p,
-                    aspectRatioMode = PlayerView.ASPECT_RATIO_MATCH_PARENT
-                ).also { pv ->
-                    pv.useController = true
-                    pv.controllerAutoHide = true
-                    pv.resizeMode = PlayerView.RESIZE_MODE_ZOOM
-                    pv.setOnClickListener {
-                        showControls = !showControls
-                        pv.useController = showControls
-                    }
-                }
             }
-
-            // PiP button
-            IconButton(
-                onClick = { enterPiP() },
+        ) { padding ->
+            Box(
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(16.dp)
+                    .fillMaxSize()
+                    .padding(padding)
+                    .background(Color.Black)
             ) {
-                Icon(
-                    imageVector = OmniIcons.Desktop,
-                    contentDescription = "Picture in Picture",
-                    tint = Color.White
-                )
+                player?.let { p ->
+                    androidx.compose.ui.viewinterop.AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).also { pv ->
+                                pv.player = p
+                                pv.useController = true
+                                pv.controllerAutoHide = true
+                                pv.resizeMode = PlayerView.RESIZE_MODE_ZOOM
+                                pv.setOnClickListener {
+                                    showControls = !showControls
+                                    pv.useController = showControls
+                                }
+                            }
+                        },
+                        update = { _ -> }
+                    )
+                }
+
+                // PiP button
+                IconButton(
+                    onClick = { enterPiP() },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(16.dp)
+                ) {
+                    Icon(
+                        imageVector = OmniIcons.Desktop,
+                        contentDescription = "Picture in Picture",
+                        tint = Color.White
+                    )
+                }
             }
         }
     }
