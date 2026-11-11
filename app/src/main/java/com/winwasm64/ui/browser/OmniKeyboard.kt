@@ -45,6 +45,24 @@ import androidx.compose.ui.unit.sp
 import org.json.JSONObject
 import org.json.JSONTokener
 
+/** Преобразовать символ в Android keyCode (для доверенной отправки KeyEvent в WebView). */
+private fun charToKeyCodeTop(c: String): Int = when (c.uppercase()) {
+    "A" -> KeyEvent.KEYCODE_A; "B" -> KeyEvent.KEYCODE_B; "C" -> KeyEvent.KEYCODE_C
+    "D" -> KeyEvent.KEYCODE_D; "E" -> KeyEvent.KEYCODE_E; "F" -> KeyEvent.KEYCODE_F
+    "G" -> KeyEvent.KEYCODE_G; "H" -> KeyEvent.KEYCODE_H; "I" -> KeyEvent.KEYCODE_I
+    "J" -> KeyEvent.KEYCODE_J; "K" -> KeyEvent.KEYCODE_K; "L" -> KeyEvent.KEYCODE_L
+    "M" -> KeyEvent.KEYCODE_M; "N" -> KeyEvent.KEYCODE_N; "O" -> KeyEvent.KEYCODE_O
+    "P" -> KeyEvent.KEYCODE_P; "Q" -> KeyEvent.KEYCODE_Q; "R" -> KeyEvent.KEYCODE_R
+    "S" -> KeyEvent.KEYCODE_S; "T" -> KeyEvent.KEYCODE_T; "U" -> KeyEvent.KEYCODE_U
+    "V" -> KeyEvent.KEYCODE_V; "W" -> KeyEvent.KEYCODE_W; "X" -> KeyEvent.KEYCODE_X
+    "Y" -> KeyEvent.KEYCODE_Y; "Z" -> KeyEvent.KEYCODE_Z
+    "0" -> KeyEvent.KEYCODE_0; "1" -> KeyEvent.KEYCODE_1; "2" -> KeyEvent.KEYCODE_2
+    "3" -> KeyEvent.KEYCODE_3; "4" -> KeyEvent.KEYCODE_4; "5" -> KeyEvent.KEYCODE_5
+    "6" -> KeyEvent.KEYCODE_6; "7" -> KeyEvent.KEYCODE_7; "8" -> KeyEvent.KEYCODE_8
+    "9" -> KeyEvent.KEYCODE_9
+    else -> 0
+}
+
 /**
  * Общее состояние виртуального курсора: панель его двигает, а оверлей полного экрана — рисует.
  * В самой странице курсор не видно: клиент GeForce NOW занимает экран через HTML-fullscreen.
@@ -247,7 +265,7 @@ fun OmniKeyPanel(
             // KeyEvent напрямую), отправляем доверенную клавишу внутрь WebView.
             if (text.contains("не изменилось") || text.contains("не удалось") || text.contains("не читается")) {
                 // Отправляем симметричный KeyEvent для буквы
-                val keyCode = charToKeyCode(ch)
+                val keyCode = charToKeyCodeTop(ch)
                 if (keyCode != 0) {
                     nativeKey(keyCode, ch)
                 }
@@ -255,23 +273,6 @@ fun OmniKeyPanel(
         }
     }
 
-    /** Преобразовать символ в Android keyCode (для доверенной отправки KeyEvent). */
-    fun charToKeyCode(c: String): Int = when (c.uppercase()) {
-        "A" -> KeyEvent.KEYCODE_A; "B" -> KeyEvent.KEYCODE_B; "C" -> KeyEvent.KEYCODE_C
-        "D" -> KeyEvent.KEYCODE_D; "E" -> KeyEvent.KEYCODE_E; "F" -> KeyEvent.KEYCODE_F
-        "G" -> KeyEvent.KEYCODE_G; "H" -> KeyEvent.KEYCODE_H; "I" -> KeyEvent.KEYCODE_I
-        "J" -> KeyEvent.KEYCODE_J; "K" -> KeyEvent.KEYCODE_K; "L" -> KeyEvent.KEYCODE_L
-        "M" -> KeyEvent.KEYCODE_M; "N" -> KeyEvent.KEYCODE_N; "O" -> KeyEvent.KEYCODE_O
-        "P" -> KeyEvent.KEYCODE_P; "Q" -> KeyEvent.KEYCODE_Q; "R" -> KeyEvent.KEYCODE_R
-        "S" -> KeyEvent.KEYCODE_S; "T" -> KeyEvent.KEYCODE_T; "U" -> KeyEvent.KEYCODE_U
-        "V" -> KeyEvent.KEYCODE_V; "W" -> KeyEvent.KEYCODE_W; "X" -> KeyEvent.KEYCODE_X
-        "Y" -> KeyEvent.KEYCODE_Y; "Z" -> KeyEvent.KEYCODE_Z
-        "0" -> KeyEvent.KEYCODE_0; "1" -> KeyEvent.KEYCODE_1; "2" -> KeyEvent.KEYCODE_2
-        "3" -> KeyEvent.KEYCODE_3; "4" -> KeyEvent.KEYCODE_4; "5" -> KeyEvent.KEYCODE_5
-        "6" -> KeyEvent.KEYCODE_6; "7" -> KeyEvent.KEYCODE_7; "8" -> KeyEvent.KEYCODE_8
-        "9" -> KeyEvent.KEYCODE_9
-        else -> 0
-    }
     fun back() {
         localBuf = if (localBuf.isEmpty()) "" else localBuf.dropLast(1)
         syncLine()
