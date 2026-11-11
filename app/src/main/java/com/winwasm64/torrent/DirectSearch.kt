@@ -144,7 +144,7 @@ object DirectSearch {
         if (chip == "🧠 Модели") {
             if (page > 0) return emptyList()
             val found = try {
-                ModelSearch.search(query, emptyList(), limit = 24, timeoutMs = timeoutMs)
+                ModelSearch.search(query, emptyList(), limit = 40, timeoutMs = timeoutMs)
             } catch (_: Throwable) {
                 emptyList()
             }
