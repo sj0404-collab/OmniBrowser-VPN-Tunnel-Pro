@@ -70,7 +70,8 @@ object DirectSearch {
     )
 
     /** Категории, по которым идём ПАРАЛЛЕЛЬНО одним запросом. */
-    val CHIPS = listOf("🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт")
+    // v4.62.0: «🧠 Модели» — поиск самих моделей ИИ (gguf, mnn, tflite, onnx, safetensors…)
+    val CHIPS = listOf("🎮 Игры", "🎬 Видео", "🎵 Музыка", "📚 Книги", "📖 Манга", "💾 Софт", "🧠 Модели")
 
     /**
      * v4.52.0: результат одного поиска сразу по ВСЕМ категориям.
@@ -137,6 +138,37 @@ object DirectSearch {
         depth: Int = 3,
         aiVariants: List<String> = emptyList()
     ): List<DirectFile> {
+        // v4.62.0: «🧠 Модели» — не архив и не торренты, а сами веса моделей: Hugging Face, GitHub, Civitai.
+        // Отдаём один раз весь список (страницы этой категории не нужны): название, формат, размер,
+        // «для чего подходит», короткое описание и прямую ссылку на файл.
+        if (chip == "🧠 Модели") {
+            if (page > 0) return emptyList()
+            val found = try {
+                ModelSearch.search(query, emptyList(), limit = 24, timeoutMs = timeoutMs)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+            return found.map { m ->
+                DirectFile(
+                    title = m.title,
+                    source = m.source,
+                    pageUrl = m.pageUrl,
+                    downloadUrl = m.downloadUrl,
+                    fileName = m.file,
+                    format = m.format,
+                    sizeLabel = m.sizeLabel,
+                    poster = "",
+                    kind = "model",
+                    description = buildString {
+                        append(m.purpose)
+                        append(" · ").append(m.popularLabel)
+                        if (m.snippet.isNotBlank()) append(" · ").append(m.snippet)
+                    },
+                    weight = 60,
+                    linkOnly = false
+                )
+            }
+        }
         // v4.53.0: ищем не одну словоформу, а упоминания («винт» → «гребной винт», winter и т. п.).
         // v4.54.0: сколько именно вариантов — задаёт человек («глубина поиска»).
         val variants = QueryExpander.variants(query, depth.coerceIn(1, 6), aiVariants)

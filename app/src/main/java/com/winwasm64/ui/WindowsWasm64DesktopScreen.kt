@@ -6267,6 +6267,17 @@ private fun DirectFilesSection(
                                 color = Omni.Accent, fontSize = 11.sp
                             )
                             Text(f.fileName, color = Omni.TextDim, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            // v4.62.0: «не куча воды, а описание и для чего подходит» — у моделей это главное
+                            if (f.description.isNotBlank() && f.kind == "model") {
+                                Text(
+                                    f.description,
+                                    color = Omni.TextDim,
+                                    fontSize = 10.sp,
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(top = 3.dp)
+                                )
+                            }
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 // v4.57.0: у обычной ссылки (сериал/страница) качать нечего
                                 if (!f.linkOnly) {

@@ -638,6 +638,7 @@ object TorrentSearchAgent {
         "book" -> "📚"
         "soft" -> "💾"
         "photo" -> "🖼"
+        "model" -> "🧠"
         else -> "📦"
     }
 
@@ -650,6 +651,7 @@ object TorrentSearchAgent {
         "📚 Книги" -> category == "book"
         "📖 Манга" -> category == "manga"
         "💾 Софт" -> category == "soft"
+        "🧠 Модели" -> category == "model"
         else -> true
     }
 
