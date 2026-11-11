@@ -435,7 +435,7 @@ object ModelSearch {
         if (text.isBlank()) return ""
         // если первый абзац — «общие слова», берём предложение, где есть сам запрос
         val sentences = text.split(". ").filter { it.length > 25 }
-        val best = sentences.firstOrNull { it.contains(term, RegexOption.IGNORE_CASE) }
+        val best = sentences.firstOrNull { it.contains(term, ignoreCase = true) }
             ?: sentences.firstOrNull()
             ?: text
         return best.take(max).trim()
