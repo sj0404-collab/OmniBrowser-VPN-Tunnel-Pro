@@ -243,15 +243,48 @@ fun OmniKeyPanel(
         syncLine()
         js("window.__omniInsert&&window.__omniInsert('${esc(ch)}')", "вставка") { text ->
             status = "вставка: $text"
+            // v4.65.0: если JS не вставил текст в DOM-поле (игра на canvas слушает
+            // KeyEvent напрямую), отправляем доверенную клавишу внутрь WebView.
+            if (text.contains("не изменилось") || text.contains("не удалось") || text.contains("не читается")) {
+                // Отправляем симметричный KeyEvent для буквы
+                val keyCode = charToKeyCode(ch)
+                if (keyCode != 0) {
+                    nativeKey(keyCode, ch)
+                }
+            }
         }
+    }
+
+    /** Преобразовать символ в Android keyCode (для доверенной отправки KeyEvent). */
+    private fun charToKeyCode(c: String): Int = when (c.uppercase()) {
+        "A" -> KeyEvent.KEYCODE_A; "B" -> KeyEvent.KEYCODE_B; "C" -> KeyEvent.KEYCODE_C
+        "D" -> KeyEvent.KEYCODE_D; "E" -> KeyEvent.KEYCODE_E; "F" -> KeyEvent.KEYCODE_F
+        "G" -> KeyEvent.KEYCODE_G; "H" -> KeyEvent.KEYCODE_H; "I" -> KeyEvent.KEYCODE_I
+        "J" -> KeyEvent.KEYCODE_J; "K" -> KeyEvent.KEYCODE_K; "L" -> KeyEvent.KEYCODE_L
+        "M" -> KeyEvent.KEYCODE_M; "N" -> KeyEvent.KEYCODE_N; "O" -> KeyEvent.KEYCODE_O
+        "P" -> KeyEvent.KEYCODE_P; "Q" -> KeyEvent.KEYCODE_Q; "R" -> KeyEvent.KEYCODE_R
+        "S" -> KeyEvent.KEYCODE_S; "T" -> KeyEvent.KEYCODE_T; "U" -> KeyEvent.KEYCODE_U
+        "V" -> KeyEvent.KEYCODE_V; "W" -> KeyEvent.KEYCODE_W; "X" -> KeyEvent.KEYCODE_X
+        "Y" -> KeyEvent.KEYCODE_Y; "Z" -> KeyEvent.KEYCODE_Z
+        "0" -> KeyEvent.KEYCODE_0; "1" -> KeyEvent.KEYCODE_1; "2" -> KeyEvent.KEYCODE_2
+        "3" -> KeyEvent.KEYCODE_3; "4" -> KeyEvent.KEYCODE_4; "5" -> KeyEvent.KEYCODE_5
+        "6" -> KeyEvent.KEYCODE_6; "7" -> KeyEvent.KEYCODE_7; "8" -> KeyEvent.KEYCODE_8
+        "9" -> KeyEvent.KEYCODE_9
+        else -> 0
     }
     fun back() {
         localBuf = if (localBuf.isEmpty()) "" else localBuf.dropLast(1)
         syncLine()
         js("window.__omniBack?window.__omniBack():'нет функций'", "⌫") { text ->
             status = "⌫: $text"
-            // Поле закрыто/не читается — последний честный путь: настоящий Backspace внутрь WebView
-            if (text.contains("нужна клавиша") || text.contains("не читается") || text.contains("вне доступа")) {
+            // v4.65.0: всегда пробуем настоящую клавишу Backspace внутрь WebView как запасной путь.
+            // Раньше этого делали только при конкретных ошибках, но игра может просто не отвечать
+            // на execCommand('delete') в своём поле — тогда нужна доверенная клавиша.
+            if (text.contains("не удалось") || text.contains("нужна клавиша") || text.contains("не читается") || text.contains("вне доступа") || text.contains("пустое") || text.contains("поле пустое") || text.contains("не удалось удалить")) {
+                nativeKeyKeepFocus(KeyEvent.KEYCODE_DEL, "⌫")
+            } else {
+                // v4.65.0: даже если JS сказал «успешно», игра может не иметь DOM-поля
+                // (canvas-based игра слушает KeyEvent напрямую). Всегда пробуем настоящую клавишу.
                 nativeKeyKeepFocus(KeyEvent.KEYCODE_DEL, "⌫")
             }
         }
@@ -838,6 +871,8 @@ const val OMNI_KEY_JS = """
   };
 
   // ── Вставка: находим поле ПО ФАКТУ ИЗМЕНЕНИЯ ─────────────────────────────────────────
+  // v4.65.0: execCommand('insertText') — единственный путь для ввода. Если он вернул true,
+  // НЕ падаем через setNativeValue/cmdInsert — иначе текст появляется 2-3 раза («I» → «III»).
   window.__omniInsert = function(txt) {
     var snap = snapshot();
     var el = activeEditable() || focusTarget();
@@ -852,6 +887,13 @@ const val OMNI_KEY_JS = """
     } else {
       try { okCmd = document.execCommand('insertText', false, txt); } catch (e) {}
     }
+    // v4.65.0: если execCommand вернул true — текст вставлен. Не проверяем changed(),
+    // не пишем в setNativeValue, не вызываем cmdInsert — это был бы дубликат.
+    if (okCmd) {
+      var ch0 = changed(snap);
+      if (ch0) { bindTo(ch0); window.__omniBlind = false; try { ch0.blur(); } catch (e) {} }
+      return 'введено (execCommand) ' + ((readOf(ch0 || el) || '').length) + ' симв.';
+    }
     var ch = changed(snap);
     if (ch) {
       bindTo(ch);
@@ -859,39 +901,21 @@ const val OMNI_KEY_JS = """
       try { ch.blur(); } catch (e) {}
       return 'ок → «' + ch.tagName + '» ' + ((readOf(ch) || '').length) + ' симв.';
     }
-    // прямая запись в найденное поле
-    if (el) {
-      var v = (readOf(el) || '') + txt;
-      setNativeValue(el, v);
-      fire(el, 'input');
-      fire(el, 'change');
-      var ch2 = changed(snap);
-      if (ch2 || readOf(el) === v) {
-        bindTo(ch2 || el);
-        window.__omniBlind = false;
-        try { el.blur(); } catch (e) {}
-        return 'ок (запись) ' + ((readOf(el) || '').length) + ' симв.';
-      }
-    }
     // Последняя попытка — команда по сфокусированному полю (работает и в закрытом shadow root)
     if (cmdInsert(txt)) {
       window.__omniBlind = true;
       return 'введено (поле компонента, чтение закрыто)';
     }
-    if (okCmd) {
-      window.__omniBlind = true;
-      return 'введено (поле компонента)';
-    }
     return 'поле не изменилось (' + diag() + ')';
   };
 
+  // v4.65.0: execCommand('delete') — единственный путь для удаления. Если он вернул true,
+  // НЕ падаем через setNativeValue — иначе удаление не работает или удаляет дважды.
   window.__omniBack = function() {
     var b = window.__omniBound;
     var el = activeEditable() || ((b && b.isConnected && visible(b)) ? b : focusTarget());
     var v = el ? (readOf(el) || '') : '';
     if (!el || !v.length) {
-      // Поле либо закрыто от чтения, либо пустое. Стираем командой браузера по фокусу —
-      // это единственный путь для закрытого shadow root.
       if (cmdDelete()) {
         window.__omniBlind = true;
         return 'удалено (поле компонента)';
@@ -903,11 +927,12 @@ const val OMNI_KEY_JS = """
     try {
       el.focus();
       if (el.setSelectionRange) el.setSelectionRange(v.length - 1, v.length);
-      if (document.execCommand('delete', false, null) && (readOf(el) || '').length === v.length - 1) {
+      if (document.execCommand('delete', false, null)) {
         try { el.blur(); } catch (e) {}
         return 'было ' + v.length + ' → стало ' + (v.length - 1);
       }
     } catch (e) {}
+    // execCommand не сработал — пробуем запись
     var nv = v.slice(0, v.length - 1);
     setNativeValue(el, nv);
     fire(el, 'input');
@@ -920,7 +945,6 @@ const val OMNI_KEY_JS = """
     var el = activeEditable() || window.__omniBound;
     if (!el || !el.isConnected) el = focusTarget();
     if (!el) {
-      // очистка по фокусу: выделить всё в поле и удалить
       try {
         document.execCommand('selectAll', false, null);
         if (cmdDelete()) return 'очищено (поле компонента)';
@@ -931,7 +955,7 @@ const val OMNI_KEY_JS = """
     try {
       el.focus();
       if (el.setSelectionRange) el.setSelectionRange(0, v.length);
-      if (document.execCommand('delete', false, null) && (readOf(el) || '').length === 0) {
+      if (document.execCommand('delete', false, null)) {
         try { el.blur(); } catch (e) {}
         return 'очищено (было ' + v.length + ')';
       }

@@ -42,13 +42,13 @@ object AiAssistant {
     )
 
     val providers: List<Provider> = listOf(
+        Provider("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1/chat/completions", "big-pickle", false,
+            "https://opencode.ai/auth", "без ключа: 13 free-моделей (big-pickle, deepseek-v4.1-flash, glm-5.3-flash, nemotron-3.5-super-vl…) · с ключом — без лимита",
+            modelFilter = { it.endsWith("-free") || it == "big-pickle" || it == "iceman-free" || it == "longcat-2.5-free" }),
         Provider("pollinations", "Pollinations", "https://text.pollinations.ai/openai", "openai", false,
             "https://enter.pollinations.ai/keys", "без ключа: 1 ответ в 30 с (gpt-oss-20b) · с бесплатным ключом — без лимита и больше моделей"),
         Provider("llm7", "LLM7", "https://api.llm7.io/v1/chat/completions", "gpt-oss:20b", false,
             "https://dash.llm7.io/#/api-keys", "без ключа: turbo-модели (gpt-oss:20b, minimax-m2.7, codestral) · с бесплатным ключом: gemini, claude, gpt, deepseek, kimi…"),
-        Provider("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1/chat/completions", "big-pickle", false,
-            "https://opencode.ai/auth", "free-модели (big-pickle, glm-5.3-flash, deepseek-v4.1-flash…) · без ключа лимит на IP, с ключом аккаунта — стабильно",
-            modelFilter = { it.endsWith("-free") || it == "big-pickle" }),
         Provider("openrouter", "OpenRouter", "https://openrouter.ai/api/v1/chat/completions", "openrouter/free", true,
             "https://openrouter.ai/keys", "десятки временных :free-моделей по бесплатному ключу", modelFilter = { it.endsWith(":free") || it == "openrouter/free" }),
         Provider("groq", "Groq", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", true,

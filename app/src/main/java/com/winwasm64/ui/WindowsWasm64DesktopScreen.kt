@@ -3746,34 +3746,15 @@ private fun TorrentClientSection(
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
     fun runSearch(query: String, keepBase: Boolean = false) {
         isSearching = true
-        // v4.58.0: человек видит, что агент именно сейчас думает, а не «спит»
-        com.winwasm64.torrent.AiCurator.mark(
-            com.winwasm64.torrent.AiCurator.State.THINKING, "поиск «${query.take(20)}»"
-        )
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        // v4.61.0: вычисления агента — ТОЛЬКО в фоне. Раньше здесь главный поток ждал модель
-        // до 6 секунд, и Android показывал «OmniBrowser & VPN Pro не отвечает».
-        com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
-        val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
-        torrentEngine.searchPublicTorrents(query, searchDepth, aiExtra) { res ->
+        // v4.65.0: поиск без агента — DirectSearch + torrent search напрямую.
+        // AiCurator (Pollinations) медленно отвечает и иногда не отвечает — отключаем.
+        torrentEngine.searchPublicTorrents(query, searchDepth, emptyList()) { res ->
             mainHandler.post {
                 catalogItems = res
                 isSearching = false
-            }
-            // v4.55.0: ИИ-куратор отбраковывает явно не то (если включён)
-            if (res.isNotEmpty() && com.winwasm64.torrent.AiCurator.isEnabled(context)) {
-                Thread({
-                    val keep = com.winwasm64.torrent.AiCurator.keepIndices(
-                        context, query, res.map { it.title }, 30
-                    )
-                    if (keep != null) {
-                        mainHandler.post {
-                            catalogItems = res.filterIndexed { idx, _ -> idx in keep || idx >= 30 }
-                        }
-                    }
-                }, "AiFilter").also { it.isDaemon = true; it.start() }
             }
         }
     }
@@ -5998,9 +5979,6 @@ private fun DirectFilesSection(
             return
         }
         busy = true
-        com.winwasm64.torrent.AiCurator.mark(
-            com.winwasm64.torrent.AiCurator.State.THINKING, "файлы · «${query.take(20)}»"
-        )
         com.winwasm64.torrent.SearchCache.directQuery = query
         com.winwasm64.torrent.SearchCache.directSort = nextSort
         com.winwasm64.torrent.SearchCache.directPage = nextPage
@@ -6010,12 +5988,10 @@ private fun DirectFilesSection(
         if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
             // v4.55.0: асинхронно — что нашлось, то сразу и показываем
-            // v4.61.0: варианты берём только готовые, расчёт идёт в фоне
-            com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
-            val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
+            // v4.65.0: без агента — DirectSearch напрямую, AiCurator (Pollinations) медленный
             val res = try {
                 com.winwasm64.torrent.DirectSearch.searchAll(
-                    query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra
+                    query, nextSort, nextPage, depth = searchDepth
                 ) { chip, files ->
                     handler.post {
                         val cur = buckets ?: com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
@@ -6367,9 +6343,6 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
             return
         }
         busy = true
-        com.winwasm64.torrent.AiCurator.mark(
-            com.winwasm64.torrent.AiCurator.State.THINKING, "фото · «${q.take(20)}»"
-        )
         if (!append) images = emptyList()
         com.winwasm64.torrent.SearchCache.photoQuery = q
         com.winwasm64.torrent.SearchCache.photoFilter = f
