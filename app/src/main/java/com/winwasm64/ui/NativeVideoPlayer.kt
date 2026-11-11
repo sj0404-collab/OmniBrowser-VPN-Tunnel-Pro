@@ -30,7 +30,7 @@ import com.winwasm64.ui.theme.OmniTheme
  * @param title Заголовок видео
  * @param thumbnailUrl Обложка (optional)
  */
-@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@OptIn(androidx.media3.common.util.UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NativeVideoPlayerScreen(
@@ -49,7 +49,7 @@ fun NativeVideoPlayerScreen(
     // Создаём ExoPlayer
     LaunchedEffect(videoUrl) {
         val exoPlayer = ExoPlayer.Builder(context)
-            .addMediaItem(MediaItem.fromUri(videoUrl))
+            .setMediaItem(MediaItem.fromUri(videoUrl))
             .setAutoPlay(true)
             .setRepeatMode(Player.REPEAT_MODE_OFF)
             .build()
@@ -72,14 +72,14 @@ fun NativeVideoPlayerScreen(
     // PiP support
     fun enterPiP() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            player?.let { p ->
+            val activity = context as? android.app.Activity
+            if (activity != null) {
                 try {
                     val params = PictureInPictureParams.Builder()
                         .setAspectRatio(Rational(16, 9))
                         .build()
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        // PiP requires Activity context
-                        (context as? android.app.Activity)?.startPictureInPictureMode(params)
+                        activity.enterPictureInPictureMode(params)
                     }
                 } catch (_: Exception) {}
             }
@@ -116,8 +116,7 @@ fun NativeVideoPlayerScreen(
                             PlayerView(ctx).also { pv ->
                                 pv.player = p
                                 pv.useController = true
-                                pv.controllerAutoHide = true
-                                pv.resizeMode = PlayerView.RESIZE_MODE_ZOOM
+                                pv.resizeMode = PlayerView.RESIZE_MODE_FIT
                                 pv.setOnClickListener {
                                     showControls = !showControls
                                     pv.useController = showControls

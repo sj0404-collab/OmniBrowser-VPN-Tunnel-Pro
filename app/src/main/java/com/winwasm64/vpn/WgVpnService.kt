@@ -85,7 +85,7 @@ class WgVpnService : VpnService() {
             // Create tunnel object
             tunnel = object : Tunnel {
                 override fun getName(): String = "OmniBrowser-WG"
-                override fun onStateChange(newState: State) {
+                override fun onStateChange(newState: Tunnel.State) {
                     VpnLog.i("WireGuard", "Tunnel state: $newState")
                     when (newState) {
                         Tunnel.State.UP -> {
