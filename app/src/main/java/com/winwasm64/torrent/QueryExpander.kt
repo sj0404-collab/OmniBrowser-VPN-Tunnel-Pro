@@ -20,10 +20,15 @@ import java.net.URLEncoder
  */
 object QueryExpander {
 
+    // v4.60.0: варианты считаются один раз на запрос — иначе Википедия дёргалась на каждую карточку
+    private val variantCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
     /** Все варианты запроса: первый — сам запрос. */
     fun variants(query: String, max: Int = 4, extra: List<String> = emptyList()): List<String> {
         val clean = query.trim()
         if (clean.isBlank()) return emptyList()
+        val cacheKey = clean.lowercase() + "|" + max + "|" + extra.joinToString(",")
+        variantCache[cacheKey]?.let { return it }
         val out = mutableListOf(clean)
         fun add(value: String?) {
             val v = value?.trim().orEmpty()
@@ -36,7 +41,10 @@ object QueryExpander {
         related(clean).forEach { add(it) }
         // v4.55.0: варианты от ИИ-куратора (если он включён и ответил)
         extra.forEach { add(it) }
-        return out.take(max)
+        val result = out.take(max)
+        if (variantCache.size > 100) variantCache.clear()
+        variantCache[cacheKey] = result
+        return result
     }
 
     /** Есть ли вариант «ассоциацией» (для пометки в карточке). */
@@ -83,8 +91,11 @@ object QueryExpander {
 
     /* ===================== ассоциации из Википедии ===================== */
 
+    private val relatedCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
     /** Статьи, которые Википедия считает связанными с запросом — бесплатный «словарь ассоциаций». */
     fun related(query: String): List<String> {
+        relatedCache[query.trim().lowercase()]?.let { return it }
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url = "https://ru.wikipedia.org/w/api.php?action=query&list=search" +
             "&srsearch=$encoded&srlimit=8&format=json&utf8=1"
@@ -103,13 +114,16 @@ object QueryExpander {
             }
         } catch (_: Throwable) {
         }
+        if (relatedCache.size > 100) relatedCache.clear()
+        relatedCache[query.trim().lowercase()] = out
         return out
     }
 
     private fun httpGet(url: String): String? = try {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 8_000
-            readTimeout = 10_000
+            // v4.60.0: ассоциации — необязательная роскошь, ждать их 10 секунд нельзя
+            connectTimeout = 3_000
+            readTimeout = 4_000
             setRequestProperty("User-Agent", "OmniBrowser/4.53 (Android)")
             setRequestProperty("Accept", "application/json")
         }

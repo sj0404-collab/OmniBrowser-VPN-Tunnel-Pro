@@ -6004,8 +6004,8 @@ private fun DirectFilesSection(
         if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
             // v4.55.0: асинхронно — что нашлось, то сразу и показываем
-            // v4.59.0: ждём модель не дольше 7 с — поиск не должен стоять из-за неё
-        val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
+            // v4.60.0: агент больше не тормозит поиск (быстрая модель сразу, умная — в фоне)
+            val aiExtra = com.winwasm64.torrent.AiCurator.expandWithin(context, query, 2)
             val res = try {
                 com.winwasm64.torrent.DirectSearch.searchAll(
                     query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra
@@ -6026,20 +6026,24 @@ private fun DirectFilesSection(
             } catch (_: Throwable) {
                 com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
             }
-            handler.post {
-                buckets = if (prev == null) res else {
-                    val merged = mutableMapOf<String, List<com.winwasm64.torrent.DirectFile>>()
-                    val chips = (prev.byChip.keys + res.byChip.keys).distinct()
-                    for (chip in chips) {
-                        merged[chip] = ((prev.byChip[chip] ?: emptyList()) + (res.byChip[chip] ?: emptyList()))
-                            .distinctBy { it.downloadUrl }
-                    }
-                    com.winwasm64.torrent.DirectSearch.Buckets(
-                        all = merged.values.flatten().distinctBy { it.downloadUrl },
-                        byChip = merged,
-                        more = res.more
-                    )
+            // v4.60.0: склейку списков делаем ЗДЕСЬ, в фоновом потоке, — в главный отдаём готовое.
+            // Раньше flatten+distinct считались на главном потоке, и на большой выдаче система
+            // показывала «OmniBrowser & VPN Pro не отвечает».
+            val finalBuckets = if (prev == null) res else {
+                val merged = mutableMapOf<String, List<com.winwasm64.torrent.DirectFile>>()
+                val chips = (prev.byChip.keys + res.byChip.keys).distinct()
+                for (chip in chips) {
+                    merged[chip] = ((prev.byChip[chip] ?: emptyList()) + (res.byChip[chip] ?: emptyList()))
+                        .distinctBy { it.downloadUrl }
                 }
+                com.winwasm64.torrent.DirectSearch.Buckets(
+                    all = merged.values.flatten().distinctBy { it.downloadUrl },
+                    byChip = merged,
+                    more = res.more
+                )
+            }
+            handler.post {
+                buckets = finalBuckets
                 busy = false
             }
         }, "DirectAll").also { it.isDaemon = true; it.start() }

@@ -37,6 +37,12 @@ object AiCurator {
     enum class State { OFF, SLEEPING, THINKING, ASKING, DONE, ERROR }
 
     private val state = AtomicReference(State.SLEEPING)
+    // v4.60.0: значения настроек держим в памяти — строка состояния перерисовывается 2 раза в секунду
+    @Volatile private var cachedEnabled: Boolean? = null
+    @Volatile private var cachedStatusText: String? = null
+    @Volatile private var cachedModelId: String? = null
+    /** Готовые варианты запроса: посчитали один раз — используем сразу в следующий раз. */
+    private val variantsCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
     private val stateNote = AtomicReference("")
     private val stateSince = AtomicLong(System.currentTimeMillis())
 
@@ -44,27 +50,41 @@ object AiCurator {
     val MODELS = listOf("openai" to "умный", "openai-fast" to "быстрый")
 
     // v4.56.0: по умолчанию ВКЛ — раньше человек не понимал, включился ли куратор вообще
-    fun isEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
+    fun isEnabled(context: Context): Boolean {
+        cachedEnabled?.let { return it }
+        val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
+        cachedEnabled = value
+        return value
+    }
 
     /** Что было в прошлый раз: «OK · вариантов 3» или текст ошибки. Видно в интерфейсе. */
-    fun status(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_STATUS, "ещё не проверялся")
-            .orEmpty()
+    fun status(context: Context): String {
+        cachedStatusText?.let { return it }
+        val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_STATUS, "ещё не проверялся").orEmpty()
+        cachedStatusText = value
+        return value
+    }
 
     private fun setStatus(context: Context, value: String) {
+        cachedStatusText = value
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_STATUS, value).apply()
     }
 
     fun setEnabled(context: Context, value: Boolean) {
+        cachedEnabled = value
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, value).apply()
         if (value) mark(State.SLEEPING, "включён — ждёт запроса") else mark(State.OFF, "выключен человеком")
     }
 
     /** Текущая модель (id для шлюза). */
-    fun model(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MODEL, "openai")
-            .orEmpty().ifBlank { "openai" }
+    fun model(context: Context): String {
+        cachedModelId?.let { return it }
+        val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_MODEL, "openai").orEmpty().ifBlank { "openai" }
+        cachedModelId = value
+        return value
+    }
 
     /** Человеческое имя модели: «умный» / «быстрый». */
     fun modelLabel(context: Context): String {
@@ -73,6 +93,7 @@ object AiCurator {
     }
 
     fun setModel(context: Context, id: String) {
+        cachedModelId = id
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_MODEL, id).apply()
         mark(State.SLEEPING, "модель заменена: ${modelLabel(context)}")
     }
@@ -174,23 +195,76 @@ object AiCurator {
     }
 
     /**
-     * v4.59.0: варианты с жёстким дедлайном.
+     * v4.60.0: варианты запроса для поиска — БЕЗ риска «приложение не отвечает».
      *
-     * Раньше поиск ЖДАЛ модель: пока «умная» думала 20–25 с, список раздач оставался пустым и
-     * человек видел «Список раздач пуст». Теперь ждём не дольше [deadlineMs]; не успела — ищем без
-     * её вариантов (свои синонимы/транслит остаются), а модель договаривает уже в фоне.
+     * Как это работает теперь:
+     *  1) если варианты для этого запроса уже считались — отдаём из памяти мгновенно;
+     *  2) иначе спрашиваем «быструю» модель (обычно 0,3–1 с) с дедлайном [deadlineMs];
+     *  3) если быстрая не ответила — «умная» продолжает думать В ФОНЕ (её ответ попадёт в память
+     *     и применится при следующем поиске), а поиск идёт дальше на своих синонимах и транслите.
+     *
+     * Раньше поиск стоял и ждал модель по 20–25 секунд — из-за этого список пустовал и система
+     * показывала «OmniBrowser & VPN Pro не отвечает».
      */
-    fun expandWithin(context: Context, query: String, limit: Int = 2, deadlineMs: Long = 7_000): List<String> {
+    fun expandWithin(context: Context, query: String, limit: Int = 2, deadlineMs: Long = 6_000): List<String> {
         if (!isEnabled(context)) return emptyList()
-        val task = java.util.concurrent.FutureTask { expand(context, query, limit) }
-        val thread = Thread(task, "AiExpand").apply { isDaemon = true; start() }
-        return try {
-            task.get(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        } catch (_: Throwable) {
-            task.cancel(true)
-            mark(State.DONE, "работал · модель думает дольше ${deadlineMs / 1000} с — ищу без её вариантов")
-            emptyList()
+        val key = query.trim().lowercase()
+        variantsCache[key]?.let {
+            mark(State.DONE, "вариантов ${it.size} · взял готовые")
+            return it
         }
+        mark(State.THINKING, "придумываю варианты запроса")
+        val fast = java.util.concurrent.FutureTask {
+            askVariants(query, limit, listOf("openai-fast"), 5_000)
+        }
+        Thread(fast, "AiFast").apply { isDaemon = true; start() }
+        val quick = try {
+            fast.get(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+            emptyList<String>()
+        }
+        if (quick.isNotEmpty()) {
+            variantsCache[key] = quick
+            setStatus(context, "OK · вариантов ${quick.size}")
+            mark(State.DONE, "вариантов ${quick.size} · ${modelLabel(context)}")
+            return quick
+        }
+        // умная модель — в фоне: её ответ пригодится в следующий раз
+        Thread({
+            val slow = askVariants(query, limit, listOf(model(context), "openai"), 45_000)
+            if (slow.isNotEmpty()) {
+                variantsCache[key] = slow
+                setStatus(context, "OK · вариантов ${slow.size}")
+                mark(State.DONE, "вариантов ${slow.size} · ${modelLabel(context)} (в фоне)")
+            } else {
+                setStatus(context, "нет ответа · ищу без вариантов ИИ")
+                mark(State.ERROR, "модель не ответила — ищу без её вариантов")
+            }
+        }, "AiSmart").apply { isDaemon = true; start() }
+        mark(State.THINKING, "модель думает в фоне · ищу без её вариантов")
+        return emptyList()
+    }
+
+    /** Запрос вариантов у конкретных моделей и разбор JSON-массива. Без изменения состояния. */
+    private fun askVariants(
+        query: String,
+        limit: Int,
+        ids: List<String>,
+        perModelMs: Int
+    ): List<String> {
+        val prompt = """
+            Ты помощник поиска. Для запроса «$query» предложи до $limit коротких поисковых вариантов
+            (синонимы, оригинальное/английское название, уточнение по типу: манга, фильм, игра, книга).
+            Ответ строго JSON-массивом строк, без пояснений.
+        """.trimIndent()
+        val raw = askWith(prompt, ids, perModelMs) ?: return emptyList()
+        val arr = extractJsonArray(raw) ?: return emptyList()
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val v = arr.optString(i).trim()
+            if (v.length in 3..60 && out.none { it.equals(v, true) } && !v.equals(query, true)) out.add(v)
+        }
+        return out
     }
 
     /**

@@ -293,7 +293,8 @@ object DirectSearch {
             // файлы и форматы забираем параллельно — иначе записи ждут друг друга
             val bag = java.util.Collections.synchronizedList(result)
             val queue = java.util.concurrent.LinkedBlockingQueue(bagItems)
-            val workers = (1..6).map {
+            // v4.60.0: было 6 потоков на категорию × 6 категорий — телефон захлёбывался
+            val workers = (1..4).map {
                 Thread({
                     while (true) {
                         val next = queue.poll() ?: break

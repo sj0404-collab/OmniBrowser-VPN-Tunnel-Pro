@@ -21,9 +21,20 @@ object Relevance {
         "найди", "найти", "покажи", "поиск", "ищи", "мне", "пожалуйста", "ещё", "еще"
     )
 
-    /** Значимые слова запроса и его вариантов. */
+    /**
+     * v4.60.0: КЭШ. Раньше на КАЖДУЮ карточку списка вызывался QueryExpander.variants(),
+     * а тот ходил в Википедию за ассоциациями — то есть на 200 найденных файлов уходило 200
+     * сетевых запросов по 8–10 секунд. Отсюда «приложение не отвечает» и ползущая выдача.
+     * Теперь список слов считается один раз на запрос и берётся из памяти.
+     */
+    private val tokenCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    /** Значимые слова запроса и его вариантов. Без сети: только основа слова, транслит, синонимы. */
     fun tokens(query: String, variants: List<String> = emptyList()): List<String> {
-        val all = (listOf(query) + variants + QueryExpander.variants(query, 3)).distinct()
+        val key = query.trim().lowercase() + "|" + variants.joinToString(",")
+        tokenCache[key]?.let { return it }
+        // синонимы из локального словаря (черепашки → tmnt) — тоже без сети
+        val all = (listOf(query) + variants + ImageSearch.aliasesFor(query)).distinct()
         val out = mutableSetOf<String>()
         for (v in all) {
             for (raw in v.lowercase().split(Regex("""[^a-zа-яё0-9]+"""))) {
@@ -34,7 +45,16 @@ object Relevance {
                 QueryExpander.stem(raw)?.let { if (it.length >= 3) out.add(it) }
             }
         }
-        return out.toList()
+        // латиница для кириллицы (рпг → rpg) — без сети
+        QueryExpander.translit(query)?.let { t ->
+            for (raw in t.lowercase().split(Regex("""[^a-zа-яё0-9]+"""))) {
+                if (raw.length >= 3 && raw !in STOP) out.add(raw)
+            }
+        }
+        val result = out.toList()
+        if (tokenCache.size > 200) tokenCache.clear()
+        tokenCache[key] = result
+        return result
     }
 
     /** 0 — не по теме, >0 — сколько слов запроса нашлось в названии. */
