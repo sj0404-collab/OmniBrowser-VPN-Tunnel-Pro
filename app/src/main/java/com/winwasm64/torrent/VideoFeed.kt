@@ -2,6 +2,7 @@ package com.winwasm64.torrent
 
 import com.winwasm64.ui.browser.NetDirect
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -411,9 +412,165 @@ return JSON.stringify(res.slice(0,200));
         .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
         .replace(Regex("\\s+"), " ")
 
+    /* ================= v4.80.0: настоящая страница канала =================
+     * Раньше «канал» открывался как поиск по его названию — отсюда в канале оказывались чужие
+     * видео. Теперь для YouTube берём id канала и его собственную выдачу (innertube /browse),
+     * а для RuTube/VK фильтруем выданное по имени канала.
+     */
+
+    /** Устойчивый ключ видео: одна и та же карточка из индекса и из браузера схлопывается. */
+    fun keyOf(c: Clip): String {
+        val u = c.url
+        Regex("""(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})""").find(u)?.let { return "yt:" + it.groupValues[1] }
+        Regex("""(?:video|clip)(-?\d+)_(\d+)""").find(u)?.let { return "vk:" + it.groupValues[1] + "_" + it.groupValues[2] }
+        Regex("""rutube\.ru/video/([0-9a-f]{6,})""", RegexOption.IGNORE_CASE).find(u)?.let { return "rt:" + it.groupValues[1].lowercase() }
+        return "u:" + u.substringBefore('#')
+    }
+
+    private fun isChannelMatch(name: String, c: Clip): Boolean {
+        val key = com.winwasm64.torrent.VideoSubs.normalize(name)
+        if (key.isBlank()) return true
+        val a = com.winwasm64.torrent.VideoSubs.normalize(c.author)
+        if (a.isNotBlank() && (a.contains(key) || key.contains(a))) return true
+        val t = c.title.lowercase()
+        return key.split(' ').filter { it.length > 3 }.any { t.contains(it) }
+    }
+
+    /** id канала YouTube: из адреса, а если его нет — по названию через поиск. */
+    fun resolveYouTubeChannel(name: String, url: String): String? {
+        Regex("""channel/(UC[A-Za-z0-9_-]{20,})""").find(url)?.let { return it.groupValues[1] }
+        val q = name.trim()
+        if (q.isBlank()) return null
+        val body = JSONObject()
+            .put("query", q)
+            .put("context", JSONObject().put("client", ytClient()))
+            .toString()
+        val (code, text) = try {
+            NetDirect.requestText(
+                "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
+                mapOf("Content-Type" to "application/json", "User-Agent" to UA_WEB_YT, "Accept-Language" to "ru"),
+                "POST", body, timeoutMs = 12_000
+            )
+        } catch (_: Throwable) {
+            return null
+        }
+        if (code !in 200..299) return null
+        val found = ArrayList<JSONObject>()
+        collectNodes(text, setOf("channelRenderer"), found)
+        val key = com.winwasm64.torrent.VideoSubs.normalize(q)
+        var best: String? = null
+        var bestScore = -1
+        for (o in found) {
+            val id = o.optString("channelId")
+            if (id.isBlank()) continue
+            val t = com.winwasm64.torrent.VideoSubs.normalize(titleText(o.opt("title")))
+            var score = 0
+            if (t.isNotBlank() && (t.contains(key) || key.contains(t))) score += 5
+            for (w in key.split(' ').filter { it.length > 3 }) if (t.contains(w)) score++
+            if (score > bestScore) { bestScore = score; best = id }
+        }
+        return best
+    }
+
+    private fun ytClient(): JSONObject = JSONObject()
+        .put("clientName", "WEB")
+        .put("clientVersion", "2.20260101.00.00")
+        .put("hl", "ru").put("gl", "RU")
+
+    /** Рекурсивно собрать объекты по именам ключей (videoRenderer, continuationCommand…). */
+    private fun collectNodes(text: String, keys: Set<String>, out: MutableList<JSONObject>) {
+        val root = try { JSONTokener(text).nextValue() } catch (_: Throwable) { return }
+        fun walk(node: Any?) {
+            when (node) {
+                is JSONObject -> {
+                    for (k in node.keys()) {
+                        val v = node.opt(k)
+                        if (k in keys && v is JSONObject) out.add(v) else walk(v)
+                    }
+                }
+                is org.json.JSONArray -> for (i in 0 until node.length()) walk(node.opt(i))
+                else -> {}
+            }
+        }
+        walk(root)
+    }
+
+    private fun titleText(o: Any?): String {
+        val obj = o as? JSONObject ?: return ""
+        obj.optString("simpleText").takeIf { it.isNotBlank() }?.let { return it }
+        val runs = obj.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) sb.append(runs.optJSONObject(i)?.optString("text").orEmpty())
+        return sb.toString()
+    }
+
+    /**
+     * Видео канала. YouTube — собственная выдача канала (только его видео, с продолжением),
+     * RuTube/VK — выдача площадки, отфильтрованная по имени канала.
+     */
+    fun channelPage(source: String, name: String, url: String, continuation: String? = null): Page {
+        if (source == SRC_YOUTUBE) {
+            val id = resolveYouTubeChannel(name, url)
+                ?: return Page(note = "не нашёл канал «$name» на YouTube")
+            val body = JSONObject()
+                .put("context", JSONObject().put("client", ytClient()))
+            if (continuation.isNullOrBlank()) body.put("browseId", id) else body.put("continuation", continuation)
+            val (code, text) = try {
+                NetDirect.requestText(
+                    "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
+                    mapOf("Content-Type" to "application/json", "User-Agent" to UA_WEB_YT, "Accept-Language" to "ru"),
+                    "POST", body.toString(), timeoutMs = 14_000
+                )
+            } catch (e: Throwable) {
+                return Page(note = "канал недоступен: " + (e.message ?: "сеть"))
+            }
+            if (code !in 200..299) return Page(note = "YouTube ответил $code")
+            val nodes = ArrayList<JSONObject>()
+            collectNodes(text, setOf("videoRenderer", "gridVideoRenderer", "compactVideoRenderer"), nodes)
+            val clips = nodes.mapNotNull { vr ->
+                val vid = vr.optString("videoId")
+                if (vid.length != 11) return@mapNotNull null
+                val len = vr.optJSONObject("lengthText")?.optString("simpleText").orEmpty()
+                val views = vr.optJSONObject("viewCountText")?.optString("simpleText").orEmpty()
+                val age = vr.optJSONObject("publishedTimeText")?.optString("simpleText").orEmpty()
+                val thumbs = vr.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                val thumb = if (thumbs != null && thumbs.length() > 0)
+                    thumbs.optJSONObject(thumbs.length() - 1)?.optString("url").orEmpty() else ""
+                Clip(
+                    id = vid,
+                    kind = CLIP_VIDEO,
+                    title = titleText(vr.opt("title")).ifBlank { "видео" },
+                    author = name,
+                    lengthText = len,
+                    viewsText = views,
+                    publishedText = age,
+                    thumb = thumb.ifBlank { "https://i.ytimg.com/vi/$vid/mqdefault.jpg" },
+                    url = "https://www.youtube.com/watch?v=$vid",
+                    source = SRC_YOUTUBE,
+                    views = parseViews("$views просмотров").second,
+                    days = parseAge(age).second,
+                    lengthSec = parseLength(len).second
+                )
+            }.distinctBy { it.id }
+            val tokens = ArrayList<JSONObject>()
+            collectNodes(text, setOf("continuationCommand"), tokens)
+            val next = tokens.firstOrNull { it.optString("token").isNotBlank() }?.optString("token")
+            return Page(clips = clips, continuation = next, note = if (clips.isEmpty()) "у канала нет видео в этой выдаче" else null)
+        }
+        // RuTube / VK: своя выдача браузером, но оставляем только карточки этого канала
+        val page = search(source, name, 0, null)
+        val only = page.clips.filter { isChannelMatch(name, it) }.distinctBy { keyOf(it) }
+        return Page(clips = only, continuation = page.continuation, note = page.note)
+    }
+
+    private val UA_WEB_YT =
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
     fun search(source: String, query: String, sort: Int = 0, continuation: String? = null): Page {
         if (continuation == null) cached(source, query)?.let { return it }
-        return put(source, query, searchFresh(source, query, sort, continuation))
+        val page = searchFresh(source, query, sort, continuation)
+        // v4.80.0: одна и та же карточка не должна повторяться (индекс и браузер дают разные адреса)
+        return put(source, query, page.copy(clips = page.clips.distinctBy { keyOf(it) }))
     }
 
     private fun searchFresh(source: String, query: String, sort: Int, continuation: String?): Page {

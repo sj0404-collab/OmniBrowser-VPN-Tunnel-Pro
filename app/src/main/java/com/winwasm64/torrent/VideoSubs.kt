@@ -24,12 +24,22 @@ object VideoSubs {
         val subs: String = ""
     )
 
+    /** v4.80.0: одинаковые каналы, подписанные с карточки и со страницы канала, больше не дублируются. */
+    fun normalize(name: String): String = name.lowercase()
+        // «Light Fox | Озвучка и Реакции на манхву и Light Fox Manga» и «Light Fox | Озвучка и Реакции…»
+        // — это один и тот же канал: сравниваем по части до разделителя
+        .substringBefore('|').substringBefore('·').substringBefore('—').substringBefore('–')
+        .replace(Regex("[^a-zа-яё0-9]+"), " ")
+        .trim()
+        .replace(Regex("\\s+"), " ")
+        .take(40)
+
     fun list(ctx: Context): List<Channel> {
         val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: ""
         if (raw.isBlank()) return emptyList()
         return try {
             val arr = JSONArray(raw)
-            (0 until arr.length()).mapNotNull { i ->
+            val all = (0 until arr.length()).mapNotNull { i ->
                 val o = arr.optJSONObject(i) ?: return@mapNotNull null
                 Channel(
                     name = o.optString("name"),
@@ -38,24 +48,44 @@ object VideoSubs {
                     subs = o.optString("subs")
                 )
             }
+            // схлопываем дубли (одно и то же имя, записанное по-разному) и сохраняем почищенный список
+            val merged = LinkedHashMap<String, Channel>()
+            for (c in all) {
+                if (c.name.isBlank()) continue
+                val k = c.source + "|" + normalize(c.name)
+                val old = merged[k]
+                merged[k] = when {
+                    old == null -> c
+                    old.url.isBlank() && c.url.isNotBlank() -> c
+                    else -> old
+                }
+            }
+            val clean = merged.values.toList()
+            if (clean.size != all.size) save(ctx, clean)
+            clean
         } catch (_: Throwable) {
             emptyList()
         }
     }
 
-    fun isSubscribed(ctx: Context, name: String, source: String): Boolean =
-        list(ctx).any { it.name.equals(name, true) && it.source == source }
+    fun isSubscribed(ctx: Context, name: String, source: String): Boolean {
+        val key = normalize(name)
+        if (key.isBlank()) return false
+        return list(ctx).any { it.source == source && normalize(it.name) == key }
+    }
 
     fun add(ctx: Context, ch: Channel) {
         val cur = list(ctx).toMutableList()
-        cur.removeAll { it.name.equals(ch.name, true) && it.source == ch.source }
+        val key = normalize(ch.name)
+        cur.removeAll { it.source == ch.source && normalize(it.name) == key }
         cur.add(0, ch)
         save(ctx, cur)
     }
 
     fun remove(ctx: Context, name: String, source: String) {
         val cur = list(ctx).toMutableList()
-        cur.removeAll { it.name.equals(name, true) && it.source == source }
+        val key = normalize(name)
+        cur.removeAll { it.source == source && normalize(it.name) == key }
         save(ctx, cur)
     }
 

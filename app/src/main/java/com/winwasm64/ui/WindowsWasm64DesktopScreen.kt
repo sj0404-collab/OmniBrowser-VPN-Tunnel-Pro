@@ -7299,10 +7299,14 @@ private fun ChannelScreen(
     onSubsChanged: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var tick by remember(ch.name) { mutableIntStateOf(0) }
     var round by remember(ch.name) { mutableIntStateOf(0) }
     var items by remember(ch.name) { mutableStateOf<List<com.winwasm64.torrent.VideoFeed.Clip>>(emptyList()) }
+    var cont by remember(ch.name) { mutableStateOf<String?>(null) }
     var note by remember(ch.name) { mutableStateOf("") }
     var loading by remember(ch.name) { mutableStateOf(true) }
+    var scrapeUrl by remember(ch.name) { mutableStateOf<String?>(null) }
     var subscribed by remember(ch.name) {
         mutableStateOf(com.winwasm64.torrent.VideoSubs.isSubscribed(context, ch.name, ch.source))
     }
@@ -7311,27 +7315,68 @@ private fun ChannelScreen(
         com.winwasm64.torrent.VideoFeed.SRC_RUTUBE -> "RuTube"
         else -> "YouTube"
     }
-    val url = remember(ch.name, round) {
-        com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)
-    }
-    WebScraper(
-        url = url,
-        source = ch.source,
-        query = ch.name,
-        round = round,
-        onProgress = { list ->
-            val merged = (list + items).distinctBy { it.url }
-            if (merged.size > items.size) items = merged
-            loading = false
-        },
-        onStatus = { note = it },
-        onFinished = { list ->
-            val merged = (list + items).distinctBy { it.url }
-            items = merged
-            loading = false
-            if (merged.isEmpty() && note.isBlank()) note = "Канал пока ничего не отдал — проверьте VPN (щит)"
+
+    // v4.80.0: сначала собственная выдача канала (только его видео), браузер — только как запасной путь
+    LaunchedEffect(tick, ch.name) {
+        loading = true
+        note = ""
+        val page = withContext(Dispatchers.IO) {
+            runCatching {
+                com.winwasm64.torrent.VideoFeed.channelPage(ch.source, ch.name, ch.url, null)
+            }.getOrElse { com.winwasm64.torrent.VideoFeed.Page(note = "канал недоступен: " + (it.message ?: "сеть")) }
         }
-    )
+        items = page.clips.distinctBy { com.winwasm64.torrent.VideoFeed.keyOf(it) }
+        cont = page.continuation
+        note = page.note.orEmpty()
+        loading = false
+        if (items.isEmpty() && ch.source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) {
+            scrapeUrl = com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)
+        }
+    }
+
+    val scraping = scrapeUrl
+    if (scraping != null) {
+        WebScraper(
+            url = scraping,
+            source = ch.source,
+            query = ch.name,
+            round = round,
+            onProgress = { list ->
+                val merged = (list + items).distinctBy { com.winwasm64.torrent.VideoFeed.keyOf(it) }
+                if (merged.size > items.size) items = merged
+                loading = false
+            },
+            onStatus = { note = it },
+            onFinished = { list ->
+                items = (list + items).distinctBy { com.winwasm64.torrent.VideoFeed.keyOf(it) }
+                loading = false
+                if (items.isEmpty()) note = "Канал пока ничего не отдал — проверьте VPN (щит)"
+                scrapeUrl = null
+            }
+        )
+    }
+
+    fun loadMore() {
+        if (loading) return
+        val token = cont
+        if (token != null) {
+            loading = true
+            scope.launch {
+                val page = withContext(Dispatchers.IO) {
+                    runCatching { com.winwasm64.torrent.VideoFeed.channelPage(ch.source, ch.name, ch.url, token) }
+                        .getOrElse { com.winwasm64.torrent.VideoFeed.Page(note = "ошибка: " + (it.message ?: "сеть")) }
+                }
+                items = (items + page.clips).distinctBy { com.winwasm64.torrent.VideoFeed.keyOf(it) }
+                cont = page.continuation
+                if (page.note != null) note = page.note.orEmpty()
+                loading = false
+            }
+        } else {
+            loading = true
+            round++
+            scrapeUrl = com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)
+        }
+    }
 
     Column(modifier = modifier.fillMaxSize()) {
         Row(
@@ -7344,6 +7389,10 @@ private fun ChannelScreen(
             )
             Text("Канал", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp,
                 modifier = Modifier.weight(1f))
+            Text(
+                "⟳", color = Color.White, fontSize = 16.sp,
+                modifier = Modifier.padding(horizontal = 8.dp).clickable { tick++ }
+            )
             Text(
                 "🌐 на сайте", color = Omni.TextFaint, fontSize = 10.sp,
                 modifier = Modifier.clickable { onOpenUrl(com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)) }
@@ -7420,7 +7469,7 @@ private fun ChannelScreen(
             item {
                 if (items.isNotEmpty() && items.size < 100) {
                     Button(
-                        onClick = { loading = true; round++ },
+                        onClick = { loadMore() },
                         modifier = Modifier.fillMaxWidth().height(42.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest),
                         contentPadding = PaddingValues(vertical = 0.dp)
