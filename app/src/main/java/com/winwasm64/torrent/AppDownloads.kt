@@ -113,6 +113,78 @@ object AppDownloads {
     }
 
     /** Папка приложения, куда всё складывается. */
+    /**
+     * v4.68.0: «не могу открыть файл» и «вот тут кнопки продолжить либо повторить».
+     *
+     * Скачанное лежит в общей папке `Загрузки/OmniBrowser`; чтобы открыть его из приложения,
+     * нужно найти реальный файл. DownloadManager может отдать `content://`-адрес, поэтому
+     * пробуем несколько путей: локальный URI, затем папку приложения по имени.
+     */
+    fun fileOf(context: Context, item: Item): File? {
+        val name = item.name.ifBlank { "файл ${item.id}" }
+        val candidates = mutableListOf<File>()
+        // 1) папка приложения
+        candidates.add(File(folder(), name))
+        // 2) общая папка «Загрузки» (так ставит enqueue)
+        try {
+            val ext = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+            candidates.add(File(File(ext, SUBDIR), name))
+        } catch (_: Throwable) {
+        }
+        // 3) путь из DownloadManager, если он файловый
+        try {
+            if (item.localUri.startsWith("file://")) {
+                candidates.add(File(java.net.URI(item.localUri)))
+            }
+        } catch (_: Throwable) {
+        }
+        return candidates.firstOrNull { it.exists() && it.length() > 0 }
+    }
+
+    /** Повторить загрузку с нуля (кнопка «Повторить» у ошибки). */
+    fun retry(context: Context, item: Item): Long? {
+        if (item.url.isBlank()) return null
+        try {
+            (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id)
+        } catch (_: Throwable) {
+        }
+        return enqueue(context, item.url, item.name)
+    }
+
+    /**
+     * Продолжить приостановленную загрузку. Публичного API для этого нет — дергаем скрытый
+     * `resumeDownload(long...)`; если прошивка не даёт, честно перезапускаем заново.
+     */
+    fun resume(context: Context, item: Item): Boolean {
+        return try {
+            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            val m = DownloadManager::class.java.getMethod("resumeDownload", LongArray::class.java)
+            m.invoke(dm, longArrayOf(item.id))
+            true
+        } catch (_: Throwable) {
+            retry(context, item) != null
+        }
+    }
+
+    /** Убрать запись и файл (кнопка «Удалить»). */
+    fun remove(context: Context, item: Item, deleteFile: Boolean = true) {
+        try {
+            (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).remove(item.id)
+        } catch (_: Throwable) {
+        }
+        if (deleteFile) {
+            try { fileOf(context, item)?.delete() } catch (_: Throwable) {}
+        }
+        unremember(context, item.id)
+    }
+
+    private fun unremember(context: Context, id: Long) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val current = prefs.getStringSet(KEY_IDS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        current.remove(id.toString())
+        prefs.edit().putStringSet(KEY_IDS, current).apply()
+    }
+
     fun folder(): File =
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), SUBDIR)
 }

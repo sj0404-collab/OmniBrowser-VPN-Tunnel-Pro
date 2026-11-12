@@ -86,6 +86,10 @@ class VideoSearchActivity : Activity() {
         channelName = intent.getStringExtra("channel").orEmpty()
         channelQuery = intent.getStringExtra("channelQuery").orEmpty()
         source = normalizeSource(intent.getStringExtra("source").orEmpty())
+        // v4.68.0: вкладка площадки открывается сразу на нужной категории (плейлисты / каналы / видео)
+        intent.getStringExtra("category")?.let { c ->
+            if (c in setOf("🎬 Видео", "🎞 Плейлисты", "📺 Каналы", "🔴 Трансляции")) category = c
+        }
         depth = SearchSettings.depth(this, "video")
 
         val root = LinearLayout(this).apply {

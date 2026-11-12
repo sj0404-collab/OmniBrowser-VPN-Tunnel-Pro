@@ -4585,8 +4585,35 @@ private fun HistoryAndDownloadsSection(
                             "Загрузки приложения (${systemDownloads.size}) · Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}",
                             color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp
                         )
+                        // v4.68.0: «кнопки продолжить либо повторить… и не могу открыть файл»
                         for (d in systemDownloads.take(20)) {
-                            Column(modifier = Modifier.fillMaxWidth()) {
+                            val file = if (d.isDone) com.winwasm64.torrent.AppDownloads.fileOf(context, d) else null
+                            fun openIt() {
+                                val f = com.winwasm64.torrent.AppDownloads.fileOf(context, d)
+                                if (f == null) {
+                                    Toast.makeText(context, "файл не найден — возможно, он удалён", Toast.LENGTH_SHORT).show()
+                                    return
+                                }
+                                val isVideo = listOf(".mp4", ".mkv", ".webm", ".m4v", ".mov", ".ts", ".m3u8", ".avi")
+                                    .any { f.name.lowercase().endsWith(it) }
+                                if (isVideo) {
+                                    context.startActivity(
+                                        Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            .putExtra("url", android.net.Uri.fromFile(f).toString())
+                                            .putExtra("title", f.name)
+                                    )
+                                } else {
+                                    nativeAppsManager.openFileInNativeApp(f).onFailure {
+                                        Toast.makeText(context, "Не открылось: ${it.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                            Column(
+                                modifier = Modifier.fillMaxWidth()
+                                    .clickable(enabled = d.isDone) { openIt() }
+                                    .padding(vertical = 3.dp)
+                            ) {
                                 Text(
                                     d.name.ifBlank { "файл ${d.id}" },
                                     color = Color.White, fontSize = 12.sp, maxLines = 1,
@@ -4594,7 +4621,7 @@ private fun HistoryAndDownloadsSection(
                                 )
                                 Text(
                                     when {
-                                        d.isDone -> "✅ готово · ${fmtBytes(d.total)}"
+                                        d.isDone -> "✅ готово · ${fmtBytes(d.total)}" + (if (file != null) " · нажмите, чтобы открыть" else " · файл не найден")
                                         d.isFailed -> "❌ ошибка (${d.reason}) · ${fmtBytes(d.bytes)} из ${fmtBytes(d.total)}"
                                         else -> "⏳ качается ${d.progress}% · ${fmtBytes(d.bytes)} из ${fmtBytes(d.total)}"
                                     },
@@ -4611,6 +4638,46 @@ private fun HistoryAndDownloadsSection(
                                         modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
                                         color = Omni.Accent, trackColor = Omni.SurfaceHighest
                                     )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 4.dp)) {
+                                    if (d.isDone) {
+                                        Button(
+                                            onClick = { openIt() },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                            modifier = Modifier.height(30.dp)
+                                        ) { Text("▶ Открыть", fontSize = 10.sp, color = Color.White) }
+                                    }
+                                    if (d.isFailed || d.status == android.app.DownloadManager.STATUS_PAUSED) {
+                                        Button(
+                                            onClick = {
+                                                val ok = com.winwasm64.torrent.AppDownloads.retry(context, d)
+                                                Toast.makeText(
+                                                    context,
+                                                    if (ok != null) "⟳ Повторяю загрузку" else "Не удалось повторить",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer),
+                                            modifier = Modifier.height(30.dp)
+                                        ) { Text("⟳ Повторить", fontSize = 10.sp, color = Color.White) }
+                                    }
+                                    if (d.status == android.app.DownloadManager.STATUS_PAUSED) {
+                                        OutlinedButton(
+                                            onClick = { com.winwasm64.torrent.AppDownloads.resume(context, d) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                            modifier = Modifier.height(30.dp)
+                                        ) { Text("➡ Продолжить", fontSize = 10.sp, color = Color.White) }
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            com.winwasm64.torrent.AppDownloads.remove(context, d)
+                                            Toast.makeText(context, "Удалено", Toast.LENGTH_SHORT).show()
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                        modifier = Modifier.height(30.dp)
+                                    ) { Text("🗑", fontSize = 10.sp, color = Omni.Danger) }
                                 }
                             }
                         }
@@ -6614,222 +6681,306 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
 private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery }) }
-    var source by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoSource) }
-    var channel by remember { mutableStateOf("") }
+    /** v4.68.0: null — поисковик (видео скрыты), иначе открыта вкладка только этой площадки. */
+    var site by remember { mutableStateOf<String?>(null) }
+    /** Действие внутри вкладки площадки: найти / плейлисты / каналы / подписки / url. */
+    var action by remember { mutableStateOf<String?>(null) }
+    var urlInput by remember { mutableStateOf("") }
     var channels by remember { mutableStateOf(com.winwasm64.torrent.VideoChannels.all(context)) }
     var newChannel by remember { mutableStateOf("") }
-    var adding by remember { mutableStateOf(false) }
-    val sources = listOf("Все", "YouTube", "RuTube", "VK Видео")
+    val sites = listOf("YouTube", "RuTube", "VK Видео")
 
-    fun open(target: String, channelName: String = "") {
-        com.winwasm64.torrent.SearchCache.videoQuery = target
-        com.winwasm64.torrent.SearchCache.videoSource = source
-        val ch = channels.firstOrNull { it.name == channelName }
+    /** Открыть выдачу ТОЛЬКО выбранной площадки (или её категорию/канал). */
+    fun launch(siteName: String, target: String, category: String? = null, channelName: String = "") {
+        val src = when (siteName) {
+            "VK Видео" -> "VK"
+            "RuTube" -> "RuTube"
+            else -> "YouTube"
+        }
         val intent = Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .putExtra("query", target)
-            .putExtra(
-                "source",
-                when (source) {
-                    "VK Видео" -> "VK"
-                    "Все" -> "YouTube"
-                    else -> source
-                }
-            )
+            .putExtra("source", src)
             .putExtra("channel", channelName)
-            .putExtra("channelQuery", ch?.query.orEmpty())
+        if (!category.isNullOrBlank()) intent.putExtra("category", category)
         context.startActivity(intent)
     }
 
-    /** v4.64.0: воспроизведение видео в native плеере (Media3 ExoPlayer) вместо WebView. */
-    fun playNative(videoUrl: String, title: String, thumbnail: String? = null) {
-        val intent = Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            .putExtra("url", videoUrl)
-            .putExtra("title", title)
-            .putExtra("thumbnail", thumbnail)
-        context.startActivity(intent)
+    /** Прямая ссылка скачивается сразу, страница ролика — через перехват потока в «Видео». */
+    fun downloadUrl(raw: String, siteName: String) {
+        val url = raw.trim()
+        if (url.isBlank()) return
+        val media = listOf(".mp4", ".webm", ".mkv", ".m4v", ".mov", ".m3u8", ".ts").any { url.lowercase().contains(it) }
+        if (media) {
+            val name = url.substringAfterLast('/').substringBefore('?').ifBlank { "video.mp4" }
+            val id = com.winwasm64.torrent.AppDownloads.enqueue(context, url, name)
+            Toast.makeText(
+                context,
+                if (id != null) "⬇ $name → Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}" else "Не удалось начать загрузку",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            launch(siteName, url)
+            Toast.makeText(context, "Открыл ролик — там кнопка «⬇ Скачать»", Toast.LENGTH_LONG).show()
+        }
     }
 
-    Column(modifier = modifier.fillMaxWidth().background(Omni.Bg).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("🎬 Видео по названию, по ссылке или в канале", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Text(
-                    "Один поиск — сразу все категории (видео, плейлисты, каналы, трансляции) с количеством " +
-                        "на каждом чипе; переключение мгновенное, без повторного поиска. Кнопка «⬇ Скачать» " +
-                        "работает и для VK/RuTube (перехват прямого mp4). Канал ниже ограничивает поиск.",
-                    color = Omni.TextDim, fontSize = 11.sp
-                )
-                CompactDarkTextField(
-                    value = query,
-                    onValueChange = {
-                        query = it
-                        com.winwasm64.torrent.SearchCache.videoQuery = it
-                    },
-                    placeholder = "Название: «я злой бог», шрек, манга… или ссылка https://",
-                    modifier = Modifier.fillMaxWidth(),
-                    onGo = { if (query.isNotBlank()) open(query.trim(), channel) }
-                )
-                SearchDepthRow("video") { }
-                Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    sources.forEach { src ->
-                        Surface(
-                            color = if (source == src) Omni.AccentContainer else Omni.SurfaceHighest,
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.clickable {
-                                source = src
-                                com.winwasm64.torrent.SearchCache.videoSource = src
-                            }
-                        ) {
-                            Text(src, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp))
-                        }
-                    }
-                }
-                Button(
-                    onClick = { if (query.isNotBlank()) open(query.trim(), channel) },
-                    modifier = Modifier.fillMaxWidth().height(42.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                ) {
-                    Text(
-                        when {
-                            query.startsWith("http") -> "▶ Смотреть ссылку в приложении"
-                            channel.isNotBlank() -> "🔍 Искать «${query.take(18)}» в канале «$channel»"
-                            else -> "🔍 Искать видео · $source"
-                        },
-                        fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White
-                    )
-                }
-            }
-        }
+    Box(modifier = modifier.fillMaxSize().background(Omni.Bg)) {
+        // Одна вертикальная прокрутка на весь раздел — раньше прокрутка не работала из-за вложенных списков
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 10.dp, top = 10.dp, bottom = 16.dp, end = 68.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // ---------- шапка: одна строка, без простыни ----------
+            Text("🎬 Видео", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text(
+                "Площадки — кнопки справа. Каждая открывает только свою вкладку; «✕ Скрыть» возвращает в поиск.",
+                color = Omni.TextDim, fontSize = 10.sp, maxLines = 2
+            )
 
-        // ---------- ПОДПИСКИ ----------
-        Surface(color = Omni.Surface, shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)) {
-            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text("📺 Подписки (${channels.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                    Text(
-                        if (adding) "Отмена" else "➕ Добавить",
-                        color = Omni.Accent, fontSize = 11.sp,
-                        modifier = Modifier.clickable { adding = !adding }
-                    )
-                }
-                Text(
-                    if (channel.isBlank()) "Канал не выбран — поиск идёт по всем площадкам."
-                    else "Выбран канал «$channel» — поиск только в нём.",
-                    color = if (channel.isBlank()) Omni.TextDim else Omni.Success, fontSize = 11.sp
-                )
-                if (adding) {
-                    CompactDarkTextField(
-                        value = newChannel,
-                        onValueChange = { newChannel = it },
-                        placeholder = "Название канала (например, LightFox Manga)",
-                        modifier = Modifier.fillMaxWidth(),
-                        onGo = {
-                            if (newChannel.isNotBlank()) {
-                                com.winwasm64.torrent.VideoChannels.add(context, newChannel)
-                                channels = com.winwasm64.torrent.VideoChannels.all(context)
-                                Toast.makeText(context, "Канал «${newChannel.trim()}» в подписках", Toast.LENGTH_SHORT).show()
-                                newChannel = ""
-                                adding = false
-                            }
-                        }
-                    )
-                    Button(
-                        onClick = {
-                            if (newChannel.isNotBlank()) {
-                                com.winwasm64.torrent.VideoChannels.add(context, newChannel)
-                                channels = com.winwasm64.torrent.VideoChannels.all(context)
-                                Toast.makeText(context, "Канал «${newChannel.trim()}» в подписках", Toast.LENGTH_SHORT).show()
-                                newChannel = ""
-                                adding = false
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth().height(38.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
-                    ) {
-                        Text("Подписаться", fontSize = 12.sp, color = Color.White)
-                    }
-                }
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    channels.chunked(2).forEach { pair ->
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            pair.forEach { ch ->
-                                val selected = ch.name == channel
-                                Surface(
-                                    color = if (selected) Omni.AccentContainer else Omni.SurfaceHighest,
-                                    shape = RoundedCornerShape(9.dp),
-                                    modifier = Modifier.weight(1f).clickable {
-                                        channel = if (selected) "" else ch.name
-                                        if (query.isNotBlank()) open(query.trim(), channel)
-                                    }
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            ch.name,
-                                            color = Color.White,
-                                            fontSize = 11.sp,
-                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        if (ch.custom) {
-                                            Text(
-                                                "✕",
-                                                color = Omni.TextDim,
-                                                fontSize = 12.sp,
-                                                modifier = Modifier.clickable {
-                                                    com.winwasm64.torrent.VideoChannels.remove(context, ch.name)
-                                                    channels = com.winwasm64.torrent.VideoChannels.all(context)
-                                                    if (channel == ch.name) channel = ""
-                                                }
-                                            )
-                                        } else {
-                                            Text("▶", fontSize = 10.sp, color = Omni.Accent)
-                                        }
-                                    }
-                                }
-                            }
-                            if (pair.size == 1) Box(modifier = Modifier.weight(1f))
-                        }
-                    }
-                }
-            }
-        }
-
-        Text("Быстрый переход по площадкам", color = Omni.Warning, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-        listOf(
-            "YouTube" to "https://m.youtube.com/results?search_query=",
-            "RuTube" to "https://rutube.ru/search/?query=",
-            "VK Видео" to "https://m.vk.com/video?q="
-        ).forEach { (name, base) ->
             Surface(
                 color = Omni.Surface,
-                shape = RoundedCornerShape(10.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
-                modifier = Modifier.fillMaxWidth().clickable {
-                    if (query.isBlank()) {
-                        Toast.makeText(context, "Сначала введите название", Toast.LENGTH_SHORT).show()
-                    } else {
-                        open(query.trim(), channel)
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline)
+            ) {
+                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CompactDarkTextField(
+                        value = query,
+                        onValueChange = {
+                            query = it
+                            com.winwasm64.torrent.SearchCache.videoQuery = it
+                        },
+                        placeholder = "Название, ссылка https:// или «канал»",
+                        modifier = Modifier.fillMaxWidth(),
+                        onGo = {
+                            val target = site ?: "YouTube"
+                            if (query.isNotBlank()) launch(target, query.trim())
+                        }
+                    )
+                    SearchDepthRow("video") { }
+                    Button(
+                        onClick = {
+                            val target = site ?: "YouTube"
+                            if (query.isNotBlank()) launch(target, query.trim())
+                            else Toast.makeText(context, "Введите название или ссылку", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                    ) {
+                        Text(
+                            when {
+                                query.startsWith("http") -> "▶ Открыть ссылку в приложении"
+                                else -> "🔍 Искать видео · ${site ?: "YouTube"}"
+                            },
+                            fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White
+                        )
                     }
                 }
-            ) {
-                Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("▶", fontSize = 16.sp)
-                    Column(modifier = Modifier.weight(1f).padding(start = 8.dp)) {
-                        Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Text(base.take(46), color = Omni.TextDim, fontSize = 10.sp, maxLines = 1)
+            }
+
+            // ---------- вкладка выбранной площадки ----------
+            val current = site
+            if (current != null) {
+                Surface(
+                    color = Omni.Surface,
+                    shape = RoundedCornerShape(12.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Omni.AccentContainer)
+                ) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("▶ $current — только эта площадка", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(
+                                "✕ Скрыть",
+                                color = Omni.Accent, fontSize = 11.sp,
+                                modifier = Modifier.clickable { site = null; action = null }
+                            )
+                        }
+                        Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf(
+                                "найти" to "🔍 Найти",
+                                "плейлисты" to "🎞 Плейлисты",
+                                "каналы" to "📺 Каналы",
+                                "подписки" to "⭐ Подписки",
+                                "url" to "⬇ Скачать по URL"
+                            ).forEach { (key, label) ->
+                                Surface(
+                                    color = if (action == key) Omni.AccentContainer else Omni.SurfaceHighest,
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.clickable { action = if (action == key) null else key }
+                                ) {
+                                    Text(label, color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp))
+                                }
+                            }
+                        }
+
+                        when (action) {
+                            "найти" -> {
+                                Text("Искать «${query.ifBlank { "…" }}» в $current", color = Omni.TextDim, fontSize = 11.sp)
+                                Button(
+                                    onClick = {
+                                        if (query.isBlank()) Toast.makeText(context, "Сначала введите название", Toast.LENGTH_SHORT).show()
+                                        else launch(current, query.trim())
+                                    },
+                                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                ) { Text("🔍 Искать в $current", fontSize = 12.sp, color = Color.White) }
+                            }
+                            "плейлисты" -> Button(
+                                onClick = { launch(current, query.trim(), "🎞 Плейлисты") },
+                                modifier = Modifier.fillMaxWidth().height(38.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                            ) { Text("🎞 Плейлисты $current" + (if (query.isBlank()) "" else " по «${query.take(16)}»"), fontSize = 12.sp, color = Color.White) }
+                            "каналы" -> Button(
+                                onClick = { launch(current, query.trim(), "📺 Каналы") },
+                                modifier = Modifier.fillMaxWidth().height(38.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                            ) { Text("📺 Каналы $current" + (if (query.isBlank()) "" else " по «${query.take(16)}»"), fontSize = 12.sp, color = Color.White) }
+                            "подписки" -> {
+                                Text("Подписки (${channels.size}) — нажмите, чтобы искать внутри канала на $current", color = Omni.TextDim, fontSize = 11.sp)
+                                channels.chunked(2).forEach { pair ->
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        pair.forEach { ch ->
+                                            Surface(
+                                                color = Omni.SurfaceHighest,
+                                                shape = RoundedCornerShape(9.dp),
+                                                modifier = Modifier.weight(1f).clickable {
+                                                    launch(current, ch.query.ifBlank { ch.name }, null, ch.name)
+                                                }
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Text(
+                                                        ch.name, color = Color.White, fontSize = 11.sp, maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        modifier = Modifier.weight(1f)
+                                                    )
+                                                    if (ch.custom) {
+                                                        Text(
+                                                            "✕", color = Omni.TextDim, fontSize = 12.sp,
+                                                            modifier = Modifier.clickable {
+                                                                com.winwasm64.torrent.VideoChannels.remove(context, ch.name)
+                                                                channels = com.winwasm64.torrent.VideoChannels.all(context)
+                                                            }
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (pair.size == 1) Box(modifier = Modifier.weight(1f))
+                                    }
+                                }
+                                CompactDarkTextField(
+                                    value = newChannel,
+                                    onValueChange = { newChannel = it },
+                                    placeholder = "Добавить канал в подписки…",
+                                    modifier = Modifier.fillMaxWidth(),
+                                    onGo = {
+                                        if (newChannel.isNotBlank()) {
+                                            com.winwasm64.torrent.VideoChannels.add(context, newChannel)
+                                            channels = com.winwasm64.torrent.VideoChannels.all(context)
+                                            newChannel = ""
+                                        }
+                                    }
+                                )
+                            }
+                            "url" -> {
+                                CompactDarkTextField(
+                                    value = urlInput,
+                                    onValueChange = { urlInput = it },
+                                    placeholder = "https://… (mp4/m3u8 скачается сразу)",
+                                    modifier = Modifier.fillMaxWidth(),
+                                    onGo = { downloadUrl(urlInput, current) }
+                                )
+                                Button(
+                                    onClick = { downloadUrl(urlInput, current) },
+                                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Omni.AccentContainer)
+                                ) { Text("⬇ Скачать с $current", fontSize = 12.sp, color = Color.White) }
+                            }
+                            else -> Text(
+                                "Выберите действие выше — откроется только $current.",
+                                color = Omni.TextDim, fontSize = 11.sp
+                            )
+                        }
                     }
-                    Text("Искать →", color = Omni.Accent, fontSize = 11.sp)
+                }
+            } else {
+                Text(
+                    "Видео скрыты. Нажмите площадку справа → выберите действие (найти, плейлисты, каналы, подписки, скачать по URL).",
+                    color = Omni.TextDim, fontSize = 11.sp
+                )
+            }
+        }
+
+        // ---------- фиксированные «плавающие» кнопки площадок справа ----------
+        Column(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            sites.forEach { name ->
+                val active = site == name
+                Surface(
+                    color = if (active) Omni.AccentContainer else Omni.SurfaceHighest,
+                    shape = RoundedCornerShape(12.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (active) Omni.Accent else Omni.Outline),
+                    modifier = Modifier.clickable {
+                        site = if (active) null else name
+                        action = null
+                    }
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            when (name) {
+                                "YouTube" -> "▶"
+                                "RuTube" -> "R"
+                                else -> "VK"
+                            },
+                            color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            when (name) {
+                                "YouTube" -> "YT"
+                                "RuTube" -> "RT"
+                                else -> "VK"
+                            },
+                            color = Omni.TextDim, fontSize = 8.sp
+                        )
+                    }
+                }
+            }
+            // вернуться в поисковик, не выбирая площадку
+            Surface(
+                color = Omni.SurfaceHighest,
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
+                modifier = Modifier.clickable { site = null; action = null }
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("🔍", fontSize = 12.sp)
+                    Text("поиск", color = Omni.TextDim, fontSize = 8.sp)
                 }
             }
         }
     }
+}
 }
 
 private fun torrentLastQueryFallback(): String = com.winwasm64.torrent.SearchCache.videoQuery.trim()
