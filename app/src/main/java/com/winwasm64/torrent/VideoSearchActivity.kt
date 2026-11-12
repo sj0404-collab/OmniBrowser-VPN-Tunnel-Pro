@@ -625,6 +625,8 @@ class VideoSearchActivity : Activity() {
             }
             else -> {
                 buttons.addView(small("▶ Смотреть") { playInline(item.url) })
+                // v4.66.0: если ссылка — уже прямой поток, играем своим плеером (Media3), а не WebView
+                if (isDirectStream(item.url)) buttons.addView(small("🎞 Плеер") { playNative(item.url, item.title) })
                 buttons.addView(small("⬇ Скачать") { startCapture(item) })
                 buttons.addView(small("🌐 Открыть") { openExternal(item.url) })
                 buttons.addView(small("📋 Ссылка") { copy(item.url) })
@@ -640,6 +642,27 @@ class VideoSearchActivity : Activity() {
     }
 
     /* ===================== действия ===================== */
+
+    /** Прямая ссылка на поток? (mp4/m3u8/webm/… или CDN-адрес с видео) */
+    private fun isDirectStream(url: String): Boolean {
+        val u = url.lowercase()
+        return u.endsWith(".mp4") || u.endsWith(".m3u8") || u.endsWith(".webm") ||
+            u.endsWith(".m4v") || u.contains(".mp4?") || u.contains("/videoplayback") ||
+            u.contains("googlevideo") || u.contains(".m3u8?")
+    }
+
+    /** v4.66.0: воспроизведение в native-плеере Media3 (с Referer/User-Agent). */
+    private fun playNative(url: String, title: String) {
+        try {
+            startActivity(
+                Intent(this, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                    .putExtra("url", url)
+                    .putExtra("title", title)
+            )
+        } catch (e: Throwable) {
+            toast("Плеер не открылся: ${e.message}")
+        }
+    }
 
     private fun playInline(url: String) {
         playerBox.visibility = View.VISIBLE

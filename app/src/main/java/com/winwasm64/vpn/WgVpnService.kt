@@ -1,173 +1,147 @@
 package com.winwasm64.vpn
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
-import android.os.Build
-import com.winwasm64.MainActivity
 import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Statistics
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
+import java.io.File
 
 /**
- * WireGuard VPN service — integration portal-wg (AetherWG) tunnel module.
+ * v4.66.0: WireGuard доведён до рабочего состояния.
  *
- * v4.64.0: добавлен WireGuard alongside existing Psiphon/Browsec tunnels.
+ * Что было не так в 4.64/4.65 (разбор приложен отдельно):
+ *  • самосборный модуль `:tunnel` не содержал `libwg-go.so` — `GoBackend` падал
+ *    с `UnsatisfiedLinkError`, а это `Error`, не `Exception`, поэтому приложение просто падало;
+ *  • запрос согласия на VPN (`VpnService.prepare`) не вызывался вообще;
+ *  • сервис нельзя было запустить из интерфейса.
  *
- * Usage:
- * 1. Пользователь добавляет конфиг WireGuard (.conf файл)
- * 2. WgVpnService запускается с конфигом
- * 3. GoBackend создаёт туннель и перенаправляет трафик
+ * Теперь используется официальная библиотека `com.wireguard.android:tunnel` (в ней настоящий
+ * userspace-бэкенд `libwg-go.so` для всех ABI), согалсие спрашивается из интерфейса, а этот
+ * объект — только контроллер: он не сервис, а тонкая обёртка над `GoBackend`.
+ *
+ * Сам туннель поднимает сервис библиотеки
+ * `com.wireguard.android.backend.GoBackend$VpnService` (объявлен в манифесте) — так задумано
+ * в wireguard-android: `GoBackend` запускает именно его.
  */
-class WgVpnService : VpnService() {
+object WgVpnService {
 
-    companion object {
-        const val ACTION_START = "com.winwasm64.vpn.WG_START"
-        const val ACTION_STOP = "com.winwasm64.vpn.WG_STOP"
-        const val EXTRA_CONFIG = "config_path"
+    const val ACTION_START = "com.winwasm64.vpn.WG_START"
+    const val ACTION_STOP = "com.winwasm64.vpn.WG_STOP"
+    const val EXTRA_CONFIG = "config_path"
 
-        @Volatile
-        var isWgActive: Boolean = false
-            private set
+    private const val TAG = "WireGuard"
 
-        @Volatile
-        var wgConfig: Config? = null
-            private set
+    @Volatile
+    var isWgActive: Boolean = false
+        private set
 
-        @Volatile
-        var wgStatistics: Statistics? = null
-            private set
-    }
+    @Volatile
+    var lastError: String = ""
+        private set
 
+    @Volatile
     private var backend: GoBackend? = null
+
+    @Volatile
     private var tunnel: Tunnel? = null
-    private var notificationManager: NotificationManager? = null
 
-    override fun onCreate() {
-        super.onCreate()
-        notificationManager = getSystemService(NotificationManager::class.java)
-        createNotificationChannel()
+    private val tunnelName = "OmniBrowser-WG"
+
+    /** Файл конфигурации внутри приложения: сюда копируется выбранный пользователем `.conf`. */
+    fun configFile(context: Context): File =
+        File(File(context.filesDir, "wg").also { it.mkdirs() }, "wg.conf")
+
+    fun hasConfig(context: Context): Boolean {
+        val f = configFile(context)
+        return f.exists() && f.length() > 20
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                val configPath = intent.getStringExtra(EXTRA_CONFIG)
-                if (configPath != null) {
-                    startWgTunnel(configPath)
-                }
-            }
-            ACTION_STOP -> {
-                stopWgTunnel()
-            }
+    /** Сохранить выбранный `.conf` (приводим текст к нормальному виду и проверяем разбор). */
+    fun saveConfig(context: Context, raw: String): String? {
+        return try {
+            val text = raw.replace("\r\n", "\n").trim() + "\n"
+            val parsed = Config.parse(text.byteInputStream())
+            if (parsed.peers.isEmpty()) return "в конфиге нет ни одного [Peer]"
+            configFile(context).writeText(text)
+            null
+        } catch (e: Throwable) {
+            "конфиг не разобран: ${e.message ?: e.javaClass.simpleName}"
         }
-        return START_NOT_STICKY
     }
 
-    private fun startWgTunnel(configPath: String) {
+    /** Нужно ли спросить у пользователя согласие на VPN (вернёт Intent — покажем его). */
+    fun prepareIntent(context: Context): Intent? = VpnService.prepare(context)
+
+    /**
+     * Поднять туннель. Блокирующий вызов — вызывать из фонового потока.
+     * Возвращает null при успехе или текст ошибки.
+     */
+    fun start(context: Context): String? {
+        if (!hasConfig(context)) return "сначала загрузите конфиг .conf"
+        // Android разрешает только один активный VPN: два сервиса одновременно жить не могут
         try {
-            // Load WireGuard config
-            val configFile = java.io.File(configPath)
-            if (!configFile.exists()) {
-                VpnLog.e("WireGuard", "Config file not found: $configPath")
-                stopWgTunnel()
-                return
+            if (BrowsecVpnService.isRunning) {
+                BrowsecVpnService.stop(context.applicationContext)
             }
-            val config = Config.parse(configFile.inputStream())
-
-            // Create GoBackend
-            backend = GoBackend(applicationContext)
-
-            // Create tunnel object
-            tunnel = object : Tunnel {
-                override fun getName(): String = "OmniBrowser-WG"
+        } catch (_: Throwable) {
+        }
+        return try {
+            val config = Config.parse(configFile(context).inputStream())
+            val be = GoBackend(context.applicationContext)
+            backend = be
+            val t = object : Tunnel {
+                override fun getName(): String = tunnelName
                 override fun onStateChange(newState: Tunnel.State) {
-                    VpnLog.i("WireGuard", "Tunnel state: $newState")
-                    when (newState) {
-                        Tunnel.State.UP -> {
-                            isWgActive = true
-                            showNotification("WireGuard активен", "Туннель WireGuard установлен")
-                        }
-                        Tunnel.State.DOWN -> {
-                            isWgActive = false
-                            showNotification("WireGuard остановлен", "Туннель WireGuard закрыт")
-                        }
-                        Tunnel.State.TOGGLE -> {
-                            if (isWgActive) stopWgTunnel()
-                        }
-                    }
+                    VpnLog.i(TAG, "состояние туннеля: $newState")
+                    isWgActive = newState == Tunnel.State.UP
                 }
             }
-
-            // Start tunnel via backend
-            wgConfig = config
-            backend?.setState(tunnel!!, Tunnel.State.UP, config)
-            VpnLog.i("WireGuard", "Tunnel started: $configPath")
-        } catch (e: Exception) {
-            VpnLog.e("WireGuard", "Failed to start tunnel: ${e.message}")
-            stopWgTunnel()
-        }
-    }
-
-    private fun stopWgTunnel() {
-        try {
-            backend?.let { backend ->
-                tunnel?.let { tunnel ->
-                    backend.setState(tunnel, Tunnel.State.DOWN, null)
-                }
-            }
-            tunnel = null
-            backend = null
-            wgConfig = null
-            wgStatistics = null
+            tunnel = t
+            be.setState(t, Tunnel.State.UP, config)
+            isWgActive = true
+            lastError = ""
+            VpnLog.i(TAG, "туннель поднят")
+            null
+        } catch (e: Throwable) {
+            // v4.66.0: ловим Throwable (а не Exception) — UnsatisfiedLinkError и прочие Error
+            // раньше проходили мимо обработчика и роняли процесс
             isWgActive = false
-            showNotification("WireGuard остановлен", "Туннель WireGuard закрыт")
-            VpnLog.i("WireGuard", "Tunnel stopped")
-            stopSelf()
-        } catch (e: Exception) {
-            VpnLog.e("WireGuard", "Failed to stop tunnel: ${e.message}")
+            lastError = e.message ?: e.javaClass.simpleName
+            VpnLog.e(TAG, "не удалось поднять туннель: $lastError")
+            lastError
         }
     }
 
-    override fun onDestroy() {
-        stopWgTunnel()
-        super.onDestroy()
+    /** Остановить туннель. Блокирующий вызов. */
+    fun stop() {
+        try {
+            val be = backend
+            val t = tunnel
+            if (be != null && t != null) be.setState(t, Tunnel.State.DOWN, null)
+        } catch (_: Throwable) {
+        }
+        backend = null
+        tunnel = null
+        isWgActive = false
+        VpnLog.i(TAG, "туннель остановлен")
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "wg_vpn_channel",
-                "WireGuard VPN",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "WireGuard VPN tunnel status"
-            }
-            notificationManager?.createNotificationChannel(channel)
+    /** Статистика: сколько принято/отдано — для строки состояния. */
+    fun statsLine(): String {
+        val t = tunnel ?: return ""
+        return try {
+            val st: Statistics = backend?.getStatistics(t) ?: return ""
+            val rx = st.totalRx()
+            val tx = st.totalTx()
+            "⬇ ${BrowsecVpnService.formatBytesShort(rx)} · ⬆ ${BrowsecVpnService.formatBytesShort(tx)}"
+        } catch (_: Throwable) {
+            ""
         }
     }
 
-    private fun showNotification(title: String, message: String) {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val notification: Notification = Notification.Builder(this, "wg_vpn_channel")
-            .setContentTitle(title)
-            .setContentText(message)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
-
-        startForeground(1, notification)
-    }
+    /** Для проверки доступности бэкенда без реального подключения. */
+    fun backendName(): String = "GoBackend (userspace, без root)"
 }

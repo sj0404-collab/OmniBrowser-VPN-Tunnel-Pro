@@ -217,6 +217,86 @@ object AiAssistant {
         }
     }
 
+    // ---------------------------------------------------- служебные короткие запросы
+    /**
+     * v4.66.0: один короткий запрос БЕЗ чата, истории и инструментов — на тех же провайдерах и
+     * моделях, что и обычный чат (именно поэтому «OpenRouter и другие провайдеры работают исправно»).
+     * Нужен агенту поиска: варианты запроса и отбраковка мусора. Ничего не пишет в чат и в статус.
+     */
+    fun quickAsk(
+        ctx: Context,
+        system: String,
+        user: String,
+        maxTokens: Int = 320,
+        timeoutMs: Int = 12_000,
+        maxProviders: Int = 4
+    ): String? {
+        val order = autoOrder(ctx).filter { configured(ctx, it) }.take(maxProviders)
+        if (order.isEmpty()) return null
+        val msgs = JSONArray().apply {
+            put(JSONObject().put("role", "system").put("content", system))
+            put(JSONObject().put("role", "user").put("content", user))
+        }
+        for (p in order) {
+            val text = oneShot(ctx, p, model(ctx, p.id), msgs, maxTokens, timeoutMs)
+            if (!text.isNullOrBlank()) return text
+        }
+        return null
+    }
+
+    /** Имена провайдеров по порядку — интерфейсу агента, чтобы показать «кто отвечает». */
+    fun providerTitles(ctx: Context): List<Pair<String, String>> =
+        autoOrder(ctx).filter { configured(ctx, it) }.map { it.id to it.title }
+
+    private fun oneShot(
+        ctx: Context,
+        p: Provider,
+        modelId: String,
+        msgs: JSONArray,
+        maxTokens: Int,
+        timeoutMs: Int
+    ): String? {
+        val url = urlOf(ctx, p)
+        if (!url.startsWith("http")) return null
+        val body = JSONObject().apply {
+            put("model", modelId)
+            put("messages", msgs)
+            put("stream", false)
+            if (maxTokens > 0) put("max_tokens", maxTokens)
+        }.toString()
+        var c: java.net.HttpURLConnection? = null
+        return try {
+            c = post(ctx, url, headers(ctx, p), body, timeoutMs)
+            if (c.responseCode !in 200..299) return null
+            val raw = c.inputStream.bufferedReader().use { it.readText() }
+            if (raw.trimStart().startsWith("data:")) {
+                // некоторые шлюзы отвечают SSE даже на stream=false
+                val sb = StringBuilder()
+                for (line in raw.lineSequence()) {
+                    val l = line.trim()
+                    if (!l.startsWith("data:")) continue
+                    val payload = l.removePrefix("data:").trim()
+                    if (payload == "[DONE]") break
+                    try {
+                        val m = JSONObject(payload).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
+                        m?.optString("content")?.let { sb.append(it) }
+                    } catch (_: Throwable) {
+                    }
+                }
+                return sb.toString().trim().ifBlank { null }
+            }
+            val o = try { JSONObject(raw) } catch (_: Throwable) { return null }
+            val m = o.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message") ?: return null
+            val content = m.optString("content")
+            val reasoning = m.optString("reasoning").ifBlank { m.optString("reasoning_content") }
+            (if (content.isNotBlank()) content else reasoning).trim().ifBlank { null }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { c?.disconnect() } catch (_: Throwable) {}
+        }
+    }
+
     private class Reply(val content: String, val reasoning: String, val toolCalls: JSONArray?)
 
     /**

@@ -53,15 +53,13 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+        <!-- v4.66.0: туннель поднимает сервис самой библиотеки WireGuard (так задумано в
+             wireguard-android: GoBackend запускает именно свой VpnService). Наш контроллер —
+             object com.winwasm64.vpn.WgVpnService, он только просит согласие и вызывает GoBackend. -->
         <service
-            android:name=".vpn.WgVpnService"
+            android:name="com.wireguard.android.backend.GoBackend$VpnService"
             android:exported="false"
-            android:stopWithTask="false"
-            android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="wireguard_vpn_tunnel" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

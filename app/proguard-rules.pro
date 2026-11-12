@@ -16,3 +16,8 @@
 -keep class go.** { *; }
 -keep class psi.** { *; }
 -keep class ca.psiphon.** { *; }
+
+# WireGuard (v4.66.0): сервис библиотеки объявлен только в манифесте, поэтому R8 его не видит
+-keep class com.wireguard.** { *; }
+-keep class com.wireguard.android.backend.GoBackend$VpnService { *; }
+-dontwarn com.wireguard.**

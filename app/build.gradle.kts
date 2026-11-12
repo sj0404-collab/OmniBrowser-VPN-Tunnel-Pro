@@ -14,7 +14,7 @@ android {
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber
-        versionName = "4.64.0"
+        versionName = "4.66.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -117,8 +117,10 @@ dependencies {
     implementation(libs.androidx.media3.session)
     // v4.4.3: запасной канал Psiphon
     implementation("ca.psiphon:psiphontunnel:2.0.42")
-    // WireGuard tunnel (portal-wg / AetherWG)
-    implementation(project(":tunnel"))
+    // v4.66.0: официальная библиотека WireGuard (Maven Central) — в ней настоящий userspace
+    // бэкенд libwg-go.so для всех ABI. Самосборный модуль :tunnel его не содержал, поэтому
+    // GoBackend падал с UnsatisfiedLinkError ещё до попытки поднять туннель.
+    implementation("com.wireguard.android:tunnel:1.0.20230706")
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
 }

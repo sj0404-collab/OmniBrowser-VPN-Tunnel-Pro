@@ -3,7 +3,6 @@ package com.winwasm64.torrent
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -30,8 +29,7 @@ object AiCurator {
     private const val PREFS = "omni_ai"
     private const val KEY_ENABLED = "enabled"
     private const val KEY_STATUS = "status"
-    private const val KEY_MODEL = "model"
-    private const val TEXT_ENDPOINT = "https://text.pollinations.ai/openai"
+    private const val KEY_PROVIDER = "provider"
 
     /** Состояние агента — то, что человек видит строкой в интерфейсе. */
     enum class State { OFF, SLEEPING, THINKING, ASKING, DONE, ERROR }
@@ -48,10 +46,16 @@ object AiCurator {
     private val stateNote = AtomicReference("")
     private val stateSince = AtomicLong(System.currentTimeMillis())
 
-    /** Доступные модели на бесплатном шлюзе (проверены: отвечают без ключа). */
-    val MODELS = listOf("openai" to "умный", "openai-fast" to "быстрый")
+    /**
+     * v4.66.0: «бери модели те, что в ИИ-чате браузера — OpenRouter и другие там работают исправно».
+     *
+     * Агент больше не ходит в один-единственный шлюз Pollinations (там 402/лимиты и 20+ секунд
+     * ожидания). Теперь он спрашивает те же провайдеры и модели, что и ИИ-ассистент
+     * ([com.winwasm64.ui.browser.AiAssistant]): OpenCode, Pollinations, LLM7, OpenRouter, Groq,
+     * Gemini, Mistral… — по порядку «авто», пока кто-нибудь не ответит.
+     */
+    @Volatile private var cachedProvider: String? = null
 
-    // v4.56.0: по умолчанию ВКЛ — раньше человек не понимал, включился ли куратор вообще
     fun isEnabled(context: Context): Boolean {
         cachedEnabled?.let { return it }
         val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
@@ -79,32 +83,50 @@ object AiCurator {
         if (value) mark(State.SLEEPING, "включён — ждёт запроса") else mark(State.OFF, "выключен человеком")
     }
 
-    /** Текущая модель (id для шлюза). */
-    fun model(context: Context): String {
-        cachedModelId?.let { return it }
+    /** «auto» или id провайдера из ИИ-чата (opencode, llm7, openrouter…). */
+    fun providerId(context: Context): String {
+        cachedProvider?.let { return it }
         val value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_MODEL, "openai").orEmpty().ifBlank { "openai" }
-        cachedModelId = value
+            .getString(KEY_PROVIDER, "auto").orEmpty().ifBlank { "auto" }
+        cachedProvider = value
         return value
     }
 
-    /** Человеческое имя модели: «умный» / «быстрый». */
+    /** Для совместимости со старым интерфейсом: «модель» агента — это выбранный провайдер. */
+    fun model(context: Context): String = providerId(context)
+
+    /** Человеческое имя: «авто · OpenCode Zen», «OpenRouter · …:free». */
     fun modelLabel(context: Context): String {
-        val id = model(context)
-        return MODELS.firstOrNull { it.first == id }?.second ?: id
+        val id = providerId(context)
+        return try {
+            if (id == "auto") {
+                val first = com.winwasm64.ui.browser.AiAssistant.autoOrder(context)
+                    .firstOrNull { com.winwasm64.ui.browser.AiAssistant.configured(context, it) }
+                if (first == null) "авто · нет провайдеров" else "авто · ${first.title}"
+            } else {
+                val p = com.winwasm64.ui.browser.AiAssistant.providers.firstOrNull { it.id == id }
+                if (p == null) id else "${p.title} · ${com.winwasm64.ui.browser.AiAssistant.model(context, p.id)}"
+            }
+        } catch (_: Throwable) {
+            id
+        }
     }
 
-    fun setModel(context: Context, id: String) {
-        cachedModelId = id
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_MODEL, id).apply()
-        mark(State.SLEEPING, "модель заменена: ${modelLabel(context)}")
+    fun setProvider(context: Context, id: String) {
+        cachedProvider = id
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_PROVIDER, id).apply()
+        mark(State.SLEEPING, "агент переключён: ${modelLabel(context)}")
     }
 
-    /** Заменить агента на другого: переключаем модель по кругу и возвращаем её имя. */
+    /** Заменить агента на другого: переключаем провайдера по кругу (авто → провайдеры из чата). */
     fun cycleModel(context: Context): String {
-        val ids = MODELS.map { it.first }
-        val next = ids[(ids.indexOf(model(context)).let { if (it < 0) 0 else it } + 1) % ids.size]
-        setModel(context, next)
+        val ids = mutableListOf("auto")
+        try {
+            ids.addAll(com.winwasm64.ui.browser.AiAssistant.autoOrder(context).map { it.id })
+        } catch (_: Throwable) {
+        }
+        val cur = ids.indexOf(providerId(context)).let { if (it < 0) 0 else it }
+        setProvider(context, ids[(cur + 1) % ids.size])
         return modelLabel(context)
     }
 
@@ -146,15 +168,15 @@ object AiCurator {
         }
     }
 
-    /** Проверка связи с ИИ: возвращает true, если шлюз ответил. */
+    /** Проверка связи с ИИ: спрашиваем провайдеров ИИ-чата и честно пишем, кто ответил. */
     fun selfTest(context: Context): Boolean {
-        mark(State.ASKING, "проверка связи")
-        val answer = ask("Ответь одним словом: работает", context)
+        mark(State.ASKING, "проверка связи · ${modelLabel(context)}")
+        val answer = ask("Ответь одним словом: работает", context, 20_000)
         val ok = !answer.isNullOrBlank()
-        setStatus(context, if (ok) "OK · " + answer!!.take(40) else "нет ответа от шлюза")
+        setStatus(context, if (ok) "OK · " + answer!!.take(40) + " · " + modelLabel(context) else "нет ответа ни от одного провайдера")
         mark(
             if (ok) State.DONE else State.ERROR,
-            if (ok) "проверка пройдена · ${modelLabel(context)}" else "шлюз не ответил"
+            if (ok) "проверка пройдена · ${modelLabel(context)}" else "все провайдеры молчат"
         )
         return ok
     }
@@ -176,7 +198,7 @@ object AiCurator {
         """.trimIndent()
         mark(State.ASKING, "варианты для «${query.take(24)}»")
         // v4.59.0: сначала «быстрая» — она отвечает мгновенно; «умная» думает ~23 с и не успевала
-        val raw = askWith(prompt, listOf("openai-fast", model(context), "openai"), 8_000)
+        val raw = ask(prompt, context, 14_000)
         if (raw == null) {
             setStatus(context, "нет ответа · варианты не получены")
             mark(State.ERROR, "нет ответа от шлюза")
@@ -268,21 +290,16 @@ object AiCurator {
         inflight.add(key)
         Thread({
             try {
-                val quick = askVariants(query, limit, listOf("openai-fast"), 5_000)
-                if (quick.isNotEmpty()) {
-                    variantsCache[key] = quick
-                    setStatus(context, "OK · вариантов ${quick.size}")
-                    mark(State.DONE, "вариантов ${quick.size} · быстрый")
+                mark(State.THINKING, "варианты для «${query.take(18)}»")
+                mark(State.ASKING, "спрашиваю ${modelLabel(context)}")
+                val variants = askVariants(query, limit, context, 25_000)
+                if (variants.isNotEmpty()) {
+                    variantsCache[key] = variants
+                    setStatus(context, "OK · вариантов ${variants.size} · ${modelLabel(context)}")
+                    mark(State.DONE, "вариантов ${variants.size} · ${modelLabel(context)}")
                 } else {
-                    val slow = askVariants(query, limit, listOf(model(context), "openai"), 45_000)
-                    if (slow.isNotEmpty()) {
-                        variantsCache[key] = slow
-                        setStatus(context, "OK · вариантов ${slow.size}")
-                        mark(State.DONE, "вариантов ${slow.size} · ${modelLabel(context)}")
-                    } else {
-                        setStatus(context, "нет ответа · ищу без вариантов ИИ")
-                        mark(State.ERROR, "модель не ответила — ищу без её вариантов")
-                    }
+                    setStatus(context, "нет ответа · ищу без вариантов ИИ")
+                    mark(State.ERROR, "провайдеры ИИ не ответили — ищу без их вариантов")
                 }
             } catch (_: Throwable) {
                 mark(State.ERROR, "сбой агента")
@@ -296,7 +313,7 @@ object AiCurator {
     private fun askVariants(
         query: String,
         limit: Int,
-        ids: List<String>,
+        context: Context?,
         perModelMs: Int
     ): List<String> {
         val prompt = """
@@ -304,7 +321,7 @@ object AiCurator {
             (синонимы, оригинальное/английское название, уточнение по типу: манга, фильм, игра, книга).
             Ответ строго JSON-массивом строк, без пояснений.
         """.trimIndent()
-        val raw = askWith(prompt, ids, perModelMs) ?: return emptyList()
+        val raw = ask(prompt, context, perModelMs) ?: return emptyList()
         val arr = extractJsonArray(raw) ?: return emptyList()
         val out = mutableListOf<String>()
         for (i in 0 until arr.length()) {
@@ -330,7 +347,7 @@ object AiCurator {
             $indexed
         """.trimIndent()
         mark(State.ASKING, "отбираю по теме из ${minOf(titles.size, limit)}")
-        val raw = ask(prompt, context)
+        val raw = ask(prompt, context, 20_000)
         if (raw == null) {
             setStatus(context, "нет ответа · фильтр не применён")
             mark(State.ERROR, "нет ответа · фильтр не применён")
@@ -360,56 +377,22 @@ object AiCurator {
     /* ===================== транспорт ===================== */
 
     /**
-     * Запрос к модели: выбранная первой, при отказе — запасная.
-     * v4.59.0: таймаут на чтение стал параметром. Раньше было жёстко 20 с, а «умная» модель на
-     * длинном промпте отвечает ~23 с — отсюда «🔴 нет ответа от шлюза» на каждом поиске.
+     * v4.66.0: один вопрос модели — через провайдеров ИИ-чата браузера (AiAssistant.quickAsk).
+     * Порядок «авто»: сначала те, у кого есть ключ, затем бесплатные без ключа. Первый ответивший
+     * и выигрывает, поэтому один медленный/лимитированный шлюз больше не блокирует весь поиск.
      */
-    private fun ask(prompt: String, context: Context? = null, readTimeoutMs: Int = 30_000): String? {
-        val preferred = context?.let { model(it) } ?: "openai"
-        val order = (listOf(preferred) + MODELS.map { it.first }).distinct()
-        val budget = (readTimeoutMs / order.size).coerceAtLeast(6_000)
-        return askWith(prompt, order, budget)
-    }
-
-    /** Спросить модели по порядку: первая ответившая и выигрывает. */
-    private fun askWith(prompt: String, ids: List<String>, perModelMs: Int): String? {
-        for (id in ids.distinct()) {
-            val answer = post(id, prompt, perModelMs)
-            if (!answer.isNullOrBlank()) return answer
-        }
-        return null
-    }
-
-    private fun post(modelId: String, prompt: String, readTimeoutMs: Int = 30_000): String? {
-        val body = JSONObject().apply {
-            put("model", modelId)
-            put(
-                "messages", JSONArray().put(
-                    JSONObject().apply {
-                        put("role", "user")
-                        put("content", prompt)
-                    }
-                )
-            )
-        }.toString()
+    private fun ask(prompt: String, context: Context?, readTimeoutMs: Int = 20_000): String? {
+        val ctx = context ?: return null
         return try {
-            val conn = (URL(TEXT_ENDPOINT).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 10_000
-                readTimeout = readTimeoutMs
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", "OmniBrowser/4.58 (Android)")
-                outputStream.use { it.write(body.toByteArray()) }
-            }
-            if (conn.responseCode !in 200..299) {
-                null
-            } else {
-                val text = conn.inputStream.bufferedReader().use { it.readText() }
-                val msg = JSONObject(text).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
-                val content = msg?.optString("content").orEmpty()
-                if (content.isNotBlank()) content else msg?.optString("reasoning").orEmpty().ifBlank { null }
-            }
+            com.winwasm64.ui.browser.AiAssistant.quickAsk(
+                ctx,
+                system = "Ты помощник поиска внутри приложения. Отвечай ровно тем, что просят: " +
+                    "если нужен JSON — только JSON, без пояснений и разметки.",
+                user = prompt,
+                maxTokens = 280,
+                timeoutMs = readTimeoutMs,
+                maxProviders = 4
+            )
         } catch (_: Throwable) {
             null
         }

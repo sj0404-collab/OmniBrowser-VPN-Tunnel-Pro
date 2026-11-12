@@ -16,7 +16,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.winwasm64.ui.browser.OmniIcons
 import com.winwasm64.ui.theme.OmniTheme
@@ -36,6 +39,8 @@ fun NativeVideoPlayerScreen(
     videoUrl: String,
     title: String,
     thumbnailUrl: String? = null,
+    /** v4.66.0: откуда пришёл поток — VK/RuTube/YouTube отдают 403 без Referer. */
+    referer: String? = null,
     onBack: () -> Unit = {},
     onComplete: () -> Unit = {}
 ) {
@@ -46,8 +51,17 @@ fun NativeVideoPlayerScreen(
     var showControls by remember { mutableStateOf(true) }
 
     // Создаём ExoPlayer
-    LaunchedEffect(videoUrl) {
-        val exoPlayer = ExoPlayer.Builder(context).build()
+    LaunchedEffect(videoUrl, referer) {
+        // v4.66.0: браузерные заголовки — без них прямые ссылки VK/RuTube отдают 403
+        val ref = referer?.takeIf { it.isNotBlank() } ?: defaultReferer(videoUrl)
+        val http = DefaultHttpDataSource.Factory()
+            .setUserAgent(USER_AGENT)
+            .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(mapOf("Referer" to ref, "Origin" to ref.trimEnd('/')))
+        val dsFactory = DefaultDataSource.Factory(context, http)
+        val exoPlayer = ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dsFactory))
+            .build()
         exoPlayer.setMediaItem(MediaItem.fromUri(videoUrl))
         exoPlayer.setRepeatMode(Player.REPEAT_MODE_OFF)
         player = exoPlayer
@@ -148,3 +162,25 @@ fun NativeVideoPlayerScreen(
         }
     }
 }
+
+/** v4.66.0: откуда пришёл поток — по этому адресу ставим Referer/Origin. */
+private fun defaultReferer(url: String): String {
+    val host = try {
+        java.net.URI(url).host?.lowercase().orEmpty()
+    } catch (_: Throwable) {
+        ""
+    }
+    return when {
+        host.contains("vk") || host.contains("userapi") -> "https://vk.com/"
+        host.contains("rutube") -> "https://rutube.ru/"
+        host.contains("ok.ru") || host.contains("mycdn") -> "https://ok.ru/"
+        host.contains("googlevideo") || host.contains("youtube") -> "https://www.youtube.com/"
+        host.contains("dailymotion") -> "https://www.dailymotion.com/"
+        host.isBlank() -> "https://www.youtube.com/"
+        else -> "https://$host/"
+    }
+}
+
+private const val USER_AGENT =
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/122.0.0.0 Mobile Safari/537.36"

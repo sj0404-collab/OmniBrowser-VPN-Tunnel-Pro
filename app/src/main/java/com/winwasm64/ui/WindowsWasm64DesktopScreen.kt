@@ -3749,12 +3749,27 @@ private fun TorrentClientSection(
         if (!keepBase) baseQuery = query
         com.winwasm64.torrent.SearchCache.torrentQuery = query
         catalogItems = emptyList()
-        // v4.65.0: поиск без агента — DirectSearch + torrent search напрямую.
-        // AiCurator (Pollinations) медленно отвечает и иногда не отвечает — отключаем.
-        torrentEngine.searchPublicTorrents(query, searchDepth, emptyList()) { res ->
+        // v4.66.0: агент вернулся, но на моделях ИИ-чата (OpenCode/LLM7/OpenRouter/…) и строго в фоне:
+        // варианты берём только готовые из памяти, а расчёт идёт параллельно с поиском.
+        com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
+        val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
+        torrentEngine.searchPublicTorrents(query, searchDepth, aiExtra) { res ->
             mainHandler.post {
                 catalogItems = res
                 isSearching = false
+            }
+            // отбраковка явно не того — тоже в фоне, выдачу не задерживает
+            if (res.isNotEmpty() && com.winwasm64.torrent.AiCurator.isEnabled(context)) {
+                Thread({
+                    val keep = com.winwasm64.torrent.AiCurator.keepIndices(
+                        context, query, res.map { it.title }, 30
+                    )
+                    if (keep != null) {
+                        mainHandler.post {
+                            catalogItems = res.filterIndexed { idx, _ -> idx in keep || idx >= 30 }
+                        }
+                    }
+                }, "AiFilter").apply { isDaemon = true; start() }
             }
         }
     }
@@ -4774,6 +4789,23 @@ private fun HistoryAndDownloadsSection(
                                 ) {
                                     Text("Открыть", fontSize = 11.sp, color = Color.White)
                                 }
+                                // v4.66.0: скачанное видео открывается своим плеером (Media3), а не «чем-нибудь»
+                                val isVideoFile = file.name.lowercase().let { n ->
+                                    listOf(".mp4", ".mkv", ".webm", ".m4v", ".mov", ".ts", ".m3u8", ".avi").any { n.endsWith(it) }
+                                }
+                                if (isVideoFile) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            context.startActivity(
+                                                Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    .putExtra("url", android.net.Uri.fromFile(file).toString())
+                                                    .putExtra("title", file.name)
+                                            )
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) { Text("🎞 Плеер", fontSize = 11.sp, color = Color.White) }
+                                }
                                 OutlinedButton(
                                     onClick = {
                                         file.delete()
@@ -5745,6 +5777,9 @@ private fun VpnChannelsSection(
         ) {
             Text("📜 Журнал VPN и браузера", fontSize = 12.sp, color = Color.White)
         }
+        // v4.66.0: WireGuard — свой сервер или .conf провайдера, с согласием Android и взаимоисключением с Browsec
+        Spacer(Modifier.height(10.dp))
+        com.winwasm64.ui.WireGuardCard(modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(12.dp))
         androidx.compose.ui.viewinterop.AndroidView(
             factory = { ctx ->
@@ -5988,10 +6023,12 @@ private fun DirectFilesSection(
         if (prev == null) buckets = com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())
         Thread({
             // v4.55.0: асинхронно — что нашлось, то сразу и показываем
-            // v4.65.0: без агента — DirectSearch напрямую, AiCurator (Pollinations) медленный
+            // v4.66.0: агент на моделях ИИ-чата; считает в фоне, поиск берёт только готовые варианты
+            com.winwasm64.torrent.AiCurator.prefetch(context, query, 2)
+            val aiExtra = com.winwasm64.torrent.AiCurator.cachedVariants(query)
             val res = try {
                 com.winwasm64.torrent.DirectSearch.searchAll(
-                    query, nextSort, nextPage, depth = searchDepth
+                    query, nextSort, nextPage, depth = searchDepth, aiVariants = aiExtra
                 ) { chip, files ->
                     handler.post {
                         val cur = buckets ?: com.winwasm64.torrent.DirectSearch.Buckets(emptyList(), emptyMap(), emptyMap())

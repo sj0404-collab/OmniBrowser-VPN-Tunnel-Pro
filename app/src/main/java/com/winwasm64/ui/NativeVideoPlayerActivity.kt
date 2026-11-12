@@ -19,6 +19,7 @@ class NativeVideoPlayerActivity : ComponentActivity() {
         val videoUrl = intent.getStringExtra("url") ?: ""
         val title = intent.getStringExtra("title") ?: "Видео"
         val thumbnailUrl = intent.getStringExtra("thumbnail")
+        val referer = intent.getStringExtra("referer")
 
         setContent {
             com.winwasm64.ui.theme.OmniTheme {
@@ -26,6 +27,7 @@ class NativeVideoPlayerActivity : ComponentActivity() {
                     videoUrl = videoUrl,
                     title = title,
                     thumbnailUrl = thumbnailUrl,
+                    referer = referer,
                     onBack = { finish() },
                     onComplete = { finish() }
                 )
