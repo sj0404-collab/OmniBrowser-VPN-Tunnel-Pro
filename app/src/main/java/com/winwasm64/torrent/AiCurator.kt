@@ -242,6 +242,37 @@ object AiCurator {
         return emptyList()
     }
 
+    /** Готовые варианты запроса из памяти — мгновенно, без сети. */
+    fun cachedVariants(query: String): List<String> =
+        variantsCache[query.trim().lowercase()] ?: emptyList()
+
+    /** Считать варианты в фоне: провайдеры ИИ-чата, первый ответивший и выигрывает. */
+    fun prefetch(context: Context, query: String, limit: Int = 2) {
+        if (!isEnabled(context)) return
+        val key = query.trim().lowercase()
+        if (key.isBlank() || variantsCache.containsKey(key) || inflight.contains(key)) return
+        inflight.add(key)
+        Thread({
+            try {
+                mark(State.THINKING, "варианты для «${query.take(18)}»")
+                mark(State.ASKING, "спрашиваю ${modelLabel(context)}")
+                val variants = askVariants(query, limit, context, 25_000)
+                if (variants.isNotEmpty()) {
+                    variantsCache[key] = variants
+                    setStatus(context, "OK · вариантов ${variants.size} · ${modelLabel(context)}")
+                    mark(State.DONE, "вариантов ${variants.size} · ${modelLabel(context)}")
+                } else {
+                    setStatus(context, "нет ответа · ищу без вариантов ИИ")
+                    mark(State.ERROR, "провайдеры ИИ не ответили — ищу без их вариантов")
+                }
+            } catch (_: Throwable) {
+                mark(State.ERROR, "сбой агента")
+            } finally {
+                inflight.remove(key)
+            }
+        }, "AiPrefetch").apply { isDaemon = true; start() }
+    }
+
     /** Запрос вариантов у конкретных моделей и разбор JSON-массива. Без изменения состояния. */
     private fun askVariants(
         query: String,
