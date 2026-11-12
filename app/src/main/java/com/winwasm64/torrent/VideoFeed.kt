@@ -283,36 +283,39 @@ return JSON.stringify(res.slice(0,200));
         return Page()
     }
 
-    /** Вытащить карточки видео площадки из HTML поисковика. */
+    /**
+     * v4.79.0: вытащить карточки площадки из HTML поисковика — БЕЗ мусора.
+     * Раньше в заголовок попадал текст ссылки целиком («Vkvideo m.vkvideo.ru › video 225265420_456239214 …»),
+     * поэтому в ленте были такие «названия». Теперь разбираем результат по блокам, чистим хлебные крошки,
+     * отбрасываем строки-идентификаторы и служебные слова.
+     */
     private fun parseEngineHtml(source: String, html: String, query: String): List<Clip> {
-        val linkRe = Regex("""<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
         val out = ArrayList<Clip>()
         val seen = HashSet<String>()
+        val linkRe = Regex("""<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
         for (m in linkRe.findAll(html)) {
             var href = m.groupValues[1]
-            if (href.startsWith("/")) continue
             val ok = when (source) {
                 SRC_VK -> Regex("""vk(video)?\.(com|ru)/(video|clip)-?\d+_\d+""").containsMatchIn(href)
                 SRC_RUTUBE -> Regex("""rutube\.ru/video/[0-9a-f]{6,}""").containsMatchIn(href)
                 else -> Regex("""(youtube\.com/watch\?v=|youtu\.be/)[A-Za-z0-9_-]{11}""").containsMatchIn(href)
             }
             if (!ok) continue
-            if (href.contains("redirect") || href.contains("duckduckgo.com/l/")) {
-                val u = Regex("""[?&]u=([^&]+)""").find(href)?.groupValues?.get(1)?.let {
-                    try { java.net.URLDecoder.decode(it, "UTF-8") } catch (_: Throwable) { null }
+            if (href.contains("/l/") || href.contains("redirect")) {
+                Regex("""[?&]u=([^&]+)""").find(href)?.groupValues?.get(1)?.let {
+                    try { href = java.net.URLDecoder.decode(it, "UTF-8") } catch (_: Throwable) {}
                 }
-                if (u != null) href = u
             }
             if (!seen.add(href)) continue
-            val title = stripTags(m.groupValues[2]).trim().take(150)
-            if (title.length < 4) continue
-            val parts = title.split("|", "·", "—", "-").map { it.trim() }.filter { it.isNotBlank() }
-            val author = if (parts.size > 1) parts.last().take(40) else ""
+            val title = cleanEngineTitle(stripTags(m.groupValues[2]))
+            if (!looksLikeTitle(title, query)) continue
+            val author = authorFromTitle(title)
             out.add(
                 Clip(
-                    id = href.substringAfterLast('/').ifBlank { href.hashCode().toString() },
+                    id = if (source == SRC_YOUTUBE) (Regex("""(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})""").find(href)?.groupValues?.get(1) ?: href)
+                         else href.substringAfterLast('/').substringBefore('?'),
                     kind = CLIP_VIDEO,
-                    title = parts.first(),
+                    title = title.take(150),
                     author = author,
                     lengthText = "",
                     viewsText = "",
@@ -325,6 +328,76 @@ return JSON.stringify(res.slice(0,200));
             if (out.size >= 30) break
         }
         return out
+    }
+
+    /** Убрать хлебные крошки, адреса, id и служебные слова из заголовка выдачи. */
+    private fun cleanEngineTitle(raw: String): String {
+        var t = raw.replace("\u00A0", " ")
+        // «Vkvideo m.vkvideo.ru › video 225265420_456239214 Продается всё…» → «Продается всё…»
+        t = t.replace(Regex("""^.*?(v?k?video|vk|rutube|youtube)[^>»›]*[»›]\s*""", RegexOption.IGNORE_CASE), " ")
+        t = t.replace(Regex("""\b\d{6,}_\d{4,}\b"""), " ")
+        t = t.replace(Regex("""\b(www\.)?(m\.)?(vkvideo\.ru|vk\.com|rutube\.ru|youtube&#39;s|youtube\.com|youtu\.be)\b""", RegexOption.IGNORE_CASE), " ")
+        t = t.replace(Regex("""\s*[›»]\s*"""), " ")
+        t = t.replace(Regex("""\s*[-–—|]\s*(ВКонтакте|VK|RuTube|YouTube)\s*$""", RegexOption.IGNORE_CASE), " ")
+        return t.replace(Regex("""\s+"""), " ").trim().trim('.', '·', '-', '—', '|')
+    }
+
+    private fun looksLikeTitle(t: String, query: String): Boolean {
+        if (t.length < 5) return false
+        val letters = t.count { it.isLetter() }
+        if (letters < 4) return false
+        if (Regex("""^[\d\s_.,:–-]+$""").matches(t)) return false
+        if (Regex("""^(видео|смотреть|смотрите|видео онлайн|vk видео|rutube|youtube)$""", RegexOption.IGNORE_CASE).matches(t)) return false
+        // заголовок должен быть хоть немного про запрос (иначе это «случайный» блок навигации)
+        return Relevance.scoreFields(query, emptyList(), t) > 0 || t.split(' ').size >= 2
+    }
+
+    /** Канал из заголовка вида «Название — Канал» (если он есть). */
+    private fun authorFromTitle(title: String): String {
+        val parts = title.split(" — ", " – ", " | ", " · ").map { it.trim() }.filter { it.isNotBlank() }
+        return if (parts.size > 1) parts.last().take(40) else ""
+    }
+
+    /**
+     * v4.79.0: обложки для карточек из индекса. У YouTube они есть сразу, у VK и RuTube берём
+     * из их же страниц (без ключей): RuTube — api/video/<id>/, VK — video_ext.php.
+     */
+    fun thumbFor(link: String): String {
+        val u = link.trim()
+        if (u.contains("youtu", true)) return headerPic(u)
+        if (u.contains("rutube.ru/video/", true)) {
+            val id = Regex("""/video/([0-9a-f]{6,})""", RegexOption.IGNORE_CASE).find(u)?.groupValues?.get(1) ?: return ""
+            val (code, text) = try {
+                NetDirect.requestText(
+                    "https://rutube.ru/api/video/$id/",
+                    mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14) Chrome/126.0 Mobile Safari/537.36", "Accept" to "application/json"),
+                    timeoutMs = 8_000
+                )
+            } catch (_: Throwable) {
+                return ""
+            }
+            if (code !in 200..299) return ""
+            return Regex(""""thumbnail_url"\s*:\s*"(https:[^"]+)"""").find(text)?.groupValues?.get(1) ?: ""
+        }
+        if (u.contains("vk.com/video", true) || u.contains("vkvideo.ru/video", true) || u.contains("vk.com/clip", true)) {
+            val m = Regex("""(?:video|clip)(-?\d+)_(\d+)""").find(u) ?: return ""
+            val oid = m.groupValues[1]
+            val vid = m.groupValues[2]
+            val (code, text) = try {
+                NetDirect.requestText(
+                    "https://vk.com/video_ext.php?oid=$oid&id=$vid",
+                    mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14) Chrome/126.0 Mobile Safari/537.36", "Accept-Language" to "ru"),
+                    timeoutMs = 8_000
+                )
+            } catch (_: Throwable) {
+                return ""
+            }
+            if (code !in 200..299) return ""
+            return Regex(""""jpg"\s*:\s*"(https:[^"]+)"""").find(text)?.groupValues?.get(1)?.replace("\\/", "/")
+                ?: Regex("""(https://sun[0-9-]*\.userapi\.com/[^"'\s]+)""").find(text)?.groupValues?.get(1)?.replace("\\/", "/")
+                ?: ""
+        }
+        return ""
     }
 
     private fun headerPic(link: String): String {

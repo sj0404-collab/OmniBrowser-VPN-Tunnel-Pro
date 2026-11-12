@@ -6793,6 +6793,22 @@ private fun VideoHomeSection(
         }
     }
 
+    /** v4.79.0: у карточек из индекса нет обложки — достаём её с площадки в фоне. */
+    fun enrichThumbs(list: List<com.winwasm64.torrent.VideoFeed.Clip>) {
+        val need = list.filter { it.thumb.isBlank() }.take(16)
+        if (need.isEmpty()) return
+        scope.launch {
+            for (c in need) {
+                val t = withContext(Dispatchers.IO) {
+                    runCatching { com.winwasm64.torrent.VideoFeed.thumbFor(c.url) }.getOrDefault("")
+                }
+                if (t.isNotBlank()) {
+                    items = items.map { if (it.url == c.url) it.copy(thumb = t) else it }
+                }
+            }
+        }
+    }
+
     fun startSearch(text: String) {
         val q = text.trim()
         if (q.isBlank()) {
@@ -6830,6 +6846,7 @@ private fun VideoHomeSection(
                 items = fast.clips
                 note = fast.note.orEmpty()
                 loading = false
+                enrichThumbs(fast.clips)
             }
             // 2) следом — полная выдача площадки во встроенном браузере
             scrapeSource = source
@@ -6881,6 +6898,7 @@ private fun VideoHomeSection(
             onFinished = { list ->
                 if (list.isNotEmpty()) {
                     items = (list + items).distinctBy { it.url }
+                    enrichThumbs(list)
                     cont = null
                     note = if (list.size >= 100) "Показано ${list.size} — нажмите «Ещё», чтобы добрать" else ""
                 } else if (note.isBlank()) {
@@ -7693,6 +7711,20 @@ private fun VideoCard(
                 ).filter { it.isNotBlank() }.distinct().joinToString(" · ")
                 if (meta.isNotBlank()) {
                     Text(meta, color = Omni.TextDim, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            // v4.79.0: подписка видна сразу, а не спрятана в меню
+            if (clip.author.isNotBlank() || clip.kind == com.winwasm64.torrent.VideoFeed.CLIP_CHANNEL) {
+                Surface(
+                    color = if (subscribed) Omni.SurfaceHighest else Omni.AccentContainer,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.padding(start = 4.dp).clickable { onSubscribe() }
+                ) {
+                    Text(
+                        if (subscribed) "✅" else "📌",
+                        color = Color.White, fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 5.dp)
+                    )
                 }
             }
             Text(

@@ -1,6 +1,7 @@
 package com.winwasm64.torrent
 
 import com.winwasm64.ui.browser.NetDirect
+import com.winwasm64.vpn.VpnLog
 import org.json.JSONObject
 
 /**
@@ -60,73 +61,108 @@ object VideoPlay {
         return null
     }
 
+    /**
+     * v4.79.0: один провайдер может ответить 400 (у YouTube это обычное дело — клиент устарел или
+     * требует аттестацию). Поэтому перебираем несколько независимых путей и берём первый живой:
+     * innertube ANDROID → innertube WEB → HTML страницы (ytInitialPlayerResponse) →
+     * Piped → Invidious. Это ключевые пути без ключей и без чужого аккаунта.
+     */
     private fun youtube(id: String): Play? {
+        var reason = ""
+        val steps: List<Pair<String, () -> Play?>> = listOf(
+            "innertube ANDROID" to { innertube(id, "ANDROID") },
+            "innertube WEB" to { innertube(id, "WEB") },
+            "страница YouTube" to { ytPage(id) },
+            "Piped" to { piped(id) },
+            "Invidious" to { invidious(id) }
+        )
+        for ((name, step) in steps) {
+            val r = try {
+                step()
+            } catch (e: Throwable) {
+                lastError = name + ": " + (e.message ?: "сеть")
+                null
+            }
+            if (r != null) {
+                if (name != "innertube ANDROID") lastError = ""
+                VpnLog.i("Плеер", "YouTube $id через $name, ${r.quality}")
+                return r
+            }
+            if (lastError.isNotBlank()) reason = lastError
+            VpnLog.w("Плеер", "YouTube $id: $name не дал поток — $lastError")
+        }
+        lastError = reason.ifBlank { "YouTube не отдал поток" }
+        return null
+    }
+
+    private fun innertube(id: String, client: String): Play? {
+        val ctx = when (client) {
+            "ANDROID" -> JSONObject()
+                .put("clientName", "ANDROID")
+                .put("clientVersion", "19.09.37")
+                .put("androidSdkVersion", 30)
+                .put("hl", "ru").put("gl", "RU")
+            else -> JSONObject()
+                .put("clientName", "WEB")
+                .put("clientVersion", "2.20260101.00.00")
+                .put("hl", "ru").put("gl", "RU")
+        }
         val body = JSONObject()
             .put("videoId", id)
-            .put(
-                "context", JSONObject().put(
-                    "client", JSONObject()
-                        .put("clientName", "ANDROID")
-                        .put("clientVersion", "19.09.37")
-                        .put("androidSdkVersion", 30)
-                        .put("hl", "ru")
-                        .put("gl", "RU")
-                )
-            )
+            .put("context", JSONObject().put("client", ctx))
             .put("contentCheckOk", true)
             .put("racyCheckOk", true)
             .toString()
-        val headers = mapOf(
+        val headers = mutableMapOf(
             "Content-Type" to "application/json",
-            "User-Agent" to UA_YT,
             "X-Goog-Api-Format-Version" to "2",
             "Accept-Language" to "ru"
         )
+        if (client == "ANDROID") headers["User-Agent"] = UA_YT else headers["User-Agent"] = UA_WEB
         val (code, text) = try {
-            NetDirect.requestText(
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                headers, "POST", body, timeoutMs = 12_000
-            )
+            NetDirect.requestText("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", headers, "POST", body, timeoutMs = 12_000)
         } catch (e: Throwable) {
-            lastError = "YouTube недоступен: " + (e.message ?: "сеть")
+            lastError = "YouTube ($client): " + (e.message ?: "сеть")
             return null
         }
         if (code !in 200..299) {
             lastError = "YouTube ответил $code"
             return null
         }
-        val json = try { JSONObject(text) } catch (_: Throwable) { lastError = "YouTube: непонятный ответ"; return null }
-        val status = json.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
-        if (status.isNotEmpty() && status != "OK") {
-            val reason = json.optJSONObject("playabilityStatus")?.optString("reason").orEmpty()
-            lastError = "YouTube: " + (reason.ifBlank { status })
+        val json = try { JSONObject(text) } catch (_: Throwable) {
+            lastError = "YouTube: непонятный ответ"
             return null
         }
-        val sd = json.optJSONObject("streamingData")
+        val status = json.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
+        if (status.isNotEmpty() && status != "OK") {
+            lastError = "YouTube: " + json.optJSONObject("playabilityStatus")?.optString("reason").orEmpty().ifBlank { status }
+            return null
+        }
+        return fromStreamingData(json)
+    }
+
+    /** Достать поток из объекта, где есть streamingData (player-ответ или ytInitialPlayerResponse). */
+    private fun fromStreamingData(json: JSONObject): Play? {
+        val sd = json.optJSONObject("streamingData") ?: return null
         val title = json.optJSONObject("videoDetails")?.optString("title").orEmpty()
-        // 1) progressive (со звуком) — идеально для встроенного плеера
-        sd?.optJSONArray("formats")?.let { arr ->
-            var best: String? = null
-            var bestLabel = ""
-            var bestRate = -1L
+        var best: String? = null
+        var bestLabel = ""
+        var bestRate = -1L
+        sd.optJSONArray("formats")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val f = arr.optJSONObject(i) ?: continue
                 val u = f.optString("url")
                 if (u.isBlank()) continue
                 val rate = f.optLong("bitrate", 0L)
                 if (rate > bestRate) {
-                    bestRate = rate
-                    best = u
+                    bestRate = rate; best = u
                     bestLabel = f.optString("qualityLabel").ifBlank { f.optString("quality") }
                 }
             }
-            if (best != null) return Play(best, "https://www.youtube.com/", title, bestLabel)
         }
-        // 2) adaptive: бывает только видео без звука — играем, но предупреждаем
-        sd?.optJSONArray("adaptiveFormats")?.let { arr ->
-            var best: String? = null
-            var bestLabel = ""
-            var bestRate = -1L
+        if (best != null) return Play(best, "https://www.youtube.com/", title, bestLabel)
+        // только видео без звука — играем, но честно предупреждаем
+        sd.optJSONArray("adaptiveFormats")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val f = arr.optJSONObject(i) ?: continue
                 if (f.optString("mimeType").startsWith("audio", true)) continue
@@ -134,17 +170,129 @@ object VideoPlay {
                 if (u.isBlank()) continue
                 val rate = f.optLong("bitrate", 0L)
                 if (rate > bestRate) {
-                    bestRate = rate
-                    best = u
+                    bestRate = rate; best = u
                     bestLabel = f.optString("qualityLabel")
                 }
             }
-            if (best != null) {
-                lastError = "у этого ролика нет потока со звуком — играю видео без звука"
-                return Play(best, "https://www.youtube.com/", title, bestLabel)
+        }
+        if (best != null) {
+            lastError = "у этого ролика нет потока со звуком — играю видео без звука"
+            return Play(best, "https://www.youtube.com/", title, bestLabel)
+        }
+        lastError = "в ответе нет прямых ссылок (нужна расшифровка подписи)"
+        return null
+    }
+
+    /** Второй путь: обычная страница просмотра, из неё ytInitialPlayerResponse. */
+    private fun ytPage(id: String): Play? {
+        val (code, html) = NetDirect.requestText(
+            "https://m.youtube.com/watch?v=$id&hl=ru",
+            mapOf("User-Agent" to UA_WEB, "Accept-Language" to "ru", "Accept" to "text/html"),
+            timeoutMs = 14_000
+        )
+        if (code !in 200..299) {
+            lastError = "страница YouTube: HTTP $code"
+            return null
+        }
+        val marker = Regex("""ytInitialPlayerResponse\s*=\s*""").find(html)
+            ?: run { lastError = "страница YouTube без данных плеера"; return null }
+        val startIdx = marker.range.last + 1
+        val json = extractJson(html, startIdx) ?: run { lastError = "не разобрал данные плеера"; return null }
+        val obj = try { JSONObject(json) } catch (_: Throwable) {
+            lastError = "данные плеера не JSON"
+            return null
+        }
+        val status = obj.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
+        if (status.isNotEmpty() && status != "OK") {
+            lastError = "YouTube: " + obj.optJSONObject("playabilityStatus")?.optString("reason").orEmpty().ifBlank { status }
+            return null
+        }
+        return fromStreamingData(obj)
+    }
+
+    /** Вырезать сбалансированный JSON-объект, начиная с позиции (строки внутри учитываются). */
+    private fun extractJson(text: String, from: Int): String? {
+        val start = text.indexOf('{', from)
+        if (start < 0) return null
+        var depth = 0
+        var inStr = false
+        var esc = false
+        for (i in start until text.length) {
+            val c = text[i]
+            if (inStr) {
+                when {
+                    esc -> esc = false
+                    c == '\\' -> esc = true
+                    c == '"' -> inStr = false
+                }
+                continue
+            }
+            when (c) {
+                '"' -> inStr = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return text.substring(start, i + 1)
+                }
             }
         }
-        lastError = "YouTube не отдал поток (возможно, нужен вход или это премьера)"
+        return null
+    }
+
+    /** Публичные Piped-серверы: отдают прямые ссылки без ключа. */
+    private fun piped(id: String): Play? {
+        val hosts = listOf(
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.adminforge.de",
+            "https://pipedapi.reallyaweso.me",
+            "https://api.piped.yt"
+        )
+        for (h in hosts) {
+            val (code, text) = try {
+                NetDirect.requestText("$h/streams/$id", mapOf("User-Agent" to UA_WEB, "Accept" to "application/json"), timeoutMs = 12_000)
+            } catch (_: Throwable) {
+                continue
+            }
+            if (code !in 200..299) continue
+            val json = try { JSONObject(text) } catch (_: Throwable) { continue }
+            val arr = json.optJSONArray("videoStreams") ?: continue
+            var best: String? = null
+            var label = ""
+            var rate = -1L
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (o.optBoolean("videoOnly", false)) continue
+                val u = o.optString("url")
+                if (u.isBlank()) continue
+                val br = o.optLong("bitrate", 0L)
+                if (br > rate) {
+                    rate = br; best = u
+                    label = o.optString("quality")
+                }
+            }
+            if (best != null) return Play(best, "https://www.youtube.com/", json.optString("title"), label)
+        }
+        lastError = "Piped не ответил"
+        return null
+    }
+
+    /** Публичные Invidious-серверы: formatStreams — потоки со звуком. */
+    private fun invidious(id: String): Play? {
+        val hosts = listOf("https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be", "https://invidious.f5.si")
+        for (h in hosts) {
+            val (code, text) = try {
+                NetDirect.requestText("$h/api/v1/videos/$id", mapOf("User-Agent" to UA_WEB, "Accept" to "application/json"), timeoutMs = 12_000)
+            } catch (_: Throwable) {
+                continue
+            }
+            if (code !in 200..299) continue
+            val json = try { JSONObject(text) } catch (_: Throwable) { continue }
+            val arr = json.optJSONArray("formatStreams") ?: continue
+            val o = arr.optJSONObject(0) ?: continue
+            val u = o.optString("url")
+            if (u.isNotBlank()) return Play(u, "https://www.youtube.com/", json.optString("title"), o.optString("resolution"))
+        }
+        lastError = "Invidious не ответил"
         return null
     }
 
