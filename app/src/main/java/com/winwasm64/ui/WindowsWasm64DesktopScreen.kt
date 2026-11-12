@@ -68,6 +68,8 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import android.media.AudioAttributes
@@ -286,6 +288,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Список VPN
     var currentSection by remember { mutableIntStateOf(0) }
+    LaunchedEffect(SectionRequest.target) {
+        val t = SectionRequest.target
+        if (t >= 0) {
+            currentSection = t
+            SectionRequest.target = -1
+        }
+    }
 
     var adBlockEnabled by remember { mutableStateOf(prefs.getBoolean("adblock_on", true)) }
     var adBlockedCount by remember { mutableIntStateOf(prefs.getInt("adblock_count", 0)) }
@@ -6459,6 +6468,11 @@ private fun sortFiles(list: List<com.winwasm64.torrent.DirectFile>, mode: Int): 
 }
 
 @Composable
+/** v4.76.0: запрос перехода на раздел из другого экрана (старый экран поиска удалён). */
+private object SectionRequest {
+    var target by mutableStateOf(-1)
+}
+
 private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoQuery.ifBlank { initialQuery }) }
@@ -6669,7 +6683,7 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                     "🎬 Видео" to {
                                         // v4.76.0: старый экран поиска удалён — уводим на вкладку «Видео»
                                         com.winwasm64.torrent.SearchCache.videoQuery = photoTitle
-                                        currentSection = 6
+                                        SectionRequest.target = 6
                                     }
                                 ).forEach { (label, action) ->
                                     Button(
