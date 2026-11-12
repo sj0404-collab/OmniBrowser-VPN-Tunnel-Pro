@@ -69,6 +69,10 @@ object AiTools {
         "list_files" to fn("list_files", "Список файлов, прикреплённых к чату: имя, тип, размер текста/число изображений, расшифровка речи."),
         "search_files" to fn("search_files", "Поиск по содержимому прикреплённых файлов (BM25): возвращает самые релевантные фрагменты с указанием файла и номера фрагмента. Используй для вопросов по документам любого объёма.", Triple("query", "string", "что искать — ключевые слова или вопрос")),
         "read_file" to fn("read_file", "Прочитать прикреплённый файл последовательно: фрагменты с номера from (с 0) — по 5 за раз. Так можно прочитать файл целиком, фрагмент за фрагментом.", Triple("name", "string", "имя файла (или его часть)"), Triple("from", "integer", "номер первого фрагмента, с 0")),
+        // v4.75.0: RAG по своим файлам и разбор изображений моделью со зрением
+        "rag_search" to fn("rag_search", "Поиск по файлам рабочей папки агента (BM25 по содержимому): возвращает самые релевантные фрагменты с путями.", Triple("query", "string", "что искать")),
+        "rag_reindex" to fn("rag_reindex", "Перестроить RAG-индекс рабочей папки (после добавления или правки файлов)."),
+        "analyze_image" to fn("analyze_image", "Посмотреть изображение моделью со зрением: путь в рабочей папке или полный путь к файлу. Возвращает описание и распознанный текст.", Triple("path", "string", "путь к изображению"), Triple("question", "string", "что именно спросить про изображение")),
         // v4.72.0: рабочая папка агента + GitHub по токену из файла-секрета
         "ws_list" to fn("ws_list", "Список файлов и папок в рабочей папке агента (Download/OmniBrowser/agent/workspace). Возвращает дерево до 200 записей."),
         "ws_read" to fn("ws_read", "Прочитать файл из рабочей папки агента.", Triple("path", "string", "путь внутри workspace, например notes/todo.md")),
@@ -98,7 +102,8 @@ object AiTools {
         mcp: List<McpClient.Tool>,
         hasDocs: Boolean,
         wantImage: Boolean,
-        extra: List<String> = emptyList()
+        extra: List<String> = emptyList(),
+        plugins: JSONArray? = null
     ): JSONArray? {
         val names = LinkedHashSet(agent.tools)
         if (hasDocs) names.addAll(fileTools)
@@ -107,6 +112,8 @@ object AiTools {
         if (names.isEmpty()) return null
         val arr = JSONArray()
         for (t in names) builtin[t]?.let { arr.put(it) }
+        // инструменты-плагины (JSON-манифесты в workspace/plugins)
+        if (plugins != null) for (i in 0 until plugins.length()) arr.put(plugins.optJSONObject(i))
         if (agent.hasTools) for (t in mcp) arr.put(JSONObject().put("type", "function").put("function", JSONObject().put("name", t.fnName).put("description", "[MCP ${t.server.name}] " + t.description).put("parameters", t.schema)))
         return arr
     }
@@ -175,7 +182,24 @@ object AiTools {
                 )
                 "gh_actions" -> com.winwasm64.torrent.GitHubBridge.workflowStatus(ctx, args.optString("repo").trim())
                 "gh_search" -> com.winwasm64.torrent.GitHubBridge.searchCode(ctx, args.optString("repo").trim(), args.optString("query"))
-                else -> "Неизвестный инструмент $name"
+                // ---- RAG по рабочей папке ----
+                "rag_search" -> {
+                    val q = args.optString("query")
+                    val found = com.winwasm64.torrent.WorkspaceRag.search(ctx, q, 5)
+                    if (found.isEmpty()) "ничего не нашлось в рабочей папке (индекс: " + com.winwasm64.torrent.WorkspaceRag.stats(ctx) + ")"
+                    else found.joinToString("\n\n") { (path, text) -> "• $path\n" + text.take(1200) }.take(TOOL_RESULT_LIMIT)
+                }
+                "rag_reindex" -> {
+                    com.winwasm64.torrent.WorkspaceRag.rebuild(ctx)
+                    "✓ индекс перестроен: " + com.winwasm64.torrent.WorkspaceRag.stats(ctx)
+                }
+                "analyze_image" -> {
+                    val p = args.optString("path").trim()
+                    val f = com.winwasm64.torrent.AgentWorkspace.file(ctx, p) ?: java.io.File(p)
+                    if (!f.isFile) "файла нет: $p" else AiAssistant.describeImage(ctx, f, args.optString("question"))
+                }
+                else -> if (name.startsWith("plugin_")) com.winwasm64.torrent.AgentPlugins.call(ctx, name, args)
+                        else "Неизвестный инструмент $name"
             }
         } catch (e: Exception) { "Ошибка инструмента $name: ${e.message}" }
     }

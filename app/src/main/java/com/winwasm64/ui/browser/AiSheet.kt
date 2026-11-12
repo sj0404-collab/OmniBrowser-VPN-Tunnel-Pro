@@ -43,6 +43,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -103,6 +104,7 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     // v4.72.0: рабочая папка агента и заметки по проекту
                     "workspace" -> SheetTitle("Workspace агента", com.winwasm64.torrent.AgentWorkspace.displayPath(ctx))
                     "notes" -> SheetTitle("Заметки агента", "NOTES.md в корне workspace — агент дописывает их сам")
+                    "tasks" -> SheetTitle("Фоновые задачи агента", "Работают без сети и при закрытом приложении · журнал в workspace/agent/tasks")
                     else -> Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 4.dp, bottom = 4.dp)) {
                         Text((chat?.title ?: "ИИ-ассистент").ifBlank { "ИИ-ассистент" }, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Omni.Text, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(status.ifBlank { "${agent.emoji} ${agent.title} · " + (if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected)) },
@@ -121,11 +123,12 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
             }
         }
         when (view) {
-            "chats" -> { AiChatsList(onPick = { view = "chat" }); return@Column }
+            "chats" -> { AiChatsList(onPick = { view = "chat" }, onOpenTasks = { view = "tasks" }); return@Column }
             "providers" -> { AiSettings(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
             "agents" -> { AiAgentsView(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
             "workspace" -> { AiWorkspaceView(host); return@Column }
             "notes" -> { AiNotesView(); return@Column }
+            "tasks" -> { AiTasksView(); return@Column }
         }
 
         // агент и провайдер
@@ -239,6 +242,17 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
             AiChip("Объясни выделенное", false, enabled = !busy) { send("Объясни простыми словами выделенный фрагмент (если выделения нет — ключевую мысль страницы). Если это термин или код — поясни, что он делает.", true) }
             AiChip("Главные факты", false, enabled = !busy) { send("Выпиши из страницы ключевые факты, цифры, даты и имена списком. Только то, что есть в тексте.", true) }
             if (agent.hasTools) AiChip("Найди похожее", false, enabled = !busy) { send("Найди в интернете 3–5 источников по теме этой страницы и кратко сравни их с ней.", true) }
+            // v4.75.0: длинная задача уходит в фон и продолжается без нас
+            AiChip("⏱ В фон", false, enabled = !busy) {
+                val q = list.lastOrNull { it.role == "user" }?.text.orEmpty()
+                if (q.isBlank()) Toast.makeText(ctx, "Сначала напишите задачу", Toast.LENGTH_SHORT).show()
+                else {
+                    val t = com.winwasm64.torrent.AgentTasks.enqueue(ctx, q.take(48), q, agent.id)
+                    com.winwasm64.torrent.AgentRunnerService.start(ctx)
+                    Toast.makeText(ctx, "Задача «${t.title}» выполняется в фоне", Toast.LENGTH_LONG).show()
+                    view = "tasks"
+                }
+            }
             // v4.73.0: несколько вариантов ответа от разных провайдеров + рекомендация агента
             AiChip("🧩 Варианты", false, enabled = !busy && !AiAssistant.variantBusy.value) {
                 val q = list.lastOrNull { it.role == "user" }?.text.orEmpty()
@@ -397,12 +411,13 @@ private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean, onRetry
 
 // ---------------------------------------------------------------------- чаты
 @Composable
-private fun AiChatsList(onPick: () -> Unit) {
+private fun AiChatsList(onPick: () -> Unit, onOpenTasks: () -> Unit = {}) {
     val ctx = LocalContext.current
     val fmt = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
     val cur by AiAssistant.current
     Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState())) {
         SheetItem(OmniIcons.Add, "Новый чат", subtitle = "Текущий агент: ${AiTools.agent(cur?.agent ?: "chat").title}", tint = Omni.Accent, onClick = { AiAssistant.newChat(ctx); AiAssistant.save(ctx); onPick() })
+        SheetItem(OmniIcons.Download, "Фоновые задачи агента", subtitle = "Длинные задачи: работают без сети и при закрытом приложении", tint = Omni.Accent, onClick = { onOpenTasks() })
         SheetDivider()
         for (c in AiAssistant.chats.toList()) {
             val title by c.titleState
@@ -747,5 +762,97 @@ private fun AiNotesView() {
             }) { Text(if (saved) "✓ Сохранено" else "Сохранить", color = Omni.Accent, fontSize = 12.sp) }
             TextButton(onClick = { text = ws.notes(ctx) }) { Text("Отменить", color = Omni.TextFaint, fontSize = 12.sp) }
         }
+    }
+}
+
+/* ============================================================================
+ * v4.75.0: ФОНОВЫЕ ЗАДАЧИ АГЕНТА
+ * Длинная задача выполняется сервисом: не прерывается без сети и при закрытии
+ * приложения, а здесь видно шаг, время, токены и результат.
+ * ========================================================================== */
+
+@Composable
+private fun AiTasksView() {
+    val ctx = LocalContext.current
+    val tasks by com.winwasm64.torrent.AgentTasks.tasks
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(tick) {
+        while (true) {
+            com.winwasm64.torrent.AgentTasks.load(ctx)
+            delay(2000)
+        }
+    }
+    val fmt = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
+    Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Задач: ${tasks.size} · активных: ${tasks.count { it.isActive }}",
+                color = Omni.TextDim, fontSize = 11.sp, modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = { tick++ }) { Text("⟳", color = Omni.Accent, fontSize = 13.sp) }
+            TextButton(onClick = { com.winwasm64.torrent.AgentTasks.clearFinished(ctx) }) {
+                Text("Убрать готовые", color = Omni.TextFaint, fontSize = 11.sp)
+            }
+        }
+        if (tasks.isEmpty()) {
+            Text(
+                "Фоновых задач нет. Напишите задачу в чате и нажмите «⏱ В фон» — агент будет выполнять её " +
+                    "даже если вы выключите экран, потеряете сеть или закроете приложение.",
+                color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.padding(16.dp)
+            )
+        }
+        for (t in tasks) {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp)
+                    .clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).padding(10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        when (t.status) {
+                            com.winwasm64.torrent.AgentTasks.RUNNING -> "⏳"
+                            com.winwasm64.torrent.AgentTasks.WAITING -> "📶"
+                            com.winwasm64.torrent.AgentTasks.DONE -> "✅"
+                            com.winwasm64.torrent.AgentTasks.FAILED -> "❌"
+                            com.winwasm64.torrent.AgentTasks.CANCELED -> "⏹"
+                            else -> "🕒"
+                        } + " " + t.title,
+                        color = Omni.Text, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                    )
+                    if (t.isActive) {
+                        TextButton(onClick = { com.winwasm64.torrent.AgentTasks.cancel(ctx, t.id) }) {
+                            Text("Стоп", color = Omni.Danger, fontSize = 11.sp)
+                        }
+                    } else {
+                        TextButton(onClick = { com.winwasm64.torrent.AgentTasks.retry(ctx, t.id) }) {
+                            Text("Повторить", color = Omni.Accent, fontSize = 11.sp)
+                        }
+                        OmniIconButton(OmniIcons.Delete, "Удалить", onClick = {
+                            com.winwasm64.torrent.AgentTasks.remove(ctx, t.id)
+                        }, tint = Omni.TextFaint, size = 26.dp, iconSize = 14.dp)
+                    }
+                }
+                Text(
+                    t.step.ifBlank { t.status } + " · " + fmt.format(java.util.Date(t.updated)) +
+                        (if (t.elapsedMs > 0) " · ${t.elapsedMs / 1000} с" else "") +
+                        (if (t.tokens > 0) " · ≈${t.tokens} ток." else "") +
+                        (if (t.attempts > 1) " · попыток ${t.attempts}" else ""),
+                    color = Omni.TextFaint, fontSize = 10.sp, maxLines = 2
+                )
+                if (t.error.isNotBlank()) Text("⚠ " + t.error.take(300), color = Omni.Warning, fontSize = 10.sp, maxLines = 3)
+                if (t.result.isNotBlank()) {
+                    Text(t.result.take(600), color = Omni.TextDim, fontSize = 11.sp, maxLines = 8, overflow = TextOverflow.Ellipsis)
+                    TextButton(onClick = {
+                        (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                            .setPrimaryClip(ClipData.newPlainText("result", t.result))
+                        Toast.makeText(ctx, "Результат скопирован", Toast.LENGTH_SHORT).show()
+                    }) { Text("Копировать результат", color = Omni.Accent, fontSize = 11.sp) }
+                }
+            }
+        }
+        Text(
+            "Журнал каждой задачи пишется в workspace: agent/tasks/<id>.md — откройте 🗂 Workspace.",
+            color = Omni.TextFaint, fontSize = 10.sp, modifier = Modifier.padding(16.dp)
+        )
     }
 }

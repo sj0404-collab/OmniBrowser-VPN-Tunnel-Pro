@@ -312,20 +312,28 @@ object YouTubeSearch {
     }
 
     private fun post(url: String, body: String): String? {
+        // v4.75.0: запросы идут через канал приложения (VPN браузера), а не напрямую.
+        // Раньше YouTube опрашивался в обход VPN: в сетях, где YouTube замедлен, поиск висел
+        // минутами и часто не возвращал вообще ничего.
         return try {
-            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 12_000
-                readTimeout = 15_000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", UA)
-                setRequestProperty("Origin", "https://www.youtube.com")
-                setRequestProperty("Referer", "https://www.youtube.com/")
-                setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8")
-                outputStream.use { it.write(body.toByteArray()) }
+            val conn = com.winwasm64.ui.browser.NetDirect.connect(
+                url,
+                mapOf(
+                    "Content-Type" to "application/json",
+                    "User-Agent" to UA,
+                    "Origin" to "https://www.youtube.com",
+                    "Referer" to "https://www.youtube.com/",
+                    "Accept-Language" to "ru-RU,ru;q=0.9,en;q=0.8"
+                ),
+                method = "POST",
+                body = body,
+                timeoutMs = 9_000
+            )
+            try {
+                if (conn.responseCode in 200..299) conn.inputStream.bufferedReader().use { it.readText() } else null
+            } finally {
+                try { conn.disconnect() } catch (_: Throwable) {}
             }
-            if (conn.responseCode in 200..299) conn.inputStream.bufferedReader().use { it.readText() } else null
         } catch (_: Throwable) {
             null
         }

@@ -3672,6 +3672,29 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
             // ===================== НИЖНЯЯ НАВИГАЦИЯ =====================
             if (fullscreenCustomView == null && !inPip) {
+                // v4.75.0: полоска «кто сейчас выполняет задачу» — фоновые задачи агента
+                val agentTasks by com.winwasm64.torrent.AgentTasks.tasks
+                LaunchedEffect(Unit) { com.winwasm64.torrent.AgentTasks.load(context) }
+                val runningTask = agentTasks.firstOrNull {
+                    it.status == com.winwasm64.torrent.AgentTasks.RUNNING ||
+                        it.status == com.winwasm64.torrent.AgentTasks.WAITING
+                }
+                if (runningTask != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .background(Omni.AccentContainer.copy(alpha = 0.35f))
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            (if (runningTask.status == com.winwasm64.torrent.AgentTasks.WAITING) "📶 ждёт сеть · " else "⏳ ") +
+                                runningTask.title.take(32) + " · " + runningTask.step.take(40),
+                            color = Color.White, fontSize = 10.sp, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                        )
+                        Text("открыть", color = Omni.Accent, fontSize = 10.sp)
+                    }
+                }
                 OmniBottomBar(
                     selected = currentSection,
                     items = listOf(
@@ -6706,6 +6729,11 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
     var loading by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
+    // v4.75.0: видно, сколько уже идёт поиск, и можно прервать
+    var elapsed by remember { mutableIntStateOf(0) }
+    // VK и RuTube разбираются настоящим встроенным браузером (как в обычном клиенте)
+    var scrapeUrl by remember { mutableStateOf<String?>(null) }
+    var scrapeSource by remember { mutableStateOf("") }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
 
@@ -6734,8 +6762,25 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
     // первый экран и любая повторная отправка / смена площадки
     LaunchedEffect(tick, source) {
         if (submitted.isBlank()) return@LaunchedEffect
+        scrapeUrl = null
+        elapsed = 0
+        // 1) уже искали — отдаём из кэша мгновенно
+        com.winwasm64.torrent.VideoFeed.cached(source, submitted)?.let {
+            items = it.clips
+            cont = it.continuation
+            note = it.note.orEmpty()
+            loading = false
+            return@LaunchedEffect
+        }
         loading = true
         note = ""
+        // 2) VK без входа отдаёт выдачу только настоящему браузеру
+        if (source == com.winwasm64.torrent.VideoFeed.SRC_VK) {
+            scrapeSource = source
+            scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
+            return@LaunchedEffect
+        }
+        // 3) RuTube: сначала быстрый API, если он пуст — тоже встроенный браузер
         val page = withContext(Dispatchers.IO) {
             runCatching { com.winwasm64.torrent.VideoFeed.search(source, submitted, sort, null) }
                 .getOrElse { com.winwasm64.torrent.VideoFeed.Page(note = "Не удалось: " + humanError(it)) }
@@ -6743,8 +6788,44 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         items = page.clips
         cont = page.continuation
         note = page.note.orEmpty()
+        if (source == com.winwasm64.torrent.VideoFeed.SRC_RUTUBE && page.clips.isEmpty()) {
+            scrapeSource = source
+            scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
+            return@LaunchedEffect
+        }
         loading = false
         listState.scrollToItem(0)
+    }
+
+    // секундомер поиска
+    LaunchedEffect(loading) {
+        if (!loading) return@LaunchedEffect
+        elapsed = 0
+        while (loading && elapsed < 600) {
+            delay(1000)
+            elapsed++
+        }
+    }
+
+    // скрытый браузер: разбирает выдачу VK/RuTube, результат — карточки
+    val currentScrape = scrapeUrl
+    if (currentScrape != null) {
+        HtmlScraper(
+            url = currentScrape,
+            js = com.winwasm64.torrent.VideoFeed.scrapeJs(scrapeSource),
+            timeoutMs = 25_000
+        ) { raw ->
+            val clips = com.winwasm64.torrent.VideoFeed.parseScraped(scrapeSource, raw)
+            if (clips.isNotEmpty()) {
+                items = clips
+                cont = null
+                note = ""
+            } else if (note.isBlank()) {
+                note = "Не удалось разобрать выдачу $scrapeSource — включите VPN (щит) и нажмите ⟳"
+            }
+            loading = false
+            scrapeUrl = null
+        }
     }
 
     val filtered = remember(items, category, sort) {
@@ -6907,7 +6988,14 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Omni.Accent, strokeWidth = 2.dp)
-                Text("  Ищу на $source…", color = Omni.TextDim, fontSize = 12.sp)
+                Text(
+                    "  Ищу на $source · ${elapsed} с" + (if (source == com.winwasm64.torrent.VideoFeed.SRC_VK) " · через встроенный браузер" else ""),
+                    color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f)
+                )
+                Text(
+                    "⏹ Отменить", color = Omni.Accent, fontSize = 11.sp,
+                    modifier = Modifier.clickable { scrapeUrl = null; loading = false; note = "Поиск прерван" }
+                )
             }
         }
 
@@ -6959,6 +7047,47 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * v4.75.0: невидимый WebView. Нужен там, где сайт отдаёт выдачу только настоящему браузеру
+ * (VK Видео без входа, RuTube с гео-фильтром): грузим страницу, ждём отрисовки и снимаем карточки JS.
+ */
+@Composable
+private fun HtmlScraper(url: String, js: String, timeoutMs: Long = 25_000, onResult: (String?) -> Unit) {
+    val context = LocalContext.current
+    var fired by remember(url) { mutableStateOf(false) }
+    AndroidView(
+        modifier = Modifier.size(1.dp),
+        factory = {
+            WebView(context).apply {
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString =
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, u: String?) {
+                        view?.postDelayed({
+                            try {
+                                view.evaluateJavascript(js) { r -> if (!fired) { fired = true; onResult(r) } }
+                            } catch (_: Throwable) {
+                                if (!fired) { fired = true; onResult(null) }
+                            }
+                        }, 3000)
+                    }
+                }
+                loadUrl(url)
+            }
+        }
+    )
+    LaunchedEffect(url) {
+        delay(timeoutMs)
+        if (!fired) {
+            fired = true
+            onResult(null)
         }
     }
 }

@@ -48,14 +48,104 @@ object VideoFeed {
         val note: String? = null
     )
 
+    /* -------------------------- кэш выдачи -------------------------- *
+     * v4.75.0: повторный поиск того же запроса отдаётся мгновенно (10 минут).
+     */
+    private val cache = LinkedHashMap<String, Pair<Long, Page>>()
+    private const val CACHE_TTL = 10 * 60_000L
+
+    fun cached(source: String, query: String): Page? {
+        val key = source + "|" + query.trim().lowercase()
+        val hit = cache[key] ?: return null
+        if (System.currentTimeMillis() - hit.first > CACHE_TTL) { cache.remove(key); return null }
+        return hit.second
+    }
+
+    private fun put(source: String, query: String, page: Page): Page {
+        if (page.clips.isNotEmpty()) {
+            cache[source + "|" + query.trim().lowercase()] = System.currentTimeMillis() to page
+            if (cache.size > 24) cache.remove(cache.keys.first())
+        }
+        return page
+    }
+
+    /** VK и RuTube ищем во встроенном браузере: только он проходит без входа и без капчи. */
+    fun scrapeUrl(source: String, query: String): String = when (source) {
+        SRC_VK -> "https://m.vk.com/video?q=" + enc(query)
+        SRC_RUTUBE -> "https://rutube.ru/search/?query=" + enc(query)
+        else -> "https://m.youtube.com/results?search_query=" + enc(query)
+    }
+
+    /** JS, который собирает карточки прямо со страницы (как это делает обычный клиент). */
+    fun scrapeJs(source: String): String = when (source) {
+        SRC_VK -> """(function(){try{var out=[],seen={};var as=document.querySelectorAll('a[href*="video"]');
+var add=function(u,t,i){if(!u||seen[u])return;if(u.indexOf('/video')<0&&u.indexOf('video-')<0)return;seen[u]=1;out.push({u:u,t:(t||'').replace(/\s+/g,' ').trim().slice(0,150),i:i||''});};
+as.forEach(function(a){var img=a.querySelector('img');add(a.href,(a.getAttribute('aria-label')||a.title||a.innerText||''),img?img.src:'');});
+return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()"""
+        SRC_RUTUBE -> """(function(){try{var out=[],seen={};var as=document.querySelectorAll('a[href*="/video/"]');
+var add=function(u,t,i){if(!u||seen[u])return;seen[u]=1;out.push({u:u,t:(t||'').replace(/\s+/g,' ').trim().slice(0,150),i:i||''});};
+as.forEach(function(a){var img=a.querySelector('img');add(a.href,(a.getAttribute('title')||a.innerText||''),img?(img.src||img.getAttribute('data-src')):'');});
+return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()"""
+        else -> "JSON.stringify([])"
+    }
+
+    /** Разбор того, что вернул встроенный браузер. */
+    fun parseScraped(source: String, raw: String?): List<Clip> {
+        if (raw.isNullOrBlank() || raw == "null") return emptyList()
+        val json = try {
+            (org.json.JSONTokener(raw).nextValue() as? String) ?: raw
+        } catch (_: Throwable) {
+            raw
+        }
+        val arr = try {
+            org.json.JSONArray(json)
+        } catch (_: Throwable) {
+            return emptyList()
+        }
+        val out = ArrayList<Clip>()
+        val seen = HashSet<String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val url = o.optString("u").substringBefore('#')
+            if (url.isBlank() || !seen.add(url)) continue
+            val rawTitle = o.optString("t")
+            val lenMatch = Regex("(\d{1,2}:\d{2}(?::\d{2})?)").find(rawTitle)
+            val viewsMatch = Regex("([\d\s.,]+)\s*(тыс\.?|млн|K|M)?\s*(просмотр|views)", RegexOption.IGNORE_CASE).find(rawTitle)
+            val authorMatch = Regex("^([^·|\n]{2,40})").find(rawTitle)
+            val title = rawTitle.replace(Regex("\s*[·|]\s*\d{1,2}:\d{2}.*$"), "").trim()
+                .ifBlank { rawTitle }.take(140)
+            if (title.length < 2) continue
+            out.add(
+                Clip(
+                    id = url.substringAfterLast('/').ifBlank { url.hashCode().toString() },
+                    kind = "video",
+                    title = title,
+                    author = if (source == SRC_VK) "" else authorMatch?.groupValues?.get(1)?.trim().orEmpty(),
+                    lengthText = lenMatch?.groupValues?.get(1).orEmpty(),
+                    viewsText = viewsMatch?.let { m -> m.groupValues[1].trim() + " " + m.groupValues[2] + " просмотров" }.orEmpty(),
+                    publishedText = "",
+                    thumb = o.optString("i"),
+                    url = url,
+                    source = source
+                )
+            )
+        }
+        return out
+    }
+
     fun search(source: String, query: String, sort: Int = 0, continuation: String? = null): Page {
+        if (continuation == null) cached(source, query)?.let { return it }
+        return put(source, query, searchFresh(source, query, sort, continuation))
+    }
+
+    private fun searchFresh(source: String, query: String, sort: Int, continuation: String?): Page {
         val q = query.trim()
         if (q.isBlank()) return Page(note = "Введите запрос")
         return when (source) {
             SRC_RUTUBE -> rutube(q, continuation)
+            // VK без входа отдаёт результаты только настоящему браузеру — его и использует экран «Видео»
             SRC_VK -> Page(
-                note = "VK Видео не отдаёт поиск без входа в аккаунт. Откройте поиск VK во встроенном окне — " +
-                    "там разбор идёт через WebView."
+                note = "VK ищу во встроенном браузере — если пусто, включите VPN и повторите"
             )
             else -> youtube(q, sort, continuation)
         }

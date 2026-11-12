@@ -67,6 +67,9 @@ object AiAssistant {
             "https://build.nvidia.com", "бесплатные кредиты по ключу build.nvidia.com"),
         Provider("huggingface", "Hugging Face", "https://router.huggingface.co/v1/chat/completions", "zai-org/GLM-5.3-Flash", true,
             "https://huggingface.co/settings/tokens", "токен HF (read), бесплатная квота"),
+        // v4.74.0: DeepSeek — в том числе как «харнесс» длинных рассуждений для плагина deepseek_harness
+        Provider("deepseek", "DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-chat", true,
+            "https://platform.deepseek.com/api_keys", "ключ DeepSeek: deepseek-chat / deepseek-reasoner (reasoning виден в «🧠 размышления»)"),
         Provider("custom", "Свой сервер", "", "", true, "", "любой OpenAI-совместимый адрес …/v1/chat/completions (LM Studio, Ollama, прокси)")
     )
 
@@ -101,6 +104,11 @@ object AiAssistant {
             set(v) { agentState.value = v }
         val messages = mutableStateListOf<Msg>()
         var updated: Long = created
+        // v4.74.0: накопленная статистика сессии — видна в «Чатах»
+        var tokens: Int = 0
+        var ms: Long = 0
+        var steps: Int = 0
+        var lastModel: String = ""
     }
 
     val chats = mutableStateListOf<Chat>()
@@ -424,9 +432,19 @@ object AiAssistant {
         "5) если просят перерисовать/перегенерировать картинку — подробно опиши её по-английски и вызови generate_image с этим описанием и нужными изменениями; " +
         "6) если ответа в файлах действительно нет — скажи это прямо и укажи, что именно проверил."
 
-    private fun buildMessages(chat: Chat, agent: AiAgent, pageContext: String?, docsListing: String): JSONArray {
+    private fun buildMessages(ctx: Context, chat: Chat, agent: AiAgent, pageContext: String?, docsListing: String): JSONArray {
         val arr = JSONArray()
+        // v4.74.0: RAG по рабочей папке агента — подмешиваем найденные фрагменты своих файлов
+        val rag = try {
+            val q = chat.messages.lastOrNull { it.role == "user" }?.text.orEmpty()
+            if (q.isBlank()) "" else com.winwasm64.torrent.WorkspaceRag.contextFor(ctx, q)
+        } catch (_: Throwable) {
+            ""
+        }
         val sys = SYSTEM + (if (agent.system.isNotBlank()) "\n\n" + agent.system else "") +
+            (if (com.winwasm64.torrent.AgentWorkspace.current(ctx).isNotBlank())
+                "\n\nРабочая папка агента: " + com.winwasm64.torrent.AgentWorkspace.displayPath(ctx) +
+                    "\nСодержимое:\n" + com.winwasm64.torrent.AgentWorkspace.tree(ctx, 80) else "") + rag +
             (if (docsListing.isNotBlank()) "\n\n" + FILES_RULES + "\n\nФайлы чата:\n" + docsListing else "") +
             (if (!pageContext.isNullOrBlank()) "\n\nКонтекст текущей страницы:\n$pageContext" else "")
         arr.put(JSONObject().put("role", "system").put("content", sys))
@@ -470,7 +488,7 @@ object AiAssistant {
         cancel.set(false)
         status.value = ""
         val docsListing = AiFiles.listing(chat.id)
-        val api = buildMessages(chat, agent, pageContext, docsListing)
+        val api = buildMessages(app, chat, agent, pageContext, docsListing)
         // изображения отправляем, если о них спрашивают или они появились после прошлого вопроса
         val imgCount = AiFiles.images(chat.id).size
         val withImages = imgCount > 0 && (imageWords.containsMatchIn(userText) || lastImagesSent[chat.id] != imgCount)
@@ -486,7 +504,8 @@ object AiAssistant {
             agent, mcpTools,
             hasDocs = docsListing.isNotBlank(),
             wantImage = AiTools.wantsImage(userText),
-            extra = extraTools
+            extra = extraTools,
+            plugins = com.winwasm64.torrent.AgentPlugins.toolsJson(app)
         )
         Thread({
             val main = android.os.Handler(android.os.Looper.getMainLooper())
@@ -540,6 +559,10 @@ object AiAssistant {
                     // v4.72.0: видно, сколько это заняло и сколько примерно токенов ушло
                     val tokens = (api.toString().length + reply.text.length) / 4
                     main.post {
+                        chat.tokens += tokens
+                        chat.ms += ms
+                        chat.steps += chat.messages.count { it.kind == "tool" }
+                        chat.lastModel = "$model (${p.title})"
                         reply.meta = "${p.title} · $model · ${ms} мс · ≈$tokens ток."
                         status.value = "${p.title} · $model · $ms мс · ≈$tokens ток."
                     }
@@ -739,6 +762,107 @@ object AiAssistant {
         clearVariants()
         ask(ctx, "Беру вариант ${index + 1} (${v.provider}).\n\n" + v.text.take(1500) +
             "\n\nРазвей этот вариант и выполни задачу: $q", null, host)
+    }
+
+    /* ===================== v4.75.0: автономная работа в фоне ===================== */
+
+    data class HeadlessResult(val ok: Boolean, val text: String, val tokens: Int)
+
+    /**
+     * Тот же агент, но без чата и без экрана: используется фоновыми задачами.
+     * Инструменты — рабочая папка (ws_*), RAG, GitHub по токену, поиск/чтение в интернете,
+     * анализ изображений и плагины. Выполняется в фоновом потоке сервиса задач.
+     */
+    fun runHeadless(ctx: Context, prompt: String, agentId: String, onStep: (String) -> Unit): HeadlessResult {
+        val app = ctx.applicationContext
+        val agent = AiTools.agent(agentId)
+        val extra = ArrayList<String>()
+        extra.addAll(AiTools.workspaceTools)
+        extra.addAll(listOf("rag_search", "rag_reindex", "search_web", "fetch_url", "analyze_image"))
+        if (com.winwasm64.torrent.GitHubBridge.configured(app)) extra.addAll(AiTools.githubTools)
+        val tools = AiTools.toolsFor(
+            agent, emptyList(),
+            hasDocs = false, wantImage = false,
+            extra = extra,
+            plugins = com.winwasm64.torrent.AgentPlugins.toolsJson(app)
+        )
+        val sys = SYSTEM +
+            (if (agent.system.isNotBlank()) "\n\n" + agent.system else "") +
+            "\n\nТы работаешь автономно в фоне. Рабочая папка: " + com.winwasm64.torrent.AgentWorkspace.displayPath(app) +
+            ". Выполняй задачу ИНСТРУМЕНТАМИ (ws_write, ws_mkdir, gh_write, rag_search, fetch_url, plugin_*), " +
+            "результат обязательно сохрани файлом в рабочей папке и в конце дай короткий отчёт."
+        val api = JSONArray()
+            .put(JSONObject().put("role", "system").put("content", sys))
+            .put(
+                JSONObject().put("role", "user").put(
+                    "content", prompt + try {
+                        com.winwasm64.torrent.WorkspaceRag.contextFor(app, prompt)
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                )
+            )
+        val order = autoOrder(app)
+        if (order.isEmpty()) return HeadlessResult(false, "нет доступных провайдеров", 0)
+        var tokens = 0
+        var steps = 0
+        var last = ""
+        while (steps < 15) {
+            if (Thread.currentThread().isInterrupted) return HeadlessResult(false, "прервано", tokens)
+            val p = order[minOf(steps / 6, order.size - 1)]
+            val model = model(app, p.id)
+            var err: String? = null
+            onStep("думает · ${p.title}")
+            val r = complete(app, p, model, api, tools, stream = false, maxTokens = 0, onDelta = {}, err = { err = it })
+                ?: return HeadlessResult(false, err ?: "нет ответа", tokens)
+            tokens += (api.toString().length + r.content.length) / 4
+            val tc = r.toolCalls
+            if (tc == null || tools == null || tc.length() == 0) {
+                last = r.content.ifBlank { r.reasoning }.trim()
+                break
+            }
+            steps++
+            val assistantMsg = JSONObject().put("role", "assistant").put("tool_calls", tc)
+            if (r.content.isNotBlank()) assistantMsg.put("content", r.content)
+            api.put(assistantMsg)
+            for (i in 0 until tc.length()) {
+                val call = tc.optJSONObject(i) ?: continue
+                val fn = call.optJSONObject("function") ?: continue
+                val name = fn.optString("name")
+                val args = try {
+                    JSONObject(fn.optString("arguments").ifBlank { "{}" })
+                } catch (_: Throwable) {
+                    JSONObject()
+                }
+                onStep("🔧 $name")
+                val res = AiTools.execute(app, null, "headless", name, args, emptyList())
+                api.put(
+                    JSONObject().put("role", "tool")
+                        .put("tool_call_id", call.optString("id").ifBlank { "call_$i" })
+                        .put("name", name)
+                        .put("content", res.take(AiTools.TOOL_RESULT_LIMIT))
+                )
+            }
+        }
+        return HeadlessResult(true, last.ifBlank { "готово" }, tokens)
+    }
+
+    /** Инструмент «посмотреть картинку»: нужна модель со зрением. */
+    fun describeImage(ctx: Context, file: java.io.File, question: String): String {
+        val app = ctx.applicationContext
+        val data = AiFiles.imageDataUrl(file.absolutePath) ?: return "не удалось прочитать изображение: " + file.name
+        val parts = JSONArray()
+            .put(JSONObject().put("type", "text").put("text", question.ifBlank { "Опиши подробно, что изображено, и выдели текст, если он есть." }))
+            .put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", data)))
+        val msgs = JSONArray().put(JSONObject().put("role", "user").put("content", parts))
+        for (p in autoOrder(app)) {
+            val vm = AiCatalog.visionModel(p.id, model(app, p.id)) ?: continue
+            var err: String? = null
+            val r = complete(app, p, vm, msgs, null, stream = false, maxTokens = 900, onDelta = {}, err = { err = it })
+            if (r != null) return r.content.ifBlank { r.reasoning }.trim()
+            VpnLog.w(TAG, "зрение ${p.title}: ${err ?: "пусто"}")
+        }
+        return "нет модели со зрением — добавьте бесплатный ключ LLM7, Gemini, Groq или api.navy (⚙ Провайдеры)"
     }
 
     /** v4.72.0: «Повторить» — убрать последний ответ и спросить заново тем же вопросом. */
