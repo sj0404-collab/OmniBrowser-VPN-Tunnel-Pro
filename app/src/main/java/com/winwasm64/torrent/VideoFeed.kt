@@ -1,5 +1,6 @@
 package com.winwasm64.torrent
 
+import com.winwasm64.ui.browser.NetDirect
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -268,11 +269,13 @@ return JSON.stringify(res.slice(0,200));
             "https://html.duckduckgo.com/html/?q=$q"
         )
         for (u in engines) {
-            val (code, html) = try {
+            val pair = try {
                 NetDirect.requestText(u, headers, timeoutMs = 9_000)
             } catch (_: Throwable) {
                 continue
             }
+            val code = pair.first
+            val html = pair.second
             if (code !in 200..299) continue
             val clips = parseEngineHtml(source, html, query)
             if (clips.isNotEmpty()) return Page(clips = clips, note = "быстрый поиск по индексу: ${clips.size} видео")
