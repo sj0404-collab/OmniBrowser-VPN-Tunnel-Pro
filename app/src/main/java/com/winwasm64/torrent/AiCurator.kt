@@ -237,76 +237,9 @@ object AiCurator {
             mark(State.DONE, "вариантов ${it.size} · взял готовые")
             return it
         }
-        mark(State.THINKING, "придумываю варианты запроса")
-        val fast = java.util.concurrent.FutureTask {
-            askVariants(query, limit, listOf("openai-fast"), 5_000)
-        }
-        Thread(fast, "AiFast").apply { isDaemon = true; start() }
-        val quick = try {
-            fast.get(deadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        } catch (_: Throwable) {
-            emptyList<String>()
-        }
-        if (quick.isNotEmpty()) {
-            variantsCache[key] = quick
-            setStatus(context, "OK · вариантов ${quick.size}")
-            mark(State.DONE, "вариантов ${quick.size} · ${modelLabel(context)}")
-            return quick
-        }
-        // умная модель — в фоне: её ответ пригодится в следующий раз
-        Thread({
-            val slow = askVariants(query, limit, listOf(model(context), "openai"), 45_000)
-            if (slow.isNotEmpty()) {
-                variantsCache[key] = slow
-                setStatus(context, "OK · вариантов ${slow.size}")
-                mark(State.DONE, "вариантов ${slow.size} · ${modelLabel(context)} (в фоне)")
-            } else {
-                setStatus(context, "нет ответа · ищу без вариантов ИИ")
-                mark(State.ERROR, "модель не ответила — ищу без её вариантов")
-            }
-        }, "AiSmart").apply { isDaemon = true; start() }
-        mark(State.THINKING, "модель думает в фоне · ищу без её вариантов")
+        // v4.66.0: не ждём модель НИ СКОЛЬКО — считаем в фоне, а поиск идёт на своих синонимах
+        prefetch(context, query, limit)
         return emptyList()
-    }
-
-    /**
-     * v4.61.0: «где-то процесс не в том потоке» — и это была правда.
-     *
-     * expandWithin() ждал быструю модель до 6 секунд. В «Файлах» он вызывался в рабочем потоке, а
-     * в «Торрентах» — прямо в главном: интерфейс стоял 6 секунд, и Android показывал
-     * «OmniBrowser & VPN Pro не отвечает». Теперь ожидания в главном потоке НЕТ вообще:
-     *  • [cachedVariants] — мгновенно отдаёт готовые варианты из памяти (или пустой список);
-     *  • [prefetch] — запускает расчёт в фоне и сразу возвращает управление.
-     * Поиск никогда не ждёт ИИ: варианты, посчитанные в прошлый раз, применяются сразу.
-     */
-    fun cachedVariants(query: String): List<String> =
-        variantsCache[query.trim().lowercase()] ?: emptyList()
-
-    /** Считать варианты в фоне (не блокирует вызывающий поток ни на миллисекунду). */
-    fun prefetch(context: Context, query: String, limit: Int = 2) {
-        if (!isEnabled(context)) return
-        val key = query.trim().lowercase()
-        if (key.isBlank() || variantsCache.containsKey(key) || inflight.contains(key)) return
-        inflight.add(key)
-        Thread({
-            try {
-                mark(State.THINKING, "варианты для «${query.take(18)}»")
-                mark(State.ASKING, "спрашиваю ${modelLabel(context)}")
-                val variants = askVariants(query, limit, context, 25_000)
-                if (variants.isNotEmpty()) {
-                    variantsCache[key] = variants
-                    setStatus(context, "OK · вариантов ${variants.size} · ${modelLabel(context)}")
-                    mark(State.DONE, "вариантов ${variants.size} · ${modelLabel(context)}")
-                } else {
-                    setStatus(context, "нет ответа · ищу без вариантов ИИ")
-                    mark(State.ERROR, "провайдеры ИИ не ответили — ищу без их вариантов")
-                }
-            } catch (_: Throwable) {
-                mark(State.ERROR, "сбой агента")
-            } finally {
-                inflight.remove(key)
-            }
-        }, "AiPrefetch").apply { isDaemon = true; start() }
     }
 
     /** Запрос вариантов у конкретных моделей и разбор JSON-массива. Без изменения состояния. */
