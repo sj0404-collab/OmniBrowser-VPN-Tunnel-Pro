@@ -108,7 +108,8 @@ object VideoFeed {
         val url = "https://rutube.ru/api/search/video/?query=" + enc(query) +
             "&limit=$RUTUBE_PAGE&offset=$offset"
         val raw = try {
-            com.winwasm64.ui.browser.NetDirect.requestText(
+            // requestText возвращает пару (код ответа, тело)
+            val (code, text) = com.winwasm64.ui.browser.NetDirect.requestText(
                 url,
                 mapOf(
                     "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36",
@@ -117,10 +118,14 @@ object VideoFeed {
                 ),
                 timeoutMs = 20_000
             )
+            if (code !in 200..299) {
+                return Page(note = "RuTube ответил кодом $code — обычно это гео-фильтр: включите VPN и повторите")
+            }
+            text
         } catch (t: Throwable) {
             return Page(note = "RuTube не ответил: " + (t.message ?: "сеть").take(90))
         }
-        if (raw.isNullOrBlank()) return Page(note = "RuTube не ответил (пустой ответ)")
+        if (raw.isBlank()) return Page(note = "RuTube не ответил (пустой ответ)")
         val results = try {
             JSONObject(raw).optJSONArray("results")
         } catch (_: Throwable) {

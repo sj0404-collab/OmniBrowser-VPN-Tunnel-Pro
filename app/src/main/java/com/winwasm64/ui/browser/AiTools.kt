@@ -69,15 +69,40 @@ object AiTools {
         "list_files" to fn("list_files", "Список файлов, прикреплённых к чату: имя, тип, размер текста/число изображений, расшифровка речи."),
         "search_files" to fn("search_files", "Поиск по содержимому прикреплённых файлов (BM25): возвращает самые релевантные фрагменты с указанием файла и номера фрагмента. Используй для вопросов по документам любого объёма.", Triple("query", "string", "что искать — ключевые слова или вопрос")),
         "read_file" to fn("read_file", "Прочитать прикреплённый файл последовательно: фрагменты с номера from (с 0) — по 5 за раз. Так можно прочитать файл целиком, фрагмент за фрагментом.", Triple("name", "string", "имя файла (или его часть)"), Triple("from", "integer", "номер первого фрагмента, с 0")),
+        // v4.72.0: рабочая папка агента + GitHub по токену из файла-секрета
+        "ws_list" to fn("ws_list", "Список файлов и папок в рабочей папке агента (Download/OmniBrowser/agent/workspace). Возвращает дерево до 200 записей."),
+        "ws_read" to fn("ws_read", "Прочитать файл из рабочей папки агента.", Triple("path", "string", "путь внутри workspace, например notes/todo.md")),
+        "ws_write" to fn("ws_write", "Создать или перезаписать файл в рабочей папке агента (папки создаются сами).", Triple("path", "string", "путь внутри workspace"), Triple("content", "string", "полное содержимое файла")),
+        "ws_mkdir" to fn("ws_mkdir", "Создать папку в рабочей папке агента.", Triple("path", "string", "путь папки внутри workspace")),
+        "ws_delete" to fn("ws_delete", "Удалить файл или папку из рабочей папки агента.", Triple("path", "string", "путь внутри workspace")),
+        "note_append" to fn("note_append", "Дописать строку в заметки агента по проекту (NOTES.md в корне workspace). Используй для важных решений и договорённостей.", Triple("text", "string", "короткая заметка")),
+        "gh_dir" to fn("gh_dir", "GitHub: список файлов в папке репозитория.", Triple("repo", "string", "owner/name"), Triple("path", "string", "путь папки, пусто = корень")),
+        "gh_read" to fn("gh_read", "GitHub: прочитать файл репозитория.", Triple("repo", "string", "owner/name"), Triple("path", "string", "путь файла")),
+        "gh_write" to fn("gh_write", "GitHub: создать или обновить файл в репозитории (коммит в ветку).", Triple("repo", "string", "owner/name"), Triple("path", "string", "путь файла"), Triple("content", "string", "содержимое"), Triple("message", "string", "сообщение коммита")),
+        "gh_actions" to fn("gh_actions", "GitHub: последние 5 прогонов CI (сборок) репозитория — статус и ветка.", Triple("repo", "string", "owner/name")),
+        "gh_search" to fn("gh_search", "GitHub: поиск по коду репозитория.", Triple("repo", "string", "owner/name"), Triple("query", "string", "что искать")),
         "generate_image" to fn("generate_image", "Сгенерировать картинку по текстовому описанию (Pollinations, бесплатно). Описание давай на английском, подробно: объект, стиль, свет, фон. Результат откроется у пользователя в новой вкладке; верни ссылку в ответе.", Triple("prompt", "string", "подробное описание на английском"), Triple("size", "string", "square | wide | tall"))
     )
 
     val fileTools = listOf("list_files", "search_files", "read_file")
 
+    /** Инструменты рабочей папки — доступны любому агенту с инструментами. */
+    val workspaceTools = listOf("ws_list", "ws_read", "ws_write", "ws_mkdir", "ws_delete", "note_append")
+
+    /** Инструменты GitHub — подключаются только когда есть токен в файле-секрете. */
+    val githubTools = listOf("gh_dir", "gh_read", "gh_write", "gh_actions", "gh_search")
+
     /** Массив tools для запроса: встроенные инструменты агента + файлы + генерация + MCP. null — инструментов нет. */
-    fun toolsFor(agent: AiAgent, mcp: List<McpClient.Tool>, hasDocs: Boolean, wantImage: Boolean): JSONArray? {
+    fun toolsFor(
+        agent: AiAgent,
+        mcp: List<McpClient.Tool>,
+        hasDocs: Boolean,
+        wantImage: Boolean,
+        extra: List<String> = emptyList()
+    ): JSONArray? {
         val names = LinkedHashSet(agent.tools)
         if (hasDocs) names.addAll(fileTools)
+        if (extra.isNotEmpty()) names.addAll(extra)
         if (wantImage || agent.hasTools) names.add("generate_image")
         if (names.isEmpty()) return null
         val arr = JSONArray()
@@ -122,6 +147,34 @@ object AiTools {
                     onMain<Unit>(host) { h, cb -> h.download(url); cb(Unit) }
                     "Загрузка поставлена в очередь: $url"
                 }
+                // ---- рабочая папка агента ----
+                "ws_list" -> com.winwasm64.torrent.AgentWorkspace.tree(ctx) + "\n(папка: " + com.winwasm64.torrent.AgentWorkspace.displayPath(ctx) + ")"
+                "ws_read" -> com.winwasm64.torrent.AgentWorkspace.readText(ctx, args.optString("path"))
+                    ?: "файла нет: " + args.optString("path")
+                "ws_write" -> {
+                    val path = args.optString("path").trim()
+                    if (path.isBlank()) return "нужен путь внутри workspace"
+                    val f = com.winwasm64.torrent.AgentWorkspace.write(ctx, path, args.optString("content"))
+                    if (f != null) "✓ записано: $path (${f.length()} Б)" else "не удалось записать $path"
+                }
+                "ws_mkdir" -> {
+                    val path = args.optString("path").trim()
+                    if (com.winwasm64.torrent.AgentWorkspace.mkdir(ctx, path) != null) "✓ папка создана: $path" else "не удалось создать $path"
+                }
+                "ws_delete" -> if (com.winwasm64.torrent.AgentWorkspace.delete(ctx, args.optString("path"))) "✓ удалено: " + args.optString("path") else "не удалось удалить " + args.optString("path")
+                "note_append" -> if (com.winwasm64.torrent.AgentWorkspace.appendNote(ctx, args.optString("text"))) "✓ заметка добавлена в NOTES.md" else "не удалось записать заметку"
+                // ---- GitHub (токен из файла-секрета) ----
+                "gh_dir" -> com.winwasm64.torrent.GitHubBridge.listDir(ctx, args.optString("repo").trim(), args.optString("path").trim())
+                "gh_read" -> com.winwasm64.torrent.GitHubBridge.readFile(ctx, args.optString("repo").trim(), args.optString("path").trim()).take(TOOL_RESULT_LIMIT)
+                "gh_write" -> com.winwasm64.torrent.GitHubBridge.writeFile(
+                    ctx,
+                    args.optString("repo").trim(),
+                    args.optString("path").trim(),
+                    args.optString("content"),
+                    args.optString("message")
+                )
+                "gh_actions" -> com.winwasm64.torrent.GitHubBridge.workflowStatus(ctx, args.optString("repo").trim())
+                "gh_search" -> com.winwasm64.torrent.GitHubBridge.searchCode(ctx, args.optString("repo").trim(), args.optString("query"))
                 else -> "Неизвестный инструмент $name"
             }
         } catch (e: Exception) { "Ошибка инструмента $name: ${e.message}" }

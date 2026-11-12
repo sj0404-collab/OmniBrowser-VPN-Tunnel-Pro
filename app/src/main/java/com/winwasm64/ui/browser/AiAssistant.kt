@@ -72,6 +72,18 @@ object AiAssistant {
 
     /** Сообщение чата. kind: text | tool (шаг агента). */
     class Msg(val role: String, text: String, val kind: String = "text", val provider: String = "") {
+        /** v4.72.0: размышления модели (reasoning) — показываем отдельной сворачиваемой строкой. */
+        val reasonState = mutableStateOf("")
+        var reasoning: String
+            get() = reasonState.value
+            set(v) { reasonState.value = v }
+
+        /** Строка под ответом: провайдер · модель · время · токены. */
+        val metaState = mutableStateOf("")
+        var meta: String
+            get() = metaState.value
+            set(v) { metaState.value = v }
+
         val textState = mutableStateOf(text)
         var text: String
             get() = textState.value
@@ -94,6 +106,8 @@ object AiAssistant {
     val chats = mutableStateListOf<Chat>()
     val current = mutableStateOf<Chat?>(null)
     val busy = mutableStateOf(false)
+    /** v4.72.0: что именно делает агент прямо сейчас — «думает», «🔧 search_web» и т. п. */
+    val liveStep = mutableStateOf("")
     val status = mutableStateOf("")
     val testResults = mutableStateOf<Map<String, String>>(emptyMap())
     private val cancel = AtomicBoolean(false)
@@ -464,9 +478,34 @@ object AiAssistant {
         // последнее сообщение пользователя заменяем на расширенное (фрагменты файлов + картинки)
         api.put(api.length() - 1, JSONObject().put("role", "user").put("content", userContent(chat, userText, withImages)))
         val mcpTools = if (mcpEnabled(app) && agent.hasTools) McpClient.tools.value else emptyList()
-        val tools = AiTools.toolsFor(agent, mcpTools, hasDocs = docsListing.isNotBlank(), wantImage = AiTools.wantsImage(userText))
+        // v4.72.0: рабочая папка агента всегда, GitHub — если есть токен в файле-секрете
+        val extraTools = ArrayList<String>()
+        if (agent.hasTools) extraTools.addAll(AiTools.workspaceTools)
+        if (com.winwasm64.torrent.GitHubBridge.configured(app)) extraTools.addAll(AiTools.githubTools)
+        val tools = AiTools.toolsFor(
+            agent, mcpTools,
+            hasDocs = docsListing.isNotBlank(),
+            wantImage = AiTools.wantsImage(userText),
+            extra = extraTools
+        )
         Thread({
             val main = android.os.Handler(android.os.Looper.getMainLooper())
+            // живой отсчёт: сколько уже работает агент и что делает
+            val startedAt = SystemClock.elapsedRealtime()
+            val timerStop = java.util.concurrent.atomic.AtomicBoolean(false)
+            val timerRef = java.util.concurrent.atomic.AtomicReference("думает")
+            Thread({
+                while (!timerStop.get()) {
+                    val sec = (SystemClock.elapsedRealtime() - startedAt) / 1000
+                    val step = liveStep.value.ifBlank { timerRef.get() }
+                    main.post { status.value = "⏳ $step · ${sec} с" }
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                }
+            }, "omni-ai-timer").also { it.isDaemon = true; it.start() }
+            fun stopTimer() {
+                timerStop.set(true)
+                liveStep.value = ""
+            }
             val sel = selected(app)
             // v4.69.0: если выбранный провайдер упёрся в лимит общего IP — не сдаёмся, пробуем остальных
             var order = if (sel == "auto") autoOrder(app)
@@ -490,14 +529,20 @@ object AiAssistant {
             for (p in order) {
                 if (cancel.get()) break
                 val model = visionModels[p.id] ?: model(app, p.id)
-                main.post { status.value = "${p.title} · $model…" }
+                timerRef.set("${p.title} · $model")
+                main.post { status.value = "⏳ ${p.title} · $model" }
                 val t0 = SystemClock.elapsedRealtime()
                 val r = runWithProvider(app, p, model, api, tools, reply, chat, host, mcpTools, main)
                 val ms = SystemClock.elapsedRealtime() - t0
                 if (r == null) {
                     ok = true
                     VpnLog.i(TAG, "${p.title} · $model · ${agent.title} · ответ ${reply.text.length} зн. за $ms мс")
-                    main.post { status.value = "${p.title} · $model · $ms мс" }
+                    // v4.72.0: видно, сколько это заняло и сколько примерно токенов ушло
+                    val tokens = (api.toString().length + reply.text.length) / 4
+                    main.post {
+                        reply.meta = "${p.title} · $model · ${ms} мс · ≈$tokens ток."
+                        status.value = "${p.title} · $model · $ms мс · ≈$tokens ток."
+                    }
                     break
                 }
                 if (cancel.get()) break
@@ -505,6 +550,7 @@ object AiAssistant {
                 VpnLog.w(TAG, "${p.title} · $model: $r ($ms мс)" + (if (order.size > 1) " — пробуем следующего" else ""))
                 main.post { reply.text = ""; status.value = "${p.title}: $r" }
             }
+            stopTimer()
             main.post {
                 if (!ok && !cancel.get()) {
                     reply.text = "⚠ Не удалось получить ответ.\n" + errors.joinToString("\n") { "• $it" } +
@@ -541,7 +587,12 @@ object AiAssistant {
                 var text = r.content
                 if (text.isBlank() && r.reasoning.isNotBlank()) text = r.reasoning.trim().lines().last { it.isNotBlank() }
                 if (text.isBlank()) return "пустой ответ"
-                main.post { reply.text = text }
+                main.post {
+                    reply.text = text
+                    // v4.72.0: показываем размышления модели отдельной строкой
+                    if (r.reasoning.isNotBlank()) reply.reasoning = r.reasoning.trim().take(4000)
+                    liveStep.value = "готовит ответ"
+                }
                 return null
             }
             steps++
@@ -557,7 +608,11 @@ object AiAssistant {
                 val argsRaw = fn.optString("arguments")
                 val args = try { if (argsRaw.isBlank()) JSONObject() else JSONObject(argsRaw) } catch (_: Exception) { JSONObject().put("input", argsRaw) }
                 val step = Msg("tool", "🔧 $name ${argsRaw.take(160)}", kind = "tool")
-                main.post { chat.messages.add(chat.messages.size - 1, step); status.value = "$name…" }
+                main.post {
+                    chat.messages.add(chat.messages.size - 1, step)
+                    liveStep.value = "🔧 $name"
+                    status.value = "🔧 $name…"
+                }
                 val t0 = SystemClock.elapsedRealtime()
                 val result = AiTools.execute(app, host, chat.id, name, args, mcpTools)
                 val ms = SystemClock.elapsedRealtime() - t0
@@ -567,6 +622,19 @@ object AiAssistant {
             }
             main.post { reply.text = "" }
         }
+    }
+
+    /** v4.72.0: «Повторить» — убрать последний ответ и спросить заново тем же вопросом. */
+    fun retry(ctx: Context, host: AiHost?) {
+        if (busy.value) return
+        val chat = current.value ?: return
+        val lastUser = chat.messages.lastOrNull { it.role == "user" } ?: return
+        val text = lastUser.text
+        while (chat.messages.isNotEmpty() && chat.messages.last() !== lastUser) {
+            chat.messages.removeAt(chat.messages.size - 1)
+        }
+        if (chat.messages.isNotEmpty()) chat.messages.removeAt(chat.messages.size - 1)
+        ask(ctx, text, null, host)
     }
 
     /** Проверка провайдера: короткий запрос без потока. */

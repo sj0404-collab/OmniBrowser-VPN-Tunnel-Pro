@@ -43,6 +43,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -97,6 +98,9 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     "chats" -> SheetTitle("Чаты", "${AiAssistant.chats.size} сохранено · хранятся на устройстве")
                     "providers" -> SheetTitle("Провайдеры и модели", "Каталог обновляется автоматически каждые 6 ч · ключи только на устройстве")
                     "agents" -> SheetTitle("Агенты и MCP", "Инструменты браузера + внешние MCP-серверы")
+                    // v4.72.0: рабочая папка агента и заметки по проекту
+                    "workspace" -> SheetTitle("Workspace агента", com.winwasm64.torrent.AgentWorkspace.displayPath(ctx))
+                    "notes" -> SheetTitle("Заметки агента", "NOTES.md в корне workspace — агент дописывает их сам")
                     else -> Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 4.dp, bottom = 4.dp)) {
                         Text((chat?.title ?: "ИИ-ассистент").ifBlank { "ИИ-ассистент" }, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Omni.Text, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(status.ifBlank { "${agent.emoji} ${agent.title} · " + (if (selected == "auto") "Авто: " + AiAssistant.autoOrder(ctx).joinToString(" → ") { it.title } else AiAssistant.providers.first { it.id == selected }.title + " · " + AiAssistant.model(ctx, selected)) },
@@ -109,12 +113,17 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                 OmniIconButton(OmniIcons.History, "Чаты", onClick = { view = "chats" })
                 OmniIconButton(OmniIcons.Apps, "Агенты и MCP", onClick = { view = "agents" })
                 OmniIconButton(OmniIcons.Tune, "Провайдеры", onClick = { view = "providers" })
+                // v4.72.0: файлы агента и заметки по проекту
+                OmniIconButton(OmniIcons.Folder, "Workspace агента", onClick = { view = "workspace" })
+                OmniIconButton(OmniIcons.Note, "Заметки агента", onClick = { view = "notes" })
             }
         }
         when (view) {
             "chats" -> { AiChatsList(onPick = { view = "chat" }); return@Column }
             "providers" -> { AiSettings(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
             "agents" -> { AiAgentsView(onOpenUrl = { onDismiss(); onOpenUrl(it) }); return@Column }
+            "workspace" -> { AiWorkspaceView(host); return@Column }
+            "notes" -> { AiNotesView(); return@Column }
         }
 
         // агент и провайдер
@@ -151,7 +160,14 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                     Text("Без ключей работают Pollinations и LLM7 (turbo). Бесплатный ключ LLM7/Groq/OpenRouter/Gemini открывает полные модели — см. ⚙.", color = Omni.TextFaint, fontSize = 12.sp)
                 }
             } else LazyColumn(state = lazy, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) {
-                itemsIndexed(list, key = { i, _ -> i }) { _, m -> AiBubble(m, isLast = m === list.lastOrNull(), busy = busy) }
+                itemsIndexed(list, key = { i, _ -> i }) { _, m ->
+                    AiBubble(
+                        m,
+                        isLast = m === list.lastOrNull(),
+                        busy = busy,
+                        onRetry = if (m === list.lastOrNull()) ({ AiAssistant.retry(ctx, host) }) else null
+                    )
+                }
             }
         }
 
@@ -251,9 +267,12 @@ private fun AiChip(text: String, selected: Boolean, dim: Boolean = false, enable
 }
 
 @Composable
-private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean) {
+private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean, onRetry: (() -> Unit)? = null) {
     val ctx = LocalContext.current
     val text by m.textState
+    val meta by m.metaState
+    val reasoning by m.reasonState
+    var showReason by remember(m) { mutableStateOf(false) }
     val user = m.role == "user"
     if (m.kind == "tool") {
         Text(text, color = Omni.TextFaint, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp), maxLines = 3, overflow = TextOverflow.Ellipsis)
@@ -276,11 +295,34 @@ private fun AiBubble(m: AiAssistant.Msg, isLast: Boolean, busy: Boolean) {
             } else SelectionContainer { Text(text, color = Omni.Text, fontSize = 14.sp, lineHeight = 20.sp) }
         }
         if (!user && text.isNotBlank() && !(isLast && busy)) {
-            TextButton(onClick = {
-                (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("ai", text))
-                Toast.makeText(ctx, "Скопировано", Toast.LENGTH_SHORT).show()
-            }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
-                Text("Копировать", color = Omni.TextFaint, fontSize = 11.sp)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = {
+                    (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("ai", text))
+                    Toast.makeText(ctx, "Скопировано", Toast.LENGTH_SHORT).show()
+                }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                    Text("Копировать", color = Omni.TextFaint, fontSize = 11.sp)
+                }
+                // v4.72.0: повтор последнего вопроса и размышления модели
+                if (onRetry != null) {
+                    TextButton(onClick = onRetry, enabled = !busy, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                        Text("Повторить", color = Omni.TextFaint, fontSize = 11.sp)
+                    }
+                }
+                if (reasoning.isNotBlank()) {
+                    TextButton(onClick = { showReason = !showReason }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                        Text(if (showReason) "🧠 скрыть размышления" else "🧠 размышления", color = Omni.TextFaint, fontSize = 11.sp)
+                    }
+                }
+                if (meta.isNotBlank()) {
+                    Text(meta, color = Omni.TextFaint, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            if (showReason && reasoning.isNotBlank()) {
+                Box(
+                    Modifier.fillMaxWidth(0.92f).clip(RoundedCornerShape(10.dp))
+                        .background(Omni.Surface).border(0.5.dp, Omni.Outline, RoundedCornerShape(10.dp))
+                        .padding(10.dp)
+                ) { Text(reasoning, color = Omni.TextDim, fontSize = 11.sp, lineHeight = 15.sp) }
             }
         }
     }
@@ -469,5 +511,174 @@ private fun AiField(value: String, hint: String, type: KeyboardType, onChange: (
             modifier = Modifier.fillMaxWidth()
         )
         if (value.isEmpty()) Text(hint, color = Omni.TextFaint, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/* ============================================================================
+ * v4.72.0: WORKSPACE АГЕНТА
+ * Папка Download/OmniBrowser/agent/workspace — всё, что создал агент. Здесь можно
+ * создать папку, импортировать файл с устройства, скачать папку в ZIP, удалить,
+ * выбрать «работать здесь» (агент видит этот путь и пишет туда напрямую).
+ * ========================================================================== */
+
+@Composable
+private fun AiWorkspaceView(host: AiHost) {
+    val ctx = LocalContext.current
+    val ws = com.winwasm64.torrent.AgentWorkspace
+    var current by remember { mutableStateOf(ws.current(ctx)) }
+    var refresh by remember { mutableIntStateOf(0) }
+    var newName by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("") }
+    var picking by remember { mutableStateOf(false) }
+    val entries = remember(current, refresh) { ws.list(ctx) }
+
+    fun path(): String = ws.displayPath(ctx)
+
+    Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("📂 " + path(), color = Omni.TextDim, fontSize = 11.sp, maxLines = 2, modifier = Modifier.weight(1f))
+            if (current.isNotBlank()) {
+                TextButton(onClick = {
+                    current = current.substringBeforeLast('/', "")
+                    ws.setCurrent(ctx, current)
+                    refresh++
+                }) { Text("⬆ Вверх", color = Omni.Accent, fontSize = 11.sp) }
+            }
+        }
+        if (status.isNotBlank()) Text(status, color = Omni.Warning, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp))
+
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            TextButton(onClick = { picking = !picking }) { Text("＋ Папка", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = {
+                // импорт файлов с устройства в текущую папку
+                host.pickFiles { uris ->
+                    Thread({
+                        val names = ArrayList<String>()
+                        for (u in uris) ws.import(ctx, u)?.let { names.add(it.name) }
+                        status = if (names.isEmpty()) "не удалось импортировать" else "добавлено: " + names.joinToString(", ")
+                        refresh++
+                    }, "ws-import").also { it.isDaemon = true; it.start() }
+                }
+            }) { Text("📥 Импорт", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = {
+                Thread({
+                    val zip = ws.zip(ctx)
+                    if (zip == null) {
+                        status = "не удалось собрать ZIP"
+                    } else {
+                        val dst = java.io.File(com.winwasm64.torrent.AppDownloads.folder(), zip.name)
+                        try {
+                            zip.copyTo(dst, overwrite = true)
+                            status = "ZIP: Загрузки/${com.winwasm64.torrent.AppDownloads.SUBDIR}/${zip.name} (${dst.length() / 1024} КБ)"
+                        } catch (t: Throwable) {
+                            status = "ZIP остался в кеше: ${zip.absolutePath}"
+                        }
+                    }
+                }, "ws-zip").also { it.isDaemon = true; it.start() }
+            }) { Text("⬇ ZIP", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = { refresh++ }) { Text("⟳", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = {
+                ws.setCurrent(ctx, "")
+                current = ""
+                refresh++
+                status = "агент теперь работает в корне workspace"
+            }) { Text("🏠 Корень", color = Omni.Accent, fontSize = 12.sp) }
+        }
+
+        if (picking) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f).heightIn(min = 38.dp).clip(RoundedCornerShape(10.dp)).background(Omni.SurfaceHigh).padding(horizontal = 10.dp, vertical = 8.dp)) {
+                    BasicTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = Omni.Text, fontSize = 13.sp),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Omni.Accent),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (newName.isEmpty()) Text("имя новой папки", color = Omni.TextFaint, fontSize = 13.sp)
+                }
+                TextButton(onClick = {
+                    val name = newName.trim()
+                    if (name.isNotBlank()) {
+                        val rel = if (current.isBlank()) name else "$current/$name"
+                        status = if (ws.mkdir(ctx, rel) != null) "папка создана: $rel" else "не удалось создать папку"
+                        newName = ""
+                        refresh++
+                    }
+                }) { Text("Создать", color = Omni.Accent, fontSize = 12.sp) }
+            }
+        }
+
+        if (entries.isEmpty()) {
+            Text(
+                "Папка пуста. Агент складывает сюда всё, что создаёт: файлы, папки, заметки. " +
+                    "Можно создать папку самому и сказать в чате «работай в папке …».",
+                color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+        }
+        for (e in entries) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)
+                    .clip(RoundedCornerShape(10.dp)).background(Omni.SurfaceHigh).padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f).clickable {
+                    if (e.isDir) {
+                        current = e.rel
+                        ws.setCurrent(ctx, e.rel)
+                        refresh++
+                    } else {
+                        Thread({
+                            val res = ws.readText(ctx, e.rel, 3000)
+                            status = if (res == null) "файл не читается" else res.take(600)
+                        }, "ws-read").also { it.isDaemon = true; it.start() }
+                    }
+                }) {
+                    Text((if (e.isDir) "📁 " else "📄 ") + e.name, color = Omni.Text, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(if (e.isDir) "папка" else "${e.size / 1024} КБ", color = Omni.TextFaint, fontSize = 10.sp)
+                }
+                OmniIconButton(OmniIcons.Delete, "Удалить", onClick = {
+                    if (ws.delete(ctx, e.rel)) { status = "удалено: ${e.name}"; refresh++ } else status = "не удалось удалить ${e.name}"
+                }, tint = Omni.Danger, size = 28.dp, iconSize = 15.dp)
+            }
+        }
+        Text(
+            "Агент видит этот workspace инструментами ws_list / ws_read / ws_write / ws_mkdir. " +
+                "Токен GitHub, если положить его в Download/OmniBrowser/secrets/github.token, даёт инструменты gh_read / gh_write / gh_actions.",
+            color = Omni.TextFaint, fontSize = 10.sp, modifier = Modifier.padding(16.dp)
+        )
+    }
+}
+
+@Composable
+private fun AiNotesView() {
+    val ctx = LocalContext.current
+    val ws = com.winwasm64.torrent.AgentWorkspace
+    var text by remember { mutableStateOf(ws.notes(ctx)) }
+    var saved by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState())) {
+        Text(
+            "Заметки по проекту: агент дописывает их сам (инструмент note_append) и читает перед работой.",
+            color = Omni.TextDim, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+        )
+        Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp).heightIn(min = 200.dp)
+            .clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh).padding(12.dp)) {
+            BasicTextField(
+                value = text,
+                onValueChange = { text = it; saved = false },
+                textStyle = androidx.compose.ui.text.TextStyle(color = Omni.Text, fontSize = 13.sp, lineHeight = 18.sp),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(Omni.Accent),
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (text.isEmpty()) Text("# Заметки проекта\n\n- ", color = Omni.TextFaint, fontSize = 13.sp)
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = {
+                saved = ws.saveNotes(ctx, text)
+                Toast.makeText(ctx, if (saved) "Заметки сохранены" else "Не удалось сохранить", Toast.LENGTH_SHORT).show()
+            }) { Text(if (saved) "✓ Сохранено" else "Сохранить", color = Omni.Accent, fontSize = 12.sp) }
+            TextButton(onClick = { text = ws.notes(ctx) }) { Text("Отменить", color = Omni.TextFaint, fontSize = 12.sp) }
+        }
     }
 }
