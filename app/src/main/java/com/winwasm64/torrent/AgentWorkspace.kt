@@ -243,7 +243,10 @@ object GitHubBridge {
         ctx.getSharedPreferences("omni_agent_ws", Context.MODE_PRIVATE).edit()
             .putString("github_token", token.trim()).apply()
         try {
-            val dir = File(File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "${AppDownloads.SUBDIR}/secrets"))
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "${AppDownloads.SUBDIR}/secrets"
+            )
             dir.mkdirs()
             File(dir, "github.token").writeText(token.trim())
         } catch (_: Throwable) {

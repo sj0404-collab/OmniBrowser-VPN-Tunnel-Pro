@@ -171,6 +171,65 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
             }
         }
 
+        // ---------- v4.73.0: карточки вариантов ----------
+        val vars by AiAssistant.variants
+        val rec by AiAssistant.variantRec
+        val recIdx by AiAssistant.variantRecIndex
+        val vBusy by AiAssistant.variantBusy
+        if (vBusy || vars.isNotEmpty()) {
+            val question = list.lastOrNull { it.role == "user" }?.text.orEmpty()
+            Surface(
+                color = Omni.SurfaceHigh,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (vBusy) "🧩 собираю варианты…" else "🧩 Варианты ответа (${vars.size})",
+                            color = Omni.Text, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text("✕ Не хочу", color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.clickable { AiAssistant.clearVariants() })
+                    }
+                    if (rec.isNotBlank()) {
+                        Text("⭐ Рекомендация агента: $rec", color = Omni.Accent, fontSize = 11.sp)
+                    }
+                    var expanded by remember(vars.size) { mutableStateOf(-1) }
+                    vars.forEachIndexed { i, v ->
+                        Row(Modifier.fillMaxWidth().clickable { expanded = if (expanded == i) -1 else i }, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "${i + 1}. ${v.provider} · ${v.model}" + (if (i == recIdx) "  ⭐" else ""),
+                                    color = if (i == recIdx) Omni.Accent else Omni.Text, fontSize = 11.sp,
+                                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold
+                                )
+                                Text(
+                                    v.text, color = Omni.TextDim, fontSize = 11.sp,
+                                    maxLines = if (expanded == i) 40 else 3, overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            TextButton(onClick = {
+                                AiAssistant.adoptVariant(ctx, host, question, i)
+                            }) { Text("Взять", color = Omni.Accent, fontSize = 11.sp) }
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (recIdx >= 0 && vars.isNotEmpty()) {
+                            TextButton(onClick = { AiAssistant.adoptVariant(ctx, host, question, recIdx) }) {
+                                Text("⭐ Взять рекомендованный", color = Omni.Accent, fontSize = 11.sp)
+                            }
+                        }
+                        TextButton(onClick = {
+                            if (question.isNotBlank()) host.currentPage { p ->
+                                AiAssistant.askVariants(ctx, question, AiAssistant.contextOf(p), host)
+                            }
+                        }) { Text("⟳ Ещё варианты", color = Omni.TextDim, fontSize = 11.sp) }
+                    }
+                }
+            }
+        }
+
         // быстрые действия
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             AiChip("Кратко о странице", false, enabled = !busy) { send("Кратко перескажи, о чём эта страница: 3–6 пунктов с главным.", true) }
@@ -178,6 +237,12 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
             AiChip("Объясни выделенное", false, enabled = !busy) { send("Объясни простыми словами выделенный фрагмент (если выделения нет — ключевую мысль страницы). Если это термин или код — поясни, что он делает.", true) }
             AiChip("Главные факты", false, enabled = !busy) { send("Выпиши из страницы ключевые факты, цифры, даты и имена списком. Только то, что есть в тексте.", true) }
             if (agent.hasTools) AiChip("Найди похожее", false, enabled = !busy) { send("Найди в интернете 3–5 источников по теме этой страницы и кратко сравни их с ней.", true) }
+            // v4.73.0: несколько вариантов ответа от разных провайдеров + рекомендация агента
+            AiChip("🧩 Варианты", false, enabled = !busy && !AiAssistant.variantBusy.value) {
+                val q = list.lastOrNull { it.role == "user" }?.text.orEmpty()
+                if (q.isBlank()) Toast.makeText(ctx, "Сначала напишите задачу", Toast.LENGTH_SHORT).show()
+                else host.currentPage { p -> AiAssistant.askVariants(ctx, q, AiAssistant.contextOf(p), host) }
+            }
         }
 
         // файлы чата (v4.8.0)

@@ -624,6 +624,123 @@ object AiAssistant {
         }
     }
 
+    /* ===================== v4.73.0: несколько вариантов ответа ===================== *
+     * Пользователь: «добавь выбор из нескольких вариантов агента, вдруг вариант не понравится,
+     * а вдруг я хочу по рекомендации агента, либо не хочу».
+     * Варианты собираются от РАЗНЫХ провайдеров (то есть фактически от разных «агентов»),
+     * затем агент сам говорит, какой лучше. Любой можно взять, а можно отказаться целиком.
+     */
+
+    class Variant(val title: String, val text: String, val provider: String, val model: String)
+
+    val variants = mutableStateOf<List<Variant>>(emptyList())
+    val variantRec = mutableStateOf("")
+    val variantRecIndex = mutableStateOf(-1)
+    val variantBusy = mutableStateOf(false)
+
+    fun clearVariants() {
+        variants.value = emptyList()
+        variantRec.value = ""
+        variantRecIndex.value = -1
+        variantBusy.value = false
+    }
+
+    /** Собрать 2–4 варианта ответа от разных провайдеров + рекомендацию. */
+    fun askVariants(ctx: Context, question: String, pageContext: String?, host: AiHost?, count: Int = 3) {
+        if (variantBusy.value) return
+        val app = ctx.applicationContext
+        val q = question.trim()
+        if (q.isBlank()) return
+        variantBusy.value = true
+        variants.value = emptyList()
+        variantRec.value = ""
+        variantRecIndex.value = -1
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        Thread({
+            val order = autoOrder(app)
+            val use = order.take(count.coerceIn(2, 4)).ifEmpty { order }
+            val page = pageContext?.take(3000)
+            val msgs = JSONArray().put(
+                JSONObject().put("role", "system").put(
+                    "content",
+                    "Ты предлагаешь один законченный вариант решения задачи. Ответь по существу, до 140 слов, " +
+                        "структурно и без вступлений."
+                )
+            ).put(
+                JSONObject().put("role", "user").put(
+                    "content", buildString {
+                        append("Задача: ").append(q)
+                        if (!page.isNullOrBlank()) append("\n\nКонтекст страницы:\n").append(page)
+                    }
+                )
+            )
+            val list = ArrayList<Variant>()
+            for ((i, p) in use.withIndex()) {
+                if (cancel.get()) break
+                val model = model(app, p.id)
+                main.post { status.value = "🧩 вариант ${i + 1}/${use.size} · ${p.title}" }
+                var err: String? = null
+                val r = complete(app, p, model, msgs, null, stream = false, maxTokens = 0, onDelta = {}, err = { err = it })
+                val text = r?.let { it.content.ifBlank { it.reasoning } }?.trim().orEmpty()
+                if (text.isNotBlank()) list.add(Variant("Вариант ${list.size + 1}", text, p.title, model))
+                else VpnLog.w(TAG, "вариант от ${p.title}: ${err ?: "пусто"}")
+            }
+            // если провайдер один — просим у него же второй и третий подход
+            if (list.size == 1 && use.isNotEmpty()) {
+                val p = use.first()
+                val model = model(app, p.id)
+                for (k in 2..2) {
+                    val r = complete(
+                        app, p, model,
+                        JSONArray().put(
+                            JSONObject().put("role", "system").put(
+                                "content", "Предложи ДРУГОЙ подход, непохожий на уже показанный. До 140 слов."
+                            )
+                        ).put(JSONObject().put("role", "user").put("content", q))
+                            .put(JSONObject().put("role", "assistant").put("content", list[0].text)),
+                        null, stream = false, maxTokens = 0, onDelta = {}, err = {}
+                    )
+                    val text = r?.let { it.content.ifBlank { it.reasoning } }?.trim().orEmpty()
+                    if (text.isNotBlank()) list.add(Variant("Вариант ${list.size + 1}", text, p.title, model))
+                    break
+                }
+            }
+            main.post { variants.value = list }
+            // рекомендация: спрашиваем ту же модель, что отвечала первой
+            if (list.size >= 2) {
+                val p = use.first()
+                val model = model(app, p.id)
+                val body = StringBuilder("Вопрос пользователя: $q\n\n")
+                list.forEachIndexed { i, v -> body.append(i + 1).append(") ").append(v.text.take(600)).append("\n\n") }
+                body.append("Выбери лучший вариант. Ответ строго двумя частями: первая строка — только номер, вторая — одна фраза почему.")
+                var err: String? = null
+                val r = complete(
+                    app, p, model,
+                    JSONArray().put(JSONObject().put("role", "user").put("content", body.toString())),
+                    null, stream = false, maxTokens = 200, onDelta = {}, err = { err = it }
+                )
+                val answer = r?.let { it.content.ifBlank { it.reasoning } }?.trim().orEmpty()
+                if (answer.isNotBlank()) {
+                    val num = Regex("(\\d+)").find(answer)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    main.post {
+                        variantRec.value = answer.lines().filter { it.isNotBlank() }.joinToString(" · ").take(400)
+                        variantRecIndex.value = (num - 1).takeIf { it in list.indices } ?: 0
+                    }
+                }
+            }
+            main.post { variantBusy.value = false; status.value = "" }
+        }, "omni-ai-variants").also { it.isDaemon = true; it.start() }
+    }
+
+    /** Взять вариант: агент развивает именно его и выполняет задачу. */
+    fun adoptVariant(ctx: Context, host: AiHost?, question: String, index: Int) {
+        val v = variants.value.getOrNull(index) ?: return
+        val q = question.trim().ifBlank { "продолжай" }
+        clearVariants()
+        ask(ctx, "Беру вариант ${index + 1} (${v.provider}).\n\n" + v.text.take(1500) +
+            "\n\nРазвей этот вариант и выполни задачу: $q", null, host)
+    }
+
     /** v4.72.0: «Повторить» — убрать последний ответ и спросить заново тем же вопросом. */
     fun retry(ctx: Context, host: AiHost?) {
         if (busy.value) return
