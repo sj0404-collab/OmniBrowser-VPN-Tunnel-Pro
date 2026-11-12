@@ -6981,6 +6981,5 @@ private fun VideoSearchSection(modifier: Modifier, initialQuery: String) {
         }
     }
 }
-}
 
 private fun torrentLastQueryFallback(): String = com.winwasm64.torrent.SearchCache.videoQuery.trim()
