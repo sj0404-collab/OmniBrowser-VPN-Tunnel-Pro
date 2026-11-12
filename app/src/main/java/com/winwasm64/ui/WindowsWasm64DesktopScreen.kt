@@ -3397,7 +3397,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 VideoHomeSection(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     initialQuery = com.winwasm64.torrent.SearchCache.videoQuery
-                        .ifBlank { torrentEngine.cachedSearchQuery }
+                        .ifBlank { torrentEngine.cachedSearchQuery },
+                    onOpenUrl = { u -> navigateTab(activeTab, u) }
                 )
             }
 
@@ -6666,12 +6667,9 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                         runGallery(photoTitle, "Фото", 0, false)
                                     },
                                     "🎬 Видео" to {
+                                        // v4.76.0: старый экран поиска удалён — уводим на вкладку «Видео»
                                         com.winwasm64.torrent.SearchCache.videoQuery = photoTitle
-                                        context.startActivity(
-                                            Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
-                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                .putExtra("query", photoTitle)
-                                        )
+                                        currentSection = 6
                                     }
                                 ).forEach { (label, action) ->
                                     Button(
@@ -6715,7 +6713,11 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
  * Здесь НЕТ ИИ: агент вызывается только из ИИ-ассистента, когда пользователь сам пишет запрос.
  */
 @Composable
-private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
+private fun VideoHomeSection(
+    modifier: Modifier,
+    initialQuery: String,
+    onOpenUrl: (String) -> Unit = {}
+) {
     val context = LocalContext.current
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -6724,27 +6726,52 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
     var source by remember { mutableStateOf(com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) }
     var category by remember { mutableStateOf("Все") }
     var sort by remember { mutableStateOf(0) }
+    var durFilter by remember { mutableStateOf(0) }          // 0 любая · 1 до 4 мин · 2 4–20 · 3 от 20
+    var nameFilter by remember { mutableStateOf("") }         // фильтр по названию/каналу, как в «Файлах»
+    var showNameFilter by remember { mutableStateOf(false) }
     var items by remember { mutableStateOf<List<com.winwasm64.torrent.VideoFeed.Clip>>(emptyList()) }
     var cont by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
-    // v4.75.0: видно, сколько уже идёт поиск, и можно прервать
     var elapsed by remember { mutableIntStateOf(0) }
-    // VK и RuTube разбираются настоящим встроенным браузером (как в обычном клиенте)
     var scrapeUrl by remember { mutableStateOf<String?>(null) }
     var scrapeSource by remember { mutableStateOf("") }
+    var scrapeRound by remember { mutableIntStateOf(0) }
+    var playing by remember { mutableStateOf("") }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
 
+    /** v4.76.0: карточка открывает ВСТРОЕННЫЙ плеер, а не сайт YouTube. */
     fun openClip(c: com.winwasm64.torrent.VideoFeed.Clip) {
-        runCatching {
-            context.startActivity(
-                Intent(context, com.winwasm64.torrent.VideoSearchActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    .putExtra("query", c.url)
-                    .putExtra("source", c.source)
-            )
+        if (c.kind != com.winwasm64.torrent.VideoFeed.CLIP_VIDEO) {
+            // плейлист/канал — открываем внутри приложения на отдельной вкладке браузера
+            onOpenUrl(c.url)
+            return
+        }
+        playing = "Открываю «${c.title.take(40)}»…"
+        scope.launch {
+            val play = withContext(Dispatchers.IO) {
+                runCatching { com.winwasm64.torrent.VideoPlay.resolve(c.url) }.getOrNull()
+            }
+            playing = ""
+            if (play == null) {
+                val why = com.winwasm64.torrent.VideoPlay.lastError.ifBlank { "не удалось получить поток" }
+                note = "Плеер: $why — открываю страницу внутри приложения"
+                onOpenUrl(c.url)
+                return@launch
+            }
+            if (com.winwasm64.torrent.VideoPlay.lastError.isNotBlank()) note = com.winwasm64.torrent.VideoPlay.lastError
+            runCatching {
+                context.startActivity(
+                    Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .putExtra("url", play.url)
+                        .putExtra("title", c.title)
+                        .putExtra("thumbnail", c.thumb)
+                        .putExtra("referer", play.referer)
+                )
+            }.onFailure { note = "Не смог открыть плеер: " + (it.message ?: "") }
         }
     }
 
@@ -6756,15 +6783,16 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         }
         submitted = q
         com.winwasm64.torrent.SearchCache.videoQuery = q
+        items = emptyList()
+        scrapeRound = 0
         tick++
     }
 
-    // первый экран и любая повторная отправка / смена площадки
+    /** Поиск. VK/RuTube — встроенным браузером (там без входа иначе никак), YouTube — innertube. */
     LaunchedEffect(tick, source) {
         if (submitted.isBlank()) return@LaunchedEffect
         scrapeUrl = null
         elapsed = 0
-        // 1) уже искали — отдаём из кэша мгновенно
         com.winwasm64.torrent.VideoFeed.cached(source, submitted)?.let {
             items = it.clips
             cont = it.continuation
@@ -6774,13 +6802,12 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         }
         loading = true
         note = ""
-        // 2) VK без входа отдаёт выдачу только настоящему браузеру
-        if (source == com.winwasm64.torrent.VideoFeed.SRC_VK) {
+        if (source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) {
             scrapeSource = source
+            scrapeRound = 0
             scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
             return@LaunchedEffect
         }
-        // 3) RuTube: сначала быстрый API, если он пуст — тоже встроенный браузер
         val page = withContext(Dispatchers.IO) {
             runCatching { com.winwasm64.torrent.VideoFeed.search(source, submitted, sort, null) }
                 .getOrElse { com.winwasm64.torrent.VideoFeed.Page(note = "Не удалось: " + humanError(it)) }
@@ -6788,16 +6815,16 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         items = page.clips
         cont = page.continuation
         note = page.note.orEmpty()
-        if (source == com.winwasm64.torrent.VideoFeed.SRC_RUTUBE && page.clips.isEmpty()) {
-            scrapeSource = source
-            scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
-            return@LaunchedEffect
-        }
         loading = false
-        listState.scrollToItem(0)
+        if (page.clips.isEmpty()) {
+            scrapeSource = source
+            scrapeRound = 0
+            scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
+        } else {
+            listState.scrollToItem(0)
+        }
     }
 
-    // секундомер поиска
     LaunchedEffect(loading) {
         if (!loading) return@LaunchedEffect
         elapsed = 0
@@ -6807,45 +6834,63 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         }
     }
 
-    // скрытый браузер: разбирает выдачу VK/RuTube, результат — карточки
+    // встроенный браузер: терпеливо ждёт отрисовку, прокручивает выдачу и копит до 100 карточек
     val currentScrape = scrapeUrl
     if (currentScrape != null) {
-        HtmlScraper(
+        WebScraper(
             url = currentScrape,
-            js = com.winwasm64.torrent.VideoFeed.scrapeJs(scrapeSource),
-            timeoutMs = 25_000
-        ) { raw ->
-            val clips = com.winwasm64.torrent.VideoFeed.parseScraped(scrapeSource, raw)
-            if (clips.isNotEmpty()) {
-                items = clips
-                cont = null
-                note = ""
-            } else if (note.isBlank()) {
-                note = "Не удалось разобрать выдачу $scrapeSource — включите VPN (щит) и нажмите ⟳"
+            source = scrapeSource,
+            query = submitted,
+            round = scrapeRound,
+            onProgress = { list ->
+                if (list.size > items.size) {
+                    items = list
+                    loading = false
+                }
+            },
+            onStatus = { msg -> note = msg },
+            onFinished = { list ->
+                if (list.isNotEmpty()) {
+                    items = list
+                    cont = null
+                    note = if (list.size >= 100) "Показано ${list.size} — нажмите «Ещё», чтобы добрать" else ""
+                } else if (note.isBlank()) {
+                    note = "На $scrapeSource ничего не нашлось — проверьте VPN (щит) или уточните запрос"
+                }
+                loading = false
+                scrapeUrl = null
             }
-            loading = false
-            scrapeUrl = null
-        }
+        )
     }
 
-    val filtered = remember(items, category, sort) {
-        val base = when (category) {
-            "🎬 Видео" -> items.filter { it.kind == "video" && !it.live }
-            "🎞 Плейлисты" -> items.filter { it.kind == "playlist" }
-            "📺 Каналы" -> items.filter { it.kind == "channel" }
+    val filtered = remember(items, category, sort, durFilter, nameFilter) {
+        var base = when (category) {
+            "🎬 Видео" -> items.filter { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_VIDEO && !it.live }
+            "🎞 Плейлисты" -> items.filter { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_PLAYLIST }
+            "📺 Каналы" -> items.filter { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_CHANNEL }
             "🔴 Трансляции" -> items.filter { it.live }
             else -> items
         }
+        base = when (durFilter) {
+            1 -> base.filter { it.lengthSec in 1..240 }
+            2 -> base.filter { it.lengthSec in 241..1200 }
+            3 -> base.filter { it.lengthSec > 1200 }
+            else -> base
+        }
+        val f = nameFilter.trim().lowercase()
+        if (f.isNotBlank()) base = base.filter { it.title.lowercase().contains(f) || it.author.lowercase().contains(f) }
         when (sort) {
-            1 -> base.sortedBy { it.days }
-            2 -> base.sortedByDescending { it.views }
-            3 -> base.sortedByDescending { it.days }
+            1 -> base.sortedByDescending { it.days }                 // новые
+            2 -> base.sortedByDescending { it.views }                // популярные
+            3 -> base.sortedBy { it.days }                           // старые
+            4 -> base.sortedWith(compareBy({ it.lengthSec == 0 }, { it.lengthSec }))          // длительность ↑
+            5 -> base.sortedWith(compareByDescending<com.winwasm64.torrent.VideoFeed.Clip> { it.lengthSec })  // длительность ↓
             else -> base
         }
     }
 
     Column(modifier = modifier.fillMaxSize()) {
-        // ---------- верхняя строка: логотип и быстрые действия ----------
+        // ---------- верхняя строка ----------
         Row(
             modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 6.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -6899,7 +6944,7 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
             ) { Text("Найти", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1) }
         }
 
-        // ---------- площадка (обязательна) ----------
+        // ---------- площадка ----------
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
                 .padding(horizontal = 10.dp),
@@ -6938,9 +6983,9 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
         ) {
             listOf(
                 "Все" to items.size,
-                "🎬 Видео" to items.count { it.kind == "video" && !it.live },
-                "🎞 Плейлисты" to items.count { it.kind == "playlist" },
-                "📺 Каналы" to items.count { it.kind == "channel" },
+                "🎬 Видео" to items.count { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_VIDEO && !it.live },
+                "🎞 Плейлисты" to items.count { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_PLAYLIST },
+                "📺 Каналы" to items.count { it.kind == com.winwasm64.torrent.VideoFeed.CLIP_CHANNEL },
                 "🔴 Трансляции" to items.count { it.live }
             ).forEach { (name, count) ->
                 val active = category == name
@@ -6958,13 +7003,15 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
             }
         }
 
-        // ---------- сортировка ----------
+        // ---------- сортировка (включая длительность от меньшей к большей) ----------
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
                 .padding(horizontal = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            listOf("По релевантности", "Новые", "Популярные", "Старые").forEachIndexed { idx, label ->
+            listOf(
+                "По релевантности", "Новые", "Популярные", "Старые", "Длительность ↑", "Длительность ↓"
+            ).forEachIndexed { idx, label ->
                 val active = sort == idx
                 Surface(
                     color = if (active) Omni.SurfaceHighest else Color.Transparent,
@@ -6979,8 +7026,61 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
             }
         }
 
+        // ---------- фильтр по длительности и по названию ----------
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            listOf("Любая длина", "до 4 мин", "4–20 мин", "от 20 мин").forEachIndexed { idx, label ->
+                val active = durFilter == idx
+                Surface(
+                    color = if (active) Omni.AccentContainer else Omni.SurfaceHighest,
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.clickable { durFilter = idx }
+                ) {
+                    Text(
+                        label, color = if (active) Color.White else Omni.TextDim, fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                    )
+                }
+            }
+            Surface(
+                color = if (showNameFilter) Omni.AccentContainer else Omni.SurfaceHighest,
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.clickable { showNameFilter = !showNameFilter }
+            ) {
+                Text(
+                    if (nameFilter.isBlank()) "🔎 фильтр" else "🔎 $nameFilter",
+                    color = if (showNameFilter) Color.White else Omni.TextDim, fontSize = 11.sp,
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp), maxLines = 1
+                )
+            }
+        }
+        if (showNameFilter) {
+            Box(modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp)) {
+                CompactDarkTextField(
+                    value = nameFilter,
+                    onValueChange = { nameFilter = it },
+                    placeholder = "Оставить только: слово в названии или канале",
+                    modifier = Modifier.fillMaxWidth(),
+                    onGo = { showNameFilter = false }
+                )
+            }
+        }
+
         if (note.isNotBlank()) {
-            Text(note, color = Omni.Warning, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp), maxLines = 3)
+            Text(
+                note, color = Omni.Warning, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp), maxLines = 3
+            )
+        }
+        if (playing.isNotBlank()) {
+            Text(
+                playing, color = Omni.Accent, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp), maxLines = 2
+            )
         }
         if (loading && items.isEmpty()) {
             Row(
@@ -6989,7 +7089,8 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
             ) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Omni.Accent, strokeWidth = 2.dp)
                 Text(
-                    "  Ищу на $source · ${elapsed} с" + (if (source == com.winwasm64.torrent.VideoFeed.SRC_VK) " · через встроенный браузер" else ""),
+                    "  Ищу на $source · ${elapsed} с" +
+                        (if (source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) " · встроенный браузер" else ""),
                     color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.weight(1f)
                 )
                 Text(
@@ -7014,20 +7115,33 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
                 })
             }
             item {
-                if (cont != null) {
+                val total = items.size
+                if (total in 1 until 100 && (cont != null || source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE)) {
                     Button(
                         onClick = {
                             if (loading) return@Button
-                            loading = true
-                            scope.launch {
-                                val page = withContext(Dispatchers.IO) {
-                                    runCatching { com.winwasm64.torrent.VideoFeed.search(source, submitted, sort, cont) }
-                                        .getOrElse { com.winwasm64.torrent.VideoFeed.Page(note = "Не удалось: " + humanError(it)) }
+                            if (source == com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) {
+                                loading = true
+                                scope.launch {
+                                    val page = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            com.winwasm64.torrent.VideoFeed.search(source, submitted, sort, cont)
+                                        }.getOrElse {
+                                            com.winwasm64.torrent.VideoFeed.Page(note = "Не удалось: " + humanError(it))
+                                        }
+                                    }
+                                    items = (items + page.clips).distinctBy { it.id }
+                                    cont = page.continuation
+                                    if (page.note != null) note = page.note.orEmpty()
+                                    loading = false
                                 }
-                                items = items + page.clips
-                                cont = page.continuation
-                                if (page.note != null) note = page.note.orEmpty()
-                                loading = false
+                            } else {
+                                // VK/RuTube: новый проход встроенного браузера — прокрутка глубже
+                                loading = true
+                                note = "Догружаю ещё…"
+                                scrapeSource = source
+                                scrapeRound++
+                                scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
                             }
                         },
                         modifier = Modifier.fillMaxWidth().height(42.dp),
@@ -7035,13 +7149,14 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
                         contentPadding = PaddingValues(vertical = 0.dp)
                     ) {
                         Text(
-                            if (loading) "Загружаю…" else "Показать ещё",
+                            if (loading) "Загружаю…" else "⬇ Показать ещё  ·  $total/100",
                             fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1
                         )
                     }
                 } else if (filtered.isNotEmpty()) {
                     Text(
-                        "Это всё, что нашлось · ${filtered.size}",
+                        if (total >= 100) "Показано 100 из 100 · уточните запрос, чтобы увидеть другое"
+                        else "Это всё, что нашлось · ${filtered.size}",
                         color = Omni.TextFaint, fontSize = 11.sp,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)
                     )
@@ -7052,45 +7167,101 @@ private fun VideoHomeSection(modifier: Modifier, initialQuery: String) {
 }
 
 /**
- * v4.75.0: невидимый WebView. Нужен там, где сайт отдаёт выдачу только настоящему браузеру
- * (VK Видео без входа, RuTube с гео-фильтром): грузим страницу, ждём отрисовки и снимаем карточки JS.
+ * v4.76.0: встроенный браузер для площадок, которые не отдают выдачу простым запросом (VK, RuTube).
+ * Терпеливо ждёт отрисовку (до 25 с), прокручивает выдачу и копит карточки до 100 штук,
+ * отдавая результат по мере поступления — как в обычном клиенте.
  */
 @Composable
-private fun HtmlScraper(url: String, js: String, timeoutMs: Long = 25_000, onResult: (String?) -> Unit) {
+private fun WebScraper(
+    url: String,
+    source: String,
+    query: String,
+    round: Int,
+    onProgress: (List<com.winwasm64.torrent.VideoFeed.Clip>) -> Unit,
+    onStatus: (String) -> Unit,
+    onFinished: (List<com.winwasm64.torrent.VideoFeed.Clip>) -> Unit
+) {
     val context = LocalContext.current
-    var fired by remember(url) { mutableStateOf(false) }
+    var web by remember(url, round) { mutableStateOf<android.webkit.WebView?>(null) }
+    val collected = remember(url, round) { LinkedHashMap<String, com.winwasm64.torrent.VideoFeed.Clip>() }
+
     AndroidView(
         modifier = Modifier.size(1.dp),
-        factory = {
-            WebView(context).apply {
+        factory = { ctx ->
+            android.webkit.WebView(ctx).apply {
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 settings.userAgentString =
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
-                webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, u: String?) {
-                        view?.postDelayed({
-                            try {
-                                view.evaluateJavascript(js) { r -> if (!fired) { fired = true; onResult(r) } }
-                            } catch (_: Throwable) {
-                                if (!fired) { fired = true; onResult(null) }
-                            }
-                        }, 3000)
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageFinished(view: android.webkit.WebView?, u: String?) {
+                        view?.evaluateJavascript("document.body.style.zoom='1';", null)
                     }
                 }
                 loadUrl(url)
+                web = this
             }
         }
     )
-    LaunchedEffect(url) {
-        delay(timeoutMs)
-        if (!fired) {
-            fired = true
-            onResult(null)
+
+    LaunchedEffect(url, round) {
+        val js = com.winwasm64.torrent.VideoFeed.scrapeJs(source)
+        var pass = 0
+        var altUsed = false
+        val maxPass = 10 + round * 6
+        while (pass < maxPass) {
+            delay(1300)
+            val w = web ?: continue
+            // v4.76.0: если мобильная выдача VK пуста — пробуем полный сайт (в нём тот же поиск)
+            if (pass == 5 && collected.isEmpty() && !altUsed) {
+                altUsed = true
+                val alt = when {
+                    url.contains("m.vk.com") -> url.replace("m.vk.com", "vk.com")
+                    url.contains("rutube.ru/search") -> url.replace("rutube.ru/search/?query=", "rutube.ru/search/?query=")
+                    else -> url
+                }
+                if (alt != url) {
+                    onStatus("Открываю полную версию $source…")
+                    w.loadUrl(alt)
+                    delay(2500)
+                }
+            }
+            val raw = evalJs(w, js)
+            if (!raw.isNullOrBlank() && raw != "\"[]\"") {
+                val list = runCatching {
+                    com.winwasm64.torrent.VideoFeed.parseScraped(source, raw, query)
+                }.getOrDefault(emptyList())
+                var added = false
+                for (c in list) if (!collected.containsKey(c.url)) { collected[c.url] = c; added = true }
+                if (added) onProgress(collected.values.toList())
+                if (collected.size >= 100) break
+            }
+            // прокручиваем — выдача VK/RuTube доезжает по мере скролла
+            w.evaluateJavascript("window.scrollBy(0, Math.round(window.innerHeight*0.95));", null)
+            pass++
+            if (pass == 7 && collected.isEmpty()) {
+                val txt = evalJs(w, "(document.body?document.body.innerText:'').slice(0,300)") ?: ""
+                onStatus(
+                    if (txt.contains("Войти") || txt.contains("Вход")) "$source просит вход — включите VPN (щит) и повторите"
+                    else "$source: пока ничего не отдал, продолжаю прокрутку…"
+                )
+            }
         }
+        onFinished(collected.values.toList())
     }
 }
+
+/** evaluateJavascript как suspend-вызов (должен вызываться из главного потока). */
+private suspend fun evalJs(web: android.webkit.WebView, js: String): String? =
+    suspendCancellableCoroutine { c ->
+        try {
+            web.evaluateJavascript(js) { r -> if (c.isActive) c.resume(r) }
+        } catch (_: Throwable) {
+            if (c.isActive) c.resume(null)
+        }
+    }
 
 /** Карточка видео: обложка 16:9, длительность, автор, просмотры, дата. */
 @Composable
@@ -7180,9 +7351,19 @@ private fun VideoCard(
                     clip.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                     maxLines = 2, overflow = TextOverflow.Ellipsis
                 )
-                val meta = listOf(clip.author, clip.viewsText, clip.publishedText)
-                    .filter { it.isNotBlank() }
-                    .joinToString(" · ")
+                // v4.76.0: видно площадку, канал, просмотры и дату — как в эталонном клиенте
+                val platformLabel = when (clip.source) {
+                    com.winwasm64.torrent.VideoFeed.SRC_VK -> "VK Видео"
+                    com.winwasm64.torrent.VideoFeed.SRC_RUTUBE -> "RuTube"
+                    else -> "YouTube"
+                }
+                val meta = listOf(
+                    clip.author.ifBlank { platformLabel },
+                    platformLabel,
+                    clip.viewsText,
+                    clip.publishedText,
+                    if (clip.lengthSec > 0) clip.lengthText else ""
+                ).filter { it.isNotBlank() }.distinct().joinToString(" · ")
                 if (meta.isNotBlank()) {
                     Text(meta, color = Omni.TextDim, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }

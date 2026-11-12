@@ -38,8 +38,14 @@ object VideoFeed {
         val source: String = SRC_YOUTUBE,
         /** числовые поля — для сортировки «новые / популярные / старые» */
         val views: Long = 0L,
-        val days: Int = 0
+        val days: Int = 0,
+        /** длительность в секундах — для фильтров и сортировки по длительности */
+        val lengthSec: Int = 0
     )
+
+    const val CLIP_VIDEO = "video"
+    const val CLIP_PLAYLIST = "playlist"
+    const val CLIP_CHANNEL = "channel"
 
     data class Page(
         val clips: List<Clip> = emptyList(),
@@ -76,21 +82,49 @@ object VideoFeed {
         else -> "https://m.youtube.com/results?search_query=" + enc(query)
     }
 
-    /** JS, который собирает карточки прямо со страницы (как это делает обычный клиент). */
-    fun scrapeJs(source: String): String = when (source) {
-        SRC_VK -> """(function(){try{var out=[],seen={};var as=document.querySelectorAll('a[href*="video"]');
-var add=function(u,t,i){if(!u||seen[u])return;if(u.indexOf('/video')<0&&u.indexOf('video-')<0)return;seen[u]=1;out.push({u:u,t:(t||'').replace(/\s+/g,' ').trim().slice(0,150),i:i||''});};
-as.forEach(function(a){var img=a.querySelector('img');add(a.href,(a.getAttribute('aria-label')||a.title||a.innerText||''),img?img.src:'');});
-return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()"""
-        SRC_RUTUBE -> """(function(){try{var out=[],seen={};var as=document.querySelectorAll('a[href*="/video/"]');
-var add=function(u,t,i){if(!u||seen[u])return;seen[u]=1;out.push({u:u,t:(t||'').replace(/\s+/g,' ').trim().slice(0,150),i:i||''});};
-as.forEach(function(a){var img=a.querySelector('img');add(a.href,(a.getAttribute('title')||a.innerText||''),img?(img.src||img.getAttribute('data-src')):'');});
-return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()"""
-        else -> "JSON.stringify([])"
-    }
+    /**
+     * v4.76.0: JS взят с проверенной схемы (именно она работает у VK/RuTube): строгий шаблон ссылки
+     * на видео, отсев служебных подписей, заголовок ищется в блоке, вместе с ним снимается весь текст
+     * блока — оттуда потом берём канал, площадку, просмотры и дату, как в обычном клиенте.
+     */
+    fun scrapeJs(source: String): String = """(function(){try{
+function clean(t){return t?t.replace(/\s+/g,' ').trim():'';}
+function isVideoLink(h){
+  if(/rutube\.ru\/video\/[0-9a-f]{8,}/i.test(h))return true;
+  if(/vk(video)?\.(com|ru)\/video-?\d+_\d+/i.test(h))return true;
+  if(/vk\.com\/clip-?\d+_\d+/i.test(h))return true;
+  if(/youtube\.com\/(watch|shorts)/i.test(h)||/youtu\.be\//i.test(h))return true;
+  return false;}
+function badTitle(t){
+  if(!t||t.length<4)return true;
+  if(/^club\d+$/i.test(t))return true;
+  if(/^[\d\s:.,]+$/.test(t))return true;
+  if(/^(на главную|поиск|видео|музыка|клипы|главная|ещё|показать все|все видео|vk видео|войти|вход|войдите|рекомендации|подписки|трансляции|моя страница)$/i.test(t))return true;
+  return false;}
+var out=[],nodes=document.querySelectorAll('a[href]');
+for(var i=0;i<nodes.length;i++){
+  var a=nodes[i],h=a.href||'';
+  if(!isVideoLink(h))continue;
+  var box=a.closest('li,article,div[class*="video"],div[class*="item"],div[class*="thumb"]')||a.parentElement;
+  var t=clean(a.getAttribute('aria-label')||a.getAttribute('title')||'');
+  if(badTitle(t)&&box){var hh=box.querySelector('h3,h2,h4,[class*=title]');if(hh)t=clean(hh.innerText||hh.getAttribute('aria-label')||'');}
+  if(badTitle(t)){var im=((box&&box.querySelector('img[alt]'))||a.querySelector('img[alt]'));if(im)t=clean(im.getAttribute('alt'));}
+  if(badTitle(t))continue;
+  var img=box?box.querySelector('img'):a.querySelector('img');
+  var snip=clean(box?box.innerText:'').slice(0,260);
+  out.push({u:h,t:t,i:img?(img.src||img.getAttribute('data-src')||''):'',s:snip});
+}
+var seen={},res=[];
+for(var j=0;j<out.length;j++){var k=out[j].u.split('#')[0];if(seen[k])continue;seen[k]=1;res.push(out[j]);}
+return JSON.stringify(res.slice(0,200));
+}catch(e){return JSON.stringify([]);}})()"""
 
-    /** Разбор того, что вернул встроенный браузер. */
-    fun parseScraped(source: String, raw: String?): List<Clip> {
+    /**
+     * Разбор того, что вернул встроенный браузер: заголовок, обложка, канал, площадка, просмотры,
+     * «22 часа назад», длительность. Площадка определяется по самой ссылке — поэтому у карточки
+     * всегда видно, откуда она (YouTube / RuTube / VK Видео), как в эталонном клиенте.
+     */
+    fun parseScraped(source: String, raw: String?, query: String = ""): List<Clip> {
         if (raw.isNullOrBlank() || raw == "null") return emptyList()
         val json = try {
             (org.json.JSONTokener(raw).nextValue() as? String) ?: raw
@@ -102,35 +136,112 @@ return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()
         } catch (_: Throwable) {
             return emptyList()
         }
-        val out = ArrayList<Clip>()
+        val all = ArrayList<Clip>()
         val seen = HashSet<String>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val url = o.optString("u").substringBefore('#')
+            val url = o.optString("u").substringBefore('#').trim()
             if (url.isBlank() || !seen.add(url)) continue
-            val rawTitle = o.optString("t")
-            val lenMatch = Regex("""(\d{1,2}:\d{2}(?::\d{2})?)""").find(rawTitle)
-            val viewsMatch = Regex("""([\d\s.,]+)\s*(тыс\.?|млн|K|M)?\s*(просмотр|views)""", RegexOption.IGNORE_CASE).find(rawTitle)
-            val authorMatch = Regex("""^([^·|\n]{2,40})""").find(rawTitle)
-            val title = rawTitle.replace(Regex("""\s*[·|]\s*\d{1,2}:\d{2}.*$"""), "").trim()
-                .ifBlank { rawTitle }.take(140)
-            if (title.length < 2) continue
-            out.add(
+            val rawTitle = o.optString("t").trim()
+            val snap = o.optString("s").removePrefix(rawTitle).trim()
+            if (rawTitle.length < 3) continue
+            val platform = when {
+                url.contains("rutube", true) -> SRC_RUTUBE
+                url.contains("vk.com", true) || url.contains("vkvideo", true) -> SRC_VK
+                url.contains("youtu", true) -> SRC_YOUTUBE
+                else -> source
+            }
+            val (lenText, lenSec) = parseLength(rawTitle + " " + snap)
+            val (viewsText, viewsNum) = parseViews(snap)
+            val (ageText, ageDays) = parseAge(snap)
+            val author = parseAuthor(snap, platform)
+            all.add(
                 Clip(
                     id = url.substringAfterLast('/').ifBlank { url.hashCode().toString() },
-                    kind = "video",
-                    title = title,
-                    author = if (source == SRC_VK) "" else authorMatch?.groupValues?.get(1)?.trim().orEmpty(),
-                    lengthText = lenMatch?.groupValues?.get(1).orEmpty(),
-                    viewsText = viewsMatch?.let { m -> m.groupValues[1].trim() + " " + m.groupValues[2] + " просмотров" }.orEmpty(),
-                    publishedText = "",
+                    kind = CLIP_VIDEO,
+                    title = rawTitle.take(150),
+                    author = author,
+                    lengthText = lenText,
+                    viewsText = viewsText,
+                    publishedText = ageText,
                     thumb = o.optString("i"),
                     url = url,
-                    source = source
+                    source = platform,
+                    views = viewsNum,
+                    days = ageDays,
+                    lengthSec = lenSec
                 )
             )
         }
-        return out
+        if (query.isBlank() || all.isEmpty()) return all
+        // оставляем только про запрос (по заголовку и по тексту блока), но не до пустого экрана
+        val keep = all.filter { Relevance.scoreFields(query, emptyList(), it.title, it.author) > 0 }
+        return if (keep.size >= 3) keep else all
+    }
+
+    private fun parseLength(text: String): Pair<String, Int> {
+        val m = Regex("""(?:^|[\s·|•])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])""").find(text) ?: return "" to 0
+        val t = m.groupValues[1]
+        val parts = t.split(":").mapNotNull { it.toIntOrNull() }
+        val sec = when (parts.size) {
+            2 -> parts[0] * 60 + parts[1]
+            3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else -> 0
+        }
+        return t to sec
+    }
+
+    private fun parseViews(snap: String): Pair<String, Long> {
+        val m = Regex(
+            """([\d][\d\s.,]{0,12})\s*(тыс\.?|млн|млрд|K|M)?\s*(?:просмотр|view)""",
+            RegexOption.IGNORE_CASE
+        ).find(snap) ?: return "" to 0L
+        val numRaw = m.groupValues[1].replace('\u00A0', ' ').replace(" ", "").replace(',', '.')
+        val num = numRaw.toDoubleOrNull() ?: return "" to 0L
+        val mult = when (m.groupValues[2].lowercase()) {
+            "тыс", "тыс.", "k" -> 1_000.0
+            "млн", "m" -> 1_000_000.0
+            "млрд" -> 1_000_000_000.0
+            else -> 1.0
+        }
+        return m.value.replaceFirstChar { it.uppercase() } to (num * mult).toLong()
+    }
+
+    private fun parseAge(snap: String): Pair<String, Int> {
+        val m = Regex(
+            """(\d+)\s*(сек|мин|час|день|дня|дней|недел|мес|год|года|лет)\w*\s*назад""",
+            RegexOption.IGNORE_CASE
+        ).find(snap) ?: return "" to 0
+        val n = m.groupValues[1].toIntOrNull() ?: return "" to 0
+        val days = when (m.groupValues[2].lowercase()) {
+            "сек" -> 0
+            "мин" -> 0
+            "час" -> 1
+            "день", "дня", "дней" -> n
+            "недел" -> n * 7
+            "мес" -> n * 30
+            "год", "года", "лет" -> n * 365
+            else -> 0
+        }
+        return m.value to days
+    }
+
+    /** Канал — сегмент перед названием площадки: «Идеальные рецепты • RuTube • 1,3 тыс. просмотров». */
+    private fun parseAuthor(snap: String, platform: String): String {
+        val parts = snap.split('•', '·', '|').map { it.trim() }.filter { it.isNotBlank() }
+        for (i in parts.indices) {
+            val p = parts[i].lowercase()
+            val mark = when (platform) {
+                SRC_RUTUBE -> p == "rutube"
+                SRC_VK -> p.contains("вконтакте") || p.contains("vk видео") || p == "vk"
+                else -> p.contains("youtube")
+            }
+            if (mark && i > 0) {
+                val candidate = parts[i - 1]
+                if (candidate.length in 2..48 && candidate.firstOrNull()?.isDigit() != true) return candidate
+            }
+        }
+        return ""
     }
 
     fun search(source: String, query: String, sort: Int = 0, continuation: String? = null): Page {
@@ -185,7 +296,8 @@ return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()
             live = extra == "live",
             source = SRC_YOUTUBE,
             views = views,
-            days = daysAgo
+            days = daysAgo,
+            lengthSec = parseLength(lengthText).second
         )
     }
 
