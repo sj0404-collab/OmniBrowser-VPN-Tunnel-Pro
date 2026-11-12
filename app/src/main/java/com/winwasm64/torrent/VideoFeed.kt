@@ -109,10 +109,10 @@ return JSON.stringify(out.slice(0,40));}catch(e){return JSON.stringify([]);}})()
             val url = o.optString("u").substringBefore('#')
             if (url.isBlank() || !seen.add(url)) continue
             val rawTitle = o.optString("t")
-            val lenMatch = Regex("(\d{1,2}:\d{2}(?::\d{2})?)").find(rawTitle)
-            val viewsMatch = Regex("([\d\s.,]+)\s*(тыс\.?|млн|K|M)?\s*(просмотр|views)", RegexOption.IGNORE_CASE).find(rawTitle)
-            val authorMatch = Regex("^([^·|\n]{2,40})").find(rawTitle)
-            val title = rawTitle.replace(Regex("\s*[·|]\s*\d{1,2}:\d{2}.*$"), "").trim()
+            val lenMatch = Regex("""(\d{1,2}:\d{2}(?::\d{2})?)""").find(rawTitle)
+            val viewsMatch = Regex("""([\d\s.,]+)\s*(тыс\.?|млн|K|M)?\s*(просмотр|views)""", RegexOption.IGNORE_CASE).find(rawTitle)
+            val authorMatch = Regex("""^([^·|\n]{2,40})""").find(rawTitle)
+            val title = rawTitle.replace(Regex("""\s*[·|]\s*\d{1,2}:\d{2}.*$"""), "").trim()
                 .ifBlank { rawTitle }.take(140)
             if (title.length < 2) continue
             out.add(
