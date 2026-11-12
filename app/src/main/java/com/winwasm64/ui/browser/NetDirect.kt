@@ -1,5 +1,6 @@
 package com.winwasm64.ui.browser
 
+import com.winwasm64.vpn.BrowserDirectRepeater
 import com.winwasm64.vpn.NetworkBypass
 import java.io.IOException
 import java.net.HttpURLConnection

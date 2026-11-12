@@ -116,7 +116,6 @@ object AiCatalog {
                         }
                         pr.edit().putLong("models_dev", System.currentTimeMillis()).apply()
                     }
-                    c.disconnect()
                 }
             } catch (e: Exception) { st["models.dev"] = "✗ ${e.message?.take(60)}" }
             VpnLog.i(AiAssistant.TAG, "каталог моделей обновлён: $total моделей · " + st.entries.joinToString(", ") { "${it.key}=${it.value}" })
