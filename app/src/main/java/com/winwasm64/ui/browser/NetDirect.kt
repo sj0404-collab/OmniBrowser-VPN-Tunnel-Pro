@@ -71,10 +71,18 @@ object NetDirect {
     ): HttpURLConnection {
         var lastError: String? = null
         val routes = mutableListOf<Route>()
-        routes.add(Route.Direct)
-        routes.add(Route.DirectAfterReset)
+        // v4.69.0: если включён VPN браузера (канал приложения), ИИ идёт ЧЕРЕЗ НЕГО, а не мимо.
+        // Иначе запросы уходили с IP оператора/Wi-Fi, и бесплатные модели отвечали «лимит на этот IP исчерпан».
+        if (appChannelActive()) {
+            routes.add(Route.BrowserProxy)
+            routes.add(Route.Direct)
+            routes.add(Route.DirectAfterReset)
+        } else {
+            routes.add(Route.Direct)
+            routes.add(Route.DirectAfterReset)
+        }
         if (NetworkBypass.physicalNetwork() != null) routes.add(Route.PhysicalNetwork)
-        if (allowProxy) routes.add(Route.BrowserProxy)
+        if (allowProxy && !routes.contains(Route.BrowserProxy)) routes.add(Route.BrowserProxy)
 
         for (route in routes) {
             val conn = try {
@@ -120,6 +128,27 @@ object NetDirect {
             return code to text
         } finally {
             try { c.disconnect() } catch (_: Throwable) {}
+        }
+    }
+
+    /** Включён ли собственный канал приложения (VPN браузера или VPN-сервис). */
+    fun appChannelActive(): Boolean = try {
+        BrowserDirectRepeater.enabled || com.winwasm64.vpn.BrowsecVpnService.isRunning
+    } catch (_: Throwable) {
+        false
+    }
+
+    /** Куда реально уходят запросы ИИ — это видно в «Провайдерах» и в строке проверки. */
+    fun channelLabel(): String {
+        return try {
+            val country = BrowserDirectRepeater.countryCode
+            when {
+                com.winwasm64.vpn.BrowsecVpnService.isRunning -> "VPN приложения ($country)"
+                BrowserDirectRepeater.enabled -> "VPN браузера ($country)"
+                else -> "напрямую (IP оператора/Wi-Fi)"
+            }
+        } catch (_: Throwable) {
+            "напрямую"
         }
     }
 

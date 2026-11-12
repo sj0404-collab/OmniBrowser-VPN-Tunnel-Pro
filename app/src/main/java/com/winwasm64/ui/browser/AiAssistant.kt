@@ -210,7 +210,12 @@ object AiAssistant {
         val msg = try { val o = JSONObject(t); (o.optJSONObject("error")?.optString("message") ?: o.optString("message")).ifBlank { null } } catch (_: Exception) { null }
         val m = msg ?: t.take(160).ifBlank { "пустой ответ" }
         return when {
-            m.contains("FreeUsageLimit", true) || m.contains("Free usage limit", true) -> "лимит free-моделей на этот IP исчерпан — нужен ключ аккаунта OpenCode"
+            // v4.69.0: лимит бесплатных моделей считается по ВНЕШНЕМУ IP, а он общий (оператор, Wi-Fi,
+            // выходной сервер VPN) — поэтому «исчерпан» бывает и на телефоне, где ИИ не запускали.
+            m.contains("FreeUsageLimit", true) || m.contains("Free usage limit", true) ||
+                (code == 429 && m.contains("free", true)) ->
+                "лимит бесплатных моделей исчерпан на этом IP — он общий (оператор/Wi-Fi/выход VPN), " +
+                    "дело не в вашем устройстве. Смена страны VPN браузера даёт другой IP; либо бесплатный ключ"
             m.contains("Free limit", true) -> "лимит без ключа: 1 ответ в 30 с (ключ снимает лимит)"
             code == 401 || code == 403 -> "нет доступа (HTTP $code): нужен ключ или ключ неверный · $m"
             code == 402 -> "лимит бесплатного тарифа: $m"
@@ -463,7 +468,9 @@ object AiAssistant {
         Thread({
             val main = android.os.Handler(android.os.Looper.getMainLooper())
             val sel = selected(app)
-            var order = if (sel == "auto") autoOrder(app) else providers.filter { it.id == sel }
+            // v4.69.0: если выбранный провайдер упёрся в лимит общего IP — не сдаёмся, пробуем остальных
+            var order = if (sel == "auto") autoOrder(app)
+            else providers.filter { it.id == sel } + autoOrder(app).filter { it.id != sel }
             val errors = ArrayList<String>()
             var ok = false
             val visionModels = HashMap<String, String>()
@@ -576,7 +583,9 @@ object AiAssistant {
             val r = complete(app, p, model, msgs, null, stream = false, maxTokens = 64, onDelta = {}, err = { err = it })
             val ms = SystemClock.elapsedRealtime() - t0
             val text = r?.let { it.content.ifBlank { it.reasoning } }?.trim()?.take(40).orEmpty()
-            val res = if (r != null) "✓ $model · $ms мс · «$text»" else "✗ ${err ?: "ошибка"}"
+            val channel = NetDirect.channelLabel()
+            val res = if (r != null) "✓ $model · $ms мс · «$text» · канал: $channel"
+            else "✗ ${err ?: "ошибка"} · канал: $channel"
             VpnLog.i(TAG, "проверка ${p.title}: $res")
             put(res)
         }, "omni-ai-test").start()

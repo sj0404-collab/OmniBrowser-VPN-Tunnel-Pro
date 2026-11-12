@@ -382,6 +382,19 @@ private fun AiSettings(onOpenUrl: (String) -> Unit) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Авто: провайдеры с ключом → Pollinations → LLM7 → OpenCode.", color = Omni.TextDim, fontSize = 12.sp)
+                // v4.69.0: человек должен видеть, каким каналом идут запросы и почему «лимит на этот IP»
+                Text(
+                    "Запросы ИИ идут: " + NetDirect.channelLabel() +
+                        " · лимит бесплатных моделей считается по внешнему IP (он общий у оператора и на выходе VPN)",
+                    color = if (NetDirect.appChannelActive()) Omni.Success else Omni.Warning,
+                    fontSize = 11.sp
+                )
+                if (!NetDirect.appChannelActive()) {
+                    Text(
+                        "Включите VPN браузера (щит сверху) и смените страну — внешний IP изменится, и лимит OpenCode/LLM7 сбросится.",
+                        color = Omni.TextFaint, fontSize = 10.sp
+                    )
+                }
                 Text("Каталог: ${catalog.values.sumOf { it.size }} моделей · " + (if (last > 0) "обновлён ${fmt.format(Date(last))}" else "не обновлялся") + " · ● без ключа ○ по ключу", color = Omni.TextFaint, fontSize = 11.sp)
             }
             TextButton(onClick = { AiCatalog.refreshAll(ctx) }, enabled = !refreshing) { Text(if (refreshing) "…" else "Обновить", color = Omni.Accent, fontSize = 12.sp) }

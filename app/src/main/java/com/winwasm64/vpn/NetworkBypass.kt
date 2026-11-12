@@ -104,6 +104,12 @@ object NetworkBypass {
 
     /** Сеть без VPN-транспорта: Wi-Fi или мобильная, с доступом в интернет. */
     private fun pick(): Network? {
+        // v4.69.0: свой VPN (Browsec) — не «обход», а нужный канал. Привязка к физической сети
+        // увела бы трафик мимо собственного туннеля, и внешний IP был бы домашним.
+        try {
+            if (BrowsecVpnService.isRunning) return null
+        } catch (_: Throwable) {
+        }
         val now = System.currentTimeMillis()
         cachedNet?.let { if (now - cachedAt < 30_000L) return it }
         val app = ctx ?: return null
