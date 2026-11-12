@@ -61,9 +61,14 @@ object AgentTasks {
         val updated: Long = 0L,
         val attempts: Int = 0,
         val tokens: Int = 0,
-        val elapsedMs: Long = 0L
+        val elapsedMs: Long = 0L,
+        /** v4.77.0: до какого времени задача имеет право работать (0 — без ограничения). */
+        val deadline: Long = 0L
     ) {
         val isActive: Boolean get() = status == RUNNING || status == QUEUED || status == WAITING
+        /** Осталось миллисекунд (0 — без лимита). */
+        val leftMs: Long get() = if (deadline <= 0L) 0L else (deadline - System.currentTimeMillis()).coerceAtLeast(0L)
+        val overLimit: Boolean get() = deadline > 0L && System.currentTimeMillis() > deadline
     }
 
     /** Для интерфейса: живой список задач. */
@@ -128,7 +133,10 @@ object AgentTasks {
             agent = agent,
             status = QUEUED,
             created = now,
-            updated = now
+            updated = now,
+            // v4.77.0: срок из настройки «сколько максимум работает над задачей»
+            deadline = com.winwasm64.ui.browser.AiAssistant.budgetMs(ctx)
+                .let { if (it > 0L) now + it else 0L }
         )
         persist(ctx, tasks.value + t)
         VpnLog.i("Агент", "задача в очередь: ${t.title}")
@@ -337,11 +345,21 @@ class AgentRunnerService : Service() {
                     Thread.sleep(WAIT_MS)
                     continue
                 }
+                if (task.overLimit) {
+                    AgentTasks.update(this, task.id) {
+                        it.copy(status = AgentTasks.DONE, step = "время вышло", error = "лимит времени исчерпан")
+                    }
+                    notify("Время вышло: ${task.title}", null, 0)
+                    continue
+                }
                 val startedAt = System.currentTimeMillis()
                 AgentTasks.update(this, task.id) { it.copy(status = AgentTasks.RUNNING, step = "запуск", attempts = it.attempts + 1) }
                 notify("Работаю: ${task.title}", task.title, 5)
                 val result = try {
-                    AiAssistant.runHeadless(this, task.prompt, task.agent) { step ->
+                    AiAssistant.runHeadless(
+                        this, task.prompt, task.agent,
+                        budgetMs = if (task.deadline > 0L) (task.deadline - System.currentTimeMillis()).coerceAtLeast(0L) else 0L
+                    ) { step ->
                         AgentTasks.update(this, task.id) { it.copy(step = step) }
                         notify(step, task.title, 40)
                     }

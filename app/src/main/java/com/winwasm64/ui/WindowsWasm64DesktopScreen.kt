@@ -6467,12 +6467,12 @@ private fun sortFiles(list: List<com.winwasm64.torrent.DirectFile>, mode: Int): 
     }
 }
 
-@Composable
 /** v4.76.0: запрос перехода на раздел из другого экрана (старый экран поиска удалён). */
 private object SectionRequest {
     var target by mutableStateOf(-1)
 }
 
+@Composable
 private fun PhotoSection(modifier: Modifier, initialQuery: String) {
     val context = LocalContext.current
     var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.photoQuery.ifBlank { initialQuery }) }

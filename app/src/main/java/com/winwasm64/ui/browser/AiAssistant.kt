@@ -131,6 +131,33 @@ object AiAssistant {
     fun setCustomUrl(ctx: Context, v: String) = prefs(ctx).edit().putString("custom_url", v.trim()).apply()
     fun selected(ctx: Context): String = prefs(ctx).getString("selected", "auto") ?: "auto"
     fun setSelected(ctx: Context, v: String) = prefs(ctx).edit().putString("selected", v).apply()
+    /* ---------------- v4.77.0: сколько максимум работает агент над одной задачей ----------------
+     * Раньше лимита не было вообще: задача могла считаться «вечной», а человек не знал, сколько
+     * ждать. Теперь лимит явный: от 1 минуты до 2 часов или без ограничений. Он виден в шапке
+     * («2:13 / 15:00»), соблюдается в чате и в фоновых задачах, и его можно продлить.
+     */
+    private val budgetOptions = listOf(60_000L, 300_000L, 900_000L, 1_800_000L, 3_600_000L, 7_200_000L, 0L)
+
+    fun budgetOptionsMs(): List<Long> = budgetOptions
+
+    fun budgetMs(ctx: Context): Long = prefs(ctx).getLong("budget_ms", 900_000L)
+
+    fun setBudgetMs(ctx: Context, ms: Long) = prefs(ctx).edit().putLong("budget_ms", ms).apply()
+
+    fun budgetLabel(ms: Long): String = when {
+        ms <= 0L -> "без лимита"
+        ms < 60_000L -> "${ms / 1000} с"
+        ms % 3_600_000L == 0L -> "${ms / 3_600_000L} ч"
+        else -> "${ms / 60_000L} мин"
+    }
+
+    /** «12:34» из миллисекунд — для отсчёта в шапке. */
+    fun clock(ms: Long): String {
+        val t = (ms.coerceAtLeast(0)) / 1000
+        return if (t >= 3600) "%d:%02d:%02d".format(t / 3600, (t % 3600) / 60, t % 60)
+        else "%d:%02d".format(t / 60, t % 60)
+    }
+
     fun mcpEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean("mcp", true)
     fun setMcpEnabled(ctx: Context, v: Boolean) = prefs(ctx).edit().putBoolean("mcp", v).apply()
 
@@ -446,7 +473,12 @@ object AiAssistant {
                 "\n\nРабочая папка агента: " + com.winwasm64.torrent.AgentWorkspace.displayPath(ctx) +
                     "\nСодержимое:\n" + com.winwasm64.torrent.AgentWorkspace.tree(ctx, 80) else "") + rag +
             (if (docsListing.isNotBlank()) "\n\n" + FILES_RULES + "\n\nФайлы чата:\n" + docsListing else "") +
-            (if (!pageContext.isNullOrBlank()) "\n\nКонтекст текущей страницы:\n$pageContext" else "")
+            (if (!pageContext.isNullOrBlank()) "\n\nКонтекст текущей страницы:\n$pageContext" else "") +
+            // v4.77.0: часть бесплатных моделей не умеет нативные инструменты — даём текстовый формат вызова,
+            // приложение распознаёт его и выполняет инструмент по-настоящему
+            "\n\nЕсли инструменты вызываются плохо, пиши вызов ОДНОЙ строкой JSON и ничего больше: " +
+            "{\"tool\":\"browser_open\",\"args\":{\"url\":\"https://…\"}} — приложение выполнит его и вернёт результат. " +
+            "Никогда не пиши вызов инструмента как «инструкцию» или «пример» вместо реального действия."
         arr.put(JSONObject().put("role", "system").put("content", sys))
         val hist = chat.messages.filter { it.kind == "text" && (it.role == "user" || (it.role == "assistant" && it.text.isNotBlank() && !it.text.startsWith("⚠"))) }.takeLast(14)
         for (m in hist) arr.put(JSONObject().put("role", m.role).put("content", m.text.take(12000)))
@@ -489,15 +521,20 @@ object AiAssistant {
         status.value = ""
         val docsListing = AiFiles.listing(chat.id)
         val api = buildMessages(app, chat, agent, pageContext, docsListing)
-        // изображения отправляем, если о них спрашивают или они появились после прошлого вопроса
+        // v4.77.0: если к чату приложены изображения, они уходят ВСЕГДА.
+        // Раньше «зрение» включалось только по словам в вопросе («посмотри», «фото»), поэтому на
+        // «ИМЕННО ВИЖН» модель получала вопрос без картинки и отвечала «не вижу изображения».
         val imgCount = AiFiles.images(chat.id).size
-        val withImages = imgCount > 0 && (imageWords.containsMatchIn(userText) || lastImagesSent[chat.id] != imgCount)
+        val withImages = imgCount > 0
         if (imgCount > 0) lastImagesSent[chat.id] = imgCount
         // последнее сообщение пользователя заменяем на расширенное (фрагменты файлов + картинки)
         api.put(api.length() - 1, JSONObject().put("role", "user").put("content", userContent(chat, userText, withImages)))
         val mcpTools = if (mcpEnabled(app) && agent.hasTools) McpClient.tools.value else emptyList()
         // v4.72.0: рабочая папка агента всегда, GitHub — если есть токен в файле-секрете
         val extraTools = ArrayList<String>()
+        // инструмент «посмотреть картинку» доступен всегда: если модель не принимает изображения,
+        // она может разобрать файл отдельным вызовом (и это видно в ленте шагов)
+        extraTools.add("analyze_image")
         if (agent.hasTools) extraTools.addAll(AiTools.workspaceTools)
         if (com.winwasm64.torrent.GitHubBridge.configured(app)) extraTools.addAll(AiTools.githubTools)
         val tools = AiTools.toolsFor(
@@ -511,13 +548,17 @@ object AiAssistant {
             val main = android.os.Handler(android.os.Looper.getMainLooper())
             // живой отсчёт: сколько уже работает агент и что делает
             val startedAt = SystemClock.elapsedRealtime()
+            val budget = budgetMs(app)
+            val deadline = if (budget > 0) startedAt + budget else Long.MAX_VALUE
             val timerStop = java.util.concurrent.atomic.AtomicBoolean(false)
             val timerRef = java.util.concurrent.atomic.AtomicReference("думает")
             Thread({
                 while (!timerStop.get()) {
-                    val sec = (SystemClock.elapsedRealtime() - startedAt) / 1000
+                    val now = SystemClock.elapsedRealtime()
+                    val passed = now - startedAt
                     val step = liveStep.value.ifBlank { timerRef.get() }
-                    main.post { status.value = "⏳ $step · ${sec} с" }
+                    val limitText = if (budget > 0) clock(passed) + " / " + clock(budget) else clock(passed)
+                    main.post { status.value = "⏳ $step · $limitText" }
                     try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
                 }
             }, "omni-ai-timer").also { it.isDaemon = true; it.start() }
@@ -547,11 +588,23 @@ object AiAssistant {
             }
             for (p in order) {
                 if (cancel.get()) break
+                if (SystemClock.elapsedRealtime() > deadline) {
+                    main.post {
+                        reply.text = reply.text.ifBlank { "⏹ Время вышло" } +
+                            "\n\n⏹ Лимит работы (" + budgetLabel(budget) + ") исчерпан. " +
+                            "Увеличьте лимит в шапке чата (⏱) и нажмите «Повторить», либо скажите «продолжай» — " +
+                            "я продолжу с этого места."
+                        chat.tokens += (api.toString().length + reply.text.length) / 4
+                        busy.value = false
+                        save(app)
+                    }
+                    return@Thread
+                }
                 val model = visionModels[p.id] ?: model(app, p.id)
                 timerRef.set("${p.title} · $model")
                 main.post { status.value = "⏳ ${p.title} · $model" }
                 val t0 = SystemClock.elapsedRealtime()
-                val r = runWithProvider(app, p, model, api, tools, reply, chat, host, mcpTools, main)
+                val r = runWithProvider(app, p, model, api, tools, reply, chat, host, mcpTools, main, deadline)
                 val ms = SystemClock.elapsedRealtime() - t0
                 if (r == null) {
                     ok = true
@@ -586,14 +639,48 @@ object AiAssistant {
         }, "omni-ai").start()
     }
 
+    /** Вызов инструмента, написанный моделью текстом: {"tool":"…","args":{…}} или {"name":…,"arguments":…}. */
+    private fun parseTextToolCall(text: String): Pair<String, JSONObject>? {
+        if (text.isBlank()) return null
+        if (!text.contains("\"tool\"") && !text.contains("\"name\"") && !text.contains("\"args\"")) return null
+        val candidates = ArrayList<String>()
+        Regex("(?s)```(?:json)?(.*?)```").findAll(text).forEach { m ->
+            val body = m.groupValues[1].trim()
+            if (body.contains('{')) candidates.add(body)
+        }
+        if (candidates.isEmpty()) {
+            val i = text.indexOf('{')
+            if (i >= 0) candidates.add(text.substring(i))
+        }
+        for (c in candidates) {
+            val open = c.indexOf('{')
+            val close = c.lastIndexOf('}')
+            if (open < 0 || close <= open) continue
+            val json = try { JSONObject(c.substring(open, close + 1)) } catch (_: Throwable) { continue }
+            val name = json.optString("tool").ifBlank { json.optString("name") }.trim()
+            if (name.isBlank() || name.contains(' ')) continue
+            val args = json.optJSONObject("args") ?: json.optJSONObject("arguments")
+                ?: json.optJSONObject("parameters") ?: json.optJSONObject("input") ?: JSONObject()
+            return name to args
+        }
+        return null
+    }
+
     /** null — успех (текст уже в reply), иначе текст ошибки. */
-    private fun runWithProvider(app: Context, p: Provider, model: String, api0: JSONArray, tools: JSONArray?, reply: Msg, chat: Chat, host: AiHost?, mcpTools: List<McpClient.Tool>, main: android.os.Handler): String? {
+    private fun runWithProvider(app: Context, p: Provider, model: String, api0: JSONArray, tools: JSONArray?, reply: Msg, chat: Chat, host: AiHost?, mcpTools: List<McpClient.Tool>, main: android.os.Handler, deadline: Long = Long.MAX_VALUE): String? {
         val api = JSONArray(api0.toString())
         var useTools = tools
         var err: String? = null
         var steps = 0
         while (true) {
             if (cancel.get()) return null
+            if (SystemClock.elapsedRealtime() > deadline) {
+                main.post {
+                    reply.text = reply.text.ifBlank { "⏹ Время вышло" } +
+                        "\n\n⏹ Лимит работы исчерпан на шаге " + steps + ". Скажите «продолжай» или увеличьте лимит (⏱)."
+                }
+                return null
+            }
             err = null
             val sb = StringBuilder()
             val r = complete(app, p, model, api, useTools, stream = true, maxTokens = 0, onDelta = { d ->
@@ -606,6 +693,36 @@ object AiAssistant {
                 return e
             }
             val tc = r.toolCalls
+            // v4.77.0: бесплатные модели часто не умеют function calling и пишут вызов JSON-ом в текст —
+            // раньше в этом месте появлялся «ответ-инструкция» вместо дела. Теперь распознаём, исполняем
+            // инструмент и продолжаем работу.
+            if (tc == null && useTools != null && steps < 8) {
+                val parsed = parseTextToolCall(r.content)
+                if (parsed != null) {
+                    steps++
+                    val name = parsed.first
+                    val args = parsed.second
+                    val step = Msg("tool", "🔧 $name (вызов из текста) ${args.toString().take(160)}", kind = "tool")
+                    main.post { chat.messages.add(chat.messages.size - 1, step); liveStep.value = "🔧 $name"; status.value = "🔧 $name…" }
+                    val t0 = SystemClock.elapsedRealtime()
+                    val result = AiTools.execute(app, host, chat.id, name, args, mcpTools)
+                    val ms = SystemClock.elapsedRealtime() - t0
+                    main.post {
+                        step.text = "🔧 $name ${args.toString().take(160)}\n→ ${result.lines().firstOrNull()?.take(120) ?: ""} (${result.length} зн., $ms мс)"
+                        reply.text = ""
+                    }
+                    api.put(JSONObject().put("role", "assistant").put("content", r.content.take(800)))
+                    api.put(
+                        JSONObject().put("role", "user").put(
+                            "content",
+                            "Результат работы инструмента $name:\n" + result.take(AiTools.TOOL_RESULT_LIMIT) +
+                                "\n\nПродолжай задачу и дай итог. Если нужен ещё инструмент — пиши ровно так: " +
+                                "{\"tool\":\"имя\",\"args\":{…}}"
+                        )
+                    )
+                    continue
+                }
+            }
             if (tc == null || useTools == null || steps >= 8) {
                 var text = r.content
                 if (text.isBlank() && r.reasoning.isNotBlank()) text = r.reasoning.trim().lines().last { it.isNotBlank() }
@@ -773,7 +890,14 @@ object AiAssistant {
      * Инструменты — рабочая папка (ws_*), RAG, GitHub по токену, поиск/чтение в интернете,
      * анализ изображений и плагины. Выполняется в фоновом потоке сервиса задач.
      */
-    fun runHeadless(ctx: Context, prompt: String, agentId: String, onStep: (String) -> Unit): HeadlessResult {
+    fun runHeadless(
+        ctx: Context,
+        prompt: String,
+        agentId: String,
+        budgetMs: Long = 0L,
+        onStep: (String) -> Unit
+    ): HeadlessResult {
+        val deadline = if (budgetMs > 0L) SystemClock.elapsedRealtime() + budgetMs else Long.MAX_VALUE
         val app = ctx.applicationContext
         val agent = AiTools.agent(agentId)
         val extra = ArrayList<String>()
@@ -809,6 +933,13 @@ object AiAssistant {
         var last = ""
         while (steps < 15) {
             if (Thread.currentThread().isInterrupted) return HeadlessResult(false, "прервано", tokens)
+            if (SystemClock.elapsedRealtime() > deadline) {
+                return HeadlessResult(
+                    true,
+                    last.ifBlank { "лимит времени исчерпан на шаге $steps — задача сохранена, можно повторить" },
+                    tokens
+                )
+            }
             val p = order[minOf(steps / 6, order.size - 1)]
             val model = model(app, p.id)
             var err: String? = null

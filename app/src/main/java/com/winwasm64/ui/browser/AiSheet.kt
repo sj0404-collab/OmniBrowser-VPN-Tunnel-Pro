@@ -82,6 +82,7 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
     var view by remember { mutableStateOf("chat") } // chat | chats | providers | agents
     var selected by remember { mutableStateOf(AiAssistant.selected(ctx)) }
     val busy by AiAssistant.busy
+    var budget by remember { mutableStateOf(AiAssistant.budgetMs(ctx)) }
     val status by AiAssistant.status
     val chat by AiAssistant.current
     val agent = AiTools.agent(chat?.agent ?: "chat")
@@ -142,6 +143,24 @@ fun AiSheetContent(host: AiHost, onOpenUrl: (String) -> Unit, onDismiss: () -> U
                 val ok = AiAssistant.configured(ctx, p)
                 AiChip(p.title + (if (ok) "" else " 🔑"), selected == p.id, dim = !ok) {
                     if (ok) { selected = p.id; AiAssistant.setSelected(ctx, p.id) } else view = "providers"
+                }
+            }
+        }
+        // v4.77.0: явный лимит работы над задачей — от секунд до двух часов
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                "⏱ " + AiAssistant.budgetLabel(budget),
+                color = Omni.TextFaint, fontSize = 10.sp,
+                modifier = Modifier.padding(end = 2.dp)
+            )
+            for (ms in AiAssistant.budgetOptionsMs()) {
+                AiChip(AiAssistant.budgetLabel(ms), budget == ms, enabled = !busy) {
+                    budget = ms
+                    AiAssistant.setBudgetMs(ctx, ms)
                 }
             }
         }
@@ -835,6 +854,7 @@ private fun AiTasksView() {
                 Text(
                     t.step.ifBlank { t.status } + " · " + fmt.format(java.util.Date(t.updated)) +
                         (if (t.elapsedMs > 0) " · ${t.elapsedMs / 1000} с" else "") +
+                        (if (t.deadline > 0 && t.isActive) " · осталось " + AiAssistant.clock(t.leftMs) else "") +
                         (if (t.tokens > 0) " · ≈${t.tokens} ток." else "") +
                         (if (t.attempts > 1) " · попыток ${t.attempts}" else ""),
                     color = Omni.TextFaint, fontSize = 10.sp, maxLines = 2

@@ -35,10 +35,10 @@ object AiTools {
             "", emptyList()),
         AiAgent("browser", "Браузер-агент", "🧭", "открывает сайты, читает страницы, ищет, скачивает, выполняет JS",
             "Ты — агент, управляющий браузером пользователя. Действуй пошагово: сначала используй инструменты (search_web, open_url, read_page, page_links, fetch_url, run_js, download_url), затем дай краткий итог со ссылками. Не выдумывай содержимое страниц — читай их инструментами. Если страница не загрузилась, попробуй read_page ещё раз или другой источник.",
-            listOf("read_page", "page_links", "open_url", "search_web", "fetch_url", "run_js", "download_url")),
+            listOf("read_page", "page_links", "open_url", "browser_open", "search_web", "fetch_url", "run_js", "download_url")),
         AiAgent("research", "Исследователь", "🔎", "ищет в интернете и сверяет несколько источников",
             "Ты — исследователь. На вопрос пользователя сначала найди информацию (search_web), открой 2–4 лучших источника (fetch_url), сопоставь факты и дай ответ с краткими ссылками на источники. Отмечай, если источники противоречат друг другу.",
-            listOf("search_web", "fetch_url", "read_page", "open_url")),
+            listOf("search_web", "fetch_url", "browser_open", "read_page", "open_url")),
         AiAgent("coder", "Программист", "💻", "код, документация, разбор ошибок; умеет читать ссылки",
             "Ты — опытный программист. Отвечай точным кодом с короткими пояснениями. При необходимости читай документацию по ссылкам (fetch_url) или текущую страницу (read_page). Код оформляй в блоках ```.",
             listOf("fetch_url", "read_page", "search_web")),
@@ -63,6 +63,7 @@ object AiTools {
         "open_url" to fn("open_url", "Открыть адрес в новой вкладке браузера (пользователь увидит страницу). Возвращает заголовок и начало текста после загрузки.", Triple("url", "string", "полный адрес http(s)")),
         "search_web" to fn("search_web", "Поиск в интернете (DuckDuckGo). Возвращает до 8 результатов: заголовок, адрес, фрагмент.", Triple("query", "string", "поисковый запрос")),
         "fetch_url" to fn("fetch_url", "Скачать страницу по адресу в фоне (без открытия вкладки) и вернуть её текст без HTML, до 9000 знаков.", Triple("url", "string", "полный адрес http(s)")),
+        "browser_open" to fn("browser_open", "Открыть адрес на вкладке браузера приложения и прочитать страницу после загрузки (движок браузера, работает там, где прямой запрос упирается в Cloudflare или JS). Возвращает текст страницы.", Triple("url", "string", "полный адрес http(s)")),
         "run_js" to fn("run_js", "Выполнить JavaScript на текущей странице (клик, прокрутка, ввод текста, извлечение данных). Верни значение через return внутри выражения-функции. Результат — строка до 3000 знаков.", Triple("code", "string", "JS-код, например (function(){document.querySelector('button').click();return 'ok'})()")),
         "download_url" to fn("download_url", "Поставить файл/видео по адресу в очередь загрузок браузера.", Triple("url", "string", "адрес файла или страницы с видео")),
         // v4.8.0: файлы чата (RAG) и генерация картинок
@@ -148,6 +149,15 @@ object AiTools {
                 }
                 "search_web" -> searchWeb(args.optString("query"))
                 "fetch_url" -> fetchUrl(args.optString("url").trim())
+                "browser_open" -> {
+                    val u = args.optString("url").trim()
+                    if (!u.startsWith("http")) "Нужен полный адрес http(s)"
+                    else {
+                        onMain<Unit>(host) { h, cb -> h.openUrl(u); cb(Unit) }
+                        Thread.sleep(2500)
+                        readPage(host, 6)
+                    }
+                }
                 "run_js" -> onMain<String?>(host) { h, cb -> h.runJs(args.optString("code"), cb) }?.let { unquote(it) }?.take(3000) ?: "null"
                 "download_url" -> {
                     val url = args.optString("url").trim()
@@ -261,9 +271,17 @@ object AiTools {
 
     fun fetchUrl(url: String): String {
         if (!url.startsWith("http")) return "Нужен полный адрес http(s)"
-        val (code, text) = get(url)
-        if (code !in 200..299) return "HTTP $code при загрузке $url\n" + text.take(500)
-        return ("Адрес: $url\n" + text).take(TOOL_RESULT_LIMIT)
+        val (code, text) = try { get(url) } catch (e: Throwable) { 0 to (e.message ?: "сеть") }
+        if (code in 200..299 && text.trim().length > 400) return ("Адрес: $url\n" + text).take(TOOL_RESULT_LIMIT)
+        // v4.77.0: сайт отдал заглушку/Cloudflare/пустой JS-каркас — читаем через текстовый рендер,
+        // который сам исполняет JS (работает без ключа)
+        val (c2, t2) = try { get("https://r.jina.ai/" + url, 45_000) } catch (_: Throwable) { 0 to "" }
+        if (c2 in 200..299 && t2.trim().length > 200) {
+            return ("Адрес: $url (прочитано через рендер)\n" + t2).take(TOOL_RESULT_LIMIT)
+        }
+        return ("HTTP " + code + " при загрузке $url\n" + text.take(400) +
+            "\n\nСайт закрыт от прямого запроса. Используйте browser_open — он открывает страницу " +
+            "движком браузера приложения (Cloudflare и JS там исполняются по-настоящему).").take(TOOL_RESULT_LIMIT)
     }
 
     fun searchWeb(query: String): String {
