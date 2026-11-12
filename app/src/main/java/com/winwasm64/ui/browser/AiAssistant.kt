@@ -193,12 +193,16 @@ object AiAssistant {
         return h
     }
 
+    /**
+     * v4.67.0: запрос к провайдеру идёт через [NetDirect] — он сам перебирает маршруты
+     * (напрямую → после сброса «мёртвой» привязки к сети → через физическую сеть → локальный прокси).
+     * Раньше здесь был только локальный прокси браузера, и при смене сети приходило
+     * «socket failed: ENONET (Machine is not on the network)».
+     */
     private fun post(ctx: Context, url: String, headers: Map<String, String>, body: String, timeoutMs: Int): java.net.HttpURLConnection {
-        val c = MediaGrabber.open(url, headers, "POST", timeoutMs)
-        c.setRequestProperty("Accept", "text/event-stream, application/json")
-        c.doOutput = true
-        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        return c
+        val h = LinkedHashMap(headers)
+        h["Accept"] = "text/event-stream, application/json"
+        return NetDirect.connect(url, h, "POST", body, timeoutMs, allowProxy = true)
     }
 
     private fun errorText(code: Int, raw: String): String {
@@ -312,7 +316,13 @@ object AiAssistant {
             if (maxTokens > 0) put("max_tokens", maxTokens)
             if (tools != null && tools.length() > 0) { put("tools", tools); put("tool_choice", "auto") }
         }.toString()
-        val c = try { post(ctx, url, headers(ctx, p), body, 180_000) } catch (e: Exception) { err("нет соединения: ${e.message ?: e.javaClass.simpleName}"); return null }
+        val c = try {
+            post(ctx, url, headers(ctx, p), body, 180_000)
+        } catch (e: Throwable) {
+            // v4.67.0: вместо «socket failed: ENONET» — понятная причина
+            err(NetDirect.humanError(e.message ?: e.javaClass.simpleName))
+            return null
+        }
         try {
             val code = try { c.responseCode } catch (e: Exception) { err("нет ответа: ${e.message}"); return null }
             if (code !in 200..299) {
@@ -337,7 +347,8 @@ object AiAssistant {
             val r = BufferedReader(InputStreamReader(ins, Charsets.UTF_8))
             return parseSse(generateSequence { r.readLine() }.iterator(), onDelta, err)
         } catch (e: IOException) {
-            err("обрыв: ${e.message}"); return null
+            err(if (NetDirect.looksLikeNetworkLoss(e.message)) NetDirect.humanError(e.message) else "обрыв: ${e.message}")
+            return null
         } finally { try { c.disconnect() } catch (_: Exception) {} }
     }
 

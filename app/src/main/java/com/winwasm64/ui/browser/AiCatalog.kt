@@ -97,9 +97,9 @@ object AiCatalog {
                 val pr = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 val need = listOf("groq" to "groq", "gemini" to "google", "mistral" to "mistral", "cerebras" to "cerebras", "huggingface" to "huggingface").filter { (pid, _) -> (result[pid]?.size ?: 0) == 0 }
                 if (need.isNotEmpty() && System.currentTimeMillis() - pr.getLong("models_dev", 0L) > MODELS_DEV_STALE_MS) {
-                    val c = MediaGrabber.open("https://models.dev/api.json", emptyMap(), "GET", 40_000)
-                    if (c.responseCode == 200) {
-                        val root = JSONObject(c.inputStream.bufferedReader().readText())
+                    val (devCode, devRaw) = NetDirect.requestText("https://models.dev/api.json", emptyMap(), "GET", null, 40_000)
+                    if (devCode == 200) {
+                        val root = JSONObject(devRaw)
                         for ((pid, devId) in need) {
                             val ms = root.optJSONObject(devId)?.optJSONObject("models") ?: continue
                             val list = ArrayList<Entry>()
@@ -147,15 +147,12 @@ object AiCatalog {
         }, "omni-ai-models").start()
     }
 
+    /** v4.67.0: списки моделей тоже идут через NetDirect — локальный прокси и «мёртвая» привязка к сети больше не мешают. */
     private fun getJson(ctx: Context, url: String, p: AiAssistant.Provider): Pair<Int, String> {
         val h = LinkedHashMap<String, String>()
         val k = AiAssistant.key(ctx, p.id)
         if (k.isNotBlank()) h["Authorization"] = "Bearer $k" else if (p.id == "llm7") h["Authorization"] = "Bearer unused"
-        val c = MediaGrabber.open(url, h, "GET", 40_000)
-        val code = c.responseCode
-        val raw = try { (if (code in 200..299) c.inputStream else (c.errorStream ?: c.inputStream)).bufferedReader().readText() } catch (_: Exception) { "" }
-        c.disconnect()
-        return code to raw
+        return NetDirect.requestText(url, h, "GET", null, 40_000)
     }
 
     private fun dataArray(raw: String): JSONArray? {

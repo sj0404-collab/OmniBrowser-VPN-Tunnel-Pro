@@ -28,6 +28,9 @@ object NetworkBypass {
 
     @Volatile private var cachedNet: Network? = null
     @Volatile private var cachedAt: Long = 0L
+    /** v4.67.0: сеть, к которой реально привязан процесс. Если она пропала — привязка «убивает» весь трафик. */
+    @Volatile private var boundNet: Network? = null
+    @Volatile private var callbackRegistered = false
 
     /**
      * v4.13.0: на многих прошивках `Network.bindSocket()` отвечает EPERM (Operation not permitted),
@@ -46,6 +49,57 @@ object NetworkBypass {
 
     fun init(context: Context) {
         ctx = context.applicationContext
+        registerNetworkCallback()
+    }
+
+    /**
+     * v4.67.0: «OpenCode Zen: нет соединения: socket failed: ENONET (Machine is not on the network)».
+     *
+     * Причина: `bindProcessToNetwork()` привязывает ВЕСЬ процесс к конкретной физической сети.
+     * Если эта сеть исчезает (переключение Wi-Fi → мобильная, включение/выключение другого VPN,
+     * смена вышки), ядро рвёт маршрут, и любой новый сокет падает с ENONET — «машина не в сети»,
+     * хотя интернет есть. Раньше привязка жила до перезапуска приложения, и весь трафик стоял.
+     * Теперь на любое изменение сети привязка снимается и кэш сети сбрасывается.
+     */
+    private fun registerNetworkCallback() {
+        if (callbackRegistered) return
+        val manager = cm() ?: return
+        try {
+            manager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = reset()
+                override fun onLost(network: Network) = reset()
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    // сеть осталась, но потеряла интернет (например, Wi-Fi без выхода) — тоже сбрасываем
+                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) reset()
+                }
+            })
+            callbackRegistered = true
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Сбросить кэш сети и снять привязку процесса: следующий запрос пойдёт по актуальной сети. */
+    fun reset() {
+        cachedNet = null
+        cachedAt = 0L
+        if (processBound) unbindProcess()
+        boundNet = null
+    }
+
+    /** Физическая сеть без VPN — для тех, кто хочет привязать к ней отдельное соединение. */
+    fun physicalNetwork(): Network? = pick()
+
+    /** Привязка процесса ещё жива? Проверяем, что сеть существует и у неё есть интернет. */
+    fun isProcessBoundValid(): Boolean {
+        if (!processBound) return false
+        val n = boundNet ?: return false
+        val manager = cm() ?: return false
+        val caps = try { manager.getNetworkCapabilities(n) } catch (_: Exception) { null }
+        if (caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            reset()
+            return false
+        }
+        return true
     }
 
     /** Сеть без VPN-транспорта: Wi-Fi или мобильная, с доступом в интернет. */
@@ -105,6 +159,7 @@ object NetworkBypass {
         return try {
             val ok = manager.bindProcessToNetwork(n)
             processBound = ok
+            boundNet = if (ok) n else null
             if (ok) method = "процесс"
             VpnLogBypass.log(if (ok) "обход чужого VPN: процесс привязан к физической сети (bindProcessToNetwork)" else "обход чужого VPN: bindProcessToNetwork вернул false")
             ok
@@ -118,6 +173,7 @@ object NetworkBypass {
     fun unbindProcess() {
         try { cm()?.bindProcessToNetwork(null) } catch (_: Exception) {}
         processBound = false
+        boundNet = null
     }
 
     /** Держим обход включённым: сокет-привязка → при EPERM привязка процесса. */
@@ -127,7 +183,7 @@ object NetworkBypass {
             method = "выключен"
             return method
         }
-        if (processBound) return method
+        if (processBound && isProcessBoundValid()) return method
         val n = pick() ?: return "нет физической сети".also { method = it }
         // пробуем привязать процесс — это надёжнее на прошивках с EPERM
         if (bindProcess()) return method
