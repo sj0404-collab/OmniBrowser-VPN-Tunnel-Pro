@@ -244,6 +244,97 @@ return JSON.stringify(res.slice(0,200));
         return ""
     }
 
+    /* ------------------- v4.78.0: быстрый поиск по индексу -------------------
+     * VK и RuTube отдают собственную выдачу только настоящему браузеру, и это небыстро (десятки
+     * секунд). Чтобы результат появлялся сразу, параллельно с браузером спрашиваем поисковый индекс
+     * по своей же площадке (site:vkvideo.ru / site:rutube.ru) — это те же видео с площадки, но за 1–3 с.
+     */
+    fun searchIndexed(source: String, query: String): Page {
+        if (query.isBlank()) return Page()
+        val site = when (source) {
+            SRC_VK -> "vkvideo.ru OR vk.com/video"
+            SRC_RUTUBE -> "rutube.ru"
+            else -> "youtube.com"
+        }
+        val q = enc("site:$site \"$query\"")
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+            "Accept-Language" to "ru,en;q=0.8",
+            "Accept" to "text/html,application/xhtml+xml"
+        )
+        val engines = listOf(
+            "https://search.brave.com/search?q=$q&source=web",
+            "https://www.bing.com/search?q=$q&setlang=ru",
+            "https://html.duckduckgo.com/html/?q=$q"
+        )
+        for (u in engines) {
+            val (code, html) = try {
+                NetDirect.requestText(u, headers, timeoutMs = 9_000)
+            } catch (_: Throwable) {
+                continue
+            }
+            if (code !in 200..299) continue
+            val clips = parseEngineHtml(source, html, query)
+            if (clips.isNotEmpty()) return Page(clips = clips, note = "быстрый поиск по индексу: ${clips.size} видео")
+        }
+        return Page()
+    }
+
+    /** Вытащить карточки видео площадки из HTML поисковика. */
+    private fun parseEngineHtml(source: String, html: String, query: String): List<Clip> {
+        val linkRe = Regex("""<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val out = ArrayList<Clip>()
+        val seen = HashSet<String>()
+        for (m in linkRe.findAll(html)) {
+            var href = m.groupValues[1]
+            if (href.startsWith("/")) continue
+            val ok = when (source) {
+                SRC_VK -> Regex("""vk(video)?\.(com|ru)/(video|clip)-?\d+_\d+""").containsMatchIn(href)
+                SRC_RUTUBE -> Regex("""rutube\.ru/video/[0-9a-f]{6,}""").containsMatchIn(href)
+                else -> Regex("""(youtube\.com/watch\?v=|youtu\.be/)[A-Za-z0-9_-]{11}""").containsMatchIn(href)
+            }
+            if (!ok) continue
+            if (href.contains("redirect") || href.contains("duckduckgo.com/l/")) {
+                val u = Regex("""[?&]u=([^&]+)""").find(href)?.groupValues?.get(1)?.let {
+                    try { java.net.URLDecoder.decode(it, "UTF-8") } catch (_: Throwable) { null }
+                }
+                if (u != null) href = u
+            }
+            if (!seen.add(href)) continue
+            val title = stripTags(m.groupValues[2]).trim().take(150)
+            if (title.length < 4) continue
+            val parts = title.split("|", "·", "—", "-").map { it.trim() }.filter { it.isNotBlank() }
+            val author = if (parts.size > 1) parts.last().take(40) else ""
+            out.add(
+                Clip(
+                    id = href.substringAfterLast('/').ifBlank { href.hashCode().toString() },
+                    kind = CLIP_VIDEO,
+                    title = parts.first(),
+                    author = author,
+                    lengthText = "",
+                    viewsText = "",
+                    publishedText = "",
+                    thumb = if (source == SRC_YOUTUBE) headerPic(href) else "",
+                    url = href,
+                    source = source
+                )
+            )
+            if (out.size >= 30) break
+        }
+        return out
+    }
+
+    private fun headerPic(link: String): String {
+        val id = Regex("""(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})""").find(link)?.groupValues?.get(1) ?: return ""
+        return "https://i.ytimg.com/vi/$id/mqdefault.jpg"
+    }
+
+    private fun stripTags(html: String): String = html
+        .replace(Regex("(?s)<[^>]+>"), " ")
+        .replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", "\"")
+        .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
+        .replace(Regex("\\s+"), " ")
+
     fun search(source: String, query: String, sort: Int = 0, continuation: String? = null): Page {
         if (continuation == null) cached(source, query)?.let { return it }
         return put(source, query, searchFresh(source, query, sort, continuation))

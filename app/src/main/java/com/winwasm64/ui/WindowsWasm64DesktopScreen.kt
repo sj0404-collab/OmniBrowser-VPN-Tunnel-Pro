@@ -6753,6 +6753,10 @@ private fun VideoHomeSection(
     var scrapeSource by remember { mutableStateOf("") }
     var scrapeRound by remember { mutableIntStateOf(0) }
     var playing by remember { mutableStateOf("") }
+    // v4.78.0: канал открывается ВНУТРИ приложения, подписки хранятся на устройстве
+    var channel by remember { mutableStateOf<com.winwasm64.torrent.VideoSubs.Channel?>(null) }
+    var subsOpen by remember { mutableStateOf(false) }
+    var subsVersion by remember { mutableIntStateOf(0) }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
 
@@ -6817,6 +6821,17 @@ private fun VideoHomeSection(
         loading = true
         note = ""
         if (source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) {
+            // 1) мгновенно: поиск по индексу в пределах площадки (site:vkvideo.ru / site:rutube.ru)
+            val fast = withContext(Dispatchers.IO) {
+                runCatching { com.winwasm64.torrent.VideoFeed.searchIndexed(source, submitted) }
+                    .getOrDefault(com.winwasm64.torrent.VideoFeed.Page())
+            }
+            if (fast.clips.isNotEmpty()) {
+                items = fast.clips
+                note = fast.note.orEmpty()
+                loading = false
+            }
+            // 2) следом — полная выдача площадки во встроенном браузере
             scrapeSource = source
             scrapeRound = 0
             scrapeUrl = com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted)
@@ -6857,15 +6872,15 @@ private fun VideoHomeSection(
             query = submitted,
             round = scrapeRound,
             onProgress = { list ->
-                if (list.size > items.size) {
-                    items = list
-                    loading = false
-                }
+                // быстрая выдача из индекса остаётся, браузерная добавляется к ней без дублей
+                val merged = (list + items).distinctBy { it.url }
+                if (merged.size > items.size) items = merged
+                loading = false
             },
             onStatus = { msg -> note = msg },
             onFinished = { list ->
                 if (list.isNotEmpty()) {
-                    items = list
+                    items = (list + items).distinctBy { it.url }
                     cont = null
                     note = if (list.size >= 100) "Показано ${list.size} — нажмите «Ещё», чтобы добрать" else ""
                 } else if (note.isBlank()) {
@@ -6903,8 +6918,41 @@ private fun VideoHomeSection(
         }
     }
 
+    val openChannel: (String, String, String) -> Unit = { name, src, url ->
+        if (name.isNotBlank()) {
+            channel = com.winwasm64.torrent.VideoSubs.Channel(
+                name = name,
+                source = if (src.isBlank()) source else src,
+                url = url
+            )
+            subsOpen = false
+        }
+    }
+
+    if (subsOpen) {
+        SubsScreen(
+            modifier = modifier,
+            onBack = { subsOpen = false },
+            onOpenChannel = { ch -> channel = ch; subsOpen = false },
+            version = subsVersion
+        )
+        return
+    }
+    val currentChannel = channel
+    if (currentChannel != null) {
+        ChannelScreen(
+            modifier = modifier,
+            ch = currentChannel,
+            onBack = { channel = null },
+            onOpen = { c -> openClip(c) },
+            onOpenUrl = onOpenUrl,
+            onSubsChanged = { subsVersion++ }
+        )
+        return
+    }
+
     Column(modifier = modifier.fillMaxSize()) {
-        // ---------- верхняя строка ----------
+        // ---------- верхняя строка: логотип и быстрые действия ----------
         Row(
             modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 6.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -6986,6 +7034,22 @@ private fun VideoHomeSection(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                     )
                 }
+            }
+            // v4.78.0: подписки на каналы — свои, на устройстве
+            val subsCount = remember(subsVersion) {
+                com.winwasm64.torrent.VideoSubs.list(context).size
+            }
+            Surface(
+                color = Omni.SurfaceHighest,
+                shape = RoundedCornerShape(9.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
+                modifier = Modifier.clickable { subsOpen = true }
+            ) {
+                Text(
+                    "📌 Подписки" + (if (subsCount > 0) " $subsCount" else ""),
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
             }
         }
 
@@ -7121,12 +7185,35 @@ private fun VideoHomeSection(
             contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 6.dp, bottom = 18.dp)
         ) {
             items(filtered) { clip ->
-                VideoCard(clip = clip, onOpen = { openClip(clip) }, onLink = {
+                VideoCard(
+                    clip = clip,
+                    onOpen = {
+                        if (clip.kind == com.winwasm64.torrent.VideoFeed.CLIP_CHANNEL) openChannel(clip.title, clip.source, clip.url)
+                        else openClip(clip)
+                    },
+                    onChannel = { openChannel(clip.author, clip.source, "") },
+                    subscribed = remember(subsVersion, clip.author, clip.source) {
+                        clip.author.isNotBlank() &&
+                            com.winwasm64.torrent.VideoSubs.isSubscribed(context, clip.author, clip.source)
+                    },
+                    onSubscribe = {
+                        if (clip.author.isNotBlank()) {
+                            com.winwasm64.torrent.VideoSubs.toggle(
+                                context,
+                                com.winwasm64.torrent.VideoSubs.Channel(clip.author, clip.source, clip.url)
+                            )
+                            subsVersion++
+                        } else {
+                            note = "У этой карточки нет имени канала"
+                        }
+                    },
+                    onLink = {
                     val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as? android.content.ClipboardManager
-                    cm?.setPrimaryClip(android.content.ClipData.newPlainText("ссылка", clip.url))
-                    Toast.makeText(context, "Ссылка скопирована", Toast.LENGTH_SHORT).show()
-                })
+                        cm?.setPrimaryClip(android.content.ClipData.newPlainText("ссылка", clip.url))
+                        Toast.makeText(context, "Ссылка скопирована", Toast.LENGTH_SHORT).show()
+                    }
+                )
             }
             item {
                 val total = items.size
@@ -7181,6 +7268,223 @@ private fun VideoHomeSection(
 }
 
 /**
+ * v4.78.0: страница канала ВНУТРИ приложения — без перехода на сайт.
+ * Обложка-шапка, имя, площадка, кнопка подписки и все видео канала (догружаются прокруткой).
+ */
+@Composable
+private fun ChannelScreen(
+    modifier: Modifier,
+    ch: com.winwasm64.torrent.VideoSubs.Channel,
+    onBack: () -> Unit,
+    onOpen: (com.winwasm64.torrent.VideoFeed.Clip) -> Unit,
+    onOpenUrl: (String) -> Unit,
+    onSubsChanged: () -> Unit
+) {
+    val context = LocalContext.current
+    var round by remember(ch.name) { mutableIntStateOf(0) }
+    var items by remember(ch.name) { mutableStateOf<List<com.winwasm64.torrent.VideoFeed.Clip>>(emptyList()) }
+    var note by remember(ch.name) { mutableStateOf("") }
+    var loading by remember(ch.name) { mutableStateOf(true) }
+    var subscribed by remember(ch.name) {
+        mutableStateOf(com.winwasm64.torrent.VideoSubs.isSubscribed(context, ch.name, ch.source))
+    }
+    val platform = when (ch.source) {
+        com.winwasm64.torrent.VideoFeed.SRC_VK -> "VK Видео"
+        com.winwasm64.torrent.VideoFeed.SRC_RUTUBE -> "RuTube"
+        else -> "YouTube"
+    }
+    val url = remember(ch.name, round) {
+        com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)
+    }
+    WebScraper(
+        url = url,
+        source = ch.source,
+        query = ch.name,
+        round = round,
+        onProgress = { list ->
+            val merged = (list + items).distinctBy { it.url }
+            if (merged.size > items.size) items = merged
+            loading = false
+        },
+        onStatus = { note = it },
+        onFinished = { list ->
+            val merged = (list + items).distinctBy { it.url }
+            items = merged
+            loading = false
+            if (merged.isEmpty() && note.isBlank()) note = "Канал пока ничего не отдал — проверьте VPN (щит)"
+        }
+    )
+
+    Column(modifier = modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 10.dp, top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "←", color = Color.White, fontSize = 20.sp,
+                modifier = Modifier.padding(horizontal = 8.dp).clickable { onBack() }
+            )
+            Text("Канал", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp,
+                modifier = Modifier.weight(1f))
+            Text(
+                "🌐 на сайте", color = Omni.TextFaint, fontSize = 10.sp,
+                modifier = Modifier.clickable { onOpenUrl(com.winwasm64.torrent.VideoSubs.channelUrl(ch.source, ch.name, ch.url)) }
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier.size(54.dp).clip(CircleShape).background(Omni.AccentContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    (ch.name.firstOrNull() ?: 'К').uppercase(),
+                    color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold
+                )
+            }
+            Column(modifier = Modifier.weight(1f).padding(start = 10.dp)) {
+                Text(ch.name, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+                Text(
+                    listOf(platform, if (items.isNotEmpty()) "${items.size} видео" else "").filter { it.isNotBlank() }.joinToString(" · "),
+                    color = Omni.TextDim, fontSize = 11.sp
+                )
+            }
+            Surface(
+                color = if (subscribed) Omni.SurfaceHighest else Omni.AccentContainer,
+                shape = RoundedCornerShape(10.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, if (subscribed) Omni.Outline else Omni.Accent),
+                modifier = Modifier.clickable {
+                    subscribed = com.winwasm64.torrent.VideoSubs.toggle(
+                        context,
+                        com.winwasm64.torrent.VideoSubs.Channel(ch.name, ch.source, ch.url)
+                    )
+                    onSubsChanged()
+                }
+            ) {
+                Text(
+                    if (subscribed) "✅ Вы подписаны" else "📌 Подписаться",
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                )
+            }
+        }
+        if (note.isNotBlank()) {
+            Text(note, color = Omni.Warning, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp), maxLines = 3)
+        }
+        if (loading && items.isEmpty()) {
+            Row(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Omni.Accent, strokeWidth = 2.dp)
+                Text("  Читаю канал…", color = Omni.TextDim, fontSize = 12.sp)
+            }
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 6.dp, bottom = 18.dp)
+        ) {
+            items(items) { clip ->
+                val vid = clip.copy(author = ch.name, source = ch.source)
+                VideoCard(clip = vid, onOpen = { onOpen(vid) }, onLink = {
+                    val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as? android.content.ClipboardManager
+                    cm?.setPrimaryClip(android.content.ClipData.newPlainText("ссылка", vid.url))
+                    Toast.makeText(context, "Ссылка скопирована", Toast.LENGTH_SHORT).show()
+                }, onChannel = {}, subscribed = subscribed, onSubscribe = {
+                    subscribed = com.winwasm64.torrent.VideoSubs.toggle(
+                        context,
+                        com.winwasm64.torrent.VideoSubs.Channel(ch.name, ch.source, ch.url)
+                    )
+                    onSubsChanged()
+                })
+            }
+            item {
+                if (items.isNotEmpty() && items.size < 100) {
+                    Button(
+                        onClick = { loading = true; round++ },
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Omni.SurfaceHighest),
+                        contentPadding = PaddingValues(vertical = 0.dp)
+                    ) { Text("⬇ Показать ещё · ${items.size}/100", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold) }
+                } else if (items.isNotEmpty()) {
+                    Text("Всё видео канала · ${items.size}", color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.padding(vertical = 10.dp))
+                }
+            }
+        }
+    }
+}
+
+/** v4.78.0: список подписок — каналы, на которые человек подписался в приложении. */
+@Composable
+private fun SubsScreen(
+    modifier: Modifier,
+    onBack: () -> Unit,
+    onOpenChannel: (com.winwasm64.torrent.VideoSubs.Channel) -> Unit,
+    version: Int
+) {
+    val context = LocalContext.current
+    var localVersion by remember { mutableIntStateOf(version) }
+    val list = remember(localVersion) { com.winwasm64.torrent.VideoSubs.list(context) }
+    Column(modifier = modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 10.dp, top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.padding(horizontal = 8.dp).clickable { onBack() })
+            Text("Подписки", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.weight(1f))
+            Text("${list.size}", color = Omni.TextFaint, fontSize = 11.sp, modifier = Modifier.padding(end = 6.dp))
+        }
+        if (list.isEmpty()) {
+            Text(
+                "Пока ни одной подписки.\n\nОткройте карточку видео → ⋮ → «📌 Подписаться» или откройте канал кнопкой «📺 Канал». " +
+                    "Канал сохранится на устройстве, его видео будут открываться здесь же, без сайта.",
+                color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.padding(16.dp)
+            )
+            return@Column
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(list) { ch ->
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh)
+                        .clickable { onOpenChannel(ch) }
+                        .padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier.size(40.dp).clip(CircleShape).background(Omni.AccentContainer),
+                        contentAlignment = Alignment.Center
+                    ) { Text((ch.name.firstOrNull() ?: 'К').uppercase(), color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+                    Column(modifier = Modifier.weight(1f).padding(start = 10.dp)) {
+                        Text(ch.name, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            when (ch.source) {
+                                com.winwasm64.torrent.VideoFeed.SRC_VK -> "VK Видео"
+                                com.winwasm64.torrent.VideoFeed.SRC_RUTUBE -> "RuTube"
+                                else -> "YouTube"
+                            } + " · открыть канал",
+                            color = Omni.TextDim, fontSize = 10.sp
+                        )
+                    }
+                    Text(
+                        "Отписаться", color = Omni.Danger, fontSize = 11.sp,
+                        modifier = Modifier.clickable {
+                            com.winwasm64.torrent.VideoSubs.remove(context, ch.name, ch.source)
+                            localVersion++
+                        }.padding(6.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
  * v4.76.0: встроенный браузер для площадок, которые не отдают выдачу простым запросом (VK, RuTube).
  * Терпеливо ждёт отрисовку (до 25 с), прокручивает выдачу и копит карточки до 100 штук,
  * отдавая результат по мере поступления — как в обычном клиенте.
@@ -7224,7 +7528,10 @@ private fun WebScraper(
         val js = com.winwasm64.torrent.VideoFeed.scrapeJs(source)
         var pass = 0
         var altUsed = false
-        val maxPass = 10 + round * 6
+        var idle = 0
+        // v4.78.0: ждём отрисовку не дольше 20 секунд и прекращаем, если выдача перестала расти
+        val startedAt = System.currentTimeMillis()
+        val maxPass = 8 + round * 5
         while (pass < maxPass) {
             delay(1300)
             val w = web ?: continue
@@ -7250,11 +7557,14 @@ private fun WebScraper(
                 var added = false
                 for (c in list) if (!collected.containsKey(c.url)) { collected[c.url] = c; added = true }
                 if (added) onProgress(collected.values.toList())
+                idle = if (added) 0 else idle + 1
                 if (collected.size >= 100) break
+                if (idle >= 5) break
             }
             // прокручиваем — выдача VK/RuTube доезжает по мере скролла
             w.evaluateJavascript("window.scrollBy(0, Math.round(window.innerHeight*0.95));", null)
             pass++
+            if (System.currentTimeMillis() - startedAt > 20_000) break
             if (pass == 7 && collected.isEmpty()) {
                 val txt = evalJs(w, "(document.body?document.body.innerText:'').slice(0,300)") ?: ""
                 onStatus(
@@ -7282,7 +7592,10 @@ private suspend fun evalJs(web: android.webkit.WebView, js: String): String? =
 private fun VideoCard(
     clip: com.winwasm64.torrent.VideoFeed.Clip,
     onOpen: () -> Unit,
-    onLink: () -> Unit
+    onLink: () -> Unit,
+    onChannel: () -> Unit = {},
+    onSubscribe: () -> Unit = {},
+    subscribed: Boolean = false
 ) {
     var menu by remember(clip.id) { mutableStateOf(false) }
     var bmp by remember(clip.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
@@ -7372,7 +7685,7 @@ private fun VideoCard(
                     else -> "YouTube"
                 }
                 val meta = listOf(
-                    clip.author.ifBlank { platformLabel },
+                    if (clip.kind == com.winwasm64.torrent.VideoFeed.CLIP_CHANNEL) "канал" else clip.author.ifBlank { platformLabel },
                     platformLabel,
                     clip.viewsText,
                     clip.publishedText,
@@ -7394,6 +7707,8 @@ private fun VideoCard(
             ) {
                 listOf(
                     "▶ Смотреть" to onOpen,
+                    "📺 Канал" to onChannel,
+                    (if (subscribed) "✅ Вы подписаны" else "📌 Подписаться") to onSubscribe,
                     "📋 Ссылка" to onLink
                 ).forEach { (label, action) ->
                     Surface(
