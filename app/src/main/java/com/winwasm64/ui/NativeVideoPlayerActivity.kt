@@ -20,6 +20,9 @@ class NativeVideoPlayerActivity : ComponentActivity() {
         val title = intent.getStringExtra("title") ?: "Видео"
         val thumbnailUrl = intent.getStringExtra("thumbnail")
         val referer = intent.getStringExtra("referer")
+        // v4.81.0: ключ библиотеки и позиция продолжения
+        val libKey = intent.getStringExtra("libKey") ?: videoUrl
+        val start = intent.getLongExtra("start", 0L)
 
         setContent {
             com.winwasm64.ui.theme.OmniTheme {
@@ -28,6 +31,10 @@ class NativeVideoPlayerActivity : ComponentActivity() {
                     title = title,
                     thumbnailUrl = thumbnailUrl,
                     referer = referer,
+                    startPositionMs = start,
+                    onProgress = { pos, dur ->
+                        com.winwasm64.torrent.VideoLibrary.setProgress(applicationContext, libKey, pos, dur)
+                    },
                     onBack = { finish() },
                     onComplete = { finish() }
                 )

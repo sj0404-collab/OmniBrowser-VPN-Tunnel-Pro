@@ -6757,6 +6757,12 @@ private fun VideoHomeSection(
     var channel by remember { mutableStateOf<com.winwasm64.torrent.VideoSubs.Channel?>(null) }
     var subsOpen by remember { mutableStateOf(false) }
     var subsVersion by remember { mutableIntStateOf(0) }
+    // v4.81.0: библиотека (смотреть позже + продолжение + скачанное) и выбор качества
+    var libraryOpen by remember { mutableStateOf(false) }
+    var libVersion by remember { mutableIntStateOf(0) }
+    var qualityFor by remember { mutableStateOf<com.winwasm64.torrent.VideoFeed.Clip?>(null) }
+    var qualityList by remember { mutableStateOf<List<com.winwasm64.torrent.VideoPlay.Variant>>(emptyList()) }
+    var qualityLoading by remember { mutableStateOf(false) }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
 
@@ -6768,7 +6774,28 @@ private fun VideoHomeSection(
             return
         }
         playing = "Открываю «${c.title.take(40)}»…"
+        com.winwasm64.torrent.VideoLibrary.ensure(context, c)
         scope.launch {
+            // v4.81.0: если файл уже скачан — играем офлайн, без сети
+            val local = withContext(Dispatchers.IO) { com.winwasm64.torrent.VideoDownloads.localFile(context, c) }
+            if (local != null) {
+                playing = ""
+                val (pos, _) = com.winwasm64.torrent.VideoLibrary.progressOf(
+                    context, com.winwasm64.torrent.VideoFeed.keyOf(c)
+                )
+                runCatching {
+                    context.startActivity(
+                        Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            .putExtra("url", local.absolutePath)
+                            .putExtra("title", c.title)
+                            .putExtra("thumbnail", c.thumb)
+                            .putExtra("libKey", com.winwasm64.torrent.VideoFeed.keyOf(c))
+                            .putExtra("start", pos)
+                    )
+                }
+                return@launch
+            }
             val play = withContext(Dispatchers.IO) {
                 runCatching { com.winwasm64.torrent.VideoPlay.resolve(c.url) }.getOrNull()
             }
@@ -6788,6 +6815,13 @@ private fun VideoHomeSection(
                         .putExtra("title", c.title)
                         .putExtra("thumbnail", c.thumb)
                         .putExtra("referer", play.referer)
+                        .putExtra("libKey", com.winwasm64.torrent.VideoFeed.keyOf(c))
+                        .putExtra(
+                            "start",
+                            com.winwasm64.torrent.VideoLibrary.progressOf(
+                                context, com.winwasm64.torrent.VideoFeed.keyOf(c)
+                            ).first
+                        )
                 )
             }.onFailure { note = "Не смог открыть плеер: " + (it.message ?: "") }
         }
@@ -6947,6 +6981,46 @@ private fun VideoHomeSection(
         }
     }
 
+    val qFor = qualityFor
+    if (qFor != null) {
+        QualityDialog(
+            clip = qFor,
+            variants = qualityList,
+            loading = qualityLoading,
+            onDismiss = { qualityFor = null },
+            onPick = { v ->
+                qualityFor = null
+                val msg = com.winwasm64.torrent.VideoDownloads.enqueue(context, qFor, v)
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                libVersion++
+            }
+        )
+    }
+    if (libraryOpen) {
+        LibraryScreen(
+            modifier = modifier,
+            version = libVersion,
+            onBack = { libraryOpen = false },
+            onPlay = { saved ->
+                val clip = com.winwasm64.torrent.VideoFeed.Clip(
+                    id = saved.key,
+                    kind = com.winwasm64.torrent.VideoFeed.CLIP_VIDEO,
+                    title = saved.title,
+                    author = saved.author,
+                    lengthText = saved.lengthText,
+                    viewsText = "",
+                    publishedText = "",
+                    thumb = saved.thumb,
+                    url = saved.url,
+                    source = saved.source,
+                    lengthSec = saved.lengthSec
+                )
+                openClip(clip)
+            },
+            onChanged = { libVersion++ }
+        )
+        return
+    }
     if (subsOpen) {
         SubsScreen(
             modifier = modifier,
@@ -7065,6 +7139,21 @@ private fun VideoHomeSection(
             ) {
                 Text(
                     "📌 Подписки" + (if (subsCount > 0) " $subsCount" else ""),
+                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+            val libCount = remember(libVersion) {
+                com.winwasm64.torrent.VideoLibrary.list(context).size
+            }
+            Surface(
+                color = Omni.SurfaceHighest,
+                shape = RoundedCornerShape(9.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Omni.Outline),
+                modifier = Modifier.clickable { libraryOpen = true }
+            ) {
+                Text(
+                    "📚 Библиотека" + (if (libCount > 0) " $libCount" else ""),
                     color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                 )
@@ -7225,6 +7314,30 @@ private fun VideoHomeSection(
                             note = "У этой карточки нет имени канала"
                         }
                     },
+                    saved = remember(libVersion, clip.url) {
+                        com.winwasm64.torrent.VideoLibrary.isSaved(context, clip)
+                    },
+                    onSave = {
+                        val now = com.winwasm64.torrent.VideoLibrary.toggleSave(context, clip)
+                        libVersion++
+                        Toast.makeText(
+                            context,
+                            if (now) "Добавлено в библиотеку" else "Убрано из библиотеки",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    onDownload = {
+                        qualityFor = clip
+                        qualityList = emptyList()
+                        qualityLoading = true
+                        scope.launch {
+                            qualityList = withContext(Dispatchers.IO) {
+                                runCatching { com.winwasm64.torrent.VideoPlay.variants(clip.url) }
+                                    .getOrDefault(emptyList())
+                            }
+                            qualityLoading = false
+                        }
+                    },
                     onLink = {
                     val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as? android.content.ClipboardManager
@@ -7281,6 +7394,165 @@ private fun VideoHomeSection(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * v4.81.0: библиотека видео — «смотреть позже», продолжение с места и скачанное офлайн.
+ */
+@Composable
+private fun LibraryScreen(
+    modifier: Modifier,
+    version: Int,
+    onBack: () -> Unit,
+    onPlay: (com.winwasm64.torrent.VideoLibrary.Saved) -> Unit,
+    onChanged: () -> Unit
+) {
+    val context = LocalContext.current
+    var localVersion by remember { mutableIntStateOf(version) }
+    val all = remember(localVersion) { com.winwasm64.torrent.VideoLibrary.list(context) }
+    val resume = all.filter { it.positionMs > 3000L && !it.watched }
+    val later = all.filter { it.saved }
+    val downloaded = all.filter { it.localPath.isNotBlank() }
+
+    fun platform(src: String) = when (src) {
+        com.winwasm64.torrent.VideoFeed.SRC_VK -> "VK Видео"
+        com.winwasm64.torrent.VideoFeed.SRC_RUTUBE -> "RuTube"
+        else -> "YouTube"
+    }
+
+    Column(modifier = modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 10.dp, top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("←", color = Color.White, fontSize = 20.sp, modifier = Modifier.padding(horizontal = 8.dp).clickable { onBack() })
+            Text("Библиотека", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.weight(1f))
+            Text("${all.size}", color = Omni.TextFaint, fontSize = 11.sp)
+        }
+        if (all.isEmpty()) {
+            Text(
+                "Пока пусто.\n\nВ карточке видео: ⋮ → «📚 Смотреть позже» — ролик появится здесь. " +
+                    "Позиция просмотра сохраняется сама, поэтому плеер всегда продолжит с того места, где вы остановились, " +
+                    "а «⬇ Скачать» положит файл на устройство и он откроется без сети.",
+                color = Omni.TextDim, fontSize = 12.sp, modifier = Modifier.padding(16.dp)
+            )
+            return@Column
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            fun section(title: String, list: List<com.winwasm64.torrent.VideoLibrary.Saved>) {
+                if (list.isEmpty()) return
+                item {
+                    Text(
+                        title + " · " + list.size,
+                        color = Omni.TextDim, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp)
+                    )
+                }
+                items(list) { s ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp)).background(Omni.SurfaceHigh)
+                            .clickable { onPlay(s) }
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier.size(40.dp).clip(CircleShape).background(Omni.AccentContainer),
+                            contentAlignment = Alignment.Center
+                        ) { Text("▶", color = Color.White, fontSize = 14.sp) }
+                        Column(modifier = Modifier.weight(1f).padding(start = 10.dp)) {
+                            Text(s.title, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                listOf(
+                                    s.author.ifBlank { platform(s.source) },
+                                    platform(s.source),
+                                    if (s.watched) "просмотрено" else if (s.progressPercent > 0) "остановились на ${s.progressPercent}%" else "",
+                                    if (s.localPath.isNotBlank()) "скачано · без сети" else "",
+                                    s.lengthText
+                                ).filter { it.isNotBlank() }.distinct().joinToString(" · "),
+                                color = Omni.TextDim, fontSize = 10.sp, maxLines = 2
+                            )
+                            if (s.progressPercent in 1..94) {
+                                Box(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).height(3.dp)
+                                    .clip(RoundedCornerShape(2.dp)).background(Omni.SurfaceHighest)) {
+                                    Box(modifier = Modifier.fillMaxWidth(s.progressPercent / 100f).height(3.dp).background(Omni.Accent))
+                                }
+                            }
+                        }
+                        Text(
+                            "✖", color = Omni.TextFaint, fontSize = 14.sp,
+                            modifier = Modifier.clickable {
+                                com.winwasm64.torrent.VideoLibrary.remove(context, s.key)
+                                localVersion++
+                                onChanged()
+                            }.padding(6.dp)
+                        )
+                    }
+                }
+            }
+            section("▶ Продолжить", resume)
+            section("📚 Смотреть позже", later)
+            section("⬇ Скачанные", downloaded)
+        }
+    }
+}
+
+/** v4.81.0: выбор качества перед скачиванием. */
+@Composable
+private fun QualityDialog(
+    clip: com.winwasm64.torrent.VideoFeed.Clip,
+    variants: List<com.winwasm64.torrent.VideoPlay.Variant>,
+    loading: Boolean,
+    onDismiss: () -> Unit,
+    onPick: (com.winwasm64.torrent.VideoPlay.Variant) -> Unit
+) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
+                .background(Omni.Surface).padding(14.dp)
+        ) {
+            Text("Скачать: ${clip.title.take(60)}", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+            Text(
+                "Файл попадёт в Download/OmniBrowser и откроется встроенным плеером без сети",
+                color = Omni.TextDim, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
+            )
+            if (loading) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Omni.Accent, strokeWidth = 2.dp)
+                    Text("  Спрашиваю доступные потоки…", color = Omni.TextDim, fontSize = 11.sp)
+                }
+            } else if (variants.isEmpty()) {
+                Text(
+                    "Площадка не отдала прямые потоки для этого ролика (закрытое видео или нужен вход).",
+                    color = Omni.Warning, fontSize = 11.sp
+                )
+            } else {
+                Column(modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                    for (v in variants) {
+                        Surface(
+                            color = Omni.SurfaceHighest,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { onPick(v) }
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text(v.label, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                                Text(
+                                    if (v.bytes > 0) (v.bytes / 1_048_576).toString() + " МБ" else if (v.isHls) "HLS" else "",
+                                    color = Omni.TextFaint, fontSize = 10.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Text("Отмена", color = Omni.Accent, fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp).clickable { onDismiss() })
         }
     }
 }
@@ -7662,7 +7934,10 @@ private fun VideoCard(
     onLink: () -> Unit,
     onChannel: () -> Unit = {},
     onSubscribe: () -> Unit = {},
-    subscribed: Boolean = false
+    subscribed: Boolean = false,
+    saved: Boolean = false,
+    onSave: () -> Unit = {},
+    onDownload: () -> Unit = {}
 ) {
     var menu by remember(clip.id) { mutableStateOf(false) }
     var bmp by remember(clip.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
@@ -7790,6 +8065,8 @@ private fun VideoCard(
                     "▶ Смотреть" to onOpen,
                     "📺 Канал" to onChannel,
                     (if (subscribed) "✅ Вы подписаны" else "📌 Подписаться") to onSubscribe,
+                    (if (saved) "📚 В библиотеке" else "📚 Смотреть позже") to onSave,
+                    "⬇ Скачать" to onDownload,
                     "📋 Ссылка" to onLink
                 ).forEach { (label, action) ->
                     Surface(

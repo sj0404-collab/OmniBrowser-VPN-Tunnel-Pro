@@ -41,6 +41,10 @@ fun NativeVideoPlayerScreen(
     thumbnailUrl: String? = null,
     /** v4.66.0: откуда пришёл поток — VK/RuTube/YouTube отдают 403 без Referer. */
     referer: String? = null,
+    /** v4.81.0: продолжить с места остановки (мс). */
+    startPositionMs: Long = 0L,
+    /** v4.81.0: плеер сообщает позицию — она сохраняется в библиотеке. */
+    onProgress: ((Long, Long) -> Unit)? = null,
     onBack: () -> Unit = {},
     onComplete: () -> Unit = {}
 ) {
@@ -49,6 +53,29 @@ fun NativeVideoPlayerScreen(
     var player by remember { mutableStateOf<ExoPlayer?>(null) }
     var isPlaying by remember { mutableStateOf(true) }
     var showControls by remember { mutableStateOf(true) }
+
+    // v4.81.0: позицию просмотра запоминаем каждые 5 секунд и при выходе
+    LaunchedEffect(videoUrl, onProgress) {
+        val cb = onProgress ?: return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(5000)
+            val p = player ?: continue
+            val pos = try { p.currentPosition } catch (_: Throwable) { -1L }
+            val dur = try { p.duration } catch (_: Throwable) { 0L }
+            if (pos >= 0) cb(pos, if (dur > 0) dur else 0L)
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(videoUrl) {
+        onDispose {
+            val p = player
+            val cb = onProgress
+            if (p != null && cb != null) {
+                val pos = try { p.currentPosition } catch (_: Throwable) { -1L }
+                val dur = try { p.duration } catch (_: Throwable) { 0L }
+                if (pos >= 0) cb(pos, if (dur > 0) dur else 0L)
+            }
+        }
+    }
 
     // Создаём ExoPlayer
     LaunchedEffect(videoUrl, referer) {
@@ -77,6 +104,10 @@ fun NativeVideoPlayerScreen(
             }
         })
         exoPlayer.prepare()
+        // v4.81.0: продолжаем с того места, где остановились
+        if (startPositionMs > 2000L) {
+            try { exoPlayer.seekTo(startPositionMs) } catch (_: Throwable) {}
+        }
         exoPlayer.playWhenReady = true
     }
 

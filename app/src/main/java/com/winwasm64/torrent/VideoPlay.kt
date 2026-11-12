@@ -296,6 +296,137 @@ object VideoPlay {
         return null
     }
 
+    /* ===================== v4.81.0: варианты качества для скачивания ===================== */
+
+    data class Variant(
+        val label: String,
+        val url: String,
+        val referer: String?,
+        val mime: String,
+        val isHls: Boolean = false,
+        val bytes: Long = 0L
+    )
+
+    /**
+     * Все доступные потоки для выбора качества: у YouTube — progressive и видео-дорожки,
+     * у VK — прямые mp4 240…2160, у RuTube — HLS и mp4. Пустой список — не удалось получить.
+     */
+    fun variants(link: String): List<Variant> {
+        lastError = ""
+        val url = link.trim()
+        val out = ArrayList<Variant>()
+        val yt = youtubeId(url)
+        if (yt != null) {
+            for (client in listOf("ANDROID", "WEB")) {
+                val json = playerJson(yt, client) ?: continue
+                val sd = json.optJSONObject("streamingData") ?: continue
+                sd.optJSONArray("formats")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val f = arr.optJSONObject(i) ?: continue
+                        val u = f.optString("url")
+                        if (u.isBlank()) continue
+                        val label = f.optString("qualityLabel").ifBlank { f.optString("quality") }
+                        out.add(Variant(label + " · mp4", u, "https://www.youtube.com/", "video/mp4", bytes = f.optLong("contentLength", 0L)))
+                    }
+                }
+                sd.optJSONArray("adaptiveFormats")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val f = arr.optJSONObject(i) ?: continue
+                        if (f.optString("mimeType").startsWith("audio", true)) continue
+                        val u = f.optString("url")
+                        if (u.isBlank()) continue
+                        val label = f.optString("qualityLabel")
+                        out.add(Variant(label + " · без звука", u, "https://www.youtube.com/", "video/mp4", bytes = f.optLong("contentLength", 0L)))
+                    }
+                }
+                if (out.isNotEmpty()) break
+            }
+            return out.distinctBy { it.url }
+        }
+        if (url.contains("rutube.ru/video/", true)) {
+            val id = Regex("""/video/([0-9a-f]{8,})""", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+            if (id != null) {
+                val (code, text) = try {
+                    NetDirect.requestText(
+                        "https://rutube.ru/api/video/$id/",
+                        mapOf("User-Agent" to UA_WEB, "Accept" to "application/json", "Referer" to "https://rutube.ru/"),
+                        timeoutMs = 12_000
+                    )
+                } catch (_: Throwable) {
+                    0 to ""
+                }
+                if (code in 200..299) {
+                    try {
+                        val json = JSONObject(text)
+                        val mp4 = json.optString("video_url")
+                        if (mp4.isNotBlank()) out.add(Variant("mp4", mp4, "https://rutube.ru/", "video/mp4"))
+                        val hls = json.optJSONObject("video_balancer")?.optString("m3u8").orEmpty()
+                        if (hls.isNotBlank()) out.add(Variant("HLS (плейлист)", hls, "https://rutube.ru/", "application/x-mpegURL", isHls = true))
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            return out
+        }
+        if (url.contains("vk.com/video", true) || url.contains("vkvideo.ru/video", true) || url.contains("vk.com/clip", true)) {
+            val m = Regex("""(?:video|clip)(-?\d+)_(\d+)""").find(url)
+            if (m != null) {
+                val oid = m.groupValues[1]
+                val vid = m.groupValues[2]
+                val (code, text) = try {
+                    NetDirect.requestText(
+                        "https://vk.com/video_ext.php?oid=$oid&id=$vid&hd=3",
+                        mapOf("User-Agent" to UA_WEB, "Accept-Language" to "ru", "Referer" to "https://vk.com/"),
+                        timeoutMs = 12_000
+                    )
+                } catch (_: Throwable) {
+                    0 to ""
+                }
+                if (code in 200..299) {
+                    Regex(""""url(240|360|480|720|1080|1440|2160)":"(https:[^"]+)"""")
+                        .findAll(text)
+                        .forEach { mm ->
+                            out.add(
+                                Variant(
+                                    mm.groupValues[1] + "p · mp4",
+                                    mm.groupValues[2].replace("\\/", "/"),
+                                    "https://vk.com/",
+                                    "video/mp4"
+                                )
+                            )
+                        }
+                }
+            }
+            return out.sortedByDescending { it.label.substringBefore('p').toIntOrNull() ?: 0 }
+        }
+        if (url.endsWith(".mp4", true)) return listOf(Variant("mp4", url, null, "video/mp4"))
+        if (url.endsWith(".m3u8", true)) return listOf(Variant("HLS (плейлист)", url, null, "application/x-mpegURL", isHls = true))
+        return out
+    }
+
+    /** Сырой player-ответ YouTube (для разбора вариантов). */
+    private fun playerJson(id: String, client: String): JSONObject? {
+        val ctx = if (client == "ANDROID") JSONObject()
+            .put("clientName", "ANDROID").put("clientVersion", "19.09.37").put("androidSdkVersion", 30)
+            .put("hl", "ru").put("gl", "RU")
+        else JSONObject().put("clientName", "WEB").put("clientVersion", "2.20260101.00.00").put("hl", "ru").put("gl", "RU")
+        val body = JSONObject().put("videoId", id).put("context", JSONObject().put("client", ctx))
+            .put("contentCheckOk", true).put("racyCheckOk", true).toString()
+        val headers = mutableMapOf(
+            "Content-Type" to "application/json",
+            "X-Goog-Api-Format-Version" to "2",
+            "Accept-Language" to "ru",
+            "User-Agent" to if (client == "ANDROID") UA_YT else UA_WEB
+        )
+        val (code, text) = try {
+            NetDirect.requestText("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", headers, "POST", body, timeoutMs = 12_000)
+        } catch (_: Throwable) {
+            return null
+        }
+        if (code !in 200..299) return null
+        return try { JSONObject(text) } catch (_: Throwable) { null }
+    }
+
     private fun rutube(link: String): Play? {
         val id = Regex("""/video/([0-9a-f]{8,})/?""", RegexOption.IGNORE_CASE).find(link)?.groupValues?.get(1)
         if (id == null) { lastError = "не понял id RuTube"; return null }
