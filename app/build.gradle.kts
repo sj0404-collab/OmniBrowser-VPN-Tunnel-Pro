@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.winwasm64.workstation"
-        minSdk = 21   // v4.88.0: универсально, включая Android 5
+        minSdk = 23   // v4.88.0: универсально для всех телефонов, планшетов и приставок (Compose требует 23+)
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber

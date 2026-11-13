@@ -12,7 +12,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        minSdk = 21
+        minSdk = 23
         manifestPlaceholders["appAuthRedirectScheme"] = "rupoop"
         // правила R8 из этого файла применяются ко ВСЕМУ нашему APK
         consumerProguardFiles("proguard-rules.pro")
