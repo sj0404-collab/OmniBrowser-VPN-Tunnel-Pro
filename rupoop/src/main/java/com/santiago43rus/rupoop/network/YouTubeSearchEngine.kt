@@ -202,7 +202,8 @@ object YouTubeSearchEngine {
         for (v in nodes) {
             val id = v.optString("videoId")
             if (id.length != 11) continue
-            val title = titleOf(v.opt("title")).ifBlank { continue }
+            val title = titleOf(v.opt("title"))
+            if (title.isBlank()) continue
             val lengthText = v.optJSONObject("lengthText")?.optString("simpleText").orEmpty()
             val viewsText = v.optJSONObject("viewCountText")?.optString("simpleText").orEmpty()
             val published = v.optJSONObject("publishedTimeText")?.optString("simpleText").orEmpty()
