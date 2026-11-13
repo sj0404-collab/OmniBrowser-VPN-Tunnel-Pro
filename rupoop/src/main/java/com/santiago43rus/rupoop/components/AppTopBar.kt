@@ -328,7 +328,6 @@ fun AppTopBar(
                             disabledContainerColor = Color.Transparent,
                             cursorColor = MaterialTheme.colorScheme.primary
                         ),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                     )
                 }
             }
