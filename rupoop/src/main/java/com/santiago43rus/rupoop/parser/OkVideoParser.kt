@@ -84,7 +84,7 @@ object OkVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val html = response.body.string()
+            val html = response.body!!.string()
 
             // 1. Direct search for hlsManifestUrl in unescaped HTML
             val unescapedHtml = unescapeAll(html)
@@ -193,7 +193,7 @@ object OkVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val body = response.body.string()
+            val body = response.body!!.string()
 
             parseOkDataOptionsJson(unescapeAll(body), originalUrl)
         } catch (e: Exception) {

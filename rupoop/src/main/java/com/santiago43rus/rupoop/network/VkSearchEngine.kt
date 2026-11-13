@@ -78,7 +78,7 @@ object VkSearchEngine {
 
         val response = httpClient.newCall(request).execute()
         if (!response.isSuccessful) return emptyList()
-        val body = response.body.string()
+        val body = response.body!!.string()
 
         val list = mutableListOf<SearchResult>()
 

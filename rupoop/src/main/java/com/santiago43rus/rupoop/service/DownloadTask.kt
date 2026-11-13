@@ -239,7 +239,7 @@ class DownloadTask(
     private suspend fun resolveMediaPlaylist(url: String, quality: String): String {
         val request = Request.Builder().url(url).build()
         val response = withContext(Dispatchers.IO) { service.client.newCall(request).execute() }
-        val body = response.body.string().ifEmpty { throw Exception("Empty playlist") }
+        val body = response.body!!.string().ifEmpty { throw Exception("Empty playlist") }
 
         if (body.contains("#EXT-X-STREAM-INF")) {
             val lines = body.lines()
@@ -274,7 +274,7 @@ class DownloadTask(
     private suspend fun fetchSegments(url: String): List<String> {
         val request = Request.Builder().url(url).build()
         val response = withContext(Dispatchers.IO) { service.client.newCall(request).execute() }
-        val body = response.body.string().ifEmpty { throw Exception("Empty media playlist") }
+        val body = response.body!!.string().ifEmpty { throw Exception("Empty media playlist") }
 
         val baseUrl = url.substringBeforeLast("/")
         return body.lines().filter { it.isNotEmpty() && !it.startsWith("#") }.map {

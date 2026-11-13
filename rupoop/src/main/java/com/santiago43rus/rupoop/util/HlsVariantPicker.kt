@@ -9,7 +9,7 @@ object HlsVariantPicker {
     private val audioRendition = Regex("#EXT-X-MEDIA:[^\\n]*TYPE=AUDIO[^\\n]*URI=\"([^\"]+)\"")
 
     private fun fetch(url: String): String =
-        client.newCall(Request.Builder().url(url).build()).execute().use { it.body.string() }
+        client.newCall(Request.Builder().url(url).build()).execute().use { it.body!!.string() }
 
     private fun absolute(masterUrl: String, uri: String): String =
         if (uri.startsWith("http")) uri else masterUrl.substringBeforeLast("/") + "/" + uri

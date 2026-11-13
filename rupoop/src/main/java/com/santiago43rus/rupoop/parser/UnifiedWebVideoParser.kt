@@ -77,7 +77,7 @@ object UnifiedWebVideoParser {
                 return@withContext null
             }
 
-            val rawHtml = response.body.string()
+            val rawHtml = response.body!!.string()
             val html = JsPackerUnpacker.unpack(rawHtml)
             val hostName = getHost(normalizedUrl) ?: "Фильм / Видео"
 
@@ -276,7 +276,7 @@ object UnifiedWebVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return@withContext null
-            val rawHtml = response.body.string()
+            val rawHtml = response.body!!.string()
             val html = JsPackerUnpacker.unpack(rawHtml)
 
             // 1. Direct stream in player HTML
@@ -628,7 +628,7 @@ object UnifiedWebVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val html = response.body.string()
+            val html = response.body!!.string()
 
             val stream = extractAniboomStream(html, iframeUrl)
                 ?: extractStreamFromPlayerHtml(html, iframeUrl)
@@ -670,7 +670,7 @@ object UnifiedWebVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val html = response.body.string()
+            val html = response.body!!.string()
             val unpacked = JsPackerUnpacker.unpack(html)
 
             // Try direct extraction from Kodik HTML
@@ -703,7 +703,7 @@ object UnifiedWebVideoParser {
 
                     val gviResp = httpClient.newCall(gviReq).execute()
                     if (gviResp.isSuccessful) {
-                        val gviBody = gviResp.body.string()
+                        val gviBody = gviResp.body!!.string()
                         val gviJson = JSONObject(gviBody)
                         val links = gviJson.optJSONObject("links")
                         if (links != null) {
@@ -958,7 +958,7 @@ object UnifiedWebVideoParser {
 
             val playlistResp = httpClient.newCall(playlistReq).execute()
             if (!playlistResp.isSuccessful) return@withContext null
-            val playlistJsonStr = playlistResp.body.string()
+            val playlistJsonStr = playlistResp.body!!.string()
 
             val titleName = extractRegex(playlistJsonStr, """"titleName"\s*:\s*"([^"]+)"""")?.let { unescapeHtml(it) } ?: fallbackTitle
             
@@ -1031,7 +1031,7 @@ object UnifiedWebVideoParser {
 
             val videoResp = httpClient.newCall(videoReq).execute()
             if (!videoResp.isSuccessful) return@withContext null
-            val videoJsonStr = videoResp.body.string()
+            val videoJsonStr = videoResp.body!!.string()
 
             val thumbUrl = extractRegex(videoJsonStr, """"thumbUrl"\s*:\s*"([^"]+)"""")?.replace("\\/", "/") ?: fallbackThumbnail
             val duration = extractRegex(videoJsonStr, """"duration"\s*:\s*([0-9]+)""")?.toLongOrNull()

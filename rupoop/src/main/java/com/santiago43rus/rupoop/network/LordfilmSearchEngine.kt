@@ -65,7 +65,7 @@ object LordfilmSearchEngine {
                     .build()
                 val response = httpClient.newCall(request).execute()
                 if (response.isSuccessful) {
-                    val html = response.body.string()
+                    val html = response.body!!.string()
                     val parsed = parseCardsFromHtml(html, hostDomain)
                     if (parsed.isNotEmpty()) {
                         results.addAll(parsed)
@@ -99,7 +99,7 @@ object LordfilmSearchEngine {
 
         val response = httpClient.newCall(request).execute()
         if (!response.isSuccessful) return emptyList()
-        val html = response.body.string()
+        val html = response.body!!.string()
 
         return parseCardsFromHtml(html, hostDomain)
     }

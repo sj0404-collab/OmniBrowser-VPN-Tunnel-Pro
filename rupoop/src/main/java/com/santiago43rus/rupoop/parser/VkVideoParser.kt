@@ -84,7 +84,7 @@ object VkVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val body = response.body.string()
+            val body = response.body!!.string()
 
             val streamUrl = extractStreamUrl(body) ?: return null
 
@@ -147,7 +147,7 @@ object VkVideoParser {
 
             val response = httpClient.newCall(request).execute()
             if (!response.isSuccessful) return null
-            val html = response.body.string()
+            val html = response.body!!.string()
 
             val streamUrl = extractStreamUrl(html) ?: return null
 

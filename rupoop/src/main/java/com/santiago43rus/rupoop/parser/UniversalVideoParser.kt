@@ -131,7 +131,7 @@ object UniversalVideoParser {
                         .build()
                     val resp = client.newCall(req).execute()
                     if (resp.isSuccessful) {
-                        val body = resp.body.string()
+                        val body = resp.body!!.string()
                         val hls = Regex(""""hlsUrl"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1)
                             ?: Regex(""""mpegFullHdUrl"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1)
                             ?: Regex(""""mpegHighUrl"\s*:\s*"([^"]+)"""").find(body)?.groupValues?.get(1)

@@ -8,7 +8,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.santiago43rus.rupoop.theme.RupoopTheme
-import com.santiago43rus.rupoop.util.isTv
+import com.santiago43rus.rupoop.util.isTv as isTvDeviceExt
+import androidx.compose.ui.platform.LocalContext
 
 /**
  * v4.87.0: экран Rupoop как ЧАСТЬ нашего приложения — без второго APK и без второго ярлыка.
@@ -39,7 +40,7 @@ fun RupoopRootScreen(
 
     RupoopTheme(themeMode = themeMode, darkTheme = isDarkTheme) {
         Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            if (remember { isTv() }) {
+            if (remember { LocalContext.current.isTvDeviceExt() }) {
                 com.santiago43rus.rupoop.tv.TvRoot(vm = vm, onThemeToggle = toggle)
             } else {
                 RutubeApp(

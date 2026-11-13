@@ -64,7 +64,7 @@ object OkSearchEngine {
 
         val response = httpClient.newCall(request).execute()
         if (!response.isSuccessful) return emptyList()
-        val html = response.body.string()
+        val html = response.body!!.string()
 
         val list = mutableListOf<SearchResult>()
 
