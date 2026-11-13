@@ -28,6 +28,7 @@ import com.winwasm64.torrent.VideoPlaylists
 import com.winwasm64.ui.browser.CoverCache
 import com.winwasm64.ui.theme.Omni
 import kotlinx.coroutines.launch
+import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
