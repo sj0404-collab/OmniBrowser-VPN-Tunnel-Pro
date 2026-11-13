@@ -76,7 +76,7 @@ class ContentFeedController(
                 } else enabledGenres
 
                 val queries = selectedGenres.map { genre ->
-                    com.santiago43rus.rupoop.util.Genres.toQuery(genre)
+                    com.santiago43rus.rupoop.util.Genres.toQuery(genre ?: "популярное")
                 }.toMutableList()
 
                 if (queries.isEmpty()) queries.add("популярное")

@@ -18,6 +18,8 @@ import com.santiago43rus.rupoop.data.Author
 import com.santiago43rus.rupoop.data.SearchResult
 import com.santiago43rus.rupoop.data.SearchSource
 import com.santiago43rus.rupoop.network.PlatformSearchEngineResolver
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.horizontalScroll
 
 /**
  * Playlist-style video list (Liked / Watch Later / Playlists).
@@ -96,7 +98,7 @@ fun VideoListScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
-                        colors = TextFieldDefaults.outlinedTextFieldColors()
+                        colors = OutlinedTextFieldDefaults.colors()
                     )
                     Spacer(Modifier.height(4.dp))
                     Row(

@@ -18,6 +18,7 @@ import com.santiago43rus.rupoop.components.VideoCardItem
 import com.santiago43rus.rupoop.components.VideoCardShimmer
 import com.santiago43rus.rupoop.data.*
 import com.santiago43rus.rupoop.util.extractId
+import androidx.compose.ui.unit.sp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
