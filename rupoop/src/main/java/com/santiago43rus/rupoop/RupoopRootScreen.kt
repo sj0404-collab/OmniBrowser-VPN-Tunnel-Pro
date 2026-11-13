@@ -42,7 +42,8 @@ fun RupoopRootScreen(
 
     RupoopTheme(themeMode = themeMode, darkTheme = isDarkTheme) {
         Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            if (isTvDevice) {
+            // ТВ-компоненты требуют API 23+, на Android 5/6 показываем обычный интерфейс
+            if (isTvDevice && android.os.Build.VERSION.SDK_INT >= 23) {
                 com.santiago43rus.rupoop.tv.TvRoot(vm = vm, onThemeToggle = toggle)
             } else {
                 RutubeApp(

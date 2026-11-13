@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- v4.88.0: minSdk 21 (Android 5), но TV-библиотеки требуют 23 — включаем их только на ТВ -->
+    <uses-sdk tools:overrideLibrary="androidx.tv.foundation,androidx.tv.material" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
