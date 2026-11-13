@@ -1,9 +1,10 @@
 // v4.87.0: RupoopFork как БИБЛИОТЕЧНЫЙ модуль нашего APK — единый интерфейс, без второго приложения.
 plugins {
-    alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.kotlin.serialization)
+    // версии плагинов заданы в корневом build.gradle.kts
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
 }
 
 android {
