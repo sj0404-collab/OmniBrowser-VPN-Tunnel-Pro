@@ -19,7 +19,6 @@ robolectric = "4.13"
 androidxTestCore = "1.6.1"
 androidxTestRunner = "1.6.2"
 # v4.87.0: модуль Rupoop (RuTube / VK / OK / LordFilm) — версии под наш toolchain (Kotlin 2.0.21, compileSdk 35)
-media3 = "1.4.1"
 appauth = "0.11.1"
 retrofit = "2.11.0"
 retrofitSerialization = "1.0.0"
@@ -51,12 +50,7 @@ androidx-compose-material3 = { group = "androidx.compose.material3", name = "mat
 androidx-compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
 androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 androidx-compose-animation = { group = "androidx.compose.animation", name = "animation" }
-androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
-androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
-androidx-media3-common = { group = "androidx.media3", name = "media3-common", version.ref = "media3" }
-androidx-media3-hls = { group = "androidx.media3", name = "media3-exoplayer-hls", version.ref = "media3" }
-androidx-media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
-androidx-media3-transformer = { group = "androidx.media3", name = "media3-transformer", version.ref = "media3" }
+androidx-media3-transformer = { group = "androidx.media3", name = "media3-transformer", version = "1.4.1" }
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workRuntime" }
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
 androidx-tv-foundation = { group = "androidx.tv", name = "tv-foundation", version.ref = "tvFoundation" }
