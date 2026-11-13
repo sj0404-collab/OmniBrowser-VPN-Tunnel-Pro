@@ -76,6 +76,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -7842,19 +7843,35 @@ private fun WebScraper(
     var web by remember(url, round) { mutableStateOf<android.webkit.WebView?>(null) }
     val collected = remember(url, round) { LinkedHashMap<String, com.winwasm64.torrent.VideoFeed.Clip>() }
 
+    Box(Modifier.size(0.dp)) {
     AndroidView(
-        modifier = Modifier.size(1.dp),
+        // v4.82.0: вьюпорт реального размера, но невидимый и без влияния на вёрстку:
+        // VK/RuTube — SPA, при нулевом размере они не отрисовывают выдачу
+        modifier = Modifier
+            .requiredWidth(412.dp)
+            .requiredHeight(732.dp)
+            .graphicsLayer(alpha = 0f),
         factory = { ctx ->
             android.webkit.WebView(ctx).apply {
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                settings.databaseEnabled = true
                 settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                settings.loadsImagesAutomatically = true
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = true
+                android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 settings.userAgentString =
                     "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
                 webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: android.webkit.WebView?, u: String?, favicon: android.graphics.Bitmap?) {
+                        // ставим хук как можно раньше, чтобы поймать все XHR площадки
+                        view?.evaluateJavascript(com.winwasm64.torrent.VideoFeed.jsonHookJs(), null)
+                    }
                     override fun onPageFinished(view: android.webkit.WebView?, u: String?) {
-                        view?.evaluateJavascript("document.body.style.zoom='1';", null)
+                        view?.evaluateJavascript(com.winwasm64.torrent.VideoFeed.jsonHookJs(), null)
                     }
                 }
                 loadUrl(url)
@@ -7862,12 +7879,14 @@ private fun WebScraper(
             }
         }
     )
+    }
 
     LaunchedEffect(url, round) {
         val js = com.winwasm64.torrent.VideoFeed.scrapeJs(source)
         var pass = 0
         var altUsed = false
         var idle = 0
+        delay(1200)
         // v4.78.0: ждём отрисовку не дольше 20 секунд и прекращаем, если выдача перестала расти
         val startedAt = System.currentTimeMillis()
         val maxPass = 8 + round * 5
@@ -7878,8 +7897,9 @@ private fun WebScraper(
             if (pass == 5 && collected.isEmpty() && !altUsed) {
                 altUsed = true
                 val alt = when {
+                    url.contains("m.vkvideo.ru") -> url.replace("m.vkvideo.ru/?q=", "m.vkvideo.ru/search?q=")
                     url.contains("m.vk.com") -> url.replace("m.vk.com", "vk.com")
-                    url.contains("rutube.ru/search") -> url.replace("rutube.ru/search/?query=", "rutube.ru/search/?query=")
+                    url.contains("rutube.ru/search") -> url.replace("rutube.ru/search/?query=", "rutube.ru/search/video/?query=")
                     else -> url
                 }
                 if (alt != url) {
@@ -7888,6 +7908,17 @@ private fun WebScraper(
                     delay(2500)
                 }
             }
+            // 1) данные, которые SPA сама получила по сети (самый точный источник)
+            val jsonRaw = evalJs(w, "JSON.stringify(window.__omni||[])")
+            val fromJson = runCatching {
+                com.winwasm64.torrent.VideoFeed.parsePageJson(jsonRaw, source)
+            }.getOrDefault(emptyList())
+            if (fromJson.isNotEmpty()) {
+                var addedJson = false
+                for (c in fromJson) if (!collected.containsKey(c.url)) { collected[c.url] = c; addedJson = true }
+                if (addedJson) onProgress(collected.values.toList())
+            }
+            // 2) разбор самой страницы (запасной путь)
             val raw = evalJs(w, js)
             if (!raw.isNullOrBlank() && raw != "\"[]\"") {
                 val list = runCatching {

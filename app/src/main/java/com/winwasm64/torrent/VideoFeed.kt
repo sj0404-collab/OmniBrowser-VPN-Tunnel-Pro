@@ -79,9 +79,136 @@ object VideoFeed {
 
     /** VK и RuTube ищем во встроенном браузере: только он проходит без входа и без капчи. */
     fun scrapeUrl(source: String, query: String): String = when (source) {
-        SRC_VK -> "https://m.vk.com/video?q=" + enc(query)
+        // v4.82.0: та же страница, что открывает человек в браузере (старый m.vk.com выдачу не отдаёт)
+        SRC_VK -> "https://m.vkvideo.ru/?q=" + enc(query)
         SRC_RUTUBE -> "https://rutube.ru/search/?query=" + enc(query)
         else -> "https://m.youtube.com/results?search_query=" + enc(query)
+    }
+
+    /**
+     * v4.82.0: площадки (VK, RuTube) — это SPA: данные приходят в JSON по XHR/fetch, а не в HTML.
+     * Поэтому вешаем хук на fetch и XMLHttpRequest и складываем ответы в window.__omni.
+     * Из них получаются точные названия, обложки, длительности, просмотры и дата — как в оригинале.
+     */
+    fun jsonHookJs(): String = """(function(){try{
+if(window.__omniInstalled)return 'ok';window.__omniInstalled=1;window.__omni=[];
+function push(u,b){try{
+  if(!b||b.length<200)return;
+  u=String(u||'');if(!/video|search|feed|catalog|results/i.test(u))return;
+  if(b.indexOf('"title"')<0)return;
+  window.__omni.push({u:u.slice(0,200),b:b.slice(0,600000)});
+  if(window.__omni.length>6)window.__omni.shift();
+}catch(e){}}
+var of=window.fetch;
+if(of){window.fetch=function(){var u='';try{u=(arguments[0]&&arguments[0].url)||arguments[0]||'';}catch(e){}
+  var p=of.apply(this,arguments);
+  try{p.then(function(r){try{r.clone().text().then(function(t){push(u,t);});}catch(e){}}).catch(function(){});}catch(e){}
+  return p;};}
+var oo=XMLHttpRequest.prototype.open, os=XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open=function(m,u){try{this.__omniU=u;}catch(e){}return oo.apply(this,arguments);};
+XMLHttpRequest.prototype.send=function(){var x=this;
+  try{x.addEventListener('load',function(){try{push(x.__omniU,x.responseText);}catch(e){}});}catch(e){}
+  return os.apply(this,arguments);};
+return 'ok';}catch(e){return 'err';}})()"""
+
+    /** Разобрать накопленные JSON-ответы площадки в карточки. */
+    fun parsePageJson(raw: String?, source: String): List<Clip> {
+        if (raw.isNullOrBlank()) return emptyList()
+        val text = try {
+            (org.json.JSONTokener(raw).nextValue() as? String) ?: raw
+        } catch (_: Throwable) {
+            raw
+        }
+        val arr = try { org.json.JSONArray(text) } catch (_: Throwable) { return emptyList() }
+        val out = LinkedHashMap<String, Clip>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val body = o.optString("b")
+            if (body.isBlank()) continue
+            val root = try { org.json.JSONTokener(body).nextValue() } catch (_: Throwable) { continue }
+            walkVideos(root, source) { clip -> if (!out.containsKey(keyOf(clip))) out[keyOf(clip)] = clip }
+            if (out.size > 120) break
+        }
+        return out.values.toList()
+    }
+
+    private fun walkVideos(node: Any?, source: String, hit: (Clip) -> Unit) {
+        when (node) {
+            is JSONObject -> {
+                clipFromJson(node, source)?.let(hit)
+                for (k in node.keys()) walkVideos(node.opt(k), source, hit)
+            }
+            is org.json.JSONArray -> for (i in 0 until node.length()) walkVideos(node.opt(i), source, hit)
+            else -> {}
+        }
+    }
+
+    /** Узнать в объекте видео площадки (VK/RuTube) и превратить в карточку. */
+    private fun clipFromJson(o: JSONObject, source: String): Clip? {
+        // ---------- VK ----------
+        if (o.has("owner_id") && o.has("id") && o.has("title")) {
+            val id = o.optLong("id")
+            val owner = o.optLong("owner_id")
+            if (id == 0L || owner == 0L) return null
+            val title = o.optString("title").trim()
+            if (title.length < 3) return null
+            val dur = o.optInt("duration", 0)
+            val views = if (o.has("views_count")) o.optLong("views_count", 0L) else o.optLong("views", 0L)
+            val date = o.optLong("date", o.optLong("added", 0L))
+            var thumb = ""
+            val img = o.optJSONArray("image") ?: o.optJSONArray("images") ?: o.optJSONArray("thumbs")
+            if (img != null && img.length() > 0) {
+                thumb = img.optJSONObject(img.length() - 1)?.optString("url").orEmpty()
+            }
+            if (thumb.isBlank()) thumb = o.optString("photo_800").ifBlank { o.optString("photo_320") }
+            if (thumb.isBlank()) o.optJSONObject("first_frame_320")?.optString("url")?.let { thumb = it }
+            if (thumb.isBlank()) o.optJSONObject("first_frame_160")?.optString("url")?.let { thumb = it }
+            val ageDays = if (date > 0) ((System.currentTimeMillis() / 1000 - date) / 86400).toInt().coerceAtLeast(0) else 0
+            return Clip(
+                id = "${owner}_$id",
+                kind = CLIP_VIDEO,
+                title = title.take(150),
+                author = o.optString("owner_name").takeIf { it.length in 2..60 }
+                    ?: o.optString("author").takeIf { it.length in 2..60 } ?: "",
+                lengthText = if (dur > 0) String.format(Locale.US, "%d:%02d", dur / 60, dur % 60) else "",
+                viewsText = if (views > 0) fmtCount(views) + " просмотров" else "",
+                publishedText = if (date > 0) ageDays.toString() + " дн. назад" else "",
+                thumb = thumb,
+                url = "https://vk.com/video${owner}_$id",
+                source = SRC_VK,
+                views = views,
+                days = ageDays,
+                lengthSec = dur
+            )
+        }
+        // ---------- RuTube ----------
+        if (source == SRC_RUTUBE && o.has("thumbnail_url") && o.has("title") && o.has("id")) {
+            val id = o.optString("id")
+            if (id.length < 8) return null
+            val dur = o.optInt("duration", 0)
+            val hits = o.optLong("hits", 0L)
+            return Clip(
+                id = id,
+                kind = CLIP_VIDEO,
+                title = o.optString("title").trim().take(150),
+                author = o.optJSONObject("author")?.optString("name").orEmpty(),
+                lengthText = if (dur > 0) String.format(Locale.US, "%d:%02d", dur / 60, dur % 60) else "",
+                viewsText = if (hits > 0) fmtCount(hits) + " просмотров" else "",
+                publishedText = "",
+                thumb = o.optString("thumbnail_url"),
+                url = "https://rutube.ru/video/$id/",
+                source = SRC_RUTUBE,
+                views = hits,
+                lengthSec = dur
+            )
+        }
+        return null
+    }
+
+    private fun fmtCount(n: Long): String = when {
+        n >= 1_000_000 -> String.format(Locale.US, "%.1f млн", n / 1_000_000.0)
+        n >= 1_000 -> String.format(Locale.US, "%.1f тыс.", n / 1_000.0)
+        else -> n.toString()
     }
 
     /**
