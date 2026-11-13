@@ -102,10 +102,14 @@ object VideoFeed {
                 return clip
             }
             if (code !in 200..299) return clip
-            val title = Regex(""""md_title"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-                ?.let { unescapeJs(it) }?.trim().orEmpty()
-            val author = Regex(""""md_author"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-                ?.let { unescapeJs(it) }?.trim().orEmpty()
+            val title = listOf("md_title", "video_title", "title").firstNotNullOfOrNull { k ->
+                Regex(""""$k"\s*:\s*"((?:[^"\\]|\\.)+)"""").find(text)?.groupValues?.get(1)
+                    ?.let { unescapeJs(decodeUnicode(it)) }?.trim()?.takeIf { it.isNotBlank() }
+            }.orEmpty()
+            val author = listOf("md_author", "author", "video_author").firstNotNullOfOrNull { k ->
+                Regex(""""$k"\s*:\s*"((?:[^"\\]|\\.)+)"""").find(text)?.groupValues?.get(1)
+                    ?.let { unescapeJs(decodeUnicode(it)) }?.trim()?.takeIf { it.isNotBlank() }
+            }.orEmpty()
             val jpg = Regex(""""jpg"\s*:\s*"(https:[^"]+)"""").find(text)?.groupValues?.get(1)?.replace("\\/", "/").orEmpty()
             val dur = Regex(""""duration"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
             return clip.copy(
@@ -476,8 +480,14 @@ return JSON.stringify(res.slice(0,200));
             }
             if (all.size >= 8) break
         }
-        return if (all.isEmpty()) Page()
-        else Page(clips = all.values.toList(), note = "быстрый поиск по индексу: ${all.size} видео")
+        // v4.84.0: в ленту — только то, что действительно про запрос
+        val only = filterRelevant(query, all.values.toList())
+        val dropped = all.size - only.size
+        return if (only.isEmpty()) Page(note = if (dropped > 0) "по индексу ничего по теме (отброшено $dropped не по теме)" else "")
+        else Page(
+            clips = only,
+            note = "быстрый поиск по индексу: ${only.size} видео" + if (dropped > 0) " (отброшено $dropped не по теме)" else ""
+        )
     }
 
     /**
@@ -529,15 +539,68 @@ return JSON.stringify(res.slice(0,200));
 
     /** Убрать хлебные крошки, адреса, id и служебные слова из заголовка выдачи. */
     private fun cleanEngineTitle(raw: String): String {
-        var t = raw.replace("\u00A0", " ")
+        var t = decodeUnicode(raw).replace("\u00A0", " ")
         // «Vkvideo m.vkvideo.ru › video 225265420_456239214 Продается всё…» → «Продается всё…»
         t = t.replace(Regex("""^.*?(v?k?video|vk|rutube|youtube)[^>»›]*[»›]\s*""", RegexOption.IGNORE_CASE), " ")
         t = t.replace(Regex("""\b\d{6,}_\d{4,}\b"""), " ")
         t = t.replace(Regex("""\b(www\.)?(m\.)?(vkvideo\.ru|vk\.com|rutube\.ru|youtube&#39;s|youtube\.com|youtu\.be)\b""", RegexOption.IGNORE_CASE), " ")
         t = t.replace(Regex("""\s*[›»]\s*"""), " ")
         t = t.replace(Regex("""\s*[-–—|]\s*(ВКонтакте|VK|RuTube|YouTube)\s*$""", RegexOption.IGNORE_CASE), " ")
-        return t.replace(Regex("""\s+"""), " ").trim().trim('.', '·', '-', '—', '|')
+        // v4.84.0: «video-», «video828472353_456240247», «clip123_456» в начале строки — это кусок адреса
+        t = t.replace(Regex("""^\s*(video|clip)[\s\-_]*\d*_?\d*[\s:.,–—-]*""", RegexOption.IGNORE_CASE), "")
+        t = t.replace(Regex("""\s*[–—-]\s*Видео от\s+\d.*$""", RegexOption.IGNORE_CASE), " ")
+        t = t.replace(Regex("""\s*[–—-]\s*Видео\s*$""", RegexOption.IGNORE_CASE), " ")
+        t = t.replace(Regex("""\s*[–—-]?\s*ВКонтакте\s*$""", RegexOption.IGNORE_CASE), " ")
+        return t.replace(Regex("""\s+"""), " ").trim().trim('.', '·', '-', '—', '|', ',')
     }
+
+    /** v4.84.0: VK отдаёт кириллицу как \\u0424\\u043e\\u0440… — раскодировать. */
+    fun decodeUnicode(src: String): String {
+        if (!src.contains("\\u")) return src
+        val sb = StringBuilder(src.length)
+        var i = 0
+        while (i < src.length) {
+            val ch = src[i]
+            if (ch == '\\' && i + 5 < src.length && (src[i + 1] == 'u' || src[i + 1] == 'U')) {
+                val hex = src.substring(i + 2, i + 6)
+                val code = hex.toIntOrNull(16)
+                if (code != null) {
+                    sb.append(code.toChar())
+                    i += 6
+                    continue
+                }
+            }
+            sb.append(ch)
+            i++
+        }
+        return sb.toString()
+    }
+
+    /**
+     * v4.84.0: жёсткий фильтр темы. Раньше по «LightFox манга» в ленту попадали «Форпост»,
+     * «Ковбой Бибоп» и футбол — то есть возвращалось всё подряд. Теперь карточка остаётся, только
+     * если слова запроса реально есть в названии, канале или адресе (с учётом словоформ).
+     */
+    fun relevant(query: String, c: Clip): Boolean {
+        val tokens = query.lowercase().replace('ё', 'е')
+            .split(Regex("""[^\p{L}\p{N}]+"""))
+            .filter { it.length >= 3 }
+            .distinct()
+        if (tokens.isEmpty()) return true
+        val hay = (c.title + " " + c.author + " " + c.url + " " + c.id)
+            .lowercase().replace('ё', 'е').replace("-", "").replace(" ", "")
+        var hit = 0
+        for (t in tokens) {
+            val probe = t.replace("-", "").take(5)
+            if (hay.contains(probe) || hay.contains(t)) hit++
+        }
+        val need = if (tokens.size == 1) 1 else (tokens.size + 1) / 2
+        return hit >= need
+    }
+
+    /** Оставить только то, что относится к запросу (без смены темы). */
+    fun filterRelevant(query: String, clips: List<Clip>): List<Clip> =
+        clips.filter { relevant(query, it) }.distinctBy { keyOf(it) }
 
     private fun looksLikeTitle(t: String, query: String): Boolean {
         if (t.length < 5) return false
@@ -547,6 +610,7 @@ return JSON.stringify(res.slice(0,200));
         // v4.83.0: «video-», «clip», «VK Видео», «Смотреть видео» — это не название, а мусор из ссылки
         if (Regex("""^(видео|смотреть|смотрите|видео онлайн|vk ?видео|rutube|youtube|video|clip|watch)[\s\-–—|:.]*$""", RegexOption.IGNORE_CASE).matches(t)) return false
         if (Regex("""^(video|clip)[\s\-–—_.]?$""", RegexOption.IGNORE_CASE).matches(t)) return false
+        if (Regex("""^(video|clip)[\s\-_]*\d""", RegexOption.IGNORE_CASE).containsMatchIn(t)) return false
         // заголовок должен быть хоть немного про запрос (иначе это «случайный» блок навигации)
         return Relevance.scoreFields(query, emptyList(), t) > 0 || t.split(' ').size >= 2
     }

@@ -6728,6 +6728,24 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
  * Здесь НЕТ ИИ: агент вызывается только из ИИ-ассистента, когда пользователь сам пишет запрос.
  */
 @Composable
+/**
+ * v4.84.0: состояние поиска «Видео» живёт вне экрана. Раньше при переходе на другую вкладку
+ * компонент уничтожался, и найденное пропадало — приходилось искать заново.
+ */
+private object VideoMemo {
+    var query: String = ""
+    var submitted: String = ""
+    var source: String = com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE
+    var category: String = "Все"
+    var sort: Int = 0
+    var dur: Int = 0
+    var nameFilter: String = ""
+    var items: List<com.winwasm64.torrent.VideoFeed.Clip> = emptyList()
+    var note: String = ""
+    var elapsed: Int = 0
+    var wasScrolling: Int = 0
+}
+
 private fun VideoHomeSection(
     modifier: Modifier,
     initialQuery: String,
@@ -6736,18 +6754,20 @@ private fun VideoHomeSection(
     val context = LocalContext.current
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    var query by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery }) }
-    var submitted by remember { mutableStateOf(com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery }) }
-    var source by remember { mutableStateOf(com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE) }
-    var category by remember { mutableStateOf("Все") }
-    var sort by remember { mutableStateOf(0) }
-    var durFilter by remember { mutableStateOf(0) }          // 0 любая · 1 до 4 мин · 2 4–20 · 3 от 20
-    var nameFilter by remember { mutableStateOf("") }         // фильтр по названию/каналу, как в «Файлах»
-    var showNameFilter by remember { mutableStateOf(false) }
-    var items by remember { mutableStateOf<List<com.winwasm64.torrent.VideoFeed.Clip>>(emptyList()) }
+    var query by remember { mutableStateOf(VideoMemo.query.ifBlank { com.winwasm64.torrent.SearchCache.videoQuery.ifBlank { initialQuery } }) }
+    var submitted by remember { mutableStateOf(VideoMemo.submitted) }
+    var source by remember { mutableStateOf(VideoMemo.source) }
+    var category by remember { mutableStateOf(VideoMemo.category) }
+    var sort by remember { mutableStateOf(VideoMemo.sort) }
+    var durFilter by remember { mutableStateOf(VideoMemo.dur) }   // 0 любая · 1 до 4 мин · 2 4–20 · 3 от 20
+    var nameFilter by remember { mutableStateOf(VideoMemo.nameFilter) } // фильтр по названию/каналу, как в «Файлах»
+    var showNameFilter by remember { mutableStateOf(VideoMemo.nameFilter.isNotBlank()) }
+    var items by remember { mutableStateOf<List<com.winwasm64.torrent.VideoFeed.Clip>>(VideoMemo.items) }
     var cont by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
-    var note by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf(VideoMemo.note) }
+    // при возврате на вкладку показываем то, что уже нашли, и не ищем заново
+    var restored by remember { mutableStateOf(VideoMemo.items.isNotEmpty() && VideoMemo.submitted.isNotBlank()) }
     var tick by remember { mutableIntStateOf(0) }
     var elapsed by remember { mutableIntStateOf(0) }
     var scrapeUrl by remember { mutableStateOf<String?>(null) }
@@ -6874,6 +6894,7 @@ private fun VideoHomeSection(
     /** Поиск. VK/RuTube — встроенным браузером (там без входа иначе никак), YouTube — innertube. */
     LaunchedEffect(tick, source) {
         if (submitted.isBlank()) return@LaunchedEffect
+        if (restored) { restored = false; return@LaunchedEffect }
         scrapeUrl = null
         elapsed = 0
         com.winwasm64.torrent.VideoFeed.cached(source, submitted)?.let {
@@ -6891,11 +6912,12 @@ private fun VideoHomeSection(
                 runCatching { com.winwasm64.torrent.VideoFeed.searchIndexed(source, submitted) }
                     .getOrDefault(com.winwasm64.torrent.VideoFeed.Page())
             }
-            if (fast.clips.isNotEmpty()) {
-                items = fast.clips
+            val fastOnly = com.winwasm64.torrent.VideoFeed.filterRelevant(submitted, fast.clips)
+            if (fastOnly.isNotEmpty()) {
+                items = fastOnly
                 note = fast.note.orEmpty()
                 loading = false
-                enrichThumbs(fast.clips)
+                enrichThumbs(fastOnly)
             }
             // 2) следом — полная выдача площадки во встроенном браузере
             scrapeSource = source
@@ -6920,6 +6942,20 @@ private fun VideoHomeSection(
         }
     }
 
+    // сохраняем всё, что нашли: возврат на вкладку — сразу с результатами
+    SideEffect {
+        VideoMemo.query = query
+        VideoMemo.submitted = submitted
+        VideoMemo.source = source
+        VideoMemo.category = category
+        VideoMemo.sort = sort
+        VideoMemo.dur = durFilter
+        VideoMemo.nameFilter = nameFilter
+        VideoMemo.items = items
+        VideoMemo.note = note
+        VideoMemo.elapsed = elapsed
+    }
+
     LaunchedEffect(loading) {
         if (!loading) return@LaunchedEffect
         elapsed = 0
@@ -6938,20 +6974,24 @@ private fun VideoHomeSection(
             query = submitted,
             round = scrapeRound,
             onProgress = { list ->
-                // быстрая выдача из индекса остаётся, браузерная добавляется к ней без дублей
-                val merged = (list + items).distinctBy { it.url }
+                // v4.84.0: и браузерная выдача проходит фильтр темы — иначе по «LightFox» лезли
+                // «Форпост», «Ковбой Бибоп» и футбол
+                val keep = com.winwasm64.torrent.VideoFeed.filterRelevant(submitted, list)
+                val merged = (keep + items).distinctBy { it.url }
                 if (merged.size > items.size) items = merged
                 loading = false
             },
             onStatus = { msg -> note = msg },
             onFinished = { list ->
-                if (list.isNotEmpty()) {
-                    items = (list + items).distinctBy { it.url }
-                    enrichThumbs(list)
+                val kept = com.winwasm64.torrent.VideoFeed.filterRelevant(submitted, list)
+                if (kept.isNotEmpty()) {
+                    items = (kept + items).distinctBy { it.url }
+                    enrichThumbs(kept)
                     cont = null
-                    note = if (list.size >= 100) "Показано ${list.size} — нажмите «Ещё», чтобы добрать" else ""
+                    note = if (kept.size >= 100) "Показано ${list.size} — нажмите «Ещё», чтобы добрать" else ""
                 } else if (note.isBlank()) {
-                    note = "На $scrapeSource ничего не нашлось — проверьте VPN (щит) или уточните запрос"
+                    note = if (list.isNotEmpty()) "На $scrapeSource всё найденное не по теме запроса — уточните название или откройте канал"
+                    else "На $scrapeSource ничего не нашлось — проверьте VPN (щит) или уточните запрос"
                 }
                 loading = false
                 scrapeUrl = null
@@ -6983,6 +7023,19 @@ private fun VideoHomeSection(
             5 -> base.sortedWith(compareByDescending<com.winwasm64.torrent.VideoFeed.Clip> { it.lengthSec })  // длительность ↓
             else -> base
         }
+    }
+
+    /**
+     * v4.84.0: «найти по группе/человеку» — если у найденного явно выделяется один автор,
+     * предлагаем перейти в него и смотреть ТОЛЬКО его видео (или похожие каналы), не меняя тему.
+     */
+    val bestAuthor = remember(items, submitted) {
+        if (submitted.isBlank()) null else items
+            .filter { it.author.isNotBlank() && com.winwasm64.torrent.VideoFeed.relevant(submitted, it) }
+            .groupBy { it.author.trim() }
+            .mapValues { it.value.size }
+            .maxByOrNull { it.value }
+            ?.takeIf { it.value >= 2 }
     }
 
     val openChannel: (String, String, String) -> Unit = { name, src, url ->
@@ -7366,6 +7419,41 @@ private fun VideoHomeSection(
             verticalArrangement = Arrangement.spacedBy(14.dp),
             contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 6.dp, bottom = 18.dp)
         ) {
+            val best = bestAuthor
+            if (best != null && nameFilter.isBlank()) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            color = Omni.AccentContainer,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.clickable { openChannel(best.key, source, "") }
+                        ) {
+                            Text(
+                                "👤 Только канал «${best.key.take(28)}» · ${best.value} видео",
+                                color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                            )
+                        }
+                        Surface(
+                            color = Omni.SurfaceHighest,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.clickable {
+                                nameFilter = best.key
+                                showNameFilter = true
+                            }
+                        ) {
+                            Text(
+                                "🔎 Оставить в ленте", color = Color.White, fontSize = 11.sp,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                            )
+                        }
+                    }
+                }
+            }
             items(filtered) { clip ->
                 VideoCard(
                     clip = clip,
