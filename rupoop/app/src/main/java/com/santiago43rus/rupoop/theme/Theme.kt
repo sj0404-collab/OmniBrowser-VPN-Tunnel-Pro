@@ -1,0 +1,98 @@
+package com.santiago43rus.rupoop.theme
+
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+import androidx.compose.foundation.text.selection.TextSelectionColors
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.graphics.Color
+
+val DarkColorScheme = darkColorScheme(
+    primary = Color.White,
+    onPrimary = Color.Black,
+    secondary = Color.White,
+    onSecondary = Color.Black,
+    primaryContainer = Color.White,
+    onPrimaryContainer = Color.Black,
+    secondaryContainer = Color.White,
+    onSecondaryContainer = Color.Black,
+    tertiary = Color(0xFF66BB6A),
+    background = DarkBackground,
+    surface = DarkSurface,
+    surfaceVariant = DarkSurfaceVariant,
+    onBackground = DarkOnBackground,
+    onSurface = DarkOnSurface,
+    onSurfaceVariant = DarkOnSurfaceVariant,
+    outline = Color(0xFF3A3A3A)
+)
+
+val LightColorScheme = lightColorScheme(
+    primary = Color(0xFF0F0F0F),
+    onPrimary = Color.White,
+    secondary = Color(0xFF0F0F0F),
+    onSecondary = Color.White,
+    primaryContainer = Color(0xFF0F0F0F),
+    onPrimaryContainer = Color.White,
+    secondaryContainer = Color(0xFF0F0F0F),
+    onSecondaryContainer = Color.White,
+    tertiary = Color(0xFF388E3C),
+    background = LightBackground,
+    surface = LightSurface,
+    surfaceVariant = LightSurfaceVariant,
+    onBackground = LightOnBackground,
+    onSurface = LightOnSurface,
+    onSurfaceVariant = LightOnSurfaceVariant,
+    outline = Color(0xFFD0D0D0)
+)
+
+val EasterEggColorScheme = darkColorScheme(
+    primary = EasterPrimary,
+    onPrimary = Color.Black,
+    secondary = EasterPrimaryDark,
+    tertiary = Color(0xFF69F0AE),
+    background = EasterBackground,
+    surface = EasterSurface,
+    surfaceVariant = EasterSurfaceVariant,
+    onBackground = EasterOnBackground,
+    onSurface = EasterOnSurface,
+    onSurfaceVariant = EasterOnSurfaceVariant,
+    outline = EasterOutline
+)
+
+@Composable
+fun RupoopTheme(
+    themeMode: String = "system",
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit
+) {
+    val isEaster = themeMode == "easter" || themeMode == "secret"
+    val isDark = when (themeMode) {
+        "light" -> false
+        "dark" -> true
+        "easter", "secret" -> true
+        else -> darkTheme
+    }
+
+    val colorScheme = when {
+        isEaster -> EasterEggColorScheme
+        isDark -> DarkColorScheme
+        else -> LightColorScheme
+    }
+
+    val selectionColor = if (isEaster) EasterPrimary else RupoopRed
+    val customTextSelectionColors = TextSelectionColors(
+        handleColor = selectionColor,
+        backgroundColor = selectionColor.copy(alpha = 0.4f)
+    )
+
+    CompositionLocalProvider(LocalTextSelectionColors provides customTextSelectionColors) {
+        MaterialTheme(
+            colorScheme = colorScheme,
+            typography = Typography,
+            content = content
+        )
+    }
+}

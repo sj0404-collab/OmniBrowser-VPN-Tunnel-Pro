@@ -1,0 +1,414 @@
+package com.santiago43rus.rupoop
+
+import android.annotation.SuppressLint
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.exoplayer.ExoPlayer
+import com.santiago43rus.rupoop.auth.AuthController
+import com.santiago43rus.rupoop.auth.GistSyncManager
+import com.santiago43rus.rupoop.auth.GitHubAuthManager
+import com.santiago43rus.rupoop.data.*
+import com.santiago43rus.rupoop.network.RetrofitClient
+import com.santiago43rus.rupoop.parser.UniversalVideoParser
+import com.santiago43rus.rupoop.player.PlaybackController
+import com.santiago43rus.rupoop.player.*
+import com.santiago43rus.rupoop.service.DownloadService
+import com.santiago43rus.rupoop.util.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+class AppViewModel(application: Application) : AndroidViewModel(application) {
+
+    @SuppressLint("StaticFieldLeak")
+    val context = application.applicationContext
+
+    init {
+        instance = this
+    }
+
+    val settingsManager = SettingsManager(context)
+    val registryManager = UserRegistryManager(context)
+    val mainFeedRecommender = MainFeedRecommendationStrategy(registryManager)
+    val relatedVideoRecommender = RelatedVideoRecommendationStrategy(registryManager)
+    val authManager = GitHubAuthManager(context)
+    val syncManager = GistSyncManager(RetrofitClient.gistApi, registryManager, settingsManager)
+    val backupManager = BackupManager(registryManager, settingsManager)
+    val downloadTracker = DownloadTracker(context)
+
+    var userRegistry by mutableStateOf(registryManager.registry)
+
+    private val _snackbarMessage = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val snackbarMessage = _snackbarMessage.asSharedFlow()
+
+    fun showSnackbar(message: String) {
+        viewModelScope.launch {
+            _snackbarMessage.emit(message)
+        }
+    }
+
+    fun exportBackupShare(ctx: Context) {
+        try {
+            val intent = backupManager.createShareIntent(ctx)
+            ctx.startActivity(Intent.createChooser(intent, "Экспорт резервной копии"))
+        } catch (e: Exception) {
+            showSnackbar("Ошибка экспорта: ${e.localizedMessage}")
+        }
+    }
+
+    fun exportBackupToUri(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val os = context.contentResolver.openOutputStream(uri)
+                if (os != null && backupManager.writeBackupToStream(os)) {
+                    showSnackbar("Резервная копия успешно сохранена")
+                } else {
+                    showSnackbar("Не удалось записать файл")
+                }
+            } catch (e: Exception) {
+                showSnackbar("Ошибка экспорта: ${e.localizedMessage}")
+            }
+        }
+    }
+
+    fun importBackupFromUri(uri: Uri, onComplete: () -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val inputStream = context.contentResolver.openInputStream(uri)
+                if (inputStream != null) {
+                    val result = backupManager.importBackupFromStream(inputStream)
+                    result.onSuccess { registry ->
+                        userRegistry = registry
+                        showSnackbar("Данные успешно импортированы!")
+                        withContext(Dispatchers.Main) {
+                            onComplete()
+                        }
+                    }.onFailure {
+                        showSnackbar("Ошибка импорта: неверный формат файла")
+                    }
+                } else {
+                    showSnackbar("Не удалось открыть выбранный файл")
+                }
+            } catch (e: Exception) {
+                showSnackbar("Ошибка импорта: ${e.localizedMessage}")
+            }
+        }
+    }
+
+    val playbackController: PlaybackController = PlaybackController(
+        context = context,
+        scope = viewModelScope,
+        registryManager = registryManager,
+        settingsManager = settingsManager,
+        relatedVideoRecommender = relatedVideoRecommender,
+        pushToGitHub = { pushToGitHub() },
+        flushToGitHub = { flushToGitHub() },
+        filterHiddenAndDisliked = { filterHiddenAndDisliked(it) },
+        removeVideoFromUiLists = { removeVideoFromUiLists(it) },
+        snackbarMessage = _snackbarMessage,
+        onRegistryUpdate = { userRegistry = it }
+    )
+
+    fun updateIsSearchVisible(vis: Boolean) {
+        navigationController.isSearchVisible = vis
+    }
+
+    fun reapplySearchFilters() {
+        searchController.reapplyGenreFilter()
+    }
+
+    val navigationController: NavigationController = NavigationController(
+        getPlayerState = { playbackController.playerState },
+        setPlayerState = { playbackController.playerState = it },
+        getIsFullscreenVideo = { playbackController.isFullscreenVideo },
+        setIsFullscreenVideo = { playbackController.isFullscreenVideo = it },
+        stopPlayer = { playbackController.exoPlayer.stop() },
+        pushToGitHub = { pushToGitHub() },
+        updateSearchStates = { q, res, o, exp, vis ->
+            searchController.searchQuery = q
+            searchResults = res
+            searchController.searchSortOrder = o
+            searchController.isSearchExpanded = exp
+            updateIsSearchVisible(vis)
+        }
+    )
+
+    val contentFeedController: ContentFeedController = ContentFeedController(
+        scope = viewModelScope,
+        settingsManager = settingsManager,
+        registryManager = registryManager,
+        mainFeedRecommender = mainFeedRecommender,
+        filterHiddenAndDisliked = { filterHiddenAndDisliked(it) },
+        onAuthorVisibleChanged = { visible ->
+            navigationController.isAuthorVisible = visible
+            if (visible) {
+                navigationController.overlayOrder = navigationController.overlayOrder.filter { it != OverlayState.AUTHOR } + OverlayState.AUTHOR
+            }
+        },
+        getPlayerState = { playbackController.playerState },
+        setPlayerState = { playbackController.playerState = it },
+        getAuthorSortOrder = { authorSortOrder }
+    )
+
+    val searchController: SearchController = SearchController(
+        scope = viewModelScope,
+        registryManager = registryManager,
+        onRegistryUpdate = { userRegistry = it },
+        pushToGitHub = { pushToGitHub() },
+        filterHiddenAndDisliked = { filterHiddenAndDisliked(it) },
+        getPlayerState = { playbackController.playerState },
+        setPlayerState = { playbackController.playerState = it },
+        getCurrentNav = { navigationController.currentNav },
+        getSearchStacks = { navigationController.searchStacks },
+        updateSearchStates = { q, res, o, exp, vis ->
+            navigationController.searchQuery = q
+            searchResults = res
+            navigationController.searchSortOrder = o
+            navigationController.isSearchExpanded = exp
+            navigationController.isSearchVisible = vis
+        },
+        getOverlayOrder = { navigationController.overlayOrder },
+        setOverlayOrder = { navigationController.overlayOrder = it },
+        getIsSearchVisible = { navigationController.isSearchVisible },
+        setIsSearchVisible = { navigationController.isSearchVisible = it },
+        onPlayUrl = { url ->
+            playVideo(SearchResult(videoUrl = url, title = "Загрузка..."))
+        }
+    )
+
+    val authController: AuthController = AuthController(
+        scope = viewModelScope,
+        settingsManager = settingsManager,
+        authManager = authManager,
+        syncManager = syncManager,
+        snackbarMessage = _snackbarMessage,
+        onRegistryUpdate = {
+            userRegistry = it
+            contentFeedController.loadHome(false)
+        },
+        loadHome = { contentFeedController.loadHome(it) },
+        getRegistry = { registryManager.registry }
+    )
+
+    var isInPipMode by mutableStateOf(false)
+    var onRequestPip: (() -> Unit)? = null
+    val isLoadingRelated: Boolean get() = playbackController.isLoadingRelated
+
+    var showDownloadNotifications by mutableStateOf(settingsManager.showDownloadNotifications)
+    var showTelegramChannelDialog by mutableStateOf(false)
+
+    val currentEpisodes: List<com.santiago43rus.rupoop.parser.Episode> get() = playbackController.currentEpisodes
+    val currentEpisodeIndex: Int get() = playbackController.currentEpisodeIndex
+    val availableAudioTracks: List<com.santiago43rus.rupoop.parser.AudioTrackSource> get() = playbackController.availableAudioTracks
+    val selectedAudioTrackId: String? get() = playbackController.selectedAudioTrackId
+    fun playEpisode(index: Int) = playbackController.playEpisode(index)
+    fun selectAudioTrack(track: com.santiago43rus.rupoop.parser.AudioTrackSource) = playbackController.selectAudioTrack(track)
+
+    fun syncPlaybackService() {
+        playbackController.syncPlaybackService()
+    }
+
+    fun updateDownloadNotifications(enabled: Boolean) {
+        showDownloadNotifications = enabled
+        settingsManager.showDownloadNotifications = enabled
+        val updatedRegistry = registryManager.registry.copy(
+            appSettings = registryManager.registry.appSettings.copy(showDownloadNotifications = enabled)
+        )
+        registryManager.updateRegistry(updatedRegistry)
+        onRegistryUpdate(updatedRegistry, forceDirect = true)
+    }
+
+    var showPlaylistDialog by mutableStateOf<SearchResult?>(null)
+    var showDownloadDialog by mutableStateOf<SearchResult?>(null)
+    var showOpenUrlDialog by mutableStateOf(false)
+    var showOnboarding by mutableStateOf(settingsManager.isFirstLaunch)
+
+    var searchResults by mutableStateOf<List<SearchResult>>(emptyList())
+    val isSearching: Boolean get() = searchController.isSearching
+    val searchError: Boolean get() = searchController.searchError
+    var authorSortOrder by mutableStateOf("-publication_ts")
+
+    private var pushJob: Job? = null
+    private var lastPushAt = 0L
+    private val pushMinIntervalMs = 5 * 60 * 1000L
+
+    // Обычный запрос (тик прогресса, списки): отправка не чаще раза в 5 минут.
+    fun pushToGitHub(forceDirect: Boolean = false) {
+        val token = settingsManager.accessToken ?: return
+        if (!isNetworkAvailable(context)) return
+        if (forceDirect) {
+            pushJob?.cancel()
+            pushJob = viewModelScope.launch {
+                try {
+                    withContext(Dispatchers.IO) { syncManager.pushDirect(token) }
+                } catch (e: Exception) {
+                    Log.e("RupoopAuth", "Direct push failed", e)
+                }
+            }
+            return
+        }
+        if (pushJob?.isActive == true) return   // отправка уже запланирована
+        val wait = (lastPushAt + pushMinIntervalMs - System.currentTimeMillis()).coerceAtLeast(5_000L)
+        pushJob = viewModelScope.launch {
+            delay(wait)
+            sendNow(token)
+        }
+    }
+
+    // Немедленная отправка: пауза, закрытие плеера, конец видео.
+    fun flushToGitHub() {
+        val token = settingsManager.accessToken ?: return
+        if (!isNetworkAvailable(context)) return
+        viewModelScope.launch { sendNow(token) }
+    }
+
+    private suspend fun sendNow(token: String) {
+        userRegistry = withContext(Dispatchers.IO) { syncManager.push(token) }
+        lastPushAt = System.currentTimeMillis()
+    }
+
+    fun handleDeepLink(url: String) {
+        val video = SearchResult(videoUrl = url, title = "Загрузка...")
+        playVideo(video, null)
+    }
+
+    fun startDownload(video: SearchResult, isAudio: Boolean = false) {
+        viewModelScope.launch {
+            if (!isNetworkAvailable(context)) {
+                _snackbarMessage.emit("Нет подключения к интернету")
+                return@launch
+            }
+            _snackbarMessage.emit("Скачивание начато: ${video.title}")
+            val rawUrl = video.videoUrl
+            val isExternal = UniversalVideoParser.isHttpUrl(rawUrl) && !UniversalVideoParser.isRutubeUrl(rawUrl)
+            val id = extractId(rawUrl) ?: rawUrl
+            val uniqueId = "${id}___${System.currentTimeMillis()}"
+
+            try {
+                val streamUrl = if (isExternal) {
+                    val parsed = withContext(Dispatchers.IO) { UniversalVideoParser.parse(rawUrl) }
+                    parsed?.streamUrl
+                } else {
+                    val rutubeId = UniversalVideoParser.extractRutubeId(rawUrl) ?: id
+                    val opt = withContext(Dispatchers.IO) { RetrofitClient.api.getVideoOptions(rutubeId) }
+                    opt.videoBalancer?.m3u8
+                }
+
+                if (!streamUrl.isNullOrEmpty()) {
+                    val serviceIntent = Intent(context, DownloadService::class.java).apply {
+                        putExtra("VIDEO_URL", streamUrl)
+                        putExtra("TITLE", video.title)
+                        putExtra("VIDEO_ID", uniqueId)
+                        putExtra("THUMBNAIL_URL", video.thumbnailUrl)
+                        putExtra("QUALITY", settingsManager.downloadQuality)
+                        putExtra("IS_AUDIO", isAudio)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(serviceIntent)
+                    } else {
+                        context.startService(serviceIntent)
+                    }
+                } else {
+                    _snackbarMessage.emit("Не удалось получить ссылку для скачивания")
+                }
+            } catch (e: Exception) {
+                Log.e("RupoopDownload", "Error starting download", e)
+                _snackbarMessage.emit("Ошибка начала загрузки")
+            }
+        }
+    }
+
+    fun pullFromGist() {
+        val token = settingsManager.accessToken ?: return
+        viewModelScope.launch {
+            try {
+                userRegistry = withContext(Dispatchers.IO) { syncManager.pull(token) }
+                settingsManager.lastSyncTime = System.currentTimeMillis()
+                settingsManager.applyAppSettings(userRegistry.appSettings)
+                _snackbarMessage.emit("Данные загружены из Gist")
+            } catch (_: Exception) {
+                _snackbarMessage.emit("Ошибка загрузки из Gist")
+            }
+        }
+    }
+
+    fun pushToGist() {
+        val token = settingsManager.accessToken ?: return
+        viewModelScope.launch {
+            try {
+                userRegistry = withContext(Dispatchers.IO) { syncManager.pushDirect(token) }
+                settingsManager.lastSyncTime = System.currentTimeMillis()
+                pushJob = null
+                _snackbarMessage.emit("Данные выгружены в Gist")
+            } catch (_: Exception) {
+                _snackbarMessage.emit("Ошибка выгрузки в Gist")
+            }
+        }
+    }
+
+    fun syncWithGitHub() {
+        pushToGist()
+    }
+
+    fun shareVideo(video: SearchResult) {
+        val sendIntent = Intent().apply {
+            action = Intent.ACTION_SEND
+            putExtra(Intent.EXTRA_TEXT, "${video.title}\n${video.videoUrl}")
+            type = "text/plain"
+        }
+        val chooser = Intent.createChooser(sendIntent, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(chooser)
+    }
+
+    fun toggleFullscreen(fill: Boolean, isManual: Boolean = false) {
+        isFullscreenVideo = fill
+        if (isManual) {
+            isFullscreenTriggeredManually = fill
+        }
+        if (fill) {
+            isPortraitLocked = false
+        }
+    }
+
+
+
+    fun dismissOnboarding() {
+        showOnboarding = false
+        loadHome(false)
+    }
+
+    fun onRegistryUpdate(registry: UserRegistry, forceDirect: Boolean = false) {
+        userRegistry = registry
+        pushToGitHub(forceDirect)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        playbackController.release()
+        sharedPlayer = null
+        if (instance == this) {
+            instance = null
+        }
+    }
+
+    companion object {
+        var sharedPlayer: ExoPlayer?
+            get() = instance?.playbackController?.exoPlayer
+            set(value) {}
+        var instance: AppViewModel? = null
+    }
+}

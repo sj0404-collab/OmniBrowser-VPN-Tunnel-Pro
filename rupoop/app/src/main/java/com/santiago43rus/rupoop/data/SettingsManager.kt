@@ -1,0 +1,132 @@
+package com.santiago43rus.rupoop.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.core.content.edit
+
+class SettingsManager(context: Context) {
+    private val prefs: SharedPreferences = context.getSharedPreferences("rupoop_settings", Context.MODE_PRIVATE)
+
+    var accessToken: String?
+        get() = prefs.getString("access_token", null)
+        set(value) = prefs.edit { putString("access_token", value) }
+
+    var themeMode: String
+        get() = prefs.getString("theme_mode", "system") ?: "system"
+        set(value) = prefs.edit { putString("theme_mode", value) }
+
+    @Deprecated("Use themeMode instead", ReplaceWith("themeMode == \"dark\""))
+    var isDarkTheme: Boolean
+        get() = themeMode == "dark"
+        set(value) {
+            themeMode = if (value) "dark" else "light"
+        }
+
+    var downloadQuality: String
+        get() = prefs.getString("download_quality", "1080") ?: "1080"
+        set(value) = prefs.edit { putString("download_quality", value) }
+
+    var showDownloadNotifications: Boolean
+        get() = prefs.getBoolean("show_download_notifications", true)
+        set(value) = prefs.edit { putBoolean("show_download_notifications", value) }
+
+    var syncFrequencyHours: Int
+        get() = prefs.getInt("sync_frequency", 24)
+        set(value) = prefs.edit { putInt("sync_frequency", value) }
+
+    var maxConcurrentDownloads: Int
+        get() = prefs.getInt("max_concurrent_downloads", 1)
+        set(value) = prefs.edit { putInt("max_concurrent_downloads", value) }
+
+    var lastSyncTime: Long
+        get() = prefs.getLong("last_sync_time", 0)
+        set(value) = prefs.edit { putLong("last_sync_time", value) }
+
+    var cachedGistId: String?
+        get() = prefs.getString("cached_gist_id", null)
+        set(value) = prefs.edit { putString("cached_gist_id", value) }
+
+    var isFirstLaunch: Boolean
+        get() = prefs.getBoolean("is_first_launch", true)
+        set(value) = prefs.edit { putBoolean("is_first_launch", value) }
+
+    var lastNotifiedVersionCode: Int
+        get() = prefs.getInt("last_notified_version_code", 0)
+        set(value) = prefs.edit { putInt("last_notified_version_code", value) }
+
+    var adultContentEnabled: Boolean
+        get() = prefs.getBoolean("adult_content", true)
+        set(value) = prefs.edit { putBoolean("adult_content", value) }
+
+    var kidsContentEnabled: Boolean
+        get() = prefs.getBoolean("kids_content", true)
+        set(value) = prefs.edit { putBoolean("kids_content", value) }
+
+    var appIcon: String
+        get() = prefs.getString("app_icon", "system") ?: "system"
+        set(value) = prefs.edit { putString("app_icon", value) }
+
+    var isEasterEggUnlocked: Boolean
+        get() = prefs.getBoolean("easter_egg_unlocked", false)
+        set(value) = prefs.edit { putBoolean("easter_egg_unlocked", value) }
+
+    var autoPlayNext: Boolean
+        get() = prefs.getBoolean("auto_play_next", true)
+        set(value) = prefs.edit { putBoolean("auto_play_next", value) }
+
+    var doubleTapSeekDuration: Int
+        get() = prefs.getInt("double_tap_seek", 10)
+        set(value) = prefs.edit { putInt("double_tap_seek", value) }
+
+    var pipEnabled: Boolean
+        get() = prefs.getBoolean("pip_enabled", true)
+        set(value) = prefs.edit { putBoolean("pip_enabled", value) }
+
+    // Sub-genre categories stored as comma-separated string
+    var enabledGenres: Set<String>
+        get() = prefs.getStringSet("enabled_genres", null) ?: setOf(
+            "аниме", "боевики", "комедии", "фантастика", "ужасы",
+            "драма", "документальные", "мультфильмы", "мультсериалы", "сериалы"
+        )
+        set(value) = prefs.edit { putStringSet("enabled_genres", value) }
+
+    fun toAppSettings(): AppSettings {
+        return AppSettings(
+            theme = themeMode,
+            downloadQuality = downloadQuality,
+            syncFrequencyHours = syncFrequencyHours,
+            maxConcurrentDownloads = maxConcurrentDownloads,
+            adultContentEnabled = adultContentEnabled,
+            kidsContentEnabled = kidsContentEnabled,
+            enabledGenres = enabledGenres.toList(),
+            autoPlayNext = autoPlayNext,
+            doubleTapSeekDuration = doubleTapSeekDuration,
+            appIcon = appIcon,
+            showDownloadNotifications = showDownloadNotifications,
+            isEasterEggUnlocked = isEasterEggUnlocked,
+            pipEnabled = pipEnabled
+        )
+    }
+
+    fun applyAppSettings(appSettings: AppSettings) {
+        downloadQuality = appSettings.downloadQuality
+        syncFrequencyHours = appSettings.syncFrequencyHours
+        maxConcurrentDownloads = appSettings.maxConcurrentDownloads
+        adultContentEnabled = appSettings.adultContentEnabled
+        kidsContentEnabled = appSettings.kidsContentEnabled
+        enabledGenres = appSettings.enabledGenres.toSet()
+        autoPlayNext = appSettings.autoPlayNext
+        doubleTapSeekDuration = appSettings.doubleTapSeekDuration
+        appIcon = appSettings.appIcon
+        showDownloadNotifications = appSettings.showDownloadNotifications
+        isEasterEggUnlocked = appSettings.isEasterEggUnlocked || isEasterEggUnlocked
+        pipEnabled = appSettings.pipEnabled
+    }
+
+    fun clearAuth() {
+        prefs.edit {
+            remove("access_token")
+            remove("cached_gist_id")
+        }
+    }
+}

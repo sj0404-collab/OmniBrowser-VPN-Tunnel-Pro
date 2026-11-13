@@ -1,0 +1,371 @@
+package com.santiago43rus.rupoop.components
+
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import com.santiago43rus.rupoop.data.*
+import com.santiago43rus.rupoop.util.formatDuration
+import com.santiago43rus.rupoop.util.formatTimeAgo
+import com.santiago43rus.rupoop.util.formatViewCount
+
+@Composable
+fun VideoCardItem(
+    video: SearchResult,
+    modifier: Modifier = Modifier,
+    history: WatchHistoryItem? = null,
+    onClick: () -> Unit,
+    onAuthorClick: (Author) -> Unit,
+    onMoreClick: (String) -> Unit,
+    isEditMode: Boolean = false,
+    isEditOnlyMode: Boolean = false
+) {
+    var showMenu by remember { mutableStateOf(false) }
+
+    val localThumbnailBitmap = remember(video.videoUrl) {
+        mutableStateOf<android.graphics.Bitmap?>(null)
+    }
+    LaunchedEffect(video.videoUrl) {
+        val isLocal = video.videoUrl.isNotEmpty() && !video.videoUrl.startsWith("http")
+        if (isLocal && video.thumbnailUrl == null && video.videoUrl.endsWith(".mp4")) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val retriever = android.media.MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(video.videoUrl)
+                    val bmp = retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    localThumbnailBitmap.value = bmp
+                } catch (_: Exception) {
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(bottom = 16.dp)
+    ) {
+        // Preview (Thumbnail)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp)
+        ) {
+            AsyncImage(
+                model = video.thumbnailUrl ?: localThumbnailBitmap.value ?: video.videoUrl, contentDescription = null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16 / 9f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.DarkGray),
+                contentScale = ContentScale.Crop
+            )
+
+            // Duration or Live badge
+            val isLiveStream = video.duration == 0 || video.duration == null && (video.tags?.any { it.contains("live", ignoreCase = true) || it.contains("эфир", ignoreCase = true) } == true || video.title.contains("прямой эфир", ignoreCase = true) || video.title.contains("live", ignoreCase = true))
+
+            if (isLiveStream) {
+                Surface(
+                    color = Color.Red,
+                    shape = RoundedCornerShape(4.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(bottom = 8.dp, end = 8.dp)
+                ) {
+                    Text(
+                        text = "В ЭФИРЕ",
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                    )
+                }
+            } else {
+                video.duration?.let { durSeconds ->
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.8f),
+                        shape = RoundedCornerShape(4.dp),
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(bottom = 8.dp, end = 8.dp)
+                    ) {
+                        Text(
+                            text = formatDuration(durSeconds.toLong()),
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+
+            // Progress Bar (if watched)
+            if (history != null && history.totalDuration > 0) {
+                 LinearProgressIndicator(
+                    progress = { history.progress.toFloat() / history.totalDuration },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(3.dp),
+                    color = Color.Red,
+                    trackColor = Color.Transparent
+                )
+            }
+        }
+
+        // Platform metadata
+        val videoUrlLower = video.videoUrl.lowercase()
+        val isLordfilm = videoUrlLower.contains("lordfilm") || videoUrlLower.contains("lordserials")
+        val platformName = when {
+            videoUrlLower.contains("vk.com") || videoUrlLower.contains("vkvideo.ru") || videoUrlLower.contains("vk.ru") -> "VK Видео"
+            videoUrlLower.contains("ok.ru") || videoUrlLower.contains("odnoklassniki.ru") -> "Одноклассники"
+            isLordfilm -> "Lordfilm"
+            else -> "Rutube"
+        }
+
+        // Header: Author & Title
+        Row(
+            modifier = Modifier
+                .padding(top = 12.dp, start = 12.dp, end = 12.dp)
+                .fillMaxWidth(),
+            verticalAlignment = Alignment.Top
+        ) {
+            val authorToNavigate = video.author ?: Author(name = platformName, platform = platformName)
+            val isClickableAuthor = !isLordfilm && platformName != "Одноклассники" && platformName != "VK Видео"
+            if (isLordfilm) {
+                val lordAuthor = Author(name = "Lordfilm", platform = "LORDFILM")
+                LordfilmAvatarBadge(
+                    size = 36.dp,
+                    modifier = Modifier.clickable(enabled = false) { onAuthorClick(lordAuthor) }
+                )
+            } else {
+                val fallbackAvatar = if (platformName == "Одноклассники") "https://ok.ru/favicon.ico"
+                    else "https://rutube.ru/static/img/default-avatar.png"
+                AsyncImage(
+                    model = video.author?.avatarUrl ?: fallbackAvatar,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(Color.Gray)
+                        .clickable(enabled = isClickableAuthor) { onAuthorClick(authorToNavigate) },
+                    contentScale = ContentScale.Crop,
+                    fallback = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_info_details),
+                    error = androidx.compose.ui.res.painterResource(id = android.R.drawable.ic_menu_info_details)
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 12.dp)
+                    .weight(1f)
+            ) {
+                Text(
+                    video.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(2.dp))
+                if (isLordfilm) {
+                    val lordAuthor = Author(name = "Lordfilm", platform = "LORDFILM")
+                    Text(
+                        platformName,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable(enabled = false) { onAuthorClick(lordAuthor) }
+                    )
+                } else {
+                    val viewsText = if (video.hits != null && video.hits > 0) formatViewCount(video.hits) else ""
+                    val timeAgoText = formatTimeAgo(video.publicationTs ?: video.createdTs)
+                    val sep1 = if (viewsText.isNotEmpty()) " • " else ""
+                    Text(
+                        "$platformName$sep1$viewsText",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (timeAgoText.isNotEmpty()) {
+                        Text(
+                            timeAgoText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Box {
+                IconButton(
+                    onClick = { showMenu = true },
+                    modifier = Modifier.size(24.dp).align(Alignment.TopEnd)
+                ) {
+                    Icon(
+                        Icons.Default.MoreVert,
+                        null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                    if (isEditOnlyMode) {
+                        DropdownMenuItem(text = { Text("Удалить") }, onClick = { showMenu = false; onMoreClick("remove") }, leadingIcon = { Icon(Icons.Default.Delete, null) })
+                    } else {
+                        if (!isEditMode) {
+                            DropdownMenuItem(text = { Text("Не интересно") }, onClick = { showMenu = false; onMoreClick("not_interested") }, leadingIcon = { Icon(Icons.Default.VisibilityOff, null) })
+                        } else {
+                            DropdownMenuItem(text = { Text("Удалить") }, onClick = { showMenu = false; onMoreClick("remove") }, leadingIcon = { Icon(Icons.Default.Delete, null) })
+                        }
+                        DropdownMenuItem(text = { Text("В плейлист") }, onClick = { showMenu = false; onMoreClick("playlist") }, leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) })
+                        DropdownMenuItem(text = { Text("Смотреть позже") }, onClick = { showMenu = false; onMoreClick("later") }, leadingIcon = { Icon(Icons.Default.WatchLater, null) })
+                        DropdownMenuItem(text = { Text("Поделиться") }, onClick = { showMenu = false; onMoreClick("share") }, leadingIcon = { Icon(Icons.Default.Share, null) })
+                        DropdownMenuItem(text = { Text("Скачать") }, onClick = { showMenu = false; onMoreClick("download") }, leadingIcon = { Icon(Icons.Outlined.Download, null) })
+                        DropdownMenuItem(text = { Text("Слушать как аудио") }, onClick = { showMenu = false; onMoreClick("audio_only") }, leadingIcon = { Icon(Icons.Default.MusicNote, null) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun VideoCardShimmer() {
+    val transition = rememberInfiniteTransition(label = "shimmer")
+    val alpha by transition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 0.6f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "shimmer_alpha"
+    )
+
+    val shimmerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = alpha)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 16.dp)
+    ) {
+        // Thumbnail Shimmer
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16 / 9f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(shimmerColor)
+            )
+        }
+
+        // Title and Avatar Row
+        Row(
+            modifier = Modifier
+                .padding(top = 12.dp, start = 12.dp, end = 12.dp)
+                .fillMaxWidth(),
+            verticalAlignment = androidx.compose.ui.Alignment.Top
+        ) {
+            // Avatar
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(shimmerColor)
+            )
+
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 12.dp)
+                    .weight(1f)
+            ) {
+                // Title line 1
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.8f)
+                        .height(16.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(shimmerColor)
+                )
+                Spacer(Modifier.height(6.dp))
+                // Title line 2
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.5f)
+                        .height(12.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(shimmerColor)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun LordfilmAvatarBadge(
+    modifier: Modifier = Modifier,
+    size: androidx.compose.ui.unit.Dp = 36.dp
+) {
+    val cornerRadius = size * (8f / 36f)
+    val fontSize = (size.value * 7f / 36f).sp
+    val lineHeight = (size.value * 8f / 36f).sp
+    Box(
+        modifier = modifier
+            .size(size)
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(Color(0xFF1E1E1E))
+            .border(1.dp, Color(0xFFE50914).copy(alpha = 0.85f), RoundedCornerShape(cornerRadius)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "LORD",
+                color = Color.White,
+                fontWeight = FontWeight.Black,
+                fontSize = fontSize,
+                lineHeight = lineHeight,
+                letterSpacing = 0.5.sp
+            )
+            Text(
+                text = "FILM",
+                color = Color(0xFFE50914),
+                fontWeight = FontWeight.Black,
+                fontSize = fontSize,
+                lineHeight = lineHeight,
+                letterSpacing = 0.5.sp
+            )
+        }
+    }
+}

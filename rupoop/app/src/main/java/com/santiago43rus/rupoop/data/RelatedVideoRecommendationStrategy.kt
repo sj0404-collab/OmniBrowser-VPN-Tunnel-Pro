@@ -1,0 +1,314 @@
+package com.santiago43rus.rupoop.data
+
+import com.santiago43rus.rupoop.data.SearchResult
+import com.santiago43rus.rupoop.data.UserRegistryManager
+import com.santiago43rus.rupoop.data.RecommendationUtils
+import java.util.Locale
+
+fun parseRomanOrInt(str: String): Int? {
+    str.toIntOrNull()?.let { return it }
+    val roman = str.uppercase(Locale.getDefault())
+    if (roman.isEmpty() || !roman.matches(Regex("^[IVXLCDM]+$"))) return null
+    var result = 0
+    var i = 0
+    val map = mapOf('I' to 1, 'V' to 5, 'X' to 10, 'L' to 50, 'C' to 100, 'D' to 500, 'M' to 1000)
+    while (i < roman.length) {
+        val s1 = map[roman[i]] ?: return null
+        if (i + 1 < roman.length) {
+            val s2 = map[roman[i + 1]]
+            if (s2 != null && s1 < s2) {
+                result += s2 - s1
+                i += 2
+                continue
+            }
+        }
+        result += s1
+        i += 1
+    }
+    return if (result > 0) result else null
+}
+
+data class SequenceInfo(
+    val baseName: String,
+    val season: Int?,
+    val episode: Int?,
+    val part: Int?,
+    val year: Int?
+)
+
+class RelatedVideoRecommendationStrategy(private val registryManager: UserRegistryManager? = null) {
+
+    fun parseSequenceInfo(title: String): SequenceInfo {
+        // Remove quotes like «...» first from the whole title to avoid splitting on slashes inside quotes
+        val cleanedTitle = title.replace(Regex("«[^»]*»?"), "")
+        val splitBySlash = cleanedTitle.split("/")
+
+        // Parse the first part to get the baseName and initial sequence info
+        val firstPartInfo = parseSinglePart(splitBySlash[0])
+
+        var season = firstPartInfo.season
+        var episode = firstPartInfo.episode
+        var part = firstPartInfo.part
+        var year = firstPartInfo.year
+
+        // If some information is missing, try to find it in subsequent parts
+        for (i in 1 until splitBySlash.size) {
+            val otherInfo = parseSinglePart(splitBySlash[i])
+            if (year == null) year = otherInfo.year
+            if (season == null) season = otherInfo.season
+            if (episode == null) episode = otherInfo.episode
+            if (part == null) part = otherInfo.part
+        }
+
+        return SequenceInfo(firstPartInfo.baseName, season, episode, part, year)
+    }
+
+    private fun parseSinglePart(partStr: String): SequenceInfo {
+        var base = partStr
+
+        // Year
+        val yearRegex = Regex("\\((\\d{4})\\)")
+        var year: Int? = null
+        yearRegex.find(base)?.let { match ->
+            year = match.groupValues[1].toIntOrNull()
+        }
+
+        // Remove stuff in brackets
+        val bracketRegex = Regex("\\[.*?\\]|\\(.*?\\)")
+        base = base.replace(bracketRegex, "")
+
+        // Season and Episode multiple formats
+        var season: Int? = null
+        var episode: Int? = null
+
+        // Formats:
+        val numPattern = "(\\d+|[IVXLCDM]+)"
+
+        // Format: с01э05
+        val seRegex1 = Regex("с(\\d{1,2})э(\\d{1,2})", RegexOption.IGNORE_CASE)
+        // Format: 1 сезон 5 серия
+        val seRegex2 = Regex("$numPattern\\s*-?я?\\s*(?:сезон|season).*?$numPattern\\s*-?я?\\s*(?:серия|эпизод|episode|ep)", RegexOption.IGNORE_CASE)
+        // Format: сезон 1 серия 5
+        val seRegex3 = Regex("(?:сезон|season|s)\\s*$numPattern.*?(?:серия|эпизод|episode|ep|e)\\s*$numPattern", RegexOption.IGNORE_CASE)
+        // Format: 5 серия (without season)
+        val eRegexOnly = Regex("$numPattern\\s*-?я?\\s*(?:серия|эпизод|episode|ep|выпуск)", RegexOption.IGNORE_CASE)
+        val eRegexOnly2 = Regex("(?:серия|эпизод|episode|ep|выпуск|e)\\s*$numPattern", RegexOption.IGNORE_CASE)
+        // Format: s01e05 or s1e5
+        val seRegexUniversal = Regex("s(\\d{1,2})\\s*e(\\d{1,3})", RegexOption.IGNORE_CASE)
+        // Format: 01x05
+        val seRegexXFormat = Regex("(\\d{1,2})x(\\d{1,3})", RegexOption.IGNORE_CASE)
+
+        when {
+            seRegex1.containsMatchIn(base) -> {
+                val match = seRegex1.find(base)!!
+                season = match.groupValues[1].toIntOrNull()
+                episode = match.groupValues[2].toIntOrNull()
+                base = base.replace(match.value, "")
+            }
+            seRegexUniversal.containsMatchIn(base) -> {
+                val match = seRegexUniversal.find(base)!!
+                season = match.groupValues[1].toIntOrNull()
+                episode = match.groupValues[2].toIntOrNull()
+                base = base.replace(match.value, "")
+            }
+            seRegexXFormat.containsMatchIn(base) -> {
+                val match = seRegexXFormat.find(base)!!
+                season = match.groupValues[1].toIntOrNull()
+                episode = match.groupValues[2].toIntOrNull()
+                base = base.replace(match.value, "")
+            }
+            seRegex2.containsMatchIn(base) -> {
+                val match = seRegex2.find(base)!!
+                season = parseRomanOrInt(match.groupValues[1])
+                episode = parseRomanOrInt(match.groupValues[2])
+                base = base.replace(match.value, "")
+            }
+            seRegex3.containsMatchIn(base) -> {
+                val match = seRegex3.find(base)!!
+                season = parseRomanOrInt(match.groupValues[1])
+                episode = parseRomanOrInt(match.groupValues[2])
+                base = base.replace(match.value, "")
+            }
+            eRegexOnly.containsMatchIn(base) -> {
+                val match = eRegexOnly.find(base)!!
+                episode = parseRomanOrInt(match.groupValues[1])
+                base = base.replace(match.value, "")
+            }
+            eRegexOnly2.containsMatchIn(base) -> {
+                val match = eRegexOnly2.find(base)!!
+                episode = parseRomanOrInt(match.groupValues[1])
+                base = base.replace(match.value, "")
+            }
+        }
+
+        var part: Int? = null
+        val pRegex1 = Regex("(?:часть|part|ч|p|фильм)\\s*$numPattern\\b", RegexOption.IGNORE_CASE)
+        val pRegex2 = Regex("$numPattern\\s*-?я?\\s*(?:часть|part)", RegexOption.IGNORE_CASE)
+        val pRegex3 = Regex("\\s+(\\d+|(?![iI]\\b)[IVXLCDM]+)\\s*$")
+
+        if (season == null && episode == null) {
+            when {
+                pRegex1.containsMatchIn(base) -> {
+                    val match = pRegex1.find(base)!!
+                    part = parseRomanOrInt(match.groupValues[1])
+                    base = base.replace(match.value, "")
+                }
+                pRegex2.containsMatchIn(base) -> {
+                    val match = pRegex2.find(base)!!
+                    part = parseRomanOrInt(match.groupValues[1])
+                    base = base.replace(match.value, "")
+                }
+                pRegex3.containsMatchIn(base) -> {
+                    val match = pRegex3.find(base)!!
+                    part = parseRomanOrInt(match.groupValues[1])
+                    base = base.replace(match.value, "")
+                }
+            }
+        }
+
+        // Cut off subtitles to make base names match for series with subtitles (e.g., Star Wars, Minions)
+        val colonIndex = base.indexOf(':')
+        if (colonIndex != -1) base = base.substring(0, colonIndex)
+        val emDashIndex = base.indexOf('—')
+        if (emDashIndex != -1) base = base.substring(0, emDashIndex)
+
+        base = base.replace(Regex("сериал|мультфильм|мультсериал|фильм|серия|аниме|шоу|hd|fullhd|озвучка", RegexOption.IGNORE_CASE), "")
+        base = base.replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "").lowercase(Locale.getDefault())
+
+        return SequenceInfo(base, season, episode, part, year)
+    }
+
+    fun isBaseNameMatching(base1: String, base2: String): Boolean {
+        if (base1.isEmpty() || base2.isEmpty()) return false
+        if (base1 == base2) return true
+        if (base1.length >= 3 && base2.length >= 3) {
+            if (base1.contains(base2) || base2.contains(base1)) return true
+        }
+        return false
+    }
+
+    fun isStrictSequel(current: SequenceInfo, candidate: SequenceInfo): Boolean {
+        if (!isBaseNameMatching(current.baseName, candidate.baseName)) return false
+
+        // Episodic
+        if (current.episode != null || candidate.episode != null) {
+            val cSeason = current.season ?: 1
+            val candSeason = candidate.season ?: 1
+
+            if (cSeason == candSeason) {
+                val cEp = current.episode ?: 1
+                val candEp = candidate.episode ?: 1
+                return candEp == cEp + 1
+            } else if (candSeason == cSeason + 1) {
+                return candidate.episode == null || candidate.episode == 1
+            }
+            return false
+        }
+
+        // Parts / Movies - prioritize part if available
+        if (current.part != null || candidate.part != null) {
+            val cPart = current.part ?: 1
+            val candPart = candidate.part ?: 1
+            return candPart == cPart + 1
+        }
+
+        // Fallback to year if no parts or episodes are specified
+        if (current.year != null && candidate.year != null) {
+            return candidate.year > current.year
+        }
+
+        return false
+    }
+
+    fun recommendRelated(video: SearchResult, pool: List<SearchResult>): List<SearchResult> {
+        val registry = registryManager?.registry ?: UserRegistry()
+        val currentInfo = parseSequenceInfo(video.title)
+
+        var strictSequel: SearchResult? = null
+        val others = mutableListOf<SearchResult>()
+
+        for (candidate in pool) {
+            if (candidate.videoUrl == video.videoUrl) continue
+            if (candidate.title.contains("мультик", ignoreCase = true)) continue
+
+            val candInfo = parseSequenceInfo(candidate.title)
+
+            // Strict Sequel Logic (works across Rutube, VK, OK, Lordfilm)
+            if (isStrictSequel(currentInfo, candInfo)) {
+                if (strictSequel == null) {
+                    strictSequel = candidate
+                } else {
+                    val currentStrictInfo = parseSequenceInfo(strictSequel.title)
+                    val currentAuthorMatch = strictSequel.author?.name?.equals(video.author?.name, ignoreCase = true) == true
+                    val candAuthorMatch = candidate.author?.name?.equals(video.author?.name, ignoreCase = true) == true
+
+                    if (!currentAuthorMatch && candAuthorMatch) {
+                        others.add(strictSequel)
+                        strictSequel = candidate
+                    } else if (currentInfo.part == null && currentInfo.episode == null && currentStrictInfo.year != null && candInfo.year != null) {
+                        if (candInfo.year < currentStrictInfo.year) {
+                            others.add(strictSequel)
+                            strictSequel = candidate
+                        } else {
+                            others.add(candidate)
+                        }
+                    } else {
+                        others.add(candidate)
+                    }
+                }
+                continue
+            }
+
+            others.add(candidate)
+        }
+
+        others.sortByDescending { candidate ->
+            var score = RecommendationUtils.calculateScore(candidate, registry)
+            if (candidate.author?.name?.equals(video.author?.name, ignoreCase = true) == true) score += 50.0f
+
+            val cInfo = parseSequenceInfo(candidate.title)
+            if (isBaseNameMatching(cInfo.baseName, currentInfo.baseName)) {
+                score += 200.0f // Give similar named ones a boost
+            }
+
+            score
+        }
+
+        val result = mutableListOf<SearchResult>()
+        if (strictSequel != null) {
+            result.add(strictSequel)
+        }
+        result.addAll(others)
+
+        return result
+    }
+
+    fun getSearchQueries(video: SearchResult): List<String> {
+        val parsed = parseSequenceInfo(video.title)
+        val rawParsed = RecommendationUtils.parseTitle(video.title)
+        val rawBase = rawParsed.base.take(50).trim()
+
+        val season = parsed.season ?: rawParsed.season
+        val episode = parsed.episode ?: rawParsed.episode
+        val part = parsed.part ?: rawParsed.part
+
+        val queries = mutableListOf<String>()
+        if (season != null && episode != null) {
+            queries.add("$rawBase сезон $season серия ${episode + 1}")
+            queries.add("$rawBase s${season}e${episode + 1}")
+            queries.add("$rawBase $season сезон ${episode + 1} серия")
+            queries.add("$rawBase сезон ${season + 1} серия 1")
+        } else if (episode != null) {
+            queries.add("$rawBase серия ${episode + 1}")
+            queries.add("$rawBase ${episode + 1} серия")
+        } else if (part != null) {
+            queries.add("$rawBase часть ${part + 1}")
+            queries.add("$rawBase ${part + 1}")
+        } else {
+            queries.add("$rawBase 2")
+            queries.add("$rawBase часть 2")
+        }
+        queries.add(rawBase)
+        return queries.distinct().filter { it.isNotBlank() }
+    }
+}
