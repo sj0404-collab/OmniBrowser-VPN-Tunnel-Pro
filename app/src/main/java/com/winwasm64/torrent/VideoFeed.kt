@@ -86,6 +86,70 @@ object VideoFeed {
     }
 
     /**
+     * v4.83.0: довести карточку из индекса до нормального вида — взять настоящее название, канал,
+     * длительность и обложку со страницы площадки (без ключей и без входа).
+     */
+    fun enrich(clip: Clip): Clip {
+        if (clip.source == SRC_VK) {
+            val m = Regex("""(?:video|clip)(-?\d+)_(\d+)""").find(clip.url) ?: return clip
+            val (code, text) = try {
+                NetDirect.requestText(
+                    "https://vk.com/video_ext.php?oid=${m.groupValues[1]}&id=${m.groupValues[2]}&hd=2",
+                    mapOf("User-Agent" to UA_WEB_YT, "Accept-Language" to "ru", "Referer" to "https://vk.com/"),
+                    timeoutMs = 9_000
+                )
+            } catch (_: Throwable) {
+                return clip
+            }
+            if (code !in 200..299) return clip
+            val title = Regex(""""md_title"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+                ?.let { unescapeJs(it) }?.trim().orEmpty()
+            val author = Regex(""""md_author"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
+                ?.let { unescapeJs(it) }?.trim().orEmpty()
+            val jpg = Regex(""""jpg"\s*:\s*"(https:[^"]+)"""").find(text)?.groupValues?.get(1)?.replace("\\/", "/").orEmpty()
+            val dur = Regex(""""duration"\s*:\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            return clip.copy(
+                title = title.ifBlank { clip.title }.take(150),
+                author = author.ifBlank { clip.author },
+                thumb = jpg.ifBlank { clip.thumb },
+                lengthText = if (dur > 0) String.format(Locale.US, "%d:%02d", dur / 60, dur % 60) else clip.lengthText,
+                lengthSec = if (dur > 0) dur else clip.lengthSec
+            )
+        }
+        if (clip.source == SRC_RUTUBE) {
+            val id = Regex("""/video/([0-9a-f]{6,})""", RegexOption.IGNORE_CASE).find(clip.url)?.groupValues?.get(1) ?: return clip
+            val (code, text) = try {
+                NetDirect.requestText(
+                    "https://rutube.ru/api/video/$id/",
+                    mapOf("User-Agent" to UA_WEB_YT, "Accept" to "application/json", "Referer" to "https://rutube.ru/"),
+                    timeoutMs = 9_000
+                )
+            } catch (_: Throwable) {
+                return clip
+            }
+            if (code !in 200..299) return clip
+            return try {
+                val o = JSONObject(text)
+                val dur = o.optInt("duration", 0)
+                clip.copy(
+                    title = o.optString("title").ifBlank { clip.title }.take(150),
+                    author = o.optJSONObject("author")?.optString("name").orEmpty().ifBlank { clip.author },
+                    thumb = o.optString("thumbnail_url").ifBlank { clip.thumb },
+                    lengthText = if (dur > 0) String.format(Locale.US, "%d:%02d", dur / 60, dur % 60) else clip.lengthText,
+                    lengthSec = if (dur > 0) dur else clip.lengthSec
+                )
+            } catch (_: Throwable) {
+                clip
+            }
+        }
+        if (clip.thumb.isBlank()) return clip.copy(thumb = thumbFor(clip.url))
+        return clip
+    }
+
+    private fun unescapeJs(s: String): String = s
+        .replace("\\/", "/").replace("\\\"", "\"").replace("\\n", " ").replace("\\\\", "\\")
+
+    /**
      * v4.82.0: площадки (VK, RuTube) — это SPA: данные приходят в JSON по XHR/fetch, а не в HTML.
      * Поэтому вешаем хук на fetch и XMLHttpRequest и складываем ответы в window.__omni.
      * Из них получаются точные названия, обложки, длительности, просмотры и дата — как в оригинале.
@@ -380,35 +444,40 @@ return JSON.stringify(res.slice(0,200));
      */
     fun searchIndexed(source: String, query: String): Page {
         if (query.isBlank()) return Page()
-        val site = when (source) {
-            SRC_VK -> "vkvideo.ru OR vk.com/video"
-            SRC_RUTUBE -> "rutube.ru"
-            else -> "youtube.com"
+        // v4.83.0: по одному сайту за запрос — так поисковики отдают больше и точнее
+        val sites = when (source) {
+            SRC_VK -> listOf("vkvideo.ru", "vk.com/video")
+            SRC_RUTUBE -> listOf("rutube.ru")
+            else -> listOf("youtube.com")
         }
-        val q = enc("site:$site \"$query\"")
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
             "Accept-Language" to "ru,en;q=0.8",
             "Accept" to "text/html,application/xhtml+xml"
         )
-        val engines = listOf(
-            "https://search.brave.com/search?q=$q&source=web",
-            "https://www.bing.com/search?q=$q&setlang=ru",
-            "https://html.duckduckgo.com/html/?q=$q"
-        )
-        for (u in engines) {
-            val pair = try {
-                NetDirect.requestText(u, headers, timeoutMs = 9_000)
-            } catch (_: Throwable) {
-                continue
+        val all = LinkedHashMap<String, Clip>()
+        for (site in sites) {
+            val q = enc("site:$site $query")
+            val engines = listOf(
+                "https://search.brave.com/search?q=$q&source=web",
+                "https://www.bing.com/search?q=$q&setlang=ru",
+                "https://html.duckduckgo.com/html/?q=$q"
+            )
+            for (u in engines) {
+                val pair = try {
+                    NetDirect.requestText(u, headers, timeoutMs = 9_000)
+                } catch (_: Throwable) {
+                    continue
+                }
+                if (pair.first !in 200..299) continue
+                val clips = parseEngineHtml(source, pair.second, query)
+                for (c in clips) if (!all.containsKey(keyOf(c))) all[keyOf(c)] = c
+                if (all.size >= 8) break
             }
-            val code = pair.first
-            val html = pair.second
-            if (code !in 200..299) continue
-            val clips = parseEngineHtml(source, html, query)
-            if (clips.isNotEmpty()) return Page(clips = clips, note = "быстрый поиск по индексу: ${clips.size} видео")
+            if (all.size >= 8) break
         }
-        return Page()
+        return if (all.isEmpty()) Page()
+        else Page(clips = all.values.toList(), note = "быстрый поиск по индексу: ${all.size} видео")
     }
 
     /**
@@ -475,7 +544,9 @@ return JSON.stringify(res.slice(0,200));
         val letters = t.count { it.isLetter() }
         if (letters < 4) return false
         if (Regex("""^[\d\s_.,:–-]+$""").matches(t)) return false
-        if (Regex("""^(видео|смотреть|смотрите|видео онлайн|vk видео|rutube|youtube)$""", RegexOption.IGNORE_CASE).matches(t)) return false
+        // v4.83.0: «video-», «clip», «VK Видео», «Смотреть видео» — это не название, а мусор из ссылки
+        if (Regex("""^(видео|смотреть|смотрите|видео онлайн|vk ?видео|rutube|youtube|video|clip|watch)[\s\-–—|:.]*$""", RegexOption.IGNORE_CASE).matches(t)) return false
+        if (Regex("""^(video|clip)[\s\-–—_.]?$""", RegexOption.IGNORE_CASE).matches(t)) return false
         // заголовок должен быть хоть немного про запрос (иначе это «случайный» блок навигации)
         return Relevance.scoreFields(query, emptyList(), t) > 0 || t.split(' ').size >= 2
     }

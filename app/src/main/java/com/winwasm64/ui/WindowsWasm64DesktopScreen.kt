@@ -6764,8 +6764,19 @@ private fun VideoHomeSection(
     var qualityFor by remember { mutableStateOf<com.winwasm64.torrent.VideoFeed.Clip?>(null) }
     var qualityList by remember { mutableStateOf<List<com.winwasm64.torrent.VideoPlay.Variant>>(emptyList()) }
     var qualityLoading by remember { mutableStateOf(false) }
+    var probeUrl by remember { mutableStateOf<String?>(null) }
+    var probeClip by remember { mutableStateOf<com.winwasm64.torrent.VideoFeed.Clip?>(null) }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
+
+    /**
+     * v4.83.0: VK отдаёт прямой поток только своему плееру. Тогда открываем страницу ролика в нашем
+     * движке и перехватываем запрос медиафайла — играет всё равно встроенный ExoPlayer.
+     */
+    fun playViaProbe(c: com.winwasm64.torrent.VideoFeed.Clip) {
+        probeClip = c
+        probeUrl = com.winwasm64.torrent.VideoPlay.probeUrl(c.url)
+    }
 
     /** v4.76.0: карточка открывает ВСТРОЕННЫЙ плеер, а не сайт YouTube. */
     fun openClip(c: com.winwasm64.torrent.VideoFeed.Clip) {
@@ -6803,8 +6814,8 @@ private fun VideoHomeSection(
             playing = ""
             if (play == null) {
                 val why = com.winwasm64.torrent.VideoPlay.lastError.ifBlank { "не удалось получить поток" }
-                note = "Плеер: $why — открываю страницу внутри приложения"
-                onOpenUrl(c.url)
+                note = "Плеер: $why — беру поток у плеера площадки"
+                playViaProbe(c)
                 return@launch
             }
             if (com.winwasm64.torrent.VideoPlay.lastError.isNotBlank()) note = com.winwasm64.torrent.VideoPlay.lastError
@@ -6828,18 +6839,21 @@ private fun VideoHomeSection(
         }
     }
 
-    /** v4.79.0: у карточек из индекса нет обложки — достаём её с площадки в фоне. */
+    /**
+     * v4.83.0: карточки из индекса приходили с мусорным названием («video-») и без обложки.
+     * Теперь дотягиваем настоящие данные со страницы площадки: название, канал, длительность, превью.
+     */
     fun enrichThumbs(list: List<com.winwasm64.torrent.VideoFeed.Clip>) {
-        val need = list.filter { it.thumb.isBlank() }.take(16)
+        val need = list.filter { it.source != com.winwasm64.torrent.VideoFeed.SRC_YOUTUBE }
+            .filter { it.thumb.isBlank() || it.lengthSec == 0 || it.author.isBlank() }
+            .take(16)
         if (need.isEmpty()) return
         scope.launch {
             for (c in need) {
-                val t = withContext(Dispatchers.IO) {
-                    runCatching { com.winwasm64.torrent.VideoFeed.thumbFor(c.url) }.getOrDefault("")
+                val better = withContext(Dispatchers.IO) {
+                    runCatching { com.winwasm64.torrent.VideoFeed.enrich(c) }.getOrDefault(c)
                 }
-                if (t.isNotBlank()) {
-                    items = items.map { if (it.url == c.url) it.copy(thumb = t) else it }
-                }
+                items = items.map { if (it.url == c.url) better else it }
             }
         }
     }
@@ -6980,6 +6994,34 @@ private fun VideoHomeSection(
             )
             subsOpen = false
         }
+    }
+
+    val pClip = probeClip
+    val pUrl = probeUrl
+    if (pClip != null && pUrl != null) {
+        MediaProbe(
+            url = pUrl,
+            onFound = { media, referer ->
+                probeUrl = null
+                probeClip = null
+                if (media == null) {
+                    note = "Площадка не показала поток — открываю страницу на вкладке браузера"
+                    onOpenUrl(pClip.url)
+                } else {
+                    runCatching {
+                        context.startActivity(
+                            Intent(context, com.winwasm64.ui.NativeVideoPlayerActivity::class.java)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                .putExtra("url", media)
+                                .putExtra("title", pClip.title)
+                                .putExtra("thumbnail", pClip.thumb)
+                                .putExtra("referer", referer)
+                                .putExtra("libKey", com.winwasm64.torrent.VideoFeed.keyOf(pClip))
+                        )
+                    }
+                }
+            }
+        )
     }
 
     val qFor = qualityFor
@@ -7267,6 +7309,38 @@ private fun VideoHomeSection(
                 playing, color = Omni.Accent, fontSize = 11.sp,
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp), maxLines = 2
             )
+        }
+        if (source == com.winwasm64.torrent.VideoFeed.SRC_VK &&
+            items.isEmpty() && !loading && submitted.isNotBlank()
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    color = Omni.AccentContainer,
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.clickable {
+                        onOpenUrl(com.winwasm64.torrent.VideoFeed.scrapeUrl(source, submitted))
+                    }
+                ) {
+                    Text(
+                        "🔓 Открыть поиск VK в браузере (войти один раз)",
+                        color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                    )
+                }
+                Surface(
+                    color = Omni.SurfaceHighest,
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.clickable { tick++ }
+                ) {
+                    Text(
+                        "⟳ Повторить", color = Color.White, fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                    )
+                }
+            }
         }
         if (loading && items.isEmpty()) {
             Row(
@@ -7820,6 +7894,59 @@ private fun SubsScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * v4.83.0: достать медиа-поток у самой площадки.
+ *
+ * VK (и часть роликов RuTube) не отдают прямой mp4 обычному запросу — только своему плееру.
+ * Открываем страницу ролика в нашем WebView и слушаем сетевые запросы: как только плеер площадки
+ * запрашивает m3u8/mp4, забираем адрес и играем его встроенным ExoPlayer.
+ */
+@Composable
+private fun MediaProbe(url: String, onFound: (String?, String?) -> Unit) {
+    val context = LocalContext.current
+    var fired by remember(url) { mutableStateOf(false) }
+    AndroidView(
+        modifier = Modifier.size(1.dp),
+        factory = { ctx ->
+            android.webkit.WebView(ctx).apply {
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                settings.userAgentString =
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webViewClient = object : android.webkit.WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: android.webkit.WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString().orEmpty()
+                        if (!fired && (
+                                u.contains(".m3u8") || u.contains(".mp4") ||
+                                    u.contains("videoplayback") || u.contains("/playlist/")
+                                )
+                        ) {
+                            fired = true
+                            onFound(u, "https://vk.com/")
+                        }
+                        return null
+                    }
+                }
+                loadUrl(url)
+            }
+        }
+    )
+    LaunchedEffect(url) {
+        delay(18_000)
+        if (!fired) {
+            fired = true
+            onFound(null, null)
         }
     }
 }

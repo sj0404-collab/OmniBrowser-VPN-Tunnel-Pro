@@ -427,6 +427,16 @@ object VideoPlay {
         return try { JSONObject(text) } catch (_: Throwable) { null }
     }
 
+    /** Адрес страницы, на которой плеер площадки сам запросит медиафайл. */
+    fun probeUrl(link: String): String {
+        val u = link.trim()
+        if (u.contains("vk.com/video", true) || u.contains("vk.com/clip", true)) {
+            return u.replace("https://vk.com/", "https://m.vkvideo.ru/")
+        }
+        if (u.contains("rutube.ru/video/", true)) return u
+        return u
+    }
+
     private fun rutube(link: String): Play? {
         val id = Regex("""/video/([0-9a-f]{8,})/?""", RegexOption.IGNORE_CASE).find(link)?.groupValues?.get(1)
         if (id == null) { lastError = "не понял id RuTube"; return null }
