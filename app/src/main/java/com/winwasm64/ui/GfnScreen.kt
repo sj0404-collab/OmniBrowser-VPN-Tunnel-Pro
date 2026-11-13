@@ -67,7 +67,7 @@ fun GfnScreen(modifier: Modifier = Modifier) {
     var reloadTick by remember { mutableIntStateOf(0) }
     var fullscreenView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
-    var statusText by remember { mutableStateOf("Загрузка клиента GeForce NOW…") }
+    var statusText by remember { mutableStateOf<String?>("Загрузка клиента GeForce NOW…") }
 
     val host = remember { GfnHolder.container(ctx) }
     val webView = remember { GfnHolder.webView(ctx) }
