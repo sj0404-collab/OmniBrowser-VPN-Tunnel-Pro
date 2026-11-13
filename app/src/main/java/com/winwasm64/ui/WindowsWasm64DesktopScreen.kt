@@ -355,7 +355,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
     // v4.19.0: своя панель ввода для полноэкранных игр (клавиатура сайта не всегда доносит нажатия)
-    var showKeyPanel by remember { mutableStateOf(false) }
+    // v4.94.0: своя панель ввода для игр удалена (мешала родному оверлею)
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -1013,6 +1013,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     fun navigateTab(tab: BrowserTabModel, rawInput: String, useProxyTunnel: Boolean = false) {
         val target = normalizeInputToUrl(rawInput)
+        // v4.94.0: GeForce NOW не открываем в обычном браузере — у него своя вкладка,
+        // куда не вмешиваются наши скрипты и клавиатуры.
+        if (target.contains("geforcenow.com", true) || target.contains("play.geforcenow", true)) {
+            currentSection = 8
+            Toast.makeText(context, "GeForce NOW открывается в своей вкладке", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (isTorrentLink(target, null, null)) {
             // v4.10.9: `.torrent?token=…` и ссылки download.php?id=… тоже идут в торрент-движок
             startTorrentFromUrl(tab, target, null, null, null)
@@ -1984,7 +1991,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
         }
         onDispose {
             // v4.19.0: вышли из полного экрана — панель ввода больше не нужна
-            showKeyPanel = false
             if (act != null && win != null && act.requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
                 WindowCompat.getInsetsController(win, win.decorView).show(WindowInsetsCompat.Type.systemBars())
                 act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -3263,27 +3269,21 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         factory = { fsHost },
                         modifier = Modifier.fillMaxSize()
                     )
-                    // v4.24.0: курсор виртуальной мыши рисуем здесь, поверх вида игры.
-                    // В самой странице его не видно: клиент GeForce NOW занимает экран
-                    // через HTML-fullscreen, и наши элементы остаются под этим слоем.
-                    if (com.winwasm64.ui.browser.OmniCursor.active) {
-                        Canvas(modifier = Modifier.fillMaxSize()) {
-                            val cx = com.winwasm64.ui.browser.OmniCursor.fx * size.width
-                            val cy = com.winwasm64.ui.browser.OmniCursor.fy * size.height
-                            drawCircle(color = Color(0x55FFC857), radius = 22f, center = Offset(cx, cy))
-                            drawCircle(color = Color(0xFFFFC857), radius = 10f, center = Offset(cx, cy))
-                            drawCircle(color = Color(0xCC101216), radius = 4f, center = Offset(cx, cy))
-                        }
-                    }
                     if (!inPip) Row(modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) {
-                        // v4.16.0: в полноэкранной игре (GeForce NOW и подобные) клавиатура, которую просит
-                        // страница, могла не открыться — даём кнопку, которая показывает её принудительно.
-                        Button(
-                            onClick = { showKeyPanel = !showKeyPanel },
-                            colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
-                            modifier = Modifier.padding(end = 8.dp)
-                        ) {
-                            Text(if (showKeyPanel) "⌨ Скрыть ввод" else "⌨ Клавиатура", fontSize = 11.sp, color = Color.White)
+                        // v4.94.0: наши «навороты» для игрового экрана убраны.
+                        // Остались только те клавиши, которые реально нужны в игре.
+                        listOf(
+                            "Esc" to android.view.KeyEvent.KEYCODE_ESCAPE,
+                            "Tab" to android.view.KeyEvent.KEYCODE_TAB,
+                            "Enter" to android.view.KeyEvent.KEYCODE_ENTER
+                        ).forEach { (label, code) ->
+                            Button(
+                                onClick = { sendKeyToWebView(activeTab.webView, code) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f)),
+                                modifier = Modifier.padding(end = 6.dp).height(34.dp)
+                            ) {
+                                Text(label, fontSize = 11.sp, color = Color.White)
+                            }
                         }
                         Button(
                             onClick = {
@@ -3294,16 +3294,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                             colors = ButtonDefaults.buttonColors(containerColor = Omni.Surface.copy(alpha = 0.80f))
                         ) {
                             Text("Выйти из полного экрана", fontSize = 11.sp, color = Color.White)
-                        }
-                    }
-                    if (showKeyPanel && !inPip) {
-                        // v4.19.0: своя панель ввода — символы уходят прямо в страницу
-                        Box(modifier = Modifier.align(Alignment.BottomCenter)) {
-                            com.winwasm64.ui.browser.OmniKeyPanel(
-                                webView = activeTab.webView,
-                                onClose = { showKeyPanel = false },
-                                onShowSystemKeyboard = { forceShowKeyboard(context, activeTab.webView) }
-                            )
                         }
                     }
                 }
@@ -3451,6 +3441,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         modifier = Modifier.weight(1f).fillMaxWidth()
                     )
                 }
+            }
+
+            // ===================== SECTION 8: GEFORCE NOW (чистый клиент) =====================
+            // v4.94.0: отдельная вкладка. Внутри — обычный WebView без наших скриптов,
+            // никаких самодельных клавиатур и курсоров: только Esc, Tab, Enter.
+            if (currentSection == 8 && !inPip) {
+                GfnScreen(modifier = Modifier.weight(1f).fillMaxWidth())
             }
 
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
@@ -3761,6 +3758,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         OmniNavItem("История", OmniIcons.History, section = 2),
                         OmniNavItem("Загрузки", OmniIcons.Download, section = 4),
                         OmniNavItem("Приложения", OmniIcons.Apps, section = 3),
+                        // v4.94.0: GeForce NOW — своя вкладка, без наших надстроек
+                        OmniNavItem("GFN", OmniIcons.Gamepad, section = 8),
                         // v4.36.0: VPN — отдельная вкладка после «Приложений», как и просили
                         OmniNavItem("VPN", OmniIcons.Shield, section = 5)
                     ),
@@ -5783,27 +5782,19 @@ private fun omniAudioBoostJs(gain: Double): String = """
 })($gain);
 """
 
+
 /**
- * v4.16.0: принудительно показать экранную клавиатуру для страницы в полноэкранном режиме.
- *
- * Зачем: в оверлее GeForce NOW (и других игр) клавиатура открывалась и сразу закрывалась.
- * До этой версии приложение вообще не трогало IME — то есть показать её повторно было нечем.
- * Теперь есть кнопка «⌨ Клавиатура»: она отдаёт фокус WebView и просит IME показать клавиатуру
- * с режимом SHOW_IMPLICIT — тот же, которым пользуется сама страница.
+ * v4.94.0: отправить одну клавишу в страницу (Esc / Tab / Enter для игрового экрана).
+ * Раньше здесь был целый самодельный ввод с подменой событий — он мешал родному оверлею игры.
  */
-private fun forceShowKeyboard(ctx: android.content.Context, wv: android.webkit.WebView?) {
+private fun sendKeyToWebView(wv: android.webkit.WebView?, keyCode: Int) {
+    if (wv == null) return
     try {
-        if (wv == null) return
-        // v4.19.0: requestFocus() у WebView сбрасывал DOM-фокус на document.body — именно из-за этого
-        // клавиатура открывалась, а нажатия до игры не доходили. Теперь фокус забираем только если
-        // WebView его вообще не имеет.
+        val now = android.os.SystemClock.uptimeMillis()
+        wv.dispatchKeyEvent(android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_DOWN, keyCode, 0))
+        wv.dispatchKeyEvent(android.view.KeyEvent(now, now, android.view.KeyEvent.ACTION_UP, keyCode, 0))
         if (!wv.hasFocus()) wv.requestFocus()
-        val imm = ctx.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
-            as? android.view.inputmethod.InputMethodManager ?: return
-        imm.showSoftInput(wv, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
-        com.winwasm64.vpn.VpnLog.i("Браузер", "полный экран: клавиатура запрошена вручную (кнопка ⌨)")
-    } catch (e: Throwable) {
-        com.winwasm64.vpn.VpnLog.w("Браузер", "клавиатуру показать не удалось: ${e.message ?: e.javaClass.simpleName}")
+    } catch (_: Throwable) {
     }
 }
 
