@@ -3442,8 +3442,16 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             // ===================== SECTION 8: GEFORCE NOW (чистый клиент) =====================
             // v4.94.0: отдельная вкладка. Внутри — обычный WebView без наших скриптов,
             // никаких самодельных клавиатур и курсоров: только Esc, Tab, Enter.
+            // v4.96.0: игра просит полный экран — тогда прячем и свою нижнюю панель,
+            // чтобы их оверлею достался весь дисплей.
+            var gfnImmersive by remember { mutableStateOf(false) }
             if (currentSection == 8 && !inPip) {
-                GfnScreen(modifier = Modifier.weight(1f).fillMaxWidth())
+                GfnScreen(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    onImmersiveChange = { gfnImmersive = it }
+                )
+            } else if (gfnImmersive) {
+                gfnImmersive = false
             }
 
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
@@ -3716,7 +3724,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             }
 
             // ===================== НИЖНЯЯ НАВИГАЦИЯ =====================
-            if (fullscreenCustomView == null && !inPip) {
+            if (fullscreenCustomView == null && !inPip && !gfnImmersive) {
                 // v4.75.0: полоска «кто сейчас выполняет задачу» — фоновые задачи агента
                 val agentTasks by com.winwasm64.torrent.AgentTasks.tasks
                 LaunchedEffect(Unit) { com.winwasm64.torrent.AgentTasks.load(context) }
