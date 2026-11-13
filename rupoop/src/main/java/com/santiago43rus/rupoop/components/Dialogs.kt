@@ -113,7 +113,7 @@ fun PlaylistSelectionDialog(
                 }
                 OutlinedTextField(
                     value = newName,
-                    onValueChange = { typed -> newName = typed },
+                    onValueChange = { newName = it },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()

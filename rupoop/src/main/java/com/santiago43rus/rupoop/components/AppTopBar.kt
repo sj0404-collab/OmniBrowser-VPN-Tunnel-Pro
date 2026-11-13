@@ -274,7 +274,7 @@ fun AppTopBar(
                     }
                     OutlinedTextField(
                         value = vm.searchQuery,
-                        onValueChange = { typed -> vm.searchQuery = typed },
+                        onValueChange = { vm.searchQuery = it },
                         singleLine = true,
                         modifier = Modifier
                             .weight(1f)
