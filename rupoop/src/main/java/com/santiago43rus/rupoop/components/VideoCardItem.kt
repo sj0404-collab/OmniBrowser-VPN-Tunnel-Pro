@@ -137,7 +137,12 @@ fun VideoCardItem(
         // Platform metadata
         val videoUrlLower = video.videoUrl.lowercase()
         val isLordfilm = videoUrlLower.contains("lordfilm") || videoUrlLower.contains("lordserials")
+        val isYouTube = videoUrlLower.contains("youtube.com") || videoUrlLower.contains("youtu.be") ||
+            videoUrlLower.contains("youtube-nocookie.com")
         val platformName = when {
+            // v4.90.0: раньше всё, что не VK/OK/Lordfilm, подписывалось как «Rutube» —
+            // поэтому карточки YouTube выглядели как RuTube
+            isYouTube -> "YouTube"
             videoUrlLower.contains("vk.com") || videoUrlLower.contains("vkvideo.ru") || videoUrlLower.contains("vk.ru") -> "VK Видео"
             videoUrlLower.contains("ok.ru") || videoUrlLower.contains("odnoklassniki.ru") -> "Одноклассники"
             isLordfilm -> "Lordfilm"
@@ -160,8 +165,11 @@ fun VideoCardItem(
                     modifier = Modifier.clickable(enabled = false) { onAuthorClick(lordAuthor) }
                 )
             } else {
-                val fallbackAvatar = if (platformName == "Одноклассники") "https://ok.ru/favicon.ico"
-                    else "https://rutube.ru/static/img/default-avatar.png"
+                val fallbackAvatar = when {
+                    platformName == "Одноклассники" -> "https://ok.ru/favicon.ico"
+                    isYouTube -> "https://www.youtube.com/s/desktop/favicon.ico"
+                    else -> "https://rutube.ru/static/img/default-avatar.png"
+                }
                 AsyncImage(
                     model = video.author?.avatarUrl ?: fallbackAvatar,
                     contentDescription = null,

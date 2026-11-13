@@ -35,7 +35,26 @@ object YouTubeVideoParser {
     }
 
     suspend fun parse(url: String): ParsedVideo? {
-        val id = extractId(url) ?: return null
+        val id = extractId(url)
+        if (id == null) {
+            Log.w(TAG, "no video id in $url")
+            return null
+        }
+        // 1) свой разбор (как у RuTube/VK) — работает без приложения
+        val own = YouTubeStreamResolver.resolve("https://www.youtube.com/watch?v=$id")
+        if (own != null && own.streamUrl.isNotBlank()) {
+            return ParsedVideo(
+                videoUrl = url,
+                streamUrl = own.streamUrl,
+                title = own.title?.takeIf { it.isNotBlank() } ?: "YouTube",
+                thumbnailUrl = own.thumbnailUrl ?: "https://i.ytimg.com/vi/$id/mqdefault.jpg",
+                authorName = "YouTube",
+                durationSeconds = own.durationSeconds,
+                sourceName = "YouTube",
+                headers = own.headers
+            )
+        }
+        // 2) мост приложения (канал/VPN и запасные пути)
         val stream = OmniYouTubeBridge.stream("https://www.youtube.com/watch?v=$id")
         if (stream == null || stream.streamUrl.isBlank()) {
             Log.w(TAG, "YouTube stream not resolved for $id")

@@ -7,7 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.santiago43rus.rupoop.network.RetrofitClient
 import com.santiago43rus.rupoop.network.LordfilmSearchEngine
-import com.santiago43rus.rupoop.network.OmniYouTubeBridge
+import com.santiago43rus.rupoop.network.YouTubeSearchEngine
 import com.santiago43rus.rupoop.network.VkSearchEngine
 import com.santiago43rus.rupoop.network.OkSearchEngine
 import com.santiago43rus.rupoop.util.PlayerState
@@ -98,7 +98,7 @@ class ContentFeedController(
                 val ytQuery = (selectedGenres.shuffled().firstOrNull() ?: "популярное")
                 val youtubeDeferred = scope.async(Dispatchers.IO) {
                     try {
-                        OmniYouTubeBridge.search(ytQuery)
+                        YouTubeSearchEngine.search(ytQuery)
                     } catch (e: Exception) {
                         Log.e("Rupoop", "YouTube home feed error", e)
                         emptyList<SearchResult>()
@@ -212,7 +212,7 @@ class ContentFeedController(
                             author.url?.contains("youtu.be") == true
                         ) {
                             // v4.89.0: подписка на YouTube-канал — только его свежие видео
-                            val chVideos = OmniYouTubeBridge.channel(author.url ?: author.name)
+                            val chVideos = YouTubeSearchEngine.channelVideos(author.url ?: author.name)
                             allSubsVideos.addAll(chVideos)
                             return@forEach
                         }
@@ -278,7 +278,7 @@ class ContentFeedController(
                     val rawResults: List<SearchResult> = when {
                         platform.startsWith("YOUTUBE") -> {
                             hasMoreAuthorVideos = false
-                            OmniYouTubeBridge.channel(author.url ?: author.name)
+                            YouTubeSearchEngine.channelVideos(author.url ?: author.name)
                         }
                         else -> when (platform) {
                         "LORDFILM" -> {

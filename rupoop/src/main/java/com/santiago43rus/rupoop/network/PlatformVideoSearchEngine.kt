@@ -50,7 +50,7 @@ object OkPlatformSearchEngine : PlatformVideoSearchEngine {
 object YouTubePlatformSearchEngine : PlatformVideoSearchEngine {
     override suspend fun search(query: String): List<SearchResult> {
         return try {
-            OmniYouTubeBridge.search(query)
+            YouTubeSearchEngine.search(query)
         } catch (_: Exception) {
             emptyList()
         }

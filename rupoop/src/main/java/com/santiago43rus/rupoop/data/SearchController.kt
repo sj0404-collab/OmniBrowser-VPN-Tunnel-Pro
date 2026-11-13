@@ -5,7 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.santiago43rus.rupoop.network.LordfilmSearchEngine
-import com.santiago43rus.rupoop.network.OmniYouTubeBridge
+import com.santiago43rus.rupoop.network.YouTubeSearchEngine
 import com.santiago43rus.rupoop.network.OkSearchEngine
 import com.santiago43rus.rupoop.network.RetrofitClient
 import com.santiago43rus.rupoop.network.VkSearchEngine
@@ -217,7 +217,7 @@ class SearchController(
                 }
             }
             SearchSource.YOUTUBE -> {
-                OmniYouTubeBridge.search(query)
+                YouTubeSearchEngine.search(query)
             }
             SearchSource.VK -> {
                 VkSearchEngine.search(query)
@@ -239,7 +239,7 @@ class SearchController(
                 }
                 val youtubeDeferred = scope.async(Dispatchers.IO) {
                     try {
-                        OmniYouTubeBridge.search(query)
+                        YouTubeSearchEngine.search(query)
                     } catch (e: Exception) {
                         Log.e("Rupoop", "YouTube search error in ALL mode", e)
                         emptyList<SearchResult>()

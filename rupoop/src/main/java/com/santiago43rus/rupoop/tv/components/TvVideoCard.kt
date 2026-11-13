@@ -49,6 +49,7 @@ fun TvVideoCard(
     val videoUrlLower = video.videoUrl.lowercase()
     val isLordfilm = videoUrlLower.contains("lordfilm") || videoUrlLower.contains("lordserials")
     val platformName = when {
+        videoUrlLower.contains("youtube.com") || videoUrlLower.contains("youtu.be") -> "YouTube"
         videoUrlLower.contains("vk.com") || videoUrlLower.contains("vkvideo.ru") || videoUrlLower.contains("vk.ru") -> "VK Видео"
         videoUrlLower.contains("ok.ru") || videoUrlLower.contains("odnoklassniki.ru") -> "Одноклассники"
         isLordfilm -> "Lordfilm"
