@@ -295,7 +295,7 @@ class DownloadTask(
                 withContext(Dispatchers.IO) {
                     val response = call.execute()
                     if (!response.isSuccessful) throw Exception("Unexpected code $response")
-                    val body = response.body
+                    val body = response.body!!
                     val buffer = ByteArray(8192)
                     body.byteStream().use { input ->
                         var bytesRead: Int

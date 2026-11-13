@@ -14,6 +14,7 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
@@ -271,7 +272,9 @@ fun AppTopBar(
                         }
                     }
                     OutlinedTextField(
-                        state = searchState,
+                        value = searchState.text.toString(),
+                        onValueChange = { searchState.setTextAndPlaceCursorAtEnd(it) },
+                        singleLine = true,
                         modifier = Modifier
                             .weight(1f)
                             .padding(end = 4.dp)
@@ -282,16 +285,15 @@ fun AppTopBar(
                                 }
                             },
                         textStyle = LocalTextStyle.current.copy(color = MaterialTheme.colorScheme.onBackground, fontSize = 14.sp),
-                        lineLimits = TextFieldLineLimits.SingleLine,
                         placeholder = {
                             Text("Поиск видео...", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f), fontSize = 14.sp)
                         },
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                        onKeyboardAction = {
+                        keyboardActions = KeyboardActions(onSearch = {
                             focusManager.clearFocus()
                             vm.performSearch(vm.searchQuery)
                             onSearch()
-                        },
+                        }),
                         trailingIcon = {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 if (vm.searchQuery.isNotEmpty()) {

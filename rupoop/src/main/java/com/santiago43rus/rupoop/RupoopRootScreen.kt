@@ -24,6 +24,8 @@ fun RupoopRootScreen(
     deepLinkVideoUrl: String? = null,
     onThemeToggled: (String) -> Unit = {}
 ) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val isTvDevice = remember(ctx) { ctx.isTvDeviceExt() }
     val vm: AppViewModel = viewModel()
     var themeMode by remember { mutableStateOf(vm.settingsManager.themeMode) }
     val systemDark = isSystemInDarkTheme()
@@ -40,7 +42,7 @@ fun RupoopRootScreen(
 
     RupoopTheme(themeMode = themeMode, darkTheme = isDarkTheme) {
         Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            if (remember { LocalContext.current.isTvDeviceExt() }) {
+            if (isTvDevice) {
                 com.santiago43rus.rupoop.tv.TvRoot(vm = vm, onThemeToggle = toggle)
             } else {
                 RutubeApp(

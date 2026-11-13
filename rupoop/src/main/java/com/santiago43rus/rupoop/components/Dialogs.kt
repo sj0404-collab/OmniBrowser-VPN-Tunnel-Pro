@@ -112,22 +112,23 @@ fun PlaylistSelectionDialog(
                     focusRequester.requestFocus()
                 }
                 OutlinedTextField(
-                    state = playlistNameState,
+                    value = playlistNameState.text.toString(),
+                    onValueChange = { playlistNameState.setTextAndPlaceCursorAtEnd(it) },
+                    singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
                         .focusRequester(focusRequester),
-                    lineLimits = androidx.compose.foundation.text.input.TextFieldLineLimits.SingleLine,
                     textStyle = LocalTextStyle.current.copy(color = MaterialTheme.colorScheme.onBackground, fontSize = 14.sp),
                     placeholder = {
                         Text("Название", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f), fontSize = 14.sp)
                     },
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
-                    onKeyboardAction = {
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
                         if (playlistNameState.text.isNotBlank()) {
                             onCreateNew(playlistNameState.text.toString())
                         }
-                    },
+                    }),
                     shape = RoundedCornerShape(24.dp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = Color.Transparent,
