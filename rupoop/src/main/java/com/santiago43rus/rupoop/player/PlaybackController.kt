@@ -20,6 +20,9 @@ import com.santiago43rus.rupoop.data.SearchResult
 import com.santiago43rus.rupoop.data.SettingsManager
 import com.santiago43rus.rupoop.data.UserRegistry
 import com.santiago43rus.rupoop.data.UserRegistryManager
+import com.santiago43rus.rupoop.network.OmniYouTubeBridge
+import com.santiago43rus.rupoop.parser.YouTubeVideoParser
+import kotlinx.coroutines.withTimeoutOrNull
 import com.santiago43rus.rupoop.data.WatchHistoryItem
 import com.santiago43rus.rupoop.data.RelatedVideoRecommendationStrategy
 import com.santiago43rus.rupoop.network.PlatformSearchEngineResolver
@@ -205,7 +208,13 @@ class PlaybackController(
             try {
                 if (isExternalUrl) {
                     Log.d("RupoopPlayer", "UniversalVideoParser parsing: $rawUrl")
-                    val parsed = withContext(Dispatchers.IO) { UniversalVideoParser.parse(rawUrl) }
+                    // v4.92.0: для YouTube не «мудрим» — 5 секунд на прямой поток,
+                    // если не вышло, ролик открывается во встроенном браузере (только видео, как PiP)
+                    val isYouTube = YouTubeVideoParser.isYouTubeUrl(rawUrl)
+                    val parsed = withContext(Dispatchers.IO) {
+                        if (isYouTube) withTimeoutOrNull(5_000) { UniversalVideoParser.parse(rawUrl) }
+                        else UniversalVideoParser.parse(rawUrl)
+                    }
                     Log.d("RupoopPlayer", "UniversalVideoParser result: streamUrl=${parsed?.streamUrl}, headers=${parsed?.headers}")
                     if (parsed != null && parsed.streamUrl.isNotBlank()) {
                         currentEpisodes = parsed.episodes
@@ -282,6 +291,9 @@ class PlaybackController(
                         delay(50)
                         exoPlayer.play()
                         loadRelatedVideosFor(updatedVideo)
+                    } else if (isYouTube && OmniYouTubeBridge.playInBrowser(rawUrl, video.title)) {
+                        snackbarMessage.emit("YouTube: открываю видео во встроенном браузере")
+                        playerState = PlayerState.CLOSED
                     } else {
                         snackbarMessage.emit("Не удалось загрузить видео по ссылке")
                         playerState = PlayerState.CLOSED

@@ -242,6 +242,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val searchError: Boolean get() = searchController.searchError
     var authorSortOrder by mutableStateOf("-publication_ts")
 
+    // v4.92.0: импорт подписок YouTube из аккаунта (вход — из браузера приложения)
+    var isImportingSubscriptions by mutableStateOf(false)
+    var subscriptionImportNote by mutableStateOf("")
+
     private var pushJob: Job? = null
     private var lastPushAt = 0L
     private val pushMinIntervalMs = 5 * 60 * 1000L

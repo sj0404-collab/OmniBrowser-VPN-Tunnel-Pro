@@ -102,6 +102,15 @@
         </receiver>
 
         <!-- v4.85.0: ПЕРВОЕ приложение в APK — «Omnibrowser» (браузер, VPN, видео, загрузки) -->
+        <!-- v4.92.0: YouTube во встроенном браузере — только видео, как PiP -->
+        <activity
+            android:name=".ui.YouTubeWebPlayerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:hardwareAccelerated="true"
+            android:supportsPictureInPicture="true" />
+
         <activity
             android:name=".MainActivity"
             android:label="Omnibrowser"

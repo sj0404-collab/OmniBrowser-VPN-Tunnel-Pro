@@ -31,6 +31,41 @@ object OmniYouTubeLink {
             channel = { ref -> channelVideos(ref) },
             stream = { url -> stream(url) }
         )
+        // v4.92.0: «YouTube просто в браузере» — только видео, как PiP
+        OmniYouTubeBridge.installWebPlayer { url, title -> openInBrowser(url, title) }
+        // v4.92.0: подписки аккаунта YouTube (тот же вход, что в браузере приложения)
+        OmniYouTubeBridge.installAccount {
+            val r = YouTubeAccount.subscriptions()
+            OmniYouTubeBridge.AccountResult(
+                channels = r.channels.map { OmniYouTubeBridge.ChannelRow(it.name, it.url, it.avatar) },
+                loggedIn = r.loggedIn,
+                note = r.note
+            )
+        }
+    }
+
+    /** Открыть ролик во встроенном браузере приложения (страница обрезана до видео). */
+    fun openInBrowser(url: String, title: String): Boolean {
+        val ctx = appContext ?: return false
+        return try {
+            ctx.startActivity(
+                android.content.Intent(ctx, com.winwasm64.ui.YouTubeWebPlayerActivity::class.java)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra("url", url)
+                    .putExtra("title", title)
+            )
+            true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /** Контекст приложения (ставится при старте) — чтобы запускать экраны из «Кино». */
+    @Volatile
+    private var appContext: android.content.Context? = null
+
+    fun attach(ctx: android.content.Context) {
+        appContext = ctx.applicationContext
     }
 
     // ── поиск ──

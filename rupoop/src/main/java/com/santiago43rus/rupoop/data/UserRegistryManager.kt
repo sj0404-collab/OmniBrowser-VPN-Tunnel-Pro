@@ -222,7 +222,7 @@ class UserRegistryManager(private val context: Context) {
     }
 
     private fun loadLocal(): UserRegistry {
-        return if (registryFile.exists()) {
+        val loaded = if (registryFile.exists()) {
             try {
                 json.decodeFromString(registryFile.readText())
             } catch (e: Exception) {
@@ -232,6 +232,10 @@ class UserRegistryManager(private val context: Context) {
         } else {
             UserRegistry()
         }
+        // v4.92.0: чистим дубли подписок (один канал — одна карточка)
+        return loaded.copy(subscriptions = loaded.subscriptions.distinctBy {
+            (it.platform.orEmpty().uppercase().take(5) + "|" + it.name.lowercase().trim())
+        })
     }
 
     private fun saveLocal(data: UserRegistry) {

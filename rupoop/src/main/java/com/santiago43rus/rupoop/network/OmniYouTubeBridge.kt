@@ -16,6 +16,16 @@ object OmniYouTubeBridge {
 
     private const val TAG = "OmniYouTubeBridge"
 
+    /** Канал из настоящих подписок аккаунта YouTube. */
+    data class ChannelRow(val name: String, val url: String, val avatar: String = "")
+
+    /** Результат чтения подписок аккаунта. */
+    data class AccountResult(
+        val channels: List<ChannelRow> = emptyList(),
+        val loggedIn: Boolean = false,
+        val note: String = ""
+    )
+
     /** Играбельный поток, найденный приложением. */
     data class Stream(
         val streamUrl: String,
@@ -45,6 +55,40 @@ object OmniYouTubeBridge {
         channelFn = channel
         streamFn = stream
         installed = true
+    }
+
+    // ── v4.92.0: просмотр во встроенном браузере и подписки аккаунта ──
+
+    @Volatile
+    private var webPlayerFn: ((String, String) -> Boolean)? = null
+
+    @Volatile
+    private var accountFn: (() -> AccountResult)? = null
+
+    /** Подключает «открыть ролик во встроенном браузере» (как PiP: только видео). */
+    fun installWebPlayer(fn: (String, String) -> Boolean) {
+        webPlayerFn = fn
+    }
+
+    /** Подключает чтение подписок аккаунта YouTube из браузера приложения. */
+    fun installAccount(fn: () -> AccountResult) {
+        accountFn = fn
+    }
+
+    /** true — приложение открыло ролик в своём браузере. */
+    fun playInBrowser(url: String, title: String): Boolean = try {
+        webPlayerFn?.invoke(url, title) ?: false
+    } catch (t: Throwable) {
+        Log.w(TAG, "web player failed: ${t.message}")
+        false
+    }
+
+    /** Подписки аккаунта: каналы, признак входа и подсказка, если что-то не так. */
+    fun accountSubscriptions(): AccountResult = try {
+        accountFn?.invoke() ?: AccountResult(note = "Приложение не подключило чтение подписок")
+    } catch (t: Throwable) {
+        Log.w(TAG, "account subscriptions failed: ${t.message}")
+        AccountResult(note = "Ошибка чтения подписок: ${t.message}")
     }
 
     /** Поиск по YouTube. Пустой список, если приложение не подключило YouTube или сеть не ответила. */

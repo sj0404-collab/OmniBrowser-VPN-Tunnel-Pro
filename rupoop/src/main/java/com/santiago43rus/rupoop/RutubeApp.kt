@@ -340,6 +340,11 @@ fun RutubeApp(
                                         onVideoClick = { video, list -> vm.playVideo(video, list) },
                                         onAuthorClick = { vm.loadAuthorVideos(it, false) },
                                         onMoreClick = { video, action -> vm.handleVideoMoreAction(video, action) },
+                                        // v4.92.0: подписки по площадкам + подписки YouTube из аккаунта
+                                        importBusy = vm.isImportingSubscriptions,
+                                        importNote = vm.subscriptionImportNote,
+                                        onImportYouTube = { vm.importYouTubeSubscriptions() },
+                                        onUnsubscribe = { author -> vm.unsubscribeAuthor(author, false) },
                                         listState = subsListState
                                     )
                                 }

@@ -12,9 +12,15 @@ import kotlinx.coroutines.withContext
 @UnstableApi
 fun AppViewModel.toggleSubscription(author: Author) {
     val subs = userRegistry.subscriptions.toMutableList()
-    val isSubbed = subs.any { it.name.equals(author.name, ignoreCase = true) }
+    // v4.92.0: один и тот же канал не должен дублироваться (сравниваем площадку + название)
+    val key = (author.platform.orEmpty().uppercase().take(5) + "|" + author.name.lowercase().trim())
+    val isSubbed = subs.any {
+        (it.platform.orEmpty().uppercase().take(5) + "|" + it.name.lowercase().trim()) == key
+    }
     if (isSubbed) {
-        subs.removeAll { it.name.equals(author.name, ignoreCase = true) }
+        subs.removeAll {
+            (it.platform.orEmpty().uppercase().take(5) + "|" + it.name.lowercase().trim()) == key
+        }
     } else {
         subs.add(author)
     }
@@ -61,6 +67,62 @@ fun AppViewModel.playYouTubePlaylist(playlistUrl: String) {
         }
         showSnackbar("Плейлист: ${videos.size} видео")
         playVideo(videos.first(), videos, isPlaylist = true)
+    }
+}
+
+// ── Подписки YouTube из аккаунта ──
+/**
+ * v4.92.0: берём подписки YouTube прямо из аккаунта, в который вы вошли в браузере приложения.
+ * Если входа нет — честно говорим об этом; для ВК/RuTube вход не нужен вообще.
+ */
+@UnstableApi
+fun AppViewModel.importYouTubeSubscriptions() {
+    if (isImportingSubscriptions) return
+    isImportingSubscriptions = true
+    subscriptionImportNote = "Проверяю вход в аккаунт YouTube…"
+    viewModelScope.launch {
+        val result = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { com.santiago43rus.rupoop.network.OmniYouTubeBridge.accountSubscriptions() }
+                .getOrElse {
+                    com.santiago43rus.rupoop.network.OmniYouTubeBridge.AccountResult(
+                        note = "Ошибка: " + (it.message ?: "неизвестно")
+                    )
+                }
+        }
+        isImportingSubscriptions = false
+        if (!result.loggedIn) {
+            subscriptionImportNote = result.note.ifBlank {
+                "Войдите в YouTube в браузере приложения — и подписки подтянутся сами"
+            }
+            return@launch
+        }
+        if (result.channels.isEmpty()) {
+            subscriptionImportNote = result.note.ifBlank { "YouTube не вернул каналы" }
+            return@launch
+        }
+        val current = userRegistry.subscriptions.toMutableList()
+        val existing = current.map { (it.platform.orEmpty() + "|" + it.name.lowercase()).trim() }.toMutableSet()
+        var added = 0
+        for (ch in result.channels) {
+            val key = "YOUTUBE|" + ch.name.lowercase().trim()
+            if (key in existing) continue
+            current.add(
+                Author(
+                    id = null,
+                    name = ch.name,
+                    avatarUrl = ch.avatar.takeIf { it.isNotBlank() },
+                    platform = "YOUTUBE",
+                    url = ch.url
+                )
+            )
+            existing.add(key)
+            added++
+        }
+        registryManager.updateRegistry(userRegistry.copy(subscriptions = current))
+        userRegistry = registryManager.registry
+        pushToGitHub()
+        subscriptionImportNote = if (added > 0) "Добавлено каналов: $added" else "Все каналы уже были в подписках"
+        showSnackbar(subscriptionImportNote)
     }
 }
 

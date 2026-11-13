@@ -52,6 +52,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         com.winwasm64.ui.MediaPositions.init(this)
         // v4.89.0: YouTube становится площадкой внутри «Кино» (поиск, каналы, встроенный плеер)
+        com.winwasm64.torrent.OmniYouTubeLink.attach(this)
         com.winwasm64.torrent.OmniYouTubeLink.install()
         CrashCatcher.install(this)
         handleIncomingIntent(intent)
