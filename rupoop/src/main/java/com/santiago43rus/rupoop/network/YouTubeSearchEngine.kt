@@ -26,6 +26,12 @@ object YouTubeSearchEngine {
 
     private const val TAG = "YouTubeSearchEngine"
 
+    /** Сколько карточек поиска отдаём за раз. */
+    const val MAX_RESULTS = 60
+
+    /** Сколько страниц continuation максимум догружаем. */
+    private const val MAX_PAGES = 4
+
     private const val ANDROID_UA = "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
     private const val WEB_UA =
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -37,12 +43,18 @@ object YouTubeSearchEngine {
         .followRedirects(true)
         .build()
 
-    suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO) {
+    /**
+     * v4.93.0: выдачу больше не обрезаем — берём несколько страниц подряд через continuation.
+     * Раньше приходило около 20 карточек, теперь до [MAX_RESULTS] (по умолчанию 60).
+     */
+    suspend fun search(query: String, maxResults: Int = MAX_RESULTS): List<SearchResult> = withContext(Dispatchers.IO) {
         val q = query.trim()
         if (q.isEmpty()) return@withContext emptyList()
 
-        var own = try {
-            innertubeSearch(q, android = true).ifEmpty { innertubeSearch(q, android = false) }
+        var own: List<SearchResult> = try {
+            searchPaged(q, android = true, maxResults = maxResults).ifEmpty {
+                searchPaged(q, android = false, maxResults = maxResults)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "innertube search failed: ${e.message}")
             emptyList()
@@ -64,6 +76,49 @@ object YouTubeSearchEngine {
             Log.w(TAG, "avatar fill failed: ${e.message}")
             distinct
         }
+    }
+
+    /** Несколько страниц innertube-поиска подряд (continuation), до [maxResults] карточек. */
+    private fun searchPaged(query: String, android: Boolean, maxResults: Int): List<SearchResult> {
+        val client = if (android) {
+            JSONObject()
+                .put("clientName", "ANDROID")
+                .put("clientVersion", "19.09.37")
+                .put("androidSdkVersion", 30)
+                .put("hl", "ru")
+                .put("gl", "RU")
+        } else jsonClient()
+        val ua = if (android) ANDROID_UA else WEB_UA
+
+        val firstBody = JSONObject()
+            .put("context", JSONObject().put("client", client))
+            .put("query", query)
+            .put("params", "EgIQAQ%3D%3D")
+        val firstRoot = postJson("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", firstBody, ua)
+            ?: return emptyList()
+
+        val out = ArrayList<SearchResult>(parseVideoNodes(firstRoot))
+        var token = continuationToken(firstRoot)
+        var pages = 1
+        while (!token.isNullOrBlank() && pages < MAX_PAGES && out.size < maxResults) {
+            val body = JSONObject()
+                .put("context", JSONObject().put("client", client))
+                .put("continuation", token)
+            val root = postJson("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", body, ua) ?: break
+            val more = parseVideoNodes(root)
+            if (more.isEmpty()) break
+            out.addAll(more)
+            token = continuationToken(root)
+            pages++
+        }
+        return out.distinctBy { it.videoUrl }.take(maxResults)
+    }
+
+    /** Токен следующей страницы выдачи. */
+    private fun continuationToken(root: JSONObject): String? {
+        val nodes = ArrayList<JSONObject>()
+        collect(root, "continuationCommand", nodes)
+        return nodes.firstOrNull { it.optString("token").isNotBlank() }?.optString("token")
     }
 
     // ── видео канала ──

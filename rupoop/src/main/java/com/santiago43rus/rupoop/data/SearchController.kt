@@ -202,20 +202,34 @@ class SearchController(
         }
     }
 
+    /**
+     * v4.93.0: RuTube отдаёт по 20-50 карточек на страницу — берём две страницы,
+     * чтобы выдача не выглядела «мало видео».
+     */
+    private suspend fun searchRutube(query: String, ordering: String?): List<SearchResult> =
+        withContext(Dispatchers.IO) {
+            val all = ArrayList<SearchResult>()
+            for (page in 1..2) {
+                val part = try {
+                    RetrofitClient.api.searchVideos(query, ordering = ordering, page = page).results
+                } catch (e: Exception) {
+                    Log.w("Rupoop", "Rutube search page $page failed", e)
+                    emptyList()
+                }
+                if (part.isEmpty()) break
+                all.addAll(part)
+                if (all.size >= 100) break
+            }
+            all.distinctBy { it.videoUrl }
+        }
+
     private suspend fun executeMultiSourceSearch(
         query: String,
         ordering: String?,
         source: SearchSource
     ): List<SearchResult> = withContext(Dispatchers.IO) {
         when (source) {
-            SearchSource.RUTUBE -> {
-                try {
-                    RetrofitClient.api.searchVideos(query, ordering = ordering).results
-                } catch (e: Exception) {
-                    Log.e("Rupoop", "Rutube search failed", e)
-                    emptyList()
-                }
-            }
+            SearchSource.RUTUBE -> searchRutube(query, ordering)
             SearchSource.YOUTUBE -> {
                 YouTubeSearchEngine.search(query)
             }
@@ -231,7 +245,7 @@ class SearchController(
             SearchSource.ALL -> {
                 val rutubeDeferred = scope.async(Dispatchers.IO) {
                     try {
-                        RetrofitClient.api.searchVideos(query, ordering = ordering).results
+                        searchRutube(query, ordering)
                     } catch (e: Exception) {
                         Log.e("Rupoop", "Rutube search error in ALL mode", e)
                         emptyList<SearchResult>()

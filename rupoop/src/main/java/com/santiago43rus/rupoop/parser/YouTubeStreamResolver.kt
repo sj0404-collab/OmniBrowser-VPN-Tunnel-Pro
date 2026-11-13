@@ -107,8 +107,7 @@ object YouTubeStreamResolver {
                 async { playerEndpoint(id, "WEB", WEB_UA) },
                 async { playerEndpoint(id, "TVHTML5_SIMPLY_EMBEDDED_PLAYER", WEB_UA) },
                 async { fromPage(id) },
-                async { fromPiped(id) },
-                async { fromInvidious(id) },
+                // v4.93.0: только оригинал — никаких Piped/Invidious-зеркал
                 async { fromBridge(id) }
             )
             jobs.awaitAll()

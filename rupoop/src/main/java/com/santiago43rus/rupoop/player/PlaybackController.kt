@@ -207,6 +207,16 @@ class PlaybackController(
         videoLoadingJob = scope.launch {
             try {
                 if (isExternalUrl) {
+                    // v4.93.0: «оставляй только оригинал» — ролик YouTube открываем сразу
+                    // во встроенном браузере (сама страница видео, низ обрезан, как PiP).
+                    // Никаких зеркал, прокси и извлечения потока для YouTube больше нет.
+                    if (YouTubeVideoParser.isYouTubeUrl(rawUrl) &&
+                        OmniYouTubeBridge.playInBrowser(rawUrl, video.title)
+                    ) {
+                        snackbarMessage.emit("YouTube: открываю видео во встроенном браузере")
+                        playerState = PlayerState.CLOSED
+                        return@launch
+                    }
                     Log.d("RupoopPlayer", "UniversalVideoParser parsing: $rawUrl")
                     // v4.92.0: для YouTube не «мудрим» — 5 секунд на прямой поток,
                     // если не вышло, ролик открывается во встроенном браузере (только видео, как PiP)

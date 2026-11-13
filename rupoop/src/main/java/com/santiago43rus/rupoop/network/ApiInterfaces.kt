@@ -8,7 +8,9 @@ interface RutubeApi {
     suspend fun searchVideos(
         @Query("query") query: String,
         @Query("ordering") ordering: String? = null,
-        @Query("page") page: Int = 1
+        @Query("page") page: Int = 1,
+        // v4.93.0: больше результатов в выдаче (раньше приходило 20)
+        @Query("limit") limit: Int = 50
     ): SearchResponse
 
     // Параметры — как у запроса сайта для ПК (client=wdp, mq=all). Без них в ответе нет 2160p.
