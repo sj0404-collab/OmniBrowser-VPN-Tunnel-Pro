@@ -94,7 +94,8 @@ object YouTubeAccount {
                 for (n in nodes) {
                     val id = n.optString("channelId")
                     if (!id.startsWith("UC")) continue
-                    val name = titleOf(n.opt("title")).ifBlank { continue }
+                    val name = titleOf(n.opt("title"))
+                    if (name.isBlank()) continue
                     val avatar = n.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
                         ?.let { arr -> if (arr.length() > 0) arr.optJSONObject(arr.length() - 1)?.optString("url") else null }
                         .orEmpty()
