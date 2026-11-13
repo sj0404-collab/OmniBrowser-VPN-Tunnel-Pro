@@ -26,7 +26,8 @@ import com.winwasm64.torrent.VideoHistory
 import com.winwasm64.torrent.VideoPlay
 import com.winwasm64.torrent.VideoPlaylists
 import com.winwasm64.ui.browser.CoverCache
-import com.winwasm64.ui.browser.Omni
+import com.winwasm64.ui.theme.Omni
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
