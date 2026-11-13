@@ -25,7 +25,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="OmniBrowser &amp; VPN Pro"
+        android:label="Omnibrowser"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true"
@@ -98,8 +98,10 @@
             </intent-filter>
         </receiver>
 
+        <!-- v4.85.0: ПЕРВОЕ приложение в APK — «Omnibrowser» (браузер, VPN, видео, загрузки) -->
         <activity
             android:name=".MainActivity"
+            android:label="Omnibrowser"
             android:exported="true"
             android:launchMode="singleTask"
             android:supportsPictureInPicture="true"
@@ -197,6 +199,41 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- v4.85.0: ВТОРОЕ приложение в том же APK и под тем же пакетом — «RuppopFork»:
+             свой ярлык, своя задача (taskAffinity), сразу движок торрентов/файлов/манги.
+             Ставится один раз: это один APK, но в системе это два отдельных приложения. -->
+        <activity
+            android:name="com.winwasm64.fork.ForkActivity"
+            android:label="Omnibrowser Fork"
+            android:icon="@drawable/ic_fork"
+            android:roundIcon="@drawable/ic_fork"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.fork"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- торрент-файлы и magnet из других приложений открывает именно форк -->
+            <intent-filter android:priority="2">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="magnet" />
+            </intent-filter>
+            <intent-filter android:priority="2">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/x-bittorrent" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name="com.winwasm64.torrent.TorrentWebSearchActivity"
             android:exported="false"

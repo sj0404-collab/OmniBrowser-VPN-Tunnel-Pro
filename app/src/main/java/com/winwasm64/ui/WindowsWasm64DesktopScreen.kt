@@ -6469,8 +6469,13 @@ private fun sortFiles(list: List<com.winwasm64.torrent.DirectFile>, mode: Int): 
 }
 
 /** v4.76.0: запрос перехода на раздел из другого экрана (старый экран поиска удалён). */
-private object SectionRequest {
+internal object SectionRequest {
     var target by mutableStateOf(-1)
+}
+
+/** v4.85.0: второе приложение в том же APK (RuppopFork) открывает нужный раздел движка. */
+fun requestSection(n: Int) {
+    SectionRequest.target = n
 }
 
 @Composable
