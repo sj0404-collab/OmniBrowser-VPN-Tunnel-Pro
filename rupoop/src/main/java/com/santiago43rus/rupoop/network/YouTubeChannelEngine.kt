@@ -147,9 +147,9 @@ object YouTubeChannelEngine {
 
     private fun pageAvatar(channelId: String): String? {
         val html = get("https://www.youtube.com/channel/$channelId") ?: return null
-        Regex("\\"avatar\\"\\s*:\\s*\\{[^}]*\\"url\\"\\s*:\\s*\\"(https://yt3[^\\"]+)")
+        Regex("""avatar"\s*:\s*\{[^}]*"url"\s*:\s*"(https://yt3[^"]+)""")
             .find(html)?.let { return it.groupValues[1].replace("\\\\u0026", "&") }
-        Regex("(https://yt3\\.googleusercontent\\.com/[^\\"\\\\s]+)")
+        Regex("""(https://yt3\.googleusercontent\.com/[^"\s]+)""")
             .find(html)?.let { return it.groupValues[1].replace("\\\\u0026", "&") }
         return null
     }
@@ -174,7 +174,7 @@ object YouTubeChannelEngine {
         if (r.contains("youtube.com/") || r.contains("youtu.be/")) {
             val url = if (r.startsWith("http")) r else "https://$r"
             val html = get(url) ?: return@withContext null
-            Regex("\\"channelId\\"\\s*:\\s*\\"(UC[A-Za-z0-9_-]{22})\\"").find(html)
+            Regex("""channelId"\s*:\s*"(UC[A-Za-z0-9_-]{22})""").find(html)
                 ?.let { return@withContext it.groupValues[1] }
             Regex("channel/(UC[A-Za-z0-9_-]{22})").find(html)?.let { return@withContext it.groupValues[1] }
             return@withContext null
