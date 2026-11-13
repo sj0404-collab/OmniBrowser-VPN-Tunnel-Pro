@@ -1,3 +1,4 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package com.santiago43rus.rupoop.components
 
 import android.Manifest
@@ -273,7 +274,7 @@ fun AppTopBar(
                     }
                     OutlinedTextField(
                         value = searchState.text.toString(),
-                        onValueChange = { searchState.setTextAndPlaceCursorAtEnd(it) },
+                        onValueChange = { new -> searchState.edit { replaceAll(new) } },
                         singleLine = true,
                         modifier = Modifier
                             .weight(1f)

@@ -1,3 +1,4 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 package com.santiago43rus.rupoop.components
 
 import androidx.compose.foundation.clickable
@@ -113,7 +114,7 @@ fun PlaylistSelectionDialog(
                 }
                 OutlinedTextField(
                     value = playlistNameState.text.toString(),
-                    onValueChange = { playlistNameState.setTextAndPlaceCursorAtEnd(it) },
+                    onValueChange = { new -> playlistNameState.edit { replaceAll(new) } },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
