@@ -24,6 +24,9 @@ object UniversalVideoParser {
         if (trimmed.startsWith("ok.ru/", ignoreCase = true) || trimmed.startsWith("odnoklassniki.ru/", ignoreCase = true) || trimmed.startsWith("m.ok.ru/", ignoreCase = true)) return true
         if (trimmed.startsWith("dzen.ru/", ignoreCase = true) || trimmed.startsWith("yandex.ru/", ignoreCase = true)) return true
         if (trimmed.startsWith("jut.su/", ignoreCase = true) || trimmed.startsWith("animego.", ignoreCase = true)) return true
+        if (trimmed.startsWith("youtube.com/", ignoreCase = true) || trimmed.startsWith("youtu.be/", ignoreCase = true) ||
+            trimmed.startsWith("www.youtube.com/", ignoreCase = true) || trimmed.startsWith("m.youtube.com/", ignoreCase = true)
+        ) return true
 
         return DOMAIN_URL_PATTERN.matcher(trimmed).matches()
     }
@@ -74,7 +77,15 @@ object UniversalVideoParser {
                 )
             }
 
-            // 2. Rutube link
+            // 2. YouTube link (v4.89.0: своя площадка внутри Rupoop, а не внешний сайт)
+            if (YouTubeVideoParser.isYouTubeUrl(url)) {
+                val yt = YouTubeVideoParser.parse(url)
+                if (yt != null) {
+                    return@withContext yt
+                }
+            }
+
+            // 3. Rutube link
             if (isRutubeUrl(url)) {
                 val rutubeId = extractRutubeId(url)
                 if (!rutubeId.isNullOrEmpty()) {

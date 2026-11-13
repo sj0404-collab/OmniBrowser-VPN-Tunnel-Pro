@@ -33,7 +33,9 @@ object YouTubeSearch {
         val daysAgo: Int,
         val thumb: String,
         val url: String,
-        val extra: String = ""
+        val extra: String = "",
+        /** v4.89.0: id канала (UC…) — нужен для YouTube-подписок внутри «Кино». */
+        val channelId: String = ""
     )
 
     data class Page(val items: List<Item>, val continuation: String?)
@@ -125,7 +127,8 @@ object YouTubeSearch {
                     daysAgo = parseDays(published),
                     thumb = thumb,
                     url = "https://m.youtube.com/watch?v=$id",
-                    extra = if (live) "live" else ""
+                    extra = if (live) "live" else "",
+                    channelId = channelIdOf(v)
                 )
             )
         }
@@ -249,6 +252,26 @@ object YouTubeSearch {
             t.contains("год") || t.contains("year") -> num * 365
             else -> 9999
         }
+    }
+
+    /** v4.89.0: id канала из карточки видео (ownerText → browseEndpoint → browseId). */
+    private fun channelIdOf(videoRenderer: JSONObject): String {
+        try {
+            val runs = videoRenderer.optJSONObject("ownerText")?.optJSONArray("runs")
+                ?: videoRenderer.optJSONObject("longBylineText")?.optJSONArray("runs")
+            val run = runs?.optJSONObject(0) ?: return ""
+            val browse = run.optJSONObject("navigationEndpoint")
+                ?.optJSONObject("browseEndpoint")
+                ?.optString("browseId")
+                .orEmpty()
+            if (browse.startsWith("UC")) return browse
+            // иногда канал лежит прямо в videoOwnerRenderer.channelId
+            val owner = videoRenderer.optJSONObject("videoOwnerRenderer")
+                ?.optString("channelId").orEmpty()
+            if (owner.startsWith("UC")) return owner
+        } catch (_: Throwable) {
+        }
+        return ""
     }
 
     private fun runsText(obj: JSONObject): String {

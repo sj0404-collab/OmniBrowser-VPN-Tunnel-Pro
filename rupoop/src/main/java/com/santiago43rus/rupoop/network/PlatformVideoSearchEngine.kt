@@ -43,6 +43,20 @@ object OkPlatformSearchEngine : PlatformVideoSearchEngine {
     }
 }
 
+/**
+ * v4.89.0: YouTube как обычная площадка Rupoop.
+ * Сам поиск делает приложение (через свой канал сети), сюда приходят уже готовые карточки.
+ */
+object YouTubePlatformSearchEngine : PlatformVideoSearchEngine {
+    override suspend fun search(query: String): List<SearchResult> {
+        return try {
+            OmniYouTubeBridge.search(query)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+}
+
 object LordfilmPlatformSearchEngine : PlatformVideoSearchEngine {
     override suspend fun search(query: String): List<SearchResult> {
         return try {
@@ -58,6 +72,13 @@ object LordfilmPlatformSearchEngine : PlatformVideoSearchEngine {
  */
 object PlatformSearchEngineResolver {
 
+    /** Ссылка на YouTube (watch, shorts, live, youtu.be, embed). */
+    fun isYouTubeUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return lower.contains("youtube.com/") || lower.contains("youtu.be/") ||
+            lower.contains("m.youtube.com/") || lower.contains("youtube-nocookie.com/")
+    }
+
     fun isLordfilmUrl(url: String): Boolean {
         val lower = url.lowercase()
         return lower.contains("lordfilm") || lower.contains("lordserials")
@@ -65,6 +86,7 @@ object PlatformSearchEngineResolver {
 
     fun resolve(videoUrl: String): PlatformVideoSearchEngine {
         return when {
+            isYouTubeUrl(videoUrl) -> YouTubePlatformSearchEngine
             UniversalVideoParser.isRutubeUrl(videoUrl) -> RutubePlatformSearchEngine
             VkVideoParser.isVkUrl(videoUrl) -> VkPlatformSearchEngine
             OkVideoParser.isOkUrl(videoUrl) -> OkPlatformSearchEngine
@@ -75,6 +97,7 @@ object PlatformSearchEngineResolver {
 
     fun getPlatformDisplayName(videoUrl: String): String {
         return when {
+            isYouTubeUrl(videoUrl) -> "YouTube"
             UniversalVideoParser.isRutubeUrl(videoUrl) -> "Rutube"
             VkVideoParser.isVkUrl(videoUrl) -> "ВКонтакте"
             OkVideoParser.isOkUrl(videoUrl) -> "Одноклассники"

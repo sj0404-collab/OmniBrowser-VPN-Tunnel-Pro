@@ -40,6 +40,14 @@ fun RupoopRootScreen(
         onThemeToggled(mode)
     }
 
+    // v4.89.0: запрос из нашего интерфейса (например, «🎬 Видео» из галереи) ищем уже здесь,
+    // в собственном поиске Rupoop — там же, где RuTube, ВК, ОК, LordFilm и YouTube.
+    LaunchedEffect(Unit) {
+        RupoopIntents.consumeQuery()?.let { q ->
+            runCatching { vm.performSearch(q) }
+        }
+    }
+
     RupoopTheme(themeMode = themeMode, darkTheme = isDarkTheme) {
         Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             // ТВ-компоненты требуют API 23+, на Android 5/6 показываем обычный интерфейс

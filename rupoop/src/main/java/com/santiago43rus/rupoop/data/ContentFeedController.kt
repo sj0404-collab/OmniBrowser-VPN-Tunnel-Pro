@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.santiago43rus.rupoop.network.RetrofitClient
 import com.santiago43rus.rupoop.network.LordfilmSearchEngine
+import com.santiago43rus.rupoop.network.OmniYouTubeBridge
 import com.santiago43rus.rupoop.network.VkSearchEngine
 import com.santiago43rus.rupoop.network.OkSearchEngine
 import com.santiago43rus.rupoop.util.PlayerState
@@ -93,7 +94,20 @@ class ContentFeedController(
                     }
                 }
 
-                val allResults = deferreds.awaitAll().flatten().distinctBy { it.videoUrl }
+                // v4.89.0: в «Главную» подмешиваем YouTube — одну подборку по жанру
+                val ytQuery = (selectedGenres.shuffled().firstOrNull() ?: "популярное")
+                val youtubeDeferred = scope.async(Dispatchers.IO) {
+                    try {
+                        OmniYouTubeBridge.search(ytQuery)
+                    } catch (e: Exception) {
+                        Log.e("Rupoop", "YouTube home feed error", e)
+                        emptyList<SearchResult>()
+                    }
+                }
+
+                val rutubeResults = deferreds.awaitAll().flatten()
+                val youtubeResults = youtubeDeferred.await()
+                val allResults = (rutubeResults + youtubeResults).distinctBy { it.videoUrl }
                 val newVideos = mainFeedRecommender.recommend(allResults)
 
                 val updatedList = if (isLoadMore) (homeVideos + newVideos).distinctBy { it.videoUrl } else newVideos
@@ -193,6 +207,15 @@ class ContentFeedController(
                 try {
                     val allSubsVideos = mutableListOf<SearchResult>()
                     userRegistry.subscriptions.forEach { author ->
+                        val platform = author.platform?.uppercase().orEmpty()
+                        if (platform.startsWith("YOUTUBE") || author.url?.contains("youtube.com") == true ||
+                            author.url?.contains("youtu.be") == true
+                        ) {
+                            // v4.89.0: подписка на YouTube-канал — только его свежие видео
+                            val chVideos = OmniYouTubeBridge.channel(author.url ?: author.name)
+                            allSubsVideos.addAll(chVideos)
+                            return@forEach
+                        }
                         val resp = if (author.id != null) {
                             withContext(Dispatchers.IO) { RetrofitClient.api.getAuthorVideos(author.id.toString(), page = subsPage) }
                         } else {
@@ -252,7 +275,12 @@ class ContentFeedController(
                         else -> "RUTUBE"
                     }
 
-                    val rawResults: List<SearchResult> = when (platform) {
+                    val rawResults: List<SearchResult> = when {
+                        platform.startsWith("YOUTUBE") -> {
+                            hasMoreAuthorVideos = false
+                            OmniYouTubeBridge.channel(author.url ?: author.name)
+                        }
+                        else -> when (platform) {
                         "LORDFILM" -> {
                             hasMoreAuthorVideos = false
                             LordfilmSearchEngine.getNovinki()
@@ -275,6 +303,7 @@ class ContentFeedController(
                                 hasMoreAuthorVideos = false
                             }
                             resp.results
+                        }
                         }
                     }
 

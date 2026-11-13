@@ -298,8 +298,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
             runCatching { com.winwasm64.torrent.VideoNotify.check(context) }.getOrDefault(emptyList())
         }
         val text = when {
-            com.winwasm64.torrent.VideoSubs.list(context).isEmpty() ->
-                "Нет подписок — подпишитесь на канал в «Кино → Поиск»"
+            com.winwasm64.torrent.RupoopStore.subscriptions(context).isEmpty() ->
+                "Нет подписок — подпишитесь на канал в «Кино» (YouTube, RuTube, ВК, ОК)"
             fresh.isEmpty() -> "Новых роликов у подписок нет"
             else -> "Новое: " + fresh.take(2).joinToString("; ") { it.channel + " — " + it.title.take(28) }
         }
@@ -3419,32 +3419,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
-            // ===================== SECTION 7: КИНО (Rupoop + наш поиск с YouTube + история + плейлисты) =====================
+            // ===================== SECTION 7: КИНО (YouTube + RuTube + ВК + ОК + LordFilm) =====================
+            // v4.89.0: своего «кривого» поиска здесь больше нет. Кино — это интерфейс Rupoop целиком,
+            // а YouTube добавлен в него как ещё одна площадка: плитка «YouTube» в поиске, в «Все»,
+            // в ленте «Главной», в подписках и в том же встроенном плеере.
             if (currentSection == 7 && !inPip) {
                 Column(Modifier.weight(1f).fillMaxWidth()) {
                     Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(
-                            "🎬 Rupoop" to 0,
-                            "🔎 Поиск" to 1,
-                            "🕘 История" to 2,
-                            "🎞 Плейлисты" to 3
-                        ).forEach { (label, idx) ->
-                            Surface(
-                                color = if (KinoMemo.tab == idx) Omni.AccentContainer else Omni.SurfaceHighest,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.clickable { KinoMemo.tab = idx }
-                            ) {
-                                Text(
-                                    label, color = Color.White, fontSize = 11.sp,
-                                    fontWeight = if (KinoMemo.tab == idx) FontWeight.Bold else FontWeight.Normal,
-                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp)
-                                )
-                            }
-                        }
-                        // v4.88.0: уведомления о новых роликах подписок (YouTube/RuTube/VK)
+                        Text(
+                            "Кино",
+                            color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        // уведомления о новых роликах подписок (YouTube — по RSS канала)
                         Surface(
                             color = Omni.SurfaceHighest,
                             shape = RoundedCornerShape(10.dp),
@@ -3452,33 +3443,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         ) {
                             Text(
                                 "🔔", color = Color.White, fontSize = 12.sp,
-                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp)
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
                             )
                         }
                     }
-                    when (KinoMemo.tab) {
-                        0 -> com.santiago43rus.rupoop.RupoopRootScreen(
-                            modifier = Modifier.weight(1f).fillMaxWidth()
-                        )
-                        1 -> VideoHomeSection(
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            initialQuery = com.winwasm64.torrent.SearchCache.videoQuery
-                                .ifBlank { torrentEngine.cachedSearchQuery },
-                            onOpenUrl = { u -> navigateTab(activeTab, u) }
-                        )
-                        2 -> com.winwasm64.ui.VideoHistoryScreen(
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            onOpen = { c -> com.winwasm64.ui.openClipStandalone(context, c) },
-                            onSearchAgain = { q, src ->
-                                com.winwasm64.torrent.SearchCache.videoQuery = q
-                                KinoMemo.tab = 1
-                            }
-                        )
-                        else -> com.winwasm64.ui.VideoPlaylistsScreen(
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            onOpen = { c -> com.winwasm64.ui.openClipStandalone(context, c) }
-                        )
-                    }
+                    com.santiago43rus.rupoop.RupoopRootScreen(
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                    )
                 }
             }
 
@@ -6757,9 +6728,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                         runGallery(photoTitle, "Фото", 0, false)
                                     },
                                     "🎬 Видео" to {
-                                        // v4.76.0: старый экран поиска удалён — уводим на вкладку «Видео»
-                                        com.winwasm64.torrent.SearchCache.videoQuery = photoTitle
-                                        KinoMemo.request(1)
+                                        // v4.89.0: ищем в самом «Кино» (Rupoop + YouTube), своего поиска больше нет
+                                        com.santiago43rus.rupoop.RupoopIntents.search(photoTitle)
                                         SectionRequest.target = 7
                                     }
                                 ).forEach { (label, action) ->
@@ -6806,8 +6776,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
  * наш поиск с YouTube, история и плейлисты. Отдельной вкладки «Видео» больше нет.
  */
 private object KinoMemo {
-    var tab by mutableIntStateOf(0)   // 0 Rupoop · 1 Поиск (YouTube/RuTube/VK) · 2 История · 3 Плейлисты
-    fun request(t: Int) { tab = t }
+    // v4.89.0: под-вкладок больше нет — «Кино» это один интерфейс Rupoop с YouTube внутри
+    fun request(@Suppress("UNUSED_PARAMETER") t: Int) {}
 }
 
 private object VideoMemo {

@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import com.santiago43rus.rupoop.data.SearchResult
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -248,19 +249,40 @@ object VideoNotify {
 
     data class Fresh(val channel: String, val source: String, val title: String, val url: String)
 
-    /** Проверить подписки: возвращает ролики, которых раньше не видели. */
+    /**
+     * v4.89.0: проверяем подписки самого «Кино» (реестр Rupoop), а не отдельный список.
+     * YouTube-каналы читаем по официальному RSS канала — быстро и без входа.
+     */
     fun check(ctx: Context, maxSubs: Int = 8): List<Fresh> {
-        val subs = VideoSubs.list(ctx)
+        val subs = RupoopStore.subscriptions(ctx)
         if (subs.isEmpty()) return emptyList()
         val seen = seenSet(ctx)
         val out = ArrayList<Fresh>()
         for (ch in subs.take(maxSubs)) {
-            val page = runCatching {
-                VideoFeed.channelPage(ch.source, ch.name, ch.url)
-            }.getOrNull() ?: continue
-            val first = page.clips.firstOrNull { it.kind == VideoFeed.CLIP_VIDEO } ?: continue
-            val key = VideoFeed.keyOf(first)
-            if (seen.add(key)) out.add(Fresh(ch.name, ch.source, first.title, first.url))
+            val isYt = ch.platform.contains("YOUTUBE", true) || ch.url.contains("youtube.com", true) ||
+                ch.url.contains("youtu.be", true)
+            val first = if (isYt) {
+                OmniYouTubeLink.channelVideos(ch.url.ifBlank { ch.name }).firstOrNull()
+            } else {
+                val src = when {
+                    ch.platform.contains("RUTUBE", true) -> VideoFeed.SRC_RUTUBE
+                    ch.platform.contains("VK", true) || ch.platform.contains("ВКОНТАКТЕ", true) -> VideoFeed.SRC_VK
+                    else -> VideoFeed.SRC_RUTUBE
+                }
+                runCatching { VideoFeed.channelPage(src, ch.name, ch.url) }
+                    .getOrNull()?.clips?.firstOrNull { it.kind == VideoFeed.CLIP_VIDEO }
+                    ?.let { clip ->
+                        SearchResult(
+                            videoUrl = clip.url,
+                            title = clip.title,
+                            thumbnailUrl = clip.thumb,
+                            author = com.santiago43rus.rupoop.data.Author(name = ch.name, platform = ch.platform),
+                            duration = clip.lengthSec.takeIf { it > 0 },
+                            hits = null
+                        )
+                    }
+            } ?: continue
+            if (seen.add(first.videoUrl)) out.add(Fresh(ch.name, ch.platform, first.title, first.videoUrl))
         }
         if (out.isNotEmpty()) saveSeen(ctx, seen)
         if (out.isNotEmpty()) notify(ctx, out)

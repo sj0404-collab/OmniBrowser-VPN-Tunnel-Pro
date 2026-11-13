@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.santiago43rus.rupoop.network.LordfilmSearchEngine
+import com.santiago43rus.rupoop.network.OmniYouTubeBridge
 import com.santiago43rus.rupoop.network.OkSearchEngine
 import com.santiago43rus.rupoop.network.RetrofitClient
 import com.santiago43rus.rupoop.network.VkSearchEngine
@@ -20,6 +21,7 @@ import kotlinx.coroutines.withContext
 
 enum class SearchSource(val displayName: String) {
     ALL("Все"),
+    YOUTUBE("YouTube"),
     RUTUBE("Rutube"),
     VK("ВКонтакте"),
     OK("Одноклассники"),
@@ -214,6 +216,9 @@ class SearchController(
                     emptyList()
                 }
             }
+            SearchSource.YOUTUBE -> {
+                OmniYouTubeBridge.search(query)
+            }
             SearchSource.VK -> {
                 VkSearchEngine.search(query)
             }
@@ -229,6 +234,14 @@ class SearchController(
                         RetrofitClient.api.searchVideos(query, ordering = ordering).results
                     } catch (e: Exception) {
                         Log.e("Rupoop", "Rutube search error in ALL mode", e)
+                        emptyList<SearchResult>()
+                    }
+                }
+                val youtubeDeferred = scope.async(Dispatchers.IO) {
+                    try {
+                        OmniYouTubeBridge.search(query)
+                    } catch (e: Exception) {
+                        Log.e("Rupoop", "YouTube search error in ALL mode", e)
                         emptyList<SearchResult>()
                     }
                 }
@@ -257,12 +270,14 @@ class SearchController(
                     }
                 }
 
+                val youtubeRes = youtubeDeferred.await()
                 val rutubeRes = rutubeDeferred.await()
                 val vkRes = vkDeferred.await()
                 val okRes = okDeferred.await()
                 val lordfilmRes = lordfilmDeferred.await()
 
-                interleaveResults(listOf(rutubeRes, vkRes, okRes, lordfilmRes))
+                // YouTube идёт первым: это самая большая площадка по объёму
+                interleaveResults(listOf(youtubeRes, rutubeRes, vkRes, okRes, lordfilmRes))
             }
         }
     }

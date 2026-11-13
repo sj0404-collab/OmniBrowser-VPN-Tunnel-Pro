@@ -49,7 +49,9 @@ data class Author(
     val id: Long? = null,
     val name: String,
     @SerialName("avatar_url") val avatarUrl: String? = null,
-    val platform: String? = null
+    val platform: String? = null,
+    /** v4.89.0: ссылка на канал (нужна YouTube-подпискам: у канала нет числового id). */
+    val url: String? = null
 )
 
 @Serializable
