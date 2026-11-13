@@ -264,7 +264,8 @@ object YouTubeChannelEngine {
         YouTubeSearchEngine.collect(root, "gridPlaylistRenderer", grids)
         for (g in grids) {
             val id = g.optString("playlistId")
-            val title = YouTubeSearchEngine.textOf(g.opt("title")).ifBlank { continue }
+            val title = YouTubeSearchEngine.textOf(g.opt("title"))
+            if (title.isBlank()) continue
             out.add(
                 SearchResult(
                     videoUrl = "https://www.youtube.com/playlist?list=$id",
