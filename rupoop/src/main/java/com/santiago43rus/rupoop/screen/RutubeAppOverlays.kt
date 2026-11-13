@@ -54,6 +54,9 @@ fun RutubeAppOverlays(
                     }
                 },
                 onMoreClick = { video, action -> vm.handleVideoMoreAction(video, action) },
+                // v4.91.0: плейлисты канала и переход к его видео
+                authorPlaylists = vm.authorPlaylists,
+                onPlaylistClick = { pl -> vm.playYouTubePlaylist(pl.videoUrl) },
                 isGitHubAuthenticated = vm.isAuthenticated,
                 currentSort = vm.authorSortOrder,
                 onSortChange = { newSort ->

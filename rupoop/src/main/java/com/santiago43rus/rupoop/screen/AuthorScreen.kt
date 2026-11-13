@@ -4,6 +4,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
@@ -16,6 +18,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -43,6 +47,8 @@ fun AuthorScreen(
     onToggleSubscription: (Author, Boolean) -> Unit,
     onMoreClick: (SearchResult, String) -> Unit,
     isGitHubAuthenticated: Boolean = false,
+    authorPlaylists: List<SearchResult> = emptyList(),
+    onPlaylistClick: (SearchResult) -> Unit = {},
     currentSort: String = "-publication_ts",
     onSortChange: (String) -> Unit = {},
     listState: LazyGridState = rememberLazyGridState()
@@ -188,6 +194,48 @@ fun AuthorScreen(
                                 }
                             }
                             HorizontalDivider()
+                        }
+                    }
+                    // v4.91.0: плейлисты самого канала (у YouTube они реальные, со своими видео)
+                    if (authorPlaylists.isNotEmpty()) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 2.dp)) {
+                                Text(
+                                    "Плейлисты канала (${authorPlaylists.size})",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                                )
+                                LazyRow(
+                                    Modifier.fillMaxWidth(),
+                                    contentPadding = PaddingValues(horizontal = 16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    items(authorPlaylists) { pl ->
+                                        Column(
+                                            Modifier.width(168.dp).clickable { onPlaylistClick(pl) }
+                                        ) {
+                                            AsyncImage(
+                                                model = pl.thumbnailUrl ?: "",
+                                                contentDescription = null,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(94.dp)
+                                                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                                                    .background(Color.DarkGray)
+                                            )
+                                            Text(
+                                                pl.title,
+                                                fontSize = 12.sp,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.padding(top = 4.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     // Sort chips

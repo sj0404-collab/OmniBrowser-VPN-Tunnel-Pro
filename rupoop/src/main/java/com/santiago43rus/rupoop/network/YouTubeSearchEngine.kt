@@ -14,12 +14,13 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * v4.90.0: поиск YouTube — свой движок внутри `:rupoop`, ровно как у RuTube/VK/OK.
+ * v4.91.0: поиск YouTube — свой движок внутри `:rupoop`, как у RuTube/VK/OK.
  *
- * Порядок как у остальных площадок: сначала свой запрос (innertube ANDROID, затем WEB),
- * и только если он ничего не вернул — просим приложение (мост: канал/VPN + запасные пути).
- * Раньше поиск целиком зависел от моста, поэтому в выдаче «YouTube» оказывались пустые
- * или чужие карточки.
+ * Что важно для пользователя:
+ *  • карточки приходят с настоящими обложками, названиями, каналом, длительностью и датой;
+ *  • у карточки сразу есть аватар канала (не серая заглушка) и id канала — поэтому
+ *    подписка и переход в канал ведут именно в этот канал;
+ *  • если свой запрос ничего не дал — идём через мост приложения (канал/VPN).
  */
 object YouTubeSearchEngine {
 
@@ -31,8 +32,8 @@ object YouTubeSearchEngine {
             "Chrome/126.0.0.0 Mobile Safari/537.36"
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(7, TimeUnit.SECONDS)
+        .readTimeout(9, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
@@ -40,30 +41,63 @@ object YouTubeSearchEngine {
         val q = query.trim()
         if (q.isEmpty()) return@withContext emptyList()
 
-        val own = try {
+        var own = try {
             innertubeSearch(q, android = true).ifEmpty { innertubeSearch(q, android = false) }
         } catch (e: Exception) {
             Log.w(TAG, "innertube search failed: ${e.message}")
             emptyList()
         }
-        if (own.isNotEmpty()) return@withContext own.distinctBy { it.videoUrl }
+        if (own.isEmpty()) {
+            own = try {
+                OmniYouTubeBridge.search(q)
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+        val distinct = own.distinctBy { it.videoUrl }
+        if (distinct.isEmpty()) return@withContext distinct
 
-        // запасной путь: мост приложения (идёт через канал/VPN)
-        val viaBridge = try {
-            OmniYouTubeBridge.search(q)
+        // настоящие аватары каналов (кэш внутри движка)
+        try {
+            YouTubeChannelEngine.fillAvatars(distinct)
+        } catch (e: Exception) {
+            Log.w(TAG, "avatar fill failed: ${e.message}")
+            distinct
+        }
+    }
+
+    // ── видео канала ──
+
+    /**
+     * Видео конкретного канала. Канал определяется точно: если по названию нельзя
+     * однозначно понять, что это тот самый канал, — НЕ подставляем чужие ролики,
+     * а ищем по названию канала и оставляем только его видео.
+     */
+    suspend fun channelVideos(ref: String): List<SearchResult> = withContext(Dispatchers.IO) {
+        val channelId = YouTubeChannelEngine.resolveChannelId(ref)
+        if (channelId != null) {
+            val byRss = channelVideosByRss(channelId, ref)
+            if (byRss.isNotEmpty()) {
+                return@withContext YouTubeChannelEngine.fillAvatars(byRss)
+            }
+            // RSS не отдал (редкость) — берём вкладку «Видео» канала
+            val byBrowse = channelVideosByBrowse(channelId)
+            if (byBrowse.isNotEmpty()) return@withContext YouTubeChannelEngine.fillAvatars(byBrowse)
+        }
+        // совсем без id: ищем и жёстко фильтруем по совпадению названия канала
+        val searched = try {
+            innertubeSearch(ref, android = false)
         } catch (e: Exception) {
             emptyList()
         }
-        viaBridge.distinctBy { it.videoUrl }
+        val norm = normalize(ref)
+        searched.filter { r ->
+            val n = normalize(r.author?.name.orEmpty())
+            n.isNotEmpty() && (n == norm || n.contains(norm) || norm.contains(n))
+        }
     }
 
-    // ── видео канала (официальный RSS канала, без входа) ──
-    suspend fun channelVideos(ref: String): List<SearchResult> = withContext(Dispatchers.IO) {
-        val channelId = channelIdOf(ref)
-        if (channelId == null) {
-            // не смогли определить канал — пробуем мост приложения
-            return@withContext OmniYouTubeBridge.channel(ref)
-        }
+    private fun channelVideosByRss(channelId: String, ref: String): List<SearchResult> {
         val xml = try {
             val request = Request.Builder()
                 .url("https://www.youtube.com/feeds/videos.xml?channel_id=$channelId")
@@ -75,7 +109,7 @@ object YouTubeSearchEngine {
             Log.w(TAG, "RSS error: ${e.message}")
             ""
         }
-        if (xml.isBlank()) return@withContext OmniYouTubeBridge.channel(ref)
+        if (xml.isBlank()) return emptyList()
 
         val channelTitle = Regex("<title>([^<]*)</title>").find(xml)?.groupValues?.get(1)?.let { decode(it) }
             ?: ref
@@ -97,7 +131,7 @@ object YouTubeSearchEngine {
                     author = Author(
                         id = null,
                         name = channelTitle,
-                        avatarUrl = null,
+                        avatarUrl = YouTubeChannelEngine.avatar(channelId),
                         platform = "YOUTUBE",
                         url = "https://www.youtube.com/channel/$channelId"
                     ),
@@ -109,43 +143,20 @@ object YouTubeSearchEngine {
                 )
             )
         }
-        out
+        return out
     }
 
-    /** Ссылка/id/название канала → UC-идентификатор. */
-    suspend fun channelIdOf(ref: String): String? = withContext(Dispatchers.IO) {
-        val r = ref.trim()
-        if (r.isEmpty()) return@withContext null
-        Regex("UC[A-Za-z0-9_-]{22}").find(r)?.let { return@withContext it.value }
-        if (r.contains("youtube.com/") || r.contains("youtu.be/")) {
-            val url = if (r.startsWith("http")) r else "https://$r"
-            val page = try {
-                val request = Request.Builder().url(url).header("User-Agent", WEB_UA).get().build()
-                http.newCall(request).execute().use { resp -> if (resp.isSuccessful) resp.body?.string().orEmpty() else "" }
-            } catch (e: Exception) {
-                ""
-            }
-            Regex("\"channelId\"\\s*:\\s*\"(UC[A-Za-z0-9_-]{22})\"").find(page)
-                ?.let { return@withContext it.groupValues[1] }
-            Regex("channel/(UC[A-Za-z0-9_-]{22})").find(page)?.let { return@withContext it.groupValues[1] }
-            return@withContext null
-        }
-        // обычное название канала: ищем канал и берём его id
-        val found = try {
-            innertubeSearch(r, android = false)
-        } catch (e: Exception) {
-            emptyList()
-        }
-        found.firstOrNull { it.author?.url?.contains("/channel/") == true }
-            ?.author?.url
-            ?.substringAfterLast("/")
+    private fun channelVideosByBrowse(channelId: String): List<SearchResult> {
+        val body = JSONObject()
+            .put("context", JSONObject().put("client", jsonClient()))
+            .put("browseId", channelId)
+            .put("params", "EgZ2aWRlb3PyBgQKAjoA") // вкладка «Видео»
+        val root = postJson("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false", body) ?: return emptyList()
+        return parseVideoNodes(root)
     }
 
-    private fun decode(s: String): String = s
-        .replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'")
-        .replace("&lt;", "<").replace("&gt;", ">")
+    // ── innertube search ──
 
-    // ── innertube ──
     private fun innertubeSearch(query: String, android: Boolean): List<SearchResult> {
         val client = if (android) {
             JSONObject()
@@ -154,55 +165,33 @@ object YouTubeSearchEngine {
                 .put("androidSdkVersion", 30)
                 .put("hl", "ru")
                 .put("gl", "RU")
-        } else {
-            JSONObject()
-                .put("clientName", "WEB")
-                .put("clientVersion", "2.20240726.00.00")
-                .put("hl", "ru")
-                .put("gl", "RU")
-        }
+        } else jsonClient()
         val body = JSONObject()
             .put("context", JSONObject().put("client", client))
             .put("query", query)
             .put("params", "EgIQAQ%3D%3D") // только видео
 
-        val request = Request.Builder()
-            .url("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
-            .header("Content-Type", "application/json")
-            .header("User-Agent", if (android) ANDROID_UA else WEB_UA)
-            .header("X-Goog-Api-Format-Version", "2")
-            .header("Accept-Language", "ru-RU,ru;q=0.9")
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .build()
+        val root = postJson(
+            "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
+            body,
+            if (android) ANDROID_UA else WEB_UA
+        ) ?: return emptyList()
+        return parseVideoNodes(root)
+    }
 
-        val text = try {
-            http.newCall(request).execute().use { r ->
-                if (!r.isSuccessful) {
-                    Log.w(TAG, "innertube ${if (android) "ANDROID" else "WEB"} -> ${r.code}")
-                    return emptyList()
-                }
-                r.body?.string().orEmpty()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "innertube request error: ${e.message}")
-            return emptyList()
-        }
-        if (text.isBlank()) return emptyList()
-
-        val root = try {
-            JSONObject(text)
-        } catch (e: Exception) {
-            return emptyList()
-        }
+    /** Разбор всех videoRenderer/compactVideoRenderer из любого ответа innertube. */
+    fun parseVideoNodes(root: JSONObject): List<SearchResult> {
         val nodes = ArrayList<JSONObject>()
         collect(root, "videoRenderer", nodes)
         if (nodes.isEmpty()) collect(root, "compactVideoRenderer", nodes)
+        if (nodes.isEmpty()) collect(root, "gridVideoRenderer", nodes)
+        if (nodes.isEmpty()) collect(root, "playlistVideoRenderer", nodes)
 
         val out = ArrayList<SearchResult>(nodes.size)
         for (v in nodes) {
             val id = v.optString("videoId")
             if (id.length != 11) continue
-            val title = titleOf(v.opt("title"))
+            val title = textOf(v.opt("title"))
             if (title.isBlank()) continue
             val lengthText = v.optJSONObject("lengthText")?.optString("simpleText").orEmpty()
             val viewsText = v.optJSONObject("viewCountText")?.optString("simpleText").orEmpty()
@@ -211,6 +200,7 @@ object YouTubeSearchEngine {
                 .ifBlank { "https://i.ytimg.com/vi/$id/mqdefault.jpg" }
             val ownerRuns = v.optJSONObject("ownerText")?.optJSONArray("runs")
                 ?: v.optJSONObject("longBylineText")?.optJSONArray("runs")
+                ?: v.optJSONObject("shortBylineText")?.optJSONArray("runs")
             val owner = ownerRuns?.optJSONObject(0)?.optString("text").orEmpty()
             val channelId = ownerRuns?.optJSONObject(0)
                 ?.optJSONObject("navigationEndpoint")
@@ -225,7 +215,7 @@ object YouTubeSearchEngine {
                     author = Author(
                         id = null,
                         name = owner.ifBlank { "YouTube" },
-                        avatarUrl = null,
+                        avatarUrl = null,   // дозаполним пачкой в fillAvatars (без 20 запросов подряд)
                         platform = "YOUTUBE",
                         url = channelId.takeIf { it.startsWith("UC") }
                             ?.let { "https://www.youtube.com/channel/$it" }
@@ -238,11 +228,12 @@ object YouTubeSearchEngine {
                 )
             )
         }
-        return out
+        return out.distinctBy { it.videoUrl }
     }
 
     // ── helpers ──
-    private fun collect(node: Any?, key: String, out: MutableList<JSONObject>) {
+
+    fun collect(node: Any?, key: String, out: MutableList<JSONObject>) {
         when (node) {
             is JSONObject -> {
                 node.optJSONObject(key)?.let { out.add(it) }
@@ -257,11 +248,13 @@ object YouTubeSearchEngine {
         }
     }
 
-    private fun titleOf(obj: Any?): String = when (obj) {
+    fun textOf(obj: Any?): String = when (obj) {
         is JSONObject -> obj.optString("simpleText").ifBlank {
-            val runs = obj.optJSONArray("runs")
-            if (runs == null) "" else (0 until runs.length()).joinToString("") {
-                runs.optJSONObject(it)?.optString("text").orEmpty()
+            obj.optString("content").ifBlank {
+                val runs = obj.optJSONArray("runs")
+                if (runs == null) "" else (0 until runs.length()).joinToString("") {
+                    runs.optJSONObject(it)?.optString("text").orEmpty()
+                }
             }
         }
         is String -> obj
@@ -277,8 +270,7 @@ object YouTubeSearchEngine {
     /** «11:58:51» / «3:07» → секунды. */
     fun parseLength(text: String): Int {
         if (text.isBlank()) return 0
-        val clean = text.trim()
-        val parts = clean.split(":")
+        val parts = text.trim().split(":")
         if (parts.size !in 2..3) return 0
         var seconds = 0
         for (p in parts) {
@@ -304,14 +296,13 @@ object YouTubeSearchEngine {
         return if (v > Int.MAX_VALUE) Int.MAX_VALUE else v.toInt()
     }
 
-    /** «3 года назад» → ISO-строка (для сортировки и подписи «когда»). */
+    /** «3 года назад» → ISO-строка (для подписи «когда» и сортировки). */
     private fun publishedToIso(text: String): String? {
         if (text.isBlank()) return null
         val t = text.lowercase()
         val n = Regex("""(\d+)""").find(t)?.groupValues?.get(1)?.toIntOrNull() ?: 1
         val days = when {
-            t.contains("секунд") || t.contains("минут") -> 0
-            t.contains("час") -> 0
+            t.contains("секунд") || t.contains("минут") || t.contains("час") -> 0
             t.contains("вчера") -> 1
             t.contains("день") || t.contains("дня") || t.contains("дней") -> n
             t.contains("недел") -> n * 7
@@ -323,4 +314,41 @@ object YouTubeSearchEngine {
         return java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
             .format(java.util.Date(at))
     }
+
+    private fun jsonClient(): JSONObject = JSONObject()
+        .put("clientName", "WEB")
+        .put("clientVersion", "2.20240726.00.00")
+        .put("hl", "ru")
+        .put("gl", "RU")
+
+    private fun postJson(url: String, body: JSONObject, ua: String = WEB_UA): JSONObject? = try {
+        val request = Request.Builder()
+            .url(url)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", ua)
+            .header("X-Goog-Api-Format-Version", "2")
+            .header("Accept-Language", "ru-RU,ru;q=0.9")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        http.newCall(request).execute().use { r ->
+            if (!r.isSuccessful) {
+                Log.w(TAG, "POST $url -> ${r.code}")
+                null
+            } else {
+                val text = r.body?.string().orEmpty()
+                if (text.isBlank()) null else JSONObject(text)
+            }
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "POST $url failed: ${e.message}")
+        null
+    }
+
+    private fun decode(s: String): String = s
+        .replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'")
+        .replace("&lt;", "<").replace("&gt;", ">")
+
+    private fun normalize(s: String): String = s.lowercase()
+        .replace("ё", "е")
+        .replace(Regex("[^а-яa-z0-9]+"), "")
 }

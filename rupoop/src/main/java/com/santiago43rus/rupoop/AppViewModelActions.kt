@@ -4,6 +4,9 @@ import androidx.media3.common.util.UnstableApi
 import com.santiago43rus.rupoop.data.Author
 import com.santiago43rus.rupoop.data.SearchResult
 import com.santiago43rus.rupoop.util.extractId
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 // ── Subscription toggle ──
 @UnstableApi
@@ -31,6 +34,33 @@ fun AppViewModel.unsubscribeAuthor(author: Author, deleteFromGist: Boolean = fal
         showSnackbar("Вы отписались от ${author.name} (удалено из Gist)")
     } else {
         showSnackbar("Вы отписались от ${author.name}")
+    }
+}
+
+// ── YouTube-плейлист канала ──
+/**
+ * v4.91.0: открыть плейлист канала так же, как обычный список видео —
+ * подгружаем его содержимое в модуле и играем первым роликом в режиме плейлиста.
+ */
+@UnstableApi
+fun AppViewModel.playYouTubePlaylist(playlistUrl: String) {
+    val id = Regex("list=([A-Za-z0-9_-]+)").find(playlistUrl)?.groupValues?.get(1)
+    if (id == null) {
+        showSnackbar("Это не плейлист")
+        return
+    }
+    viewModelScope.launch {
+        showSnackbar("Загружаю плейлист…")
+        val videos = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { com.santiago43rus.rupoop.network.YouTubeChannelEngine.playlistVideos(id) }
+                .getOrDefault(emptyList())
+        }
+        if (videos.isEmpty()) {
+            showSnackbar("В этом плейлисте нет доступных видео")
+            return@launch
+        }
+        showSnackbar("Плейлист: ${videos.size} видео")
+        playVideo(videos.first(), videos, isPlaylist = true)
     }
 }
 

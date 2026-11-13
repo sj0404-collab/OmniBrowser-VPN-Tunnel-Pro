@@ -267,6 +267,10 @@ var AppViewModel.authorPage: Int
     get() = contentFeedController.authorPage
     set(value) { contentFeedController.authorPage = value }
 
+var AppViewModel.authorPlaylists: List<SearchResult>
+    get() = contentFeedController.authorPlaylists
+    set(value) { contentFeedController.authorPlaylists = value }
+
 var AppViewModel.hasMoreAuthorVideos: Boolean
     get() = contentFeedController.hasMoreAuthorVideos
     set(value) { contentFeedController.hasMoreAuthorVideos = value }

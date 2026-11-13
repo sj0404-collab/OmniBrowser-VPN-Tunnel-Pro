@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.santiago43rus.rupoop.network.RetrofitClient
 import com.santiago43rus.rupoop.network.LordfilmSearchEngine
+import com.santiago43rus.rupoop.network.YouTubeChannelEngine
 import com.santiago43rus.rupoop.network.YouTubeSearchEngine
 import com.santiago43rus.rupoop.network.VkSearchEngine
 import com.santiago43rus.rupoop.network.OkSearchEngine
@@ -30,6 +31,12 @@ class ContentFeedController(
     var liveVideos by mutableStateOf<List<SearchResult>>(emptyList())
     var subscriptionVideos by mutableStateOf<List<SearchResult>>(emptyList())
     var authorVideos by mutableStateOf<List<SearchResult>>(emptyList())
+
+    /** v4.91.0: плейлисты канала (сейчас — YouTube: реальные плейлисты канала). */
+    var authorPlaylists by mutableStateOf<List<SearchResult>>(emptyList())
+
+    /** защита от гонки: плейлисты применяем только для последнего открытого канала */
+    private var authorToken = 0
 
     // ── Pagination: Home ──
     var isHomeLoadingMore by mutableStateOf(false)
@@ -266,6 +273,21 @@ class ContentFeedController(
 
                     onAuthorVisibleChanged(true)
                     if (getPlayerState() == PlayerState.FULL) setPlayerState(PlayerState.MINI)
+
+                    // плейлисты канала грузим сразу, параллельно с видео
+                    authorPlaylists = emptyList()
+                    val token = ++authorToken
+                    scope.launch(Dispatchers.IO) {
+                        val isYtAuthor = author.platform?.uppercase()?.startsWith("YOUTUBE") == true ||
+                            author.url?.contains("youtube.com") == true
+                        if (isYtAuthor) {
+                            val chId = YouTubeChannelEngine.resolveChannelId(author.url ?: author.name)
+                            val lists = if (chId != null) YouTubeChannelEngine.channelPlaylists(chId) else emptyList()
+                            withContext(Dispatchers.Main) {
+                                if (token == authorToken) authorPlaylists = lists
+                            }
+                        }
+                    }
                 }
                 try {
                     val platform = author.platform?.uppercase() ?: when {
