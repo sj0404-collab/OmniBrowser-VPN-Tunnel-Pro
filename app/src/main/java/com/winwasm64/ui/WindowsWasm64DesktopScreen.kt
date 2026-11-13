@@ -1323,10 +1323,6 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                     if (newProgress >= 15 && view != null) {
                         injectActiveExtensions(view)
                     }
-                    if (newProgress >= 100 && view != null) {
-                        // v4.19.0: приёмник клавиш для своей панели ввода
-                        try { view.evaluateJavascript(com.winwasm64.ui.browser.OMNI_KEY_JS, null) } catch (_: Throwable) {}
-                    }
                 }
 
                 override fun onReceivedTitle(view: WebView?, title: String?) {
