@@ -273,8 +273,8 @@ fun AppTopBar(
                         }
                     }
                     OutlinedTextField(
-                        value = searchState.text.toString(),
-                        onValueChange = { new -> searchState.edit { replaceAll(new) } },
+                        value = vm.searchQuery,
+                        onValueChange = { typed -> vm.searchQuery = typed },
                         singleLine = true,
                         modifier = Modifier
                             .weight(1f)

@@ -108,13 +108,12 @@ fun PlaylistSelectionDialog(
         title = { Text(if (isCreating) "Новый плейлист" else "Добавить в плейлист") },
         text = {
             if (isCreating) {
-                val playlistNameState = rememberTextFieldState("")
                 LaunchedEffect(Unit) {
                     focusRequester.requestFocus()
                 }
                 OutlinedTextField(
-                    value = playlistNameState.text.toString(),
-                    onValueChange = { new -> playlistNameState.edit { replaceAll(new) } },
+                    value = newName,
+                    onValueChange = { typed -> newName = typed },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -126,8 +125,8 @@ fun PlaylistSelectionDialog(
                     },
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
                     keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
-                        if (playlistNameState.text.isNotBlank()) {
-                            onCreateNew(playlistNameState.text.toString())
+                        if (newName.isNotBlank()) {
+                            onCreateNew(newName)
                         }
                     }),
                     shape = RoundedCornerShape(24.dp),
@@ -142,9 +141,6 @@ fun PlaylistSelectionDialog(
                     ),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                 )
-                LaunchedEffect(playlistNameState.text) {
-                    newName = playlistNameState.text.toString()
-                }
             } else {
                 LazyColumn {
                     items(playlists) { p -> Row(Modifier.fillMaxWidth().clickable { onPlaylistSelected(p.name) }.padding(12.dp)) { Text(p.name) } }
