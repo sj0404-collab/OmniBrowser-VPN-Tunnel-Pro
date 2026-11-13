@@ -14,7 +14,7 @@ android {
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber
-        versionName = "4.86.0"
+        versionName = "4.87.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -101,6 +101,8 @@ android {
 }
 
 dependencies {
+    // v4.87.0: интерфейс и движок RupoopFork (RuTube/VK/OK/LordFilm) внутри нашего APK
+    implementation(project(":rupoop"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)

@@ -25,33 +25,6 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # v4.86.0: сначала собираем ВТОРОЕ приложение (RupoopFork) из его исходников в rupoop/,
-      # и кладём готовый APK внутрь нашего — так в одном установочном файле едут два приложения.
-      - name: Build second app (RupoopFork) and embed its APK
-        continue-on-error: true
-        run: |
-          set -e
-          cd rupoop
-          chmod +x gradlew
-          cp ../debug.keystore keystore.jks
-          {
-            echo "KEYSTORE_PASSWORD=android"
-            echo "KEY_ALIAS=androiddebugkey"
-            echo "KEY_PASSWORD=android"
-            echo "GH_CLIENT_ID="
-            echo "PROXY_URL="
-            echo "DONATE_URL="
-            if [ -n "$ANDROID_HOME" ]; then echo "sdk.dir=$ANDROID_HOME"; fi
-          } > local.properties
-          ./gradlew assembleRelease -x test --stacktrace --no-daemon \
-            || ./gradlew assembleDebug -x test --stacktrace --no-daemon
-          APK=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
-          if [ -z "$APK" ]; then APK=$(ls app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1); fi
-          test -n "$APK"
-          mkdir -p ../app/src/main/assets
-          cp "$APK" ../app/src/main/assets/rupofork.apk
-          ls -lh ../app/src/main/assets/rupofork.apk
-
       - name: Run Unit Tests & Assemble Signed Release APK (R8 + Unified Keystore)
         run: |
           chmod +x gradlew

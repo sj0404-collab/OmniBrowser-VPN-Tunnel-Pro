@@ -329,7 +329,7 @@ fun OmniBottomBar(selected: Int, items: List<OmniNavItem>, onSelect: (Int) -> Un
                         Modifier
                             .clip(RoundedCornerShape(14.dp))
                             .background(if (isSelected) Omni.AccentContainer else Color.Transparent)
-                            .padding(horizontal = 18.dp, vertical = 3.dp)
+                            .padding(horizontal = 10.dp, vertical = 3.dp)
                     ) {
                         Icon(item.icon, item.label, tint = if (isSelected) Omni.Accent else Omni.TextDim, modifier = Modifier.size(22.dp))
                     }

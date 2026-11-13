@@ -18,3 +18,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "WindowsWasm64"
 include(":app")
+// v4.87.0: движок и интерфейс RupoopFork входят в наш APK одним модулем
+include(":rupoop")

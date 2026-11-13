@@ -3412,6 +3412,13 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
+            // ===================== SECTION 7: КИНО (интерфейс Rupoop внутри нашего приложения) =====================
+            if (currentSection == 7 && !inPip) {
+                com.santiago43rus.rupoop.RupoopRootScreen(
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
+            }
+
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
             if (currentSection == 2 && !inPip) {
                 HistoryAndDownloadsSection(
@@ -3717,6 +3724,8 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         OmniNavItem("Торренты", OmniIcons.Torrent, section = 1),
                         // v4.71.0: «Видео» — отдельная вкладка, чтобы поиск роликов был виден сразу
                         OmniNavItem("Видео", OmniIcons.Play, section = 6),
+                        // v4.87.0: «Кино» — интерфейс Rupoop (RuTube/VK/OK/LordFilm) внутри нашего приложения
+                        OmniNavItem("Кино", OmniIcons.Film, section = 7),
                         OmniNavItem("История", OmniIcons.History, section = 2),
                         OmniNavItem("Загрузки", OmniIcons.Download, section = 4),
                         OmniNavItem("Приложения", OmniIcons.Apps, section = 3),
