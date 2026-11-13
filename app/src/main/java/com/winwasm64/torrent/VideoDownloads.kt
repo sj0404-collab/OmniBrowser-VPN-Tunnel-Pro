@@ -21,6 +21,10 @@ object VideoDownloads {
     const val UA =
         "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
+    /** v4.88.0: точный путь, куда попадёт скачанный файл — показываем в диалоге выбора качества. */
+    fun destPath(clip: VideoFeed.Clip): String =
+        "${AppDownloads.SUBDIR}/" + safeName(clip.title, "mp4")
+
     private fun safeName(title: String, ext: String): String {
         val base = title.replace(Regex("""[\\/:*?"<>|]+"""), " ").trim().replace(Regex("\\s+"), " ")
         val t = base.ifBlank { "video" }.take(70)

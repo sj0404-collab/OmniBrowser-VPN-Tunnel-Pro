@@ -10,11 +10,11 @@ android {
 
     defaultConfig {
         applicationId = "com.winwasm64.workstation"
-        minSdk = 24
+        minSdk = 21   // v4.88.0: универсально, включая Android 5
         targetSdk = 35
         val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 4000 + ciRunNumber
-        versionName = "4.87.0"
+        versionName = "4.88.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -27,7 +27,8 @@ android {
         // Только ARM-устройства (телефоны/планшеты). x86/x86_64 нужны лишь эмуляторам ПК
         ndk {
             // v4.4.3: только arm64 — библиотека Psiphon весит 31 МБ на каждую архитектуру
-            abiFilters += listOf("arm64-v8a")
+            // v4.88.0: универсальная сборка — телефоны, планшеты и приставки (32 и 64 бита)
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
     }
 
@@ -85,6 +86,8 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // v4.88.0: java.time и прочее для Android 5/6 через десугаринг
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -101,6 +104,7 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.2")
     // v4.87.0: интерфейс и движок RupoopFork (RuTube/VK/OK/LordFilm) внутри нашего APK
     implementation(project(":rupoop"))
     implementation(libs.androidx.core.ktx)

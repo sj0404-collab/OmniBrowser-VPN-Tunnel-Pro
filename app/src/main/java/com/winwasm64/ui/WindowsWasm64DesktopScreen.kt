@@ -289,6 +289,23 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
 
     // Bottom sections: 0 = Браузер, 1 = Торренты, 2 = История и Загрузки, 3 = Приложения + Список VPN
     var currentSection by remember { mutableIntStateOf(0) }
+    // v4.88.0: проверка обновлений подписок (YouTube/RuTube/VK) с уведомлением
+    var kinoCheckUp by remember { mutableStateOf(false) }
+    LaunchedEffect(kinoCheckUp) {
+        if (!kinoCheckUp) return@LaunchedEffect
+        kinoCheckUp = false
+        val fresh = kotlinx.coroutines.withContext(Dispatchers.IO) {
+            runCatching { com.winwasm64.torrent.VideoNotify.check(context) }.getOrDefault(emptyList())
+        }
+        val text = when {
+            com.winwasm64.torrent.VideoSubs.list(context).isEmpty() ->
+                "Нет подписок — подпишитесь на канал в «Кино → Поиск»"
+            fresh.isEmpty() -> "Новых роликов у подписок нет"
+            else -> "Новое: " + fresh.take(2).joinToString("; ") { it.channel + " — " + it.title.take(28) }
+        }
+        runCatching { android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_LONG).show() }
+    }
+
     LaunchedEffect(SectionRequest.target) {
         val t = SectionRequest.target
         if (t >= 0) {
@@ -3402,21 +3419,67 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                 )
             }
 
-            // ===================== SECTION 6: ВИДЕО (своя вкладка) =====================
-            if (currentSection == 6 && !inPip) {
-                VideoHomeSection(
-                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                    initialQuery = com.winwasm64.torrent.SearchCache.videoQuery
-                        .ifBlank { torrentEngine.cachedSearchQuery },
-                    onOpenUrl = { u -> navigateTab(activeTab, u) }
-                )
-            }
-
-            // ===================== SECTION 7: КИНО (интерфейс Rupoop внутри нашего приложения) =====================
+            // ===================== SECTION 7: КИНО (Rupoop + наш поиск с YouTube + история + плейлисты) =====================
             if (currentSection == 7 && !inPip) {
-                com.santiago43rus.rupoop.RupoopRootScreen(
-                    modifier = Modifier.weight(1f).fillMaxWidth()
-                )
+                Column(Modifier.weight(1f).fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            "🎬 Rupoop" to 0,
+                            "🔎 Поиск" to 1,
+                            "🕘 История" to 2,
+                            "🎞 Плейлисты" to 3
+                        ).forEach { (label, idx) ->
+                            Surface(
+                                color = if (KinoMemo.tab == idx) Omni.AccentContainer else Omni.SurfaceHighest,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.clickable { KinoMemo.tab = idx }
+                            ) {
+                                Text(
+                                    label, color = Color.White, fontSize = 11.sp,
+                                    fontWeight = if (KinoMemo.tab == idx) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp)
+                                )
+                            }
+                        }
+                        // v4.88.0: уведомления о новых роликах подписок (YouTube/RuTube/VK)
+                        Surface(
+                            color = Omni.SurfaceHighest,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.clickable { kinoCheckUp = true }
+                        ) {
+                            Text(
+                                "🔔", color = Color.White, fontSize = 12.sp,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp)
+                            )
+                        }
+                    }
+                    when (KinoMemo.tab) {
+                        0 -> com.santiago43rus.rupoop.RupoopRootScreen(
+                            modifier = Modifier.weight(1f).fillMaxWidth()
+                        )
+                        1 -> VideoHomeSection(
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            initialQuery = com.winwasm64.torrent.SearchCache.videoQuery
+                                .ifBlank { torrentEngine.cachedSearchQuery },
+                            onOpenUrl = { u -> navigateTab(activeTab, u) }
+                        )
+                        2 -> com.winwasm64.ui.VideoHistoryScreen(
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            onOpen = { c -> com.winwasm64.ui.openClipStandalone(context, c) },
+                            onSearchAgain = { q, src ->
+                                com.winwasm64.torrent.SearchCache.videoQuery = q
+                                KinoMemo.tab = 1
+                            }
+                        )
+                        else -> com.winwasm64.ui.VideoPlaylistsScreen(
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
+                            onOpen = { c -> com.winwasm64.ui.openClipStandalone(context, c) }
+                        )
+                    }
+                }
             }
 
             // ===================== SECTION 2: HISTORY & DOWNLOADS MANAGER =====================
@@ -3722,9 +3785,7 @@ fun WindowsWasm64DesktopScreen(initialIntentUri: String? = null) {
                         // не открывались: нажатие выбирало уже выбранный раздел.
                         OmniNavItem("Браузер", OmniIcons.Globe, section = 0),
                         OmniNavItem("Торренты", OmniIcons.Torrent, section = 1),
-                        // v4.71.0: «Видео» — отдельная вкладка, чтобы поиск роликов был виден сразу
-                        OmniNavItem("Видео", OmniIcons.Play, section = 6),
-                        // v4.87.0: «Кино» — интерфейс Rupoop (RuTube/VK/OK/LordFilm) внутри нашего приложения
+                        // v4.88.0: отдельной вкладки «Видео» нет — всё видео (и YouTube) внутри «Кино»
                         OmniNavItem("Кино", OmniIcons.Film, section = 7),
                         OmniNavItem("История", OmniIcons.History, section = 2),
                         OmniNavItem("Загрузки", OmniIcons.Download, section = 4),
@@ -6698,7 +6759,8 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
                                     "🎬 Видео" to {
                                         // v4.76.0: старый экран поиска удалён — уводим на вкладку «Видео»
                                         com.winwasm64.torrent.SearchCache.videoQuery = photoTitle
-                                        SectionRequest.target = 6
+                                        KinoMemo.request(1)
+                                        SectionRequest.target = 7
                                     }
                                 ).forEach { (label, action) ->
                                     Button(
@@ -6739,6 +6801,15 @@ private fun PhotoSection(modifier: Modifier, initialQuery: String) {
  * v4.84.0: состояние поиска «Видео» живёт вне экрана. Раньше при переходе на другую вкладку
  * компонент уничтожался, и найденное пропадало — приходилось искать заново.
  */
+/**
+ * v4.88.0: «Кино» — единственная видео-вкладка: внутри неё Rupoop (RuTube/VK/OK/LordFilm),
+ * наш поиск с YouTube, история и плейлисты. Отдельной вкладки «Видео» больше нет.
+ */
+private object KinoMemo {
+    var tab by mutableIntStateOf(0)   // 0 Rupoop · 1 Поиск (YouTube/RuTube/VK) · 2 История · 3 Плейлисты
+    fun request(t: Int) { tab = t }
+}
+
 private object VideoMemo {
     var query: String = ""
     var submitted: String = ""
@@ -6800,6 +6871,9 @@ private fun VideoHomeSection(
     var qualityLoading by remember { mutableStateOf(false) }
     var probeUrl by remember { mutableStateOf<String?>(null) }
     var probeClip by remember { mutableStateOf<com.winwasm64.torrent.VideoFeed.Clip?>(null) }
+    // v4.88.0: «в плейлист» — с названием и типом видео
+    var plFor by remember { mutableStateOf<com.winwasm64.torrent.VideoFeed.Clip?>(null) }
+    var plVersion by remember { mutableIntStateOf(0) }
 
     fun humanError(t: Throwable): String = (t.message ?: "сеть").take(100)
 
@@ -6821,6 +6895,8 @@ private fun VideoHomeSection(
         }
         playing = "Открываю «${c.title.take(40)}»…"
         com.winwasm64.torrent.VideoLibrary.ensure(context, c)
+        // v4.88.0: история кино — все площадки, включая YouTube
+        com.winwasm64.torrent.VideoHistory.addWatch(context, c)
         scope.launch {
             // v4.81.0: если файл уже скачан — играем офлайн, без сети
             val local = withContext(Dispatchers.IO) { com.winwasm64.torrent.VideoDownloads.localFile(context, c) }
@@ -6900,6 +6976,7 @@ private fun VideoHomeSection(
         }
         submitted = q
         com.winwasm64.torrent.SearchCache.videoQuery = q
+        com.winwasm64.torrent.VideoHistory.addQuery(context, q, source)
         items = emptyList()
         scrapeRound = 0
         tick++
@@ -7088,6 +7165,53 @@ private fun VideoHomeSection(
                     }
                 }
             }
+        )
+    }
+
+    // v4.88.0: диалог «добавить в плейлист»
+    val plClip = plFor
+    if (plClip != null) {
+        val lists = remember(plVersion, plClip.url) { com.winwasm64.torrent.VideoPlaylists.list(context) }
+        val kindNow = com.winwasm64.torrent.VideoPlaylists.kindOf(plClip)
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { plFor = null },
+            title = { Text("В плейлист · $kindNow") },
+            text = {
+                Column {
+                    if (lists.isEmpty()) {
+                        Text("Плейлистов пока нет — создайте первый кнопкой ниже.", fontSize = 12.sp)
+                    }
+                    lists.forEach { pl ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(9.dp))
+                                .clickable {
+                                    com.winwasm64.torrent.VideoPlaylists.add(context, pl.name, plClip)
+                                    note = "Добавлено в «" + pl.name + "»"
+                                    plFor = null
+                                    plVersion++
+                                }
+                                .padding(vertical = 9.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("🎞", fontSize = 14.sp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(pl.name, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                            Text(pl.count.toString(), fontSize = 11.sp, color = Omni.TextFaint)
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "＋ Создать плейлист «$kindNow»",
+                        fontSize = 12.sp, color = Omni.Accent,
+                        modifier = Modifier.clickable {
+                            com.winwasm64.torrent.VideoPlaylists.create(context, "Мой $kindNow", kindNow)
+                            plVersion++
+                        }.padding(vertical = 6.dp)
+                    )
+                }
+            },
+            confirmButton = { TextButton(onClick = { plFor = null }) { Text("Готово") } }
         )
     }
 
@@ -7491,6 +7615,7 @@ private fun VideoHomeSection(
                             note = "У этой карточки нет имени канала"
                         }
                     },
+                    onPlaylist = { plFor = clip },
                     saved = remember(libVersion, clip.url) {
                         com.winwasm64.torrent.VideoLibrary.isSaved(context, clip)
                     },
@@ -7696,8 +7821,12 @@ private fun QualityDialog(
         ) {
             Text("Скачать: ${clip.title.take(60)}", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 2)
             Text(
-                "Файл попадёт в Download/OmniBrowser и откроется встроенным плеером без сети",
-                color = Omni.TextDim, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
+                "Куда: Download/" + com.winwasm64.torrent.VideoDownloads.destPath(clip),
+                color = Omni.Success, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp)
+            )
+            Text(
+                "Файл виден в «Загрузках» и открывается встроенным плеером без сети",
+                color = Omni.TextDim, fontSize = 10.sp, modifier = Modifier.padding(bottom = 8.dp)
             )
             if (loading) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -8197,6 +8326,7 @@ private fun VideoCard(
     subscribed: Boolean = false,
     saved: Boolean = false,
     onSave: () -> Unit = {},
+    onPlaylist: () -> Unit = {},
     onDownload: () -> Unit = {}
 ) {
     var menu by remember(clip.id) { mutableStateOf(false) }
@@ -8326,6 +8456,7 @@ private fun VideoCard(
                     "📺 Канал" to onChannel,
                     (if (subscribed) "✅ Вы подписаны" else "📌 Подписаться") to onSubscribe,
                     (if (saved) "📚 В библиотеке" else "📚 Смотреть позже") to onSave,
+                    "🎞 В плейлист" to onPlaylist,
                     "⬇ Скачать" to onDownload,
                     "📋 Ссылка" to onLink
                 ).forEach { (label, action) ->
