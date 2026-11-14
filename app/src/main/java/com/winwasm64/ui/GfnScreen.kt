@@ -19,6 +19,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -36,7 +38,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -75,7 +76,6 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
     val activity = remember(ctx) { ctx.findActivity() }
     // v4.96.0: по умолчанию Android-UA — только в нём NVIDIA пускает в игру
     var desktopUa by remember { mutableStateOf(GfnHolder.desktopUa) }
-    var reloadTick by remember { mutableIntStateOf(0) }
     var fullscreenView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
     var statusText by remember { mutableStateOf<String?>("Загрузка клиента GeForce NOW…") }
@@ -110,21 +110,21 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
             fullscreenView = null
             onImmersiveChange(false)
             applyImmersive(activity, false)
+            // v4.99.0: НЕ вызываем onPause — клиент на паузе давал чёрный экран при возврате на вкладку.
+            // Просто отцепляем вид: сессия и рендерер остаются живыми.
             try {
                 (webView.parent as? ViewGroup)?.removeView(webView)
-                webView.onPause()
             } catch (_: Throwable) {
             }
         }
     }
 
-    LaunchedEffect(desktopUa, reloadTick) {
-        try {
-            GfnHolder.applyUa(webView, desktopUa)
-            webView.onResume()
-            webView.loadUrl(GfnHolder.URL)
-        } catch (_: Throwable) {
-        }
+    // v4.99.0: при каждом входе на вкладку приводим вид в чувство (без перезагрузки, если страница жива)
+    LaunchedEffect(Unit) { GfnHolder.onAttach(webView) }
+
+    LaunchedEffect(desktopUa) {
+        GfnHolder.applyUa(webView, desktopUa)
+        if (GfnHolder.pageReady) GfnHolder.reload(webView, hard = true)
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -135,11 +135,19 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                 // ── служебная полоса: НАД страницей, не поверх ──
                 Row(
                     modifier = Modifier.fillMaxWidth().background(Color(0xFF101215))
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    KeyChip("⟳") { reloadTick++ }
+                    KeyChip("⟳") {
+                        statusText = "Перезагрузка клиента…"
+                        GfnHolder.reload(webView, hard = false)
+                    }
+                    KeyChip("⟳⟳") {
+                        statusText = "Полный перезапуск страницы…"
+                        GfnHolder.reload(webView, hard = true)
+                    }
                     KeyChip(if (desktopUa) "Режим: десктоп" else "Режим: Android") {
                         desktopUa = !desktopUa
                     }
@@ -318,7 +326,6 @@ private object GfnHolder {
             isClickable = true
             isFocusable = true
             isFocusableInTouchMode = true
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             with(settings) {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -345,6 +352,7 @@ private object GfnHolder {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    pageReady = true
                     onStatus?.invoke(null)
                     view?.requestFocus()
                 }
@@ -356,6 +364,7 @@ private object GfnHolder {
                 ) {
                     super.onReceivedError(view, request, error)
                     if (request?.isForMainFrame == true) {
+                        pageReady = false
                         onStatus?.invoke("Сеть: ${error?.description ?: "ошибка"} — нажмите ⟳")
                     }
                 }
@@ -369,6 +378,11 @@ private object GfnHolder {
                     onHideCustomViewCallback?.invoke()
                 }
 
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    super.onProgressChanged(view, newProgress)
+                    if (newProgress in 1..99) onStatus?.invoke("Загрузка клиента… $newProgress%")
+                }
+
                 override fun onPermissionRequest(request: PermissionRequest?) {
                     // микрофон для голосового чата в игре
                     try {
@@ -380,6 +394,55 @@ private object GfnHolder {
         }
         web = wv
         return wv
+    }
+
+    /** v4.99.0: страница дорисовалась хотя бы раз? */
+    var pageReady: Boolean = false
+
+    /**
+     * v4.99.0: возврат на вкладку. Раньше мы ставили клиент на паузу при уходе, и после возврата
+     * страница оставалась чёрной, а «⟳» ничего не менял. Теперь: будим, чиним раскладку и, если
+     * страница так и не догрузилась, загружаем заново.
+     */
+    fun onAttach(wv: WebView) {
+        try {
+            wv.onResume()
+            wv.resumeTimers()
+            wv.visibility = View.VISIBLE
+            wv.requestLayout()
+            wv.invalidate()
+        } catch (_: Throwable) {
+        }
+        if (!pageReady) reload(wv, hard = false)
+    }
+
+    /**
+     * v4.99.0: настоящая перезагрузка.
+     *  • hard = false — снова открыть клиент (loadUrl, а не reload: reload на «зависшем» рендерере
+     *    часто ничего не делает, а вызов loadUrl перезапускает страницу с нуля);
+     *  • hard = true  — сначала about:blank, потом клиент: это гарантированно новый рендерер.
+     */
+    fun reload(wv: WebView, hard: Boolean) {
+        pageReady = false
+        try {
+            wv.stopLoading()
+        } catch (_: Throwable) {
+        }
+        try {
+            if (hard) {
+                wv.loadUrl("about:blank")
+                wv.postDelayed({
+                    try {
+                        wv.loadUrl(URL)
+                    } catch (_: Throwable) {
+                    }
+                }, 200L)
+            } else {
+                wv.loadUrl(URL)
+            }
+            wv.invalidate()
+        } catch (_: Throwable) {
+        }
     }
 
     /** UA и Client Hints — всегда согласованно (и строка, и userAgentData). */
