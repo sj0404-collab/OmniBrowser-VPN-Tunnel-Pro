@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v4.101.0: своя адаптивная иконка. Раньше на Android 8+ бралась иконка библиотеки :rupoop
+     (белая «R» на тёмном квадрате) — она перекрывала наши mipmap-*.png и меняла обложку. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/omni_ic_bg" />
+    <foreground android:drawable="@mipmap/omni_ic_foreground" />
+</adaptive-icon>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- v4.101.0: фон адаптивной иконки OmniBrowser (тёмно-синий, как у знака) -->
+    <color name="omni_ic_bg">#000027</color>
+</resources>
