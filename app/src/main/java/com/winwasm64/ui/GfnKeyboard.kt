@@ -5,6 +5,7 @@ import android.os.SystemClock
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.View
+import android.view.inputmethod.BaseInputConnection
 import android.webkit.WebView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -31,8 +33,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -40,7 +44,14 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 
 /**
- * v4.97.0: наша клавиатура для GeForce NOW — белые клавиши, панель тащится и масштабируется.
+ * v4.98.0: наша клавиатура для GeForce NOW — белые клавиши + ПРОЗРАЧНАЯ СТРОКА ВВОДА.
+ *
+ * Почему строка ввода: из наших клавиш в игру доходил только Enter. Символы в клиент NVIDIA попадают
+ * не «нажатием», а как текст в его скрытое поле, поэтому теперь всё, что вы набираете, сначала идёт
+ * в видимую прозрачную строку, а оттуда — в игру двумя каналами сразу:
+ *   1) InputConnection.commitText (настоящий ввод текста в сфокусированное поле страницы);
+ *   2) KeyEvent по каждому символу (на случай, если клиент слушает только keydown).
+ * Строку можно заполнять и системной клавиатурой, и нашими клавишами — путь один и тот же.
  *
  * Зачем своя: у клиента NVIDIA и у самой игры есть экранные клавиатуры, но их нажатия не доходят
  * до стрима (символы не вводятся, клавиатура сразу закрывается), а убрать их мы не можем — они
@@ -62,6 +73,8 @@ fun GfnKeyboardPanel(
     var scale by remember { mutableFloatStateOf(1f) }
     var shift by remember { mutableStateOf(false) }
     var ru by remember { mutableStateOf(false) }
+    // v4.98.0: прозрачная строка ввода
+    var line by remember { mutableStateOf("") }
 
     val rows = (if (ru) RU_LOWER else EN_LOWER).split("|")
 
@@ -100,23 +113,83 @@ fun GfnKeyboardPanel(
                 KbChip("✕") { onClose() }
             }
 
+            // ── прозрачная строка ввода: печатайте сюда, текст уходит в игру ──
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0x14FFFFFF), RoundedCornerShape(7.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.weight(1f).padding(vertical = 6.dp)) {
+                    if (line.isEmpty()) {
+                        Text(
+                            "прозрачная строка ввода — печатайте сюда",
+                            color = Color(0x59FFFFFF),
+                            fontSize = 11.sp
+                        )
+                    }
+                    BasicTextField(
+                        value = line,
+                        onValueChange = { nv ->
+                            val old = line
+                            if (nv.length > old.length) {
+                                val added = nv.substring(old.length)
+                                line = nv
+                                forwardText(added, activity, webView)
+                            } else if (nv.length < old.length) {
+                                repeat(old.length - nv.length) {
+                                    sendKey(KeyEvent.KEYCODE_DEL, activity, webView)
+                                }
+                                line = nv
+                            } else {
+                                line = nv
+                            }
+                        },
+                        textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                        cursorBrush = SolidColor(Color.White),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                KbChip("⏎") { sendKey(KeyEvent.KEYCODE_ENTER, activity, webView) }
+                KbChip("⌫") {
+                    if (line.isNotEmpty()) line = line.dropLast(1) else sendKey(KeyEvent.KEYCODE_DEL, activity, webView)
+                }
+                KbChip("очистить") { line = "" }
+            }
+
             rows.forEach { row ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(3.dp)
                 ) {
                     row.forEach { c ->
-                        val t = if (shift) c.uppercase() else c.toString()
-                        Key(t) { typeChar(if (shift) c.uppercaseChar() else c, activity, webView) }
+                        val ch = if (shift) c.uppercaseChar() else c
+                        Key(if (shift) c.uppercase() else c.toString()) {
+                            val nv = line + ch
+                            line = nv
+                            forwardText(ch.toString(), activity, webView)
+                        }
                     }
                 }
             }
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                "1234567890".forEach { c -> Key(c.toString()) { typeChar(c, activity, webView) } }
+                "1234567890".forEach { c ->
+                    Key(c.toString()) {
+                        line += c.toString()
+                        forwardText(c.toString(), activity, webView)
+                    }
+                }
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                "-=.,!?@#".forEach { c -> Key(c.toString()) { typeChar(c, activity, webView) } }
+                "-=.,!?@#".forEach { c ->
+                    Key(c.toString()) {
+                        line += c.toString()
+                        forwardText(c.toString(), activity, webView)
+                    }
+                }
             }
 
             // ── служебные клавиши ──
@@ -141,7 +214,10 @@ fun GfnKeyboardPanel(
                 KbChip("↑") { sendKey(KeyEvent.KEYCODE_DPAD_UP, activity, webView) }
                 KbChip("↓") { sendKey(KeyEvent.KEYCODE_DPAD_DOWN, activity, webView) }
                 KbChip("→") { sendKey(KeyEvent.KEYCODE_DPAD_RIGHT, activity, webView) }
-                Key("Пробел", weight = 1f) { typeChar(' ', activity, webView) }
+                Key("Пробел", weight = 1f) {
+                    line += " "
+                    forwardText(" ", activity, webView)
+                }
             }
         }
     }
@@ -201,6 +277,24 @@ fun sendKey(keyCode: Int, activity: Activity?, webView: WebView?) {
         } catch (_: Throwable) {
         }
     }
+}
+
+/**
+ * v4.98.0: текст в игру двумя каналами сразу — InputConnection.commitText и KeyEvent по символам.
+ * Клиент NVIDIA в мобильном режиме слушает ввод текста в своём скрытом поле, поэтому одного
+ * keydown мало (из наших клавиш доходил только Enter).
+ */
+fun forwardText(text: String, activity: Activity?, webView: WebView?) {
+    if (text.isEmpty()) return
+    if (webView != null) {
+        try {
+            val ic = BaseInputConnection(webView, false)
+            ic.commitText(text, 1)
+            ic.finishComposingText()
+        } catch (_: Throwable) {
+        }
+    }
+    text.forEach { c -> typeChar(c, activity, webView) }
 }
 
 /** Символ → настоящие клавиатурные события (с шифтом там, где он нужен). */
