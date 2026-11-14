@@ -7,7 +7,6 @@ import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
-import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -80,6 +79,8 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
     var fullscreenView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
     var statusText by remember { mutableStateOf<String?>("Загрузка клиента GeForce NOW…") }
+    // v4.97.0: наша клавиатура (белая), перетаскиваемая и масштабируемая
+    var kbOpen by remember { mutableStateOf(false) }
 
     val host = remember { GfnHolder.container(ctx) }
     val webView = remember { GfnHolder.webView(ctx) }
@@ -174,10 +175,10 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                     horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    KeyChip("Esc") { pressKey(webView, KeyEvent.KEYCODE_ESCAPE) }
-                    KeyChip("Tab") { pressKey(webView, KeyEvent.KEYCODE_TAB) }
-                    KeyChip("Enter") { pressKey(webView, KeyEvent.KEYCODE_ENTER) }
-                    KeyChip("⌨") { showKeyboard(ctx, webView) }
+                    KeyChip("Esc") { sendKey(KeyEvent.KEYCODE_ESCAPE, activity, webView) }
+                    KeyChip("Tab") { sendKey(KeyEvent.KEYCODE_TAB, activity, webView) }
+                    KeyChip("Enter") { sendKey(KeyEvent.KEYCODE_ENTER, activity, webView) }
+                    KeyChip(if (kbOpen) "⌨▾" else "⌨") { kbOpen = !kbOpen }
                 }
             }
         }
@@ -216,10 +217,10 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                KeyChip("Esc") { pressKey(webView, KeyEvent.KEYCODE_ESCAPE) }
-                KeyChip("Tab") { pressKey(webView, KeyEvent.KEYCODE_TAB) }
-                KeyChip("Enter") { pressKey(webView, KeyEvent.KEYCODE_ENTER) }
-                KeyChip("⌨") { showKeyboard(ctx, webView) }
+                KeyChip("Esc") { sendKey(KeyEvent.KEYCODE_ESCAPE, activity, webView) }
+                KeyChip("Tab") { sendKey(KeyEvent.KEYCODE_TAB, activity, webView) }
+                KeyChip("Enter") { sendKey(KeyEvent.KEYCODE_ENTER, activity, webView) }
+                KeyChip(if (kbOpen) "⌨▾" else "⌨") { kbOpen = !kbOpen }
                 KeyChip("Выйти") {
                     try {
                         fullscreenCallback?.onCustomViewHidden()
@@ -229,6 +230,11 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                     fullscreenView = null
                 }
             }
+        }
+
+        // v4.97.0: наша белая клавиатура — поверх всего; тащится за шапку, масштабируется −/+
+        if (kbOpen) {
+            GfnKeyboardPanel(activity = activity, webView = webView, onClose = { kbOpen = false })
         }
     }
 }
@@ -336,10 +342,6 @@ private object GfnHolder {
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             } catch (_: Throwable) {
             }
-            setOnTouchListener { v, _ ->
-                if (!v.hasFocus()) v.requestFocus()
-                false
-            }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
@@ -411,26 +413,3 @@ private fun KeyChip(label: String, onClick: () -> Unit) {
     }
 }
 
-/** Одно нажатие клавиши в страницу (без синтетических DOM-событий). */
-private fun pressKey(wv: WebView?, keyCode: Int) {
-    if (wv == null) return
-    try {
-        if (!wv.hasFocus()) wv.requestFocus()
-        val now = SystemClock.uptimeMillis()
-        wv.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
-        wv.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
-    } catch (_: Throwable) {
-    }
-}
-
-private fun showKeyboard(ctx: Context, wv: WebView?) {
-    try {
-        wv?.let {
-            if (!it.hasFocus()) it.requestFocus()
-            val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE)
-                as? android.view.inputmethod.InputMethodManager
-            imm?.showSoftInput(it, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
-        }
-    } catch (_: Throwable) {
-    }
-}
