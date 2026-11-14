@@ -215,11 +215,9 @@ fun RutubeApp(
 
     LaunchedEffect(Unit) {
         vm.initializeApp()
-        val currentVersion = BuildConfig.VERSION_CODE
-        if (vm.settingsManager.lastNotifiedVersionCode < currentVersion) {
-            vm.showTelegramChannelDialog = true
-            vm.settingsManager.lastNotifiedVersionCode = currentVersion
-        }
+        // v4.100.0: никаких уведомлений «от Rupoop» — диалог Telegram-канала больше не показываем
+        vm.showTelegramChannelDialog = false
+        vm.settingsManager.lastNotifiedVersionCode = BuildConfig.VERSION_CODE
     }
     LaunchedEffect(vm.currentNav) {
         if (vm.currentNav == NavItem.LIVE && vm.liveVideos.isEmpty()) vm.loadLiveStreams(false)

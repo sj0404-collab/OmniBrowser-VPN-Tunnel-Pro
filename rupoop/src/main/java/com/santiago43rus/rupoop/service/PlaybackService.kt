@@ -153,7 +153,7 @@ class PlaybackService : MediaSessionService() {
         val basePlayer = AppViewModel.sharedPlayer ?: return buildFallbackNotification()
         val currentVideo = AppViewModel.instance?.currentVideo
         val title = currentVideo?.title ?: "Воспроизведение"
-        val author = currentVideo?.author?.name ?: "Rupoop"
+        val author = currentVideo?.author?.name ?: "Кино"
         val isPlaying = basePlayer.isPlaying
 
         val vm = AppViewModel.instance

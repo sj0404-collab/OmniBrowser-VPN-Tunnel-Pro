@@ -78,7 +78,7 @@ class GistSyncManager(
             applySettingsToPreferences(mergedRegistry.appSettings)
 
             val request = GistRequest(
-                description = "Rupoop User Registry",
+                description = "OmniBrowser User Registry",
                 public = false,
                 files = mapOf(SYNC_FILE_NAME to GistFile(content = json.encodeToString(mergedRegistry)))
             )
@@ -112,7 +112,7 @@ class GistSyncManager(
             registryManager.updateRegistry(currentWithPrefs)
 
             val request = GistRequest(
-                description = "Rupoop User Registry",
+                description = "OmniBrowser User Registry",
                 public = false,
                 files = mapOf(SYNC_FILE_NAME to GistFile(content = json.encodeToString(currentWithPrefs)))
             )

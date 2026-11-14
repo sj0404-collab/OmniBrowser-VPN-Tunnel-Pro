@@ -180,10 +180,11 @@ fun AppTopBar(
                             vm.currentNav == NavItem.LIBRARY && vm.currentLibSub == LibrarySubScreen.HISTORY -> "История просмотра"
                             vm.currentNav == NavItem.LIBRARY && vm.currentLibSub == LibrarySubScreen.DOWNLOADS -> "Загрузки"
                             else -> when (vm.currentNav) {
-                                NavItem.HOME -> "Rupoop"
+                                // v4.100.0: в шапке больше нет названия Rupoop
+                                NavItem.HOME -> "Кино"
                                 NavItem.LIVE -> "Трансляции"
-                                NavItem.SUBSCRIPTIONS -> "Rupoop"
-                                NavItem.LIBRARY -> "Rupoop"
+                                NavItem.SUBSCRIPTIONS -> "Подписки"
+                                NavItem.LIBRARY -> "Библиотека"
                             }
                         },
                         fontWeight = FontWeight.Bold,

@@ -154,13 +154,13 @@ fun RutubeAppOverlays(
             onDismissRequest = { vm.showTelegramChannelDialog = false },
             title = {
                 Text(
-                    text = "Telegram-канал Rupoop",
+                    text = "OmniBrowser",
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
                 )
             },
             text = {
                 Text(
-                    text = "Подписывайтесь на наш официальный Telegram-канал @rupoopapp!\n\nТам быстрее всего выходят свежие беты, хотфиксы, ответы на вопросы и оперативная обратная связь по работе приложения на ваших устройствах."
+                    text = "Свежие сборки OmniBrowser VPN Tunnel Pro выходят на GitHub Releases."
                 )
             },
             confirmButton = {
@@ -168,7 +168,7 @@ fun RutubeAppOverlays(
                     onClick = {
                         vm.showTelegramChannelDialog = false
                         try {
-                            uriHandler.openUri("https://t.me/rupoopapp")
+                            uriHandler.openUri("https://github.com/sj0404-collab/OmniBrowser-VPN-Tunnel-Pro/releases")
                         } catch (_: Exception) {}
                     },
                     colors = ButtonDefaults.buttonColors(

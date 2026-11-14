@@ -49,8 +49,8 @@ class BackupManager(
         return Intent(Intent.ACTION_SEND).apply {
             type = "application/json"
             putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "Резервная копия Rupoop")
-            putExtra(Intent.EXTRA_TEXT, "Резервная копия Rupoop (настройки, история, подписки, плейлисты)")
+            putExtra(Intent.EXTRA_SUBJECT, "Резервная копия Кино")
+            putExtra(Intent.EXTRA_TEXT, "Резервная копия Кино (настройки, история, подписки, плейлисты)")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }

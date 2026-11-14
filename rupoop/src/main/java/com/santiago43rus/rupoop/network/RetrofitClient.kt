@@ -19,7 +19,7 @@ object RetrofitClient {
     private val okHttpClient = OkHttpClient.Builder()
         .addInterceptor { chain ->
             val request = chain.request().newBuilder()
-                .header("User-Agent", "Rupoop-App")
+                .header("User-Agent", "OmniBrowser-App")
                 .build()
             chain.proceed(request)
         }

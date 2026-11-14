@@ -448,8 +448,7 @@ fun TvSettingsScreen(
                 ) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Версия: $versionName ($versionCode)", fontSize = 15.sp)
-                        Text("Telegram: t.me/rupoopapp", color = colorScheme.onSurfaceVariant, fontSize = 14.sp)
-                        Text("Исходный код: github.com/santiago43rus/Rupoop", color = colorScheme.onSurfaceVariant, fontSize = 14.sp)
+                        Text("OmniBrowser VPN Tunnel Pro", color = colorScheme.onSurfaceVariant, fontSize = 14.sp)
                         Text("Лицензия: MIT License", color = colorScheme.onSurfaceVariant, fontSize = 14.sp)
                     }
                 }

@@ -128,12 +128,16 @@ object DownloadIndexer {
 
         // 3. Manual directories fallback (Rupoop, Movies, Music)
         try {
-            val rupoopDir = File(Environment.getExternalStorageDirectory(), "Rupoop")
+            // v4.100.0: папка переименована в Omnibrowser; старая Rupoop тоже читается,
+            // чтобы уже скачанное не пропало
+            val rupoopDir = File(Environment.getExternalStorageDirectory(), "Omnibrowser")
+            val legacyDir = File(Environment.getExternalStorageDirectory(), "Rupoop")
             val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
             val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
             
             val manualFiles = mutableListOf<File>()
             if (rupoopDir.exists()) rupoopDir.listFiles()?.let { manualFiles.addAll(it) }
+            if (legacyDir.exists()) legacyDir.listFiles()?.let { manualFiles.addAll(it) }
             if (moviesDir.exists()) moviesDir.listFiles()?.let { manualFiles.addAll(it) }
             if (musicDir.exists()) musicDir.listFiles()?.let { manualFiles.addAll(it) }
             

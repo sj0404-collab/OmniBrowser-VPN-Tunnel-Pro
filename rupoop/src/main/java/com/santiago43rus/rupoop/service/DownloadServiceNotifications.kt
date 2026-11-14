@@ -37,7 +37,7 @@ internal fun currentGeneration(uploadId: String): Int =
 internal fun DownloadService.getServiceNotification(): Notification {
     return NotificationCompat.Builder(this, CHANNEL_SILENT_ID)
         .setSmallIcon(android.R.drawable.stat_sys_download)
-        .setContentTitle("Служба загрузок Rupoop")
+        .setContentTitle("Загрузки Кино")
         .setContentText("Выполняются фоновые задачи загрузки...")
         .setPriority(NotificationCompat.PRIORITY_MIN)
         .setOngoing(true)

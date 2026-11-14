@@ -139,22 +139,15 @@ fun SupportAndAboutSection(
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.clickable { onVersionClick() }
             )
+            // v4.100.0: чужие ссылки (Telegram-канал и репозиторий Rupoop) убраны —
+            // в «Кино» больше нет ни названия, ни брендинга Rupoop
             ListItem(
-                headlineContent = { Text("Telegram-канал") },
-                supportingContent = { Text("t.me/rupoopapp • Сырые, тестовые и бета-сборки") },
-                leadingContent = { Icon(Icons.AutoMirrored.Filled.Send, null, tint = MaterialTheme.colorScheme.primary) },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                modifier = Modifier.clickable {
-                    uriHandler.openUri("https://t.me/rupoopapp")
-                }
-            )
-            ListItem(
-                headlineContent = { Text("Исходный код") },
-                supportingContent = { Text("GitHub") },
+                headlineContent = { Text("Сборки OmniBrowser") },
+                supportingContent = { Text("GitHub Releases") },
                 leadingContent = { Icon(Icons.Default.Code, null, tint = Color.Gray) },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier.clickable {
-                    uriHandler.openUri("https://github.com/santiago43rus/Rupoop")
+                    uriHandler.openUri("https://github.com/sj0404-collab/OmniBrowser-VPN-Tunnel-Pro/releases")
                 }
             )
             ListItem(
