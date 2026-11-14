@@ -21,6 +21,7 @@ import android.widget.FrameLayout
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -81,16 +83,25 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
     var statusText by remember { mutableStateOf<String?>("Загрузка клиента GeForce NOW…") }
     // v4.97.0: наша клавиатура (белая), перетаскиваемая и масштабируемая
     var kbOpen by remember { mutableStateOf(false) }
+    // v4.102.0: если клиент не отрисовался — предлагаем перезагрузку/пересоздание
+    var stuck by remember { mutableStateOf(false) }
+    var wvVersion by remember { mutableIntStateOf(0) }
 
     val host = remember { GfnHolder.container(ctx) }
-    val webView = remember { GfnHolder.webView(ctx) }
+    // v4.102.0: при «Пересоздать» WebView уничтожается и строится заново внутри того же контейнера
+    val webView = remember(wvVersion) {
+        if (wvVersion == 0) GfnHolder.webView(ctx) else GfnHolder.recreate(ctx)
+    }
 
     GfnHolder.onShowCustomView = { view, cb ->
         fullscreenView = view
         fullscreenCallback = cb
     }
     GfnHolder.onHideCustomViewCallback = { fullscreenView = null }
-    GfnHolder.onStatus = { text -> statusText = text }
+    GfnHolder.onStatus = { text ->
+        statusText = text
+        if (text == null) stuck = false
+    }
 
     val isFull = fullscreenView != null
 
@@ -122,6 +133,11 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
     // v4.99.0: при каждом входе на вкладку приводим вид в чувство (без перезагрузки, если страница жива)
     LaunchedEffect(Unit) { GfnHolder.onAttach(webView) }
 
+    LaunchedEffect(wvVersion) {
+        kotlinx.coroutines.delay(20_000)
+        if (!GfnHolder.pageReady) stuck = true
+    }
+
     LaunchedEffect(desktopUa) {
         GfnHolder.applyUa(webView, desktopUa)
         if (GfnHolder.pageReady) GfnHolder.reload(webView, hard = true)
@@ -140,14 +156,20 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    KeyChip("⟳") {
-                        statusText = "Перезагрузка клиента…"
-                        GfnHolder.reload(webView, hard = false)
-                    }
-                    KeyChip("⟳⟳") {
-                        statusText = "Полный перезапуск страницы…"
-                        GfnHolder.reload(webView, hard = true)
-                    }
+                    // v4.102.0: одна кнопка. Тап — перезагрузка, долгое нажатие — жёсткий перезапуск.
+                    KeyChip(
+                        "⟳",
+                        onClick = {
+                            stuck = false
+                            statusText = "Перезагрузка клиента…"
+                            GfnHolder.reload(webView, hard = false)
+                        },
+                        onLongClick = {
+                            stuck = false
+                            statusText = "Жёсткий перезапуск страницы…"
+                            GfnHolder.reload(webView, hard = true)
+                        }
+                    )
                     KeyChip(if (desktopUa) "Режим: десктоп" else "Режим: Android") {
                         desktopUa = !desktopUa
                     }
@@ -236,6 +258,33 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                     }
                     fullscreenCallback = null
                     fullscreenView = null
+                }
+            }
+        }
+
+        // v4.102.0: страница так и не отрисовалась — не оставляем человека с чёрным экраном
+        if (stuck && !isFull) {
+            Box(
+                Modifier.fillMaxSize().background(Color(0xE6000000)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Клиент GeForce NOW не отрисовался", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Обычно помогает перезагрузка страницы", color = Color(0xFF9AA0AA), fontSize = 11.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        KeyChip("⟳ Перезагрузить") {
+                            stuck = false
+                            GfnHolder.reload(webView, hard = true)
+                        }
+                        KeyChip("Пересоздать клиент") {
+                            stuck = false
+                            statusText = "Пересоздаём клиент…"
+                            wvVersion++
+                        }
+                    }
                 }
             }
         }
@@ -380,7 +429,8 @@ private object GfnHolder {
 
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
                     super.onProgressChanged(view, newProgress)
-                    if (newProgress in 1..99) onStatus?.invoke("Загрузка клиента… $newProgress%")
+                    if (newProgress >= 100) pageReady = true
+                    else if (newProgress > 0) onStatus?.invoke("Загрузка клиента… $newProgress%")
                 }
 
                 override fun onPermissionRequest(request: PermissionRequest?) {
@@ -413,7 +463,42 @@ private object GfnHolder {
             wv.invalidate()
         } catch (_: Throwable) {
         }
-        if (!pageReady) reload(wv, hard = false)
+        // Не мешаем уже идущей загрузке: иначе быстрый уход/возврат на вкладку перезапускал страницу
+        if (!pageReady && wv.progress !in 1..99) reload(wv, hard = false)
+    }
+
+    /**
+     * v4.102.0: пересоздать клиент с нуля — когда рендерер умер и ни reload, ни about:blank не помогают.
+     * Контейнер остаётся тем же, поэтому композиция не ломается.
+     */
+    fun recreate(ctx: Context): WebView {
+        try {
+            web?.let { old ->
+                (old.parent as? ViewGroup)?.removeView(old)
+                old.stopLoading()
+                old.destroy()
+            }
+        } catch (_: Throwable) {
+        }
+        web = null
+        pageReady = false
+        val wv = webView(ctx)
+        try {
+            host?.let { h ->
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                h.addView(
+                    wv,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+            applyUa(wv, desktopUa)
+            wv.loadUrl(URL)
+        } catch (_: Throwable) {
+        }
+        return wv
     }
 
     /**
@@ -457,12 +542,15 @@ private object GfnHolder {
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun KeyChip(label: String, onClick: () -> Unit) {
+private fun KeyChip(label: String, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
     Surface(
         color = Color(0xCC202124),
         shape = RoundedCornerShape(50),
-        modifier = Modifier.height(32.dp).clickable(onClick = onClick)
+        modifier = Modifier
+            .height(32.dp)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
     ) {
         Box(contentAlignment = Alignment.Center) {
             Text(
