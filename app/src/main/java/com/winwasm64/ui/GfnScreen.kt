@@ -19,6 +19,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -29,9 +30,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -39,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,10 +51,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -86,6 +94,10 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
     // v4.102.0: если клиент не отрисовался — предлагаем перезагрузку/пересоздание
     var stuck by remember { mutableStateOf(false) }
     var wvVersion by remember { mutableIntStateOf(0) }
+    // v4.103.0: в полном экране игры по умолчанию НИЧЕГО нашего не рисуем
+    var panelInGame by remember { mutableStateOf(false) }
+    var hx by remember { mutableFloatStateOf(0f) }
+    var hy by remember { mutableFloatStateOf(0f) }
 
     val host = remember { GfnHolder.container(ctx) }
     // v4.102.0: при «Пересоздать» WebView уничтожается и строится заново внутри того же контейнера
@@ -173,6 +185,9 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                     KeyChip(if (desktopUa) "Режим: десктоп" else "Режим: Android") {
                         desktopUa = !desktopUa
                     }
+                    KeyChip(if (panelInGame) "В игре: панель вкл" else "В игре: панель выкл") {
+                        panelInGame = !panelInGame
+                    }
                     KeyChip("В Chrome") {
                         try {
                             ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GfnHolder.URL)))
@@ -198,19 +213,6 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                 modifier = if (isFull) Modifier.fillMaxSize() else Modifier.fillMaxWidth().weight(1f)
             )
 
-            if (!isFull) {
-                // ── нужные клавиши: отдельная полоса ПОД страницей ──
-                Row(
-                    modifier = Modifier.fillMaxWidth().background(Color(0xFF101215)).padding(vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    KeyChip("Esc") { sendKey(KeyEvent.KEYCODE_ESCAPE, activity, webView) }
-                    KeyChip("Tab") { sendKey(KeyEvent.KEYCODE_TAB, activity, webView) }
-                    KeyChip("Enter") { sendKey(KeyEvent.KEYCODE_ENTER, activity, webView) }
-                    KeyChip(if (kbOpen) "⌨▾" else "⌨") { kbOpen = !kbOpen }
-                }
-            }
         }
 
         // ── их собственный полный экран: поверх страницы, страница остаётся живой ──
@@ -241,25 +243,8 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
             }
             AndroidView(factory = { fsBox }, modifier = Modifier.fillMaxSize())
 
-            // маленькие кнопки в углу, чтобы не закрывать их оверлей
-            Row(
-                modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                KeyChip("Esc") { sendKey(KeyEvent.KEYCODE_ESCAPE, activity, webView) }
-                KeyChip("Tab") { sendKey(KeyEvent.KEYCODE_TAB, activity, webView) }
-                KeyChip("Enter") { sendKey(KeyEvent.KEYCODE_ENTER, activity, webView) }
-                KeyChip(if (kbOpen) "⌨▾" else "⌨") { kbOpen = !kbOpen }
-                KeyChip("Выйти") {
-                    try {
-                        fullscreenCallback?.onCustomViewHidden()
-                    } catch (_: Throwable) {
-                    }
-                    fullscreenCallback = null
-                    fullscreenView = null
-                }
-            }
+            // v4.103.0: в полном экране никаких наших кнопок поверх игры.
+            // Выход — системная кнопка «Назад» (см. BackHandler ниже).
         }
 
         // v4.102.0: страница так и не отрисовалась — не оставляем человека с чёрным экраном
@@ -285,6 +270,46 @@ fun GfnScreen(modifier: Modifier = Modifier, onImmersiveChange: (Boolean) -> Uni
                             wvVersion++
                         }
                     }
+                }
+            }
+        }
+
+        // v4.103.0: одна маленькая плавающая кнопка вместо полосы снизу.
+        // Вне полного экрана — видна всегда; в игре — только если включили «панель в игре».
+        // Её можно утащить в любое место, чтобы не закрывать нужный угол.
+        if (!isFull || panelInGame) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .offset { IntOffset(hx.roundToInt(), hy.roundToInt()) }
+                    .padding(10.dp)
+                    .size(42.dp)
+                    .background(Color(0x99101216), CircleShape)
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, drag ->
+                            change.consume()
+                            hx += drag.x
+                            hy += drag.y
+                        }
+                    }
+                    .clickable { kbOpen = !kbOpen },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(if (kbOpen) "▾" else "⌨", color = Color.White, fontSize = 16.sp)
+            }
+        }
+
+        // v4.103.0: «Назад» — выйти из игры или закрыть нашу панель. Своих кнопок на экране не держим.
+        androidx.activity.compose.BackHandler(enabled = isFull || kbOpen) {
+            when {
+                kbOpen -> kbOpen = false
+                fullscreenView != null -> {
+                    try {
+                        fullscreenCallback?.onCustomViewHidden()
+                    } catch (_: Throwable) {
+                    }
+                    fullscreenCallback = null
+                    fullscreenView = null
                 }
             }
         }
@@ -403,7 +428,7 @@ private object GfnHolder {
                     super.onPageFinished(view, url)
                     pageReady = true
                     onStatus?.invoke(null)
-                    view?.requestFocus()
+                    // v4.103.0: фокус не отбираем — в игре он должен остаться у видеопотока
                 }
 
                 override fun onReceivedError(
