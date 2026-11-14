@@ -544,7 +544,7 @@ private object GfnHolder {
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun KeyChip(label: String, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+private fun KeyChip(label: String, onLongClick: (() -> Unit)? = null, onClick: () -> Unit) {
     Surface(
         color = Color(0xCC202124),
         shape = RoundedCornerShape(50),
